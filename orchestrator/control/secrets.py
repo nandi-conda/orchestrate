@@ -20,7 +20,7 @@ SERVICE = "orchestrate"
 KNOWN = {
     "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and local runners",
                          "Authorization: Bearer <key> to https://api.deepseek.com"),
-    "SPRITES_TOKEN": ("Fly Sprites org token, needed with WORKER_PROVIDER=sprites",
+    "SPRITES_TOKEN": ("Fly Sprites org token; stored, it moves workers to sprites",
                       "Authorization: Bearer <token> to https://api.sprites.dev/v1"),
 }
 

@@ -34,12 +34,11 @@ The router's decision shows above the request box. **Project activity** in the
 thread list shows every event in the project, and each thread shows its own
 transcript, including messages from other threads.
 
-With `DEEPSEEK_API_KEY` set (env or keyring, service `orchestrate`), the
+With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
 orchestrator starts the real runner from `../runner` as a local subprocess,
 one worker per project, and the router uses `deepseek-flash`. Without the key it
 falls back to an echo runner (`control.devrunner`) and a rule-based router. That
-way you can click through the whole UI with no credentials. Set
-`ORCH_DEVRUNNER=1` to force the echo runner even when the key is present.
+way you can click through the whole UI with no credentials.
 
 The echo runner understands two lines, so you can test thread-to-thread
 traffic without a model: `spawn: <task>` starts a child thread, which reports
@@ -57,47 +56,73 @@ as root, so it is skipped there.
 
 ## Configuration
 
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `DEEPSEEK_API_KEY` | env, then keyring | router model, and passed to local runners. Sent as `Authorization: Bearer <key>` to `https://api.deepseek.com` |
-| `ROUTER_MODEL` | `deepseek-flash` | model the router uses |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | any OpenAI-compatible endpoint |
-| `DATABASE_URL` | `sqlite:///orchestrator.db` | `postgresql://…` selects the Postgres store |
-| `WORKER_PROVIDER` | `local` | `local` or `sprites` |
-| `RUNNER_DIR` | `../runner` | runner checkout for the local provider |
-| `RUNNER_CAPACITY` | `16` | running threads per worker before another worker starts |
-| `ORCHESTRATOR_PUBLIC_URL` | `http://127.0.0.1:<port>` | where runners reach the peer API |
-| `SPRITES_TOKEN` | env, then keyring | needed with `WORKER_PROVIDER=sprites`. Sent as `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
-| `RUNNER_SOURCE` / `RUNNER_REF` | this repo / `main` | what a sprite checks out |
-| `SPRITES_PREFIX` | `orch-` | sprite name prefix |
+There are no environment variables to set. Two secrets come from the system
+keyring (service `orchestrate`, username = the name), and everything else is
+worked out at runtime.
 
-Missing secrets are printed to the console at startup with the exact name, the header
-they're sent as, and the keyring backend that was searched. Store any of them with
-`pixi run set-key NAME`. A password added by hand in a keyring GUI (for example
-`DEEPSEEK_API_KEY` in the Login keyring) also works: an item labelled exactly like
-the variable is accepted, as long as its collection is unlocked.
+| Secret | What | Sent as |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | router model, and passed to the runners. Without it the router decides by rule and local runners use the echo runner | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
+| `SPRITES_TOKEN` | lets workers run on Sprites instead of this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
+
+Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
+the exact name, the header they're sent as, and the keyring backend that was
+searched. A password added by hand in a keyring GUI (for example
+`DEEPSEEK_API_KEY` in the Login keyring) also works: an item labelled exactly
+like the variable is accepted, as long as its collection is unlocked. An
+environment variable of the same name is read first.
+
+What the control plane works out for itself:
+
+| | How |
+| --- | --- |
+| Where workers run | The address the browser reached it on. A loopback or private address keeps workers local; a public one moves them to sprites when `SPRITES_TOKEN` is stored, and stays local when it is not |
+| What the runner calls back on | The same address, taken from `Host` and `X-Forwarded-Host`/`X-Forwarded-Proto` of the request that asked for the worker |
+| What a sprite checks out | This checkout's `origin` remote and current branch, with a warning when the sprite would not get this exact commit |
+| Which router | The model when `DEEPSEEK_API_KEY` is stored, the rule-based one otherwise |
+| Storage | SQLite in `orchestrator.db`, or `--db postgresql://…` for several control planes |
+
+Flags: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db`.
+
+Because the callback address comes from the request, publish the control plane
+behind a proxy you trust and have it forward the original host, and remember
+that only `/api/peer/*` is authenticated — the UI API is not. Reaching the UI
+through a public URL means anyone with that URL can use it.
 
 ### Storage
 
 `control/store.py` defines a `Store` interface with two backends:
 
 - **SQLite** is the default. It needs no setup and fits a single control plane process.
-- **Postgres** (`DATABASE_URL=postgresql://…`) lets several control plane
-  instances share state. Appends are announced with `LISTEN/NOTIFY`, so an
-  event written by one instance wakes SSE streams on all of them.
+- **Postgres** (`--db postgresql://…`) lets several control plane instances
+  share state. Appends are announced with `LISTEN/NOTIFY`, so an event written
+  by one instance wakes SSE streams on all of them.
 
 Runners never touch the database; they talk to the control plane over HTTP.
 
 ### Sprites
 
-With `WORKER_PROVIDER=sprites`, each worker is a sprite named
-`orch-<project>-w<n>`. The provider clones this repo to `/opt/orchestrate`, runs
-`runner/deploy/bootstrap.sh`, and registers `runner/deploy/start.sh` as the
-sprite service on port 8080. It also sets a network policy that allows only
-DeepSeek, GitHub, the package mirrors and the orchestrator. Runners call the
-peer API back on `ORCHESTRATOR_PUBLIC_URL`, so that URL has to be reachable from
-the sprite: deploy the control plane somewhere public, or tunnel it. This
-provider hasn't been run against the live API yet.
+When a request arrives on a public address and `SPRITES_TOKEN` is stored, each
+worker is a sprite named `orch-<project>-w<n>`. The provider clones this repo to
+`/opt/orchestrate`, runs `runner/deploy/bootstrap.sh`, and registers
+`runner/deploy/start.sh` as the sprite service on port 8080. It also sets a
+network policy that allows only DeepSeek, GitHub, the package mirrors and the
+orchestrator. Runners call the peer API back on the address the request came in
+on, so that address has to be reachable from the sprite: run the control plane
+with `--host 0.0.0.0` on a public machine, or put a tunnel in front of it.
+
+```sh
+cd orchestrator
+pixi run set-key SPRITES_TOKEN
+pixi run serve --host 0.0.0.0          # or: cloudflared tunnel --url http://localhost:8000
+```
+
+A loopback or private request keeps workers local, so a laptop session never
+silently starts billable sprites. The sprite checks out this checkout's `origin`
+and current branch, so push before expecting local commits to be there; a
+sprite has no git credentials, so the repository must be publicly readable.
+
+This provider has not been run end-to-end against the live API yet.
 
 ## Layout
 
@@ -107,7 +132,8 @@ provider hasn't been run against the live API yet.
 | `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, request handling |
 | `control/router.py` | `ModelRouter` (DeepSeek), `HeuristicRouter` |
 | `control/store.py` | `Store` interface, `SqliteStore`, `PostgresStore` |
-| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider` |
+| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` (which of the two, per request) |
+| `control/context.py` | the address the current request came in on |
 | `control/runner_client.py` | HTTP client for `runner/API.md` |
 | `control/devrunner.py` | echo runner speaking the same API |
 | `control/secrets.py` | env-then-keyring lookup (shared convention with the runner) |

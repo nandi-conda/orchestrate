@@ -15,7 +15,6 @@ Both lean toward spawning.
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Protocol
 
@@ -107,11 +106,14 @@ class ModelRouter:
         return plan
 
 
-def router_from_env() -> Router:
+ROUTER_MODEL = "deepseek-flash"
+MODEL_BASE_URL = "https://api.deepseek.com"
+
+
+def default_router() -> Router:
+    """The router asks a model when the DeepSeek key is stored, and decides by
+    rule when it is not, so the UI works without credentials."""
     from .secrets import get_secret
 
     key = get_secret("DEEPSEEK_API_KEY")
-    if not key:
-        return HeuristicRouter()
-    return ModelRouter(key, os.environ.get("ROUTER_MODEL", "deepseek-flash"),
-                       os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+    return ModelRouter(key, ROUTER_MODEL, MODEL_BASE_URL) if key else HeuristicRouter()

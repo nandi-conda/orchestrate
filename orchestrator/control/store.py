@@ -3,7 +3,7 @@
 `Store` is the interface the rest of the control plane uses. Two backends:
 
 - `SqliteStore`: the default, for local dev and tests. One process only.
-- `PostgresStore`: chosen when DATABASE_URL starts with postgres://. Several
+- `PostgresStore`: chosen when `--db` is a postgres:// URL. Several
   control plane instances can share it; appends are announced with
   LISTEN/NOTIFY so every instance wakes its SSE streams and inboxes.
 
@@ -346,7 +346,7 @@ class PostgresStore(_SqlStore):
             return seq
 
 
-def store_from_env(url: str | None) -> Store:
+def store_from_url(url: str | None) -> Store:
     if url and url.startswith(("postgres://", "postgresql://")):
         return PostgresStore(url)
     path = url.removeprefix("sqlite:///") if url else "orchestrator.db"

@@ -5,7 +5,8 @@ It has no model. Each turn it says what it got, and:
 - a line `tell t_xxx: <text>` sends that thread a message,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
-The control plane uses it when ../runner is missing or ORCH_DEVRUNNER=1.
+The control plane uses it when ../runner is missing or DEEPSEEK_API_KEY is not
+stored.
 """
 
 from __future__ import annotations

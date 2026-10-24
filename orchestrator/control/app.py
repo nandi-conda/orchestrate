@@ -4,20 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from .providers import WorkerProvider, provider_from_env
-from .router import Router, router_from_env
+from .context import base_url_from_scope, request_base_url
+from .providers import WorkerProvider, default_provider
+from .router import Router, default_router
 from .service import Orchestrator
-from .store import Store, store_from_env
+from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
@@ -79,18 +80,35 @@ def peer_entry(t: dict) -> dict:
             "summary": t["summary"], "files": t["files"], "parent": t["parent_id"]}
 
 
+class BaseUrlMiddleware:
+    """Record the address this request came in on, so workers can call back to
+    it and the provider can tell local from reachable-remotely."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        token = request_base_url.set(base_url_from_scope(scope))
+        try:
+            return await self.app(scope, receive, send)
+        finally:
+            request_base_url.reset(token)
+
+
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
                router: Router | None = None, public_url: str | None = None,
                shutdown_event: asyncio.Event | None = None) -> Starlette:
-    store = store or store_from_env(os.environ.get("DATABASE_URL"))
+    store = store or store_from_url(None)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}
 
     @asynccontextmanager
     async def lifespan(app):
         await store.open()
-        orch = Orchestrator(store, provider or provider_from_env(), router or router_from_env(),
-                            public_url if public_url is not None else os.environ.get("ORCHESTRATOR_PUBLIC_URL", ""))
+        orch = Orchestrator(store, provider or default_provider(), router or default_router(),
+                            public_url or "")
         holder["orch"] = orch
         app.state.orch = orch
         try:
@@ -352,4 +370,4 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/p/{pid}", index),
     ]
     routes.append(Mount("/ui", StaticFiles(directory=UI_DIR, check_dir=False)))
-    return Starlette(routes=routes, lifespan=lifespan)
+    return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(BaseUrlMiddleware)])

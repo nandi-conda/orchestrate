@@ -78,7 +78,7 @@ def server(tmp_path, monkeypatch):
     url = f"http://127.0.0.1:{port}"
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                      LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
-                     HeuristicRouter(), public_url=url)
+                     HeuristicRouter())  # no public_url: it comes from the request's Host
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()

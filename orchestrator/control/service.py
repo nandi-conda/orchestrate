@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 
+from .context import request_base_url
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
 from .runner_client import RunnerClient
@@ -19,7 +19,16 @@ from .store import Store
 log = logging.getLogger("orchestrator")
 
 MAX_HOPS = 6
+CAPACITY = 16  # running threads per worker before another one starts
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
+
+
+def worker_spec(project: dict, index: int, public_url: str = "") -> WorkerSpec:
+    """Where the next worker should call back. `public_url` is an explicit
+    override; otherwise the address the current request came in on, which is
+    what decides local versus sprite too."""
+    return WorkerSpec(project_id=project["id"], index=index, repo_url=project.get("repo_url", ""),
+                      orchestrator_url=public_url or request_base_url.get(), capacity=CAPACITY)
 
 
 @dataclass
@@ -68,9 +77,7 @@ class Orchestrator:
                     best, best_load = lw, running
             if best is not None:
                 return best
-            spec = WorkerSpec(project_id=project["id"], index=len(lws) + 1, repo_url=project.get("repo_url", ""),
-                              orchestrator_url=self.public_url,
-                              capacity=int(os.environ.get("RUNNER_CAPACITY", "16")))
+            spec = worker_spec(project, len(lws) + 1, self.public_url)
             worker = await self.provider.create(spec)
             await self.store.upsert_worker(worker.record())
             lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))

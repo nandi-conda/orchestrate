@@ -14,11 +14,13 @@ when every worker it has is at capacity.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import secrets
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -87,6 +89,71 @@ def passthrough_env() -> dict:
     return {k: os.environ[k] for k in keep if k in os.environ}
 
 
+def public_url_ok(url: str) -> bool:
+    """Can a sprite reach this URL? Loopback, LAN and link-local addresses
+    cannot be dialled from outside, so those count as unusable. A name is taken
+    at face value: only DNS knows where it points."""
+    host = httpx.URL(url).host if url else ""
+    if not host or host == "localhost":
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True
+
+
+def allow_host_rule(url: str) -> dict | None:
+    """A network-policy rule that lets a sprite reach `url`.
+
+    A name is allowed as a domain; an address needs an explicit port, because
+    address rules match `protocol`/`port` rather than everything on a host."""
+    u = httpx.URL(url or "")
+    host = u.host
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return {"action": "allow", "domain": host}
+    return {"action": "allow", "address": host, "protocol": "tcp",
+            "port": u.port or (443 if u.scheme == "https" else 80)}
+
+
+DEFAULT_SOURCE = "https://github.com/nandi-conda/orchestrate"
+DEFAULT_REF = "main"
+
+
+def _git(root: Path, *args: str) -> str:
+    try:
+        out = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def repo_source_default(root: Path | None = None) -> tuple[str, str]:
+    """What a sprite should check out: this checkout's `origin` and branch, so a
+    run against sprites exercises the code in front of you. A tarball or a
+    detached checkout has neither, hence the public repository as fallback."""
+    root = root or Path(__file__).resolve().parents[2]
+    branch = _git(root, "symbolic-ref", "--short", "HEAD")
+    return (_git(root, "remote", "get-url", "origin") or DEFAULT_SOURCE,
+            branch or DEFAULT_REF)
+
+
+def checkout_note(root: Path, ref: str) -> str:
+    """What the sprite would run instead of this checkout, or "" when it would
+    run exactly it."""
+    head = _git(root, "rev-parse", "HEAD")
+    pushed = _git(root, "rev-parse", "--verify", "-q", f"origin/{ref}")
+    if not pushed:
+        return f"origin has no {ref!r} branch, so the sprite clone will fail; push it."
+    if head and head != pushed:
+        return (f"sprites clone origin/{ref}, not this checkout's HEAD; local commits and edits "
+                "are not in that commit.")
+    return ""
+
+
 class LocalProvider:
     name = "local"
 
@@ -97,8 +164,7 @@ class LocalProvider:
         if use_devrunner is None:
             from .secrets import get_secret
 
-            use_devrunner = (os.environ.get("ORCH_DEVRUNNER") == "1"
-                             or not (self.runner_dir / "pixi.toml").exists()
+            use_devrunner = (not (self.runner_dir / "pixi.toml").exists()
                              or not get_secret("DEEPSEEK_API_KEY"))
             if use_devrunner:
                 print("LocalProvider: using the echo runner (control.devrunner). The real runner needs "
@@ -189,9 +255,17 @@ class SpritesProvider:
         self.token = token or get_secret("SPRITES_TOKEN") or ""
         if not self.token:
             raise RuntimeError("SpritesProvider needs SPRITES_TOKEN")
-        self.source = source or os.environ.get("RUNNER_SOURCE", "https://github.com/nandi-conda/orchestrate")
-        self.ref = ref or os.environ.get("RUNNER_REF", "main")
-        self.prefix = prefix if prefix is not None else os.environ.get("SPRITES_PREFIX", "orch-")
+        default_source, default_ref = repo_source_default()
+        self.source = source or default_source
+        self.ref = ref or default_ref
+        if not self.source.startswith(("http://", "https://")):
+            print(f"SpritesProvider: {self.source} is not an http(s) URL and a sprite has no git "
+                  "credentials; the clone will fail unless the URL is publicly readable.", file=sys.stderr)
+        elif not source and not ref:
+            note = checkout_note(Path(__file__).resolve().parents[2], self.ref)
+            if note:
+                print(f"SpritesProvider: {note}", file=sys.stderr)
+        self.prefix = prefix if prefix is not None else "orch-"
         self.allow_domains = allow_domains if allow_domains is not None else [
             "api.deepseek.com", "github.com", "*.github.com", "*.githubusercontent.com",
             "conda.anaconda.org", "prefix.dev", "*.prefix.dev", "pixi.sh", "pypi.org",
@@ -213,7 +287,7 @@ class SpritesProvider:
 
         await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_REF": self.ref})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
-               "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/work/threads",
+               "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity)}
         if spec.repo_url:
             env["RUNNER_REPO"] = spec.repo_url
@@ -229,8 +303,9 @@ class SpritesProvider:
                 pass
         if self.allow_domains:
             rules = [{"action": "allow", "domain": d} for d in self.allow_domains]
-            if spec.orchestrator_url:
-                rules.append({"action": "allow", "domain": httpx.URL(spec.orchestrator_url).host})
+            rule = allow_host_rule(spec.orchestrator_url)
+            if rule:
+                rules.append(rule)
             await self.http.post(f"/sprites/{name}/policy/network", json={"rules": rules})
         await wait_healthy(worker.url, timeout=300)
         return worker
@@ -250,10 +325,54 @@ class SpritesProvider:
         await self.http.aclose()
 
 
-def provider_from_env() -> WorkerProvider:
-    kind = os.environ.get("WORKER_PROVIDER", "local")
-    if kind == "sprites":
-        return SpritesProvider()
-    if kind == "local":
-        return LocalProvider(os.environ.get("RUNNER_DIR"))
-    raise RuntimeError(f"unknown WORKER_PROVIDER {kind!r} (local or sprites)")
+class AutoProvider:
+    """Workers run where the control plane was reached from.
+
+    A request on a loopback or private address means the browser is on this
+    machine or this network, so workers stay local. A request through a public
+    address means someone can reach us from outside, so a sprite can call back
+    and gets the work when a token is stored; without one, the control plane
+    runs its own workers.
+
+    The decision is per worker, from the URL recorded for the request that
+    asked for it (`control.context`), so the same process serves a local UI and
+    a tunnel without being told which.
+    """
+
+    name = "auto"
+
+    def __init__(self, local: LocalProvider | None = None, sprites: SpritesProvider | None = None) -> None:
+        self._local = local
+        self._sprites = sprites
+        self._looked_for_token = sprites is not None
+
+    def local(self) -> LocalProvider:
+        if self._local is None:
+            self._local = LocalProvider()
+        return self._local
+
+    def sprites(self) -> SpritesProvider | None:
+        if not self._looked_for_token:
+            from .secrets import get_secret
+
+            self._looked_for_token = True
+            self._sprites = SpritesProvider() if get_secret("SPRITES_TOKEN") else None
+        return self._sprites
+
+    async def create(self, spec: WorkerSpec) -> Worker:
+        provider = self.sprites() if public_url_ok(spec.orchestrator_url) else None
+        return await (provider or self.local()).create(spec)
+
+    async def destroy(self, worker: Worker) -> None:
+        provider = self._sprites if worker.provider == "sprites" else self._local
+        if provider is not None:
+            await provider.destroy(worker)
+
+    async def close(self) -> None:
+        for provider in (self._local, self._sprites):
+            if provider is not None:
+                await provider.close()
+
+
+def default_provider() -> WorkerProvider:
+    return AutoProvider()
