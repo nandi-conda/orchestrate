@@ -124,10 +124,12 @@ class AgentThread:
                 break
         else:
             self.emit("error", {"error": f"step limit {self.limits.max_steps} reached"})
+        if not self.summary:  # the model ended without finish/set_summary: its last words stand in
+            self.summary = (final or self.title)[:500]
         self.set_state("idle")
         self.emit("turn_done", {"summary": self.summary, "final": final})
         try:
-            await self.peers.set_summary(self.id, self.summary or final[:500], sorted(self.files))
+            await self.peers.set_summary(self.id, self.summary, sorted(self.files))
             if self.parent:
                 await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary or final}")
         except Exception as e:

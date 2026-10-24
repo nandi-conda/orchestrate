@@ -118,6 +118,8 @@ async def test_http_api(tmp_path):
         assert r.status_code == 201
         tid = r.json()["id"]
         await host.wait_idle(tid)
+        done = [e for e in host.threads[tid].events if e["type"] == "turn_done"][0]
+        assert done["data"]["summary"] == "hi there"  # no finish call: last reply becomes the summary
         threads = (await c.get("/threads", headers=h)).json()
         assert threads[0]["id"] == tid and threads[0]["state"] == "idle"
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202
