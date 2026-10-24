@@ -18,9 +18,9 @@ SERVICE = "orchestrate"
 
 # name -> (what it is for, how it is sent)
 KNOWN = {
-    "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and local runners",
+    "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and every worker",
                          "Authorization: Bearer <key> to https://api.deepseek.com"),
-    "SPRITES_TOKEN": ("Fly Sprites org token; stored, it moves workers to sprites",
+    "SPRITES_TOKEN": ("Fly Sprites org token; stored, workers always run on Sprites",
                       "Authorization: Bearer <token> to https://api.sprites.dev/v1"),
 }
 

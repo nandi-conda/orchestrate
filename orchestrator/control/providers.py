@@ -9,6 +9,8 @@ when every worker it has is at capacity.
   (control.devrunner), so the whole loop works without any credentials.
 - `SpritesProvider` creates a Fly Sprite per worker, installs the runner on
   it and runs it as a sprite service on port 8080.
+- `AutoProvider` is the default: sprites whenever `SPRITES_TOKEN` is stored,
+  local workers otherwise.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -84,9 +86,18 @@ def free_port() -> int:
 
 
 def passthrough_env() -> dict:
-    """Model credentials a runner needs; never the Sprites token."""
+    """Model credentials a runner needs; never the Sprites token.
+
+    Look each one up with `get_secret` rather than reading the environment
+    directly: a key stored only in the keyring is copied into `os.environ` when
+    it is found, so the runner subprocess/sprite service inherits it just like
+    an environment variable would.
+    """
+    from .secrets import get_secret
+
     keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS")
-    return {k: os.environ[k] for k in keep if k in os.environ}
+    found = {k: get_secret(k) for k in keep}
+    return {k: v for k, v in found.items() if v}
 
 
 def public_url_ok(url: str) -> bool:
@@ -277,6 +288,11 @@ class SpritesProvider:
         return f"{self.prefix}{spec.project_id}-w{spec.index}".replace("_", "-").lower()
 
     async def create(self, spec: WorkerSpec) -> Worker:
+        from .secrets import get_secret
+
+        if not get_secret("DEEPSEEK_API_KEY"):
+            raise RuntimeError("SpritesProvider needs DEEPSEEK_API_KEY (env or keyring): "
+                               "the runner cannot start without it")
         name = self.sprite_name(spec)
         r = await self.http.post("/sprites", json={"name": name, "url_settings": {"auth": "public"}})
         if r.status_code not in (200, 201, 409):
@@ -326,17 +342,16 @@ class SpritesProvider:
 
 
 class AutoProvider:
-    """Workers run where the control plane was reached from.
+    """Remote first: workers are sprites whenever a token is stored, no matter
+    where the browser reached the control plane from. Without a token the
+    control plane falls back to local workers, so the offline echo demo still
+    works.
 
-    A request on a loopback or private address means the browser is on this
-    machine or this network, so workers stay local. A request through a public
-    address means someone can reach us from outside, so a sprite can call back
-    and gets the work when a token is stored; without one, the control plane
-    runs its own workers.
-
-    The decision is per worker, from the URL recorded for the request that
-    asked for it (`control.context`), so the same process serves a local UI and
-    a tunnel without being told which.
+    The request address still decides what a sprite calls back on. A loopback
+    or private address cannot be dialled from a sprite, so that worker is sent
+    with no callback URL (the peer tools then see only its own threads) and a
+    warning says how to restore them: pass `--public-url` with the tunnel or
+    public address a sprite can reach.
     """
 
     name = "auto"
@@ -345,6 +360,8 @@ class AutoProvider:
         self._local = local
         self._sprites = sprites
         self._looked_for_token = sprites is not None
+        self._warned_local = False
+        self._warned_callback = False
 
     def local(self) -> LocalProvider:
         if self._local is None:
@@ -360,8 +377,23 @@ class AutoProvider:
         return self._sprites
 
     async def create(self, spec: WorkerSpec) -> Worker:
-        provider = self.sprites() if public_url_ok(spec.orchestrator_url) else None
-        return await (provider or self.local()).create(spec)
+        provider = self.sprites()
+        if provider is None:
+            if not self._warned_local:
+                self._warned_local = True
+                print("AutoProvider: SPRITES_TOKEN is not stored; using local workers. "
+                      "Store it with `pixi run set-key SPRITES_TOKEN` to run workers on Sprites.",
+                      file=sys.stderr)
+            return await self.local().create(spec)
+        if not public_url_ok(spec.orchestrator_url):
+            if not self._warned_callback:
+                self._warned_callback = True
+                where = spec.orchestrator_url or "the control plane"
+                print(f"AutoProvider: a sprite cannot reach {where}; running workers without "
+                      "the orchestrator peer API. Pass --public-url with the address a sprite "
+                      "can reach (a tunnel or public host) to enable it.", file=sys.stderr)
+            spec = replace(spec, orchestrator_url="")
+        return await provider.create(spec)
 
     async def destroy(self, worker: Worker) -> None:
         provider = self._sprites if worker.provider == "sprites" else self._local

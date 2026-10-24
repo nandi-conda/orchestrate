@@ -48,11 +48,21 @@ class Recording:
         pass
 
 
-async def test_a_loopback_address_runs_workers_here(env):
+async def test_a_loopback_address_still_uses_sprites(env, capsys):
+    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     local, sprites = Recording("local"), Recording("sprites")
     p = providers.AutoProvider(local=local, sprites=sprites)
     worker = await p.create(worker_spec({"id": "p_1"}, 1, "http://127.0.0.1:8000"))
-    assert worker.provider == "local" and not sprites.created
+    assert worker.provider == "sprites" and not local.created
+    assert "peer API" in capsys.readouterr().err
+
+
+async def test_a_loopback_callback_is_left_out(env):
+    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
+    sprites = Recording("sprites")
+    p = providers.AutoProvider(sprites=sprites)
+    await p.create(worker_spec({"id": "p_1"}, 1, "http://127.0.0.1:8000"))
+    assert sprites.created[0].orchestrator_url == ""
 
 
 async def test_a_public_address_moves_workers_to_sprites(env):
@@ -63,11 +73,25 @@ async def test_a_public_address_moves_workers_to_sprites(env):
     assert sprites.created and not local.created
 
 
-async def test_a_public_address_without_a_token_stays_local(env):
+async def test_a_public_url_override_keeps_the_callback(env):
+    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
+    sprites = Recording("sprites")
+    p = providers.AutoProvider(sprites=sprites)
+    token = request_base_url.set("http://127.0.0.1:8000")
+    try:
+        spec = worker_spec({"id": "p_1"}, 1, "https://orch.example.com")
+    finally:
+        request_base_url.reset(token)
+    await p.create(spec)
+    assert sprites.created[0].orchestrator_url == "https://orch.example.com"
+
+
+async def test_a_public_address_without_a_token_stays_local(env, capsys):
     local = Recording("local")
     p = providers.AutoProvider(local=local)
     await p.create(worker_spec({"id": "p_1"}, 1, "https://orch.example.com"))
     assert local.created
+    assert "SPRITES_TOKEN is not stored" in capsys.readouterr().err
 
 
 async def test_destroy_goes_to_the_provider_that_made_the_worker(env):
@@ -89,6 +113,17 @@ async def test_destroy_goes_to_the_provider_that_made_the_worker(env):
 ])
 def test_public_url_ok(url, ok):
     assert providers.public_url_ok(url) is ok
+
+
+def test_passthrough_env_reads_a_keyring_only_secret(env):
+    env.setattr(secrets, "get_secret", lambda name: "deepseek" if name == "DEEPSEEK_API_KEY" else None)
+    assert providers.passthrough_env() == {"DEEPSEEK_API_KEY": "deepseek"}
+
+
+def test_passthrough_env_never_includes_the_sprites_token(env):
+    env.setattr(secrets, "get_secret", lambda name: f"value-{name}")
+    kept = providers.passthrough_env()
+    assert "SPRITES_TOKEN" not in kept
 
 
 @pytest.mark.parametrize("url,rule", [
@@ -203,6 +238,16 @@ async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
     try:
         assert (p.source, p.ref) == ("https://example.com/fork.git", "dev")
         assert p.sprite_name(providers.WorkerSpec(project_id="p_ab12cd34", index=1)) == "orch-p-ab12cd34-w1"
+    finally:
+        await p.close()
+
+
+async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(env):
+    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
+    p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
+    try:
+        with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+            await p.create(providers.WorkerSpec(project_id="p_1", index=1))
     finally:
         await p.close()
 
