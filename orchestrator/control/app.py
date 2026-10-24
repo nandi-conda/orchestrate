@@ -80,8 +80,10 @@ def peer_entry(t: dict) -> dict:
 
 
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
-               router: Router | None = None, public_url: str | None = None) -> Starlette:
+               router: Router | None = None, public_url: str | None = None,
+               shutdown_event: asyncio.Event | None = None) -> Starlette:
     store = store or store_from_env(os.environ.get("DATABASE_URL"))
+    stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}
 
     @asynccontextmanager
@@ -196,16 +198,31 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         return JSONResponse([display(e) for e in events if e["type"] not in HIDDEN])
 
     def sse(project_id: str, thread_id: str | None, after: int):
+        async def idle(last: int, seconds: float) -> bool:
+            """Wait for events, or return True as soon as shutdown begins."""
+            events_wait = asyncio.ensure_future(store.wait_events(project_id, last, seconds))
+            stop_wait = asyncio.ensure_future(stop.wait())
+            try:
+                done, _ = await asyncio.wait({events_wait, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in (events_wait, stop_wait):
+                    w.cancel()
+                await asyncio.gather(events_wait, stop_wait, return_exceptions=True)
+            if events_wait in done and not events_wait.cancelled():
+                events_wait.result()  # a store error is the stream's error, as before
+            return stop.is_set()
+
         async def gen():
             last = after
             yield ": connected\n\n"
-            while True:
+            while not stop.is_set():
                 events = await store.list_events(project_id, thread_id, last)
                 for e in events:
                     last = e["seq"]
                     yield f"id: {e['seq']}\nevent: {e['type']}\ndata: {json.dumps(display(e))}\n\n"
                 if not events:
-                    await store.wait_events(project_id, last, 15.0)
+                    if await idle(last, 15.0):
+                        return
                     if not await store.list_events(project_id, thread_id, last, limit=1):
                         yield ": ping\n\n"
 

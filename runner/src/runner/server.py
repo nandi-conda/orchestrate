@@ -141,7 +141,10 @@ def main():
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)
     app = create_app(host_from_env(), token)
-    uvicorn.run(app, host=os.environ.get("RUNNER_HOST", "0.0.0.0"), port=int(os.environ.get("RUNNER_PORT", "8080")))
+    # /events streams stay open for subscribers (the control plane's relay), so
+    # bound the wait for them; otherwise Ctrl+C never completes.
+    uvicorn.run(app, host=os.environ.get("RUNNER_HOST", "0.0.0.0"), port=int(os.environ.get("RUNNER_PORT", "8080")),
+                timeout_graceful_shutdown=int(os.environ.get("RUNNER_GRACEFUL_SHUTDOWN", "5")))
 
 
 if __name__ == "__main__":
