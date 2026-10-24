@@ -57,12 +57,22 @@ async def test_a_loopback_address_still_uses_sprites(env, capsys):
     assert "peer API" in capsys.readouterr().err
 
 
-async def test_a_loopback_callback_is_left_out(env):
+async def test_a_loopback_callback_switches_to_pull_mode(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     sprites = Recording("sprites")
     p = providers.AutoProvider(sprites=sprites)
     await p.create(worker_spec({"id": "p_1"}, 1, "http://127.0.0.1:8000"))
     assert sprites.created[0].orchestrator_url == ""
+    assert sprites.created[0].peer_mode == "pull"
+
+
+def test_peer_env():
+    w = providers.Worker(id="w", project_id="p", provider="sprites", handle="", url="u")
+    pull = providers.WorkerSpec(project_id="p", index=1, peer_mode="pull")
+    assert providers.peer_env(pull, w) == {"RUNNER_PEERS": "pull"} and w.peers == "pull"
+    direct = providers.WorkerSpec(project_id="p", index=1, orchestrator_url="https://o.example.com")
+    assert providers.peer_env(direct, w) == {"ORCHESTRATOR_URL": "https://o.example.com",
+                                             "ORCHESTRATOR_TOKEN": w.token} and w.peers == "http"
 
 
 async def test_a_public_address_moves_workers_to_sprites(env):
@@ -84,6 +94,7 @@ async def test_a_public_url_override_keeps_the_callback(env):
         request_base_url.reset(token)
     await p.create(spec)
     assert sprites.created[0].orchestrator_url == "https://orch.example.com"
+    assert sprites.created[0].peer_mode == ""
 
 
 async def test_a_public_address_without_a_token_stays_local(env, capsys):

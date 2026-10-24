@@ -2,6 +2,7 @@
 echo runner (control.devrunner), served over real HTTP so the peer API is used."""
 
 import asyncio
+from dataclasses import replace
 import socket
 import sys
 import threading
@@ -71,13 +72,22 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def server(tmp_path, monkeypatch):
+class PullLocalProvider(LocalProvider):
+    """Local workers that cannot dial the control plane, like a sprite behind a
+    laptop's localhost: the control plane has to collect their peer calls."""
+
+    async def create(self, spec):
+        return await super().create(replace(spec, orchestrator_url="", peer_mode="pull"))
+
+
+@pytest.fixture(params=["http", "pull"])
+def server(tmp_path, monkeypatch, request):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
+    provider = (PullLocalProvider if request.param == "pull" else LocalProvider)(
+        workdir=str(tmp_path / "workers"), use_devrunner=True)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider,
                      HeuristicRouter())  # no public_url: it comes from the request's Host
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     th = threading.Thread(target=srv.run, daemon=True)

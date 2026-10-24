@@ -1,12 +1,16 @@
 """How a thread reaches the rest of the system: other threads and the orchestrator.
 
 The orchestrator owns the thread directory and the message bus. A runner talks
-to it through `HttpPeers`. `LocalPeers` keeps everything in-process, for a
-runner used on its own (CLI, tests).
+to it through `HttpPeers` when it can dial the orchestrator, or through
+`PulledPeers` when it cannot (a control plane on a laptop): then the calls wait
+in a `PeerOutbox` until the orchestrator collects them. `LocalPeers` keeps
+everything in-process, for a runner used on its own (CLI, tests).
 """
 
 from __future__ import annotations
 
+import asyncio
+import secrets
 from typing import Any, Callable, Awaitable, Protocol
 
 import httpx
@@ -47,6 +51,82 @@ class HttpPeers:
 
     async def set_summary(self, thread_id, summary, files=None):
         await self._req("PUT", f"/api/peer/threads/{thread_id}/summary", json={"summary": summary, "files": files or []})
+
+
+class PeerOutbox:
+    """Peer API calls waiting for the orchestrator to collect them.
+
+    The orchestrator long-polls `GET /peer/calls` (runner/API.md), runs each
+    call against its own peer API and posts the answer to `/peer/calls/{id}`.
+    Every connection is opened by the orchestrator, so the worker never needs
+    to reach it. A call handed out but not answered within `lease` seconds
+    (a dropped poll response) is handed out again.
+    """
+
+    def __init__(self, lease: float = 60.0) -> None:
+        self.lease = lease
+        self.calls: dict[str, dict] = {}
+        self.leased: dict[str, float] = {}
+        self.futures: dict[str, asyncio.Future] = {}
+        self.cond = asyncio.Condition()
+
+    async def call(self, method: str, path: str, params: dict | None, json: Any, timeout: float) -> tuple[int, Any]:
+        cid = f"pc_{secrets.token_hex(6)}"
+        fut = asyncio.get_running_loop().create_future()
+        self.futures[cid] = fut
+        async with self.cond:
+            self.calls[cid] = {"id": cid, "method": method, "path": path, "params": params, "json": json}
+            self.cond.notify_all()
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self.calls.pop(cid, None)
+            self.leased.pop(cid, None)
+            self.futures.pop(cid, None)
+
+    async def take(self, wait: float = 25.0) -> list[dict]:
+        """Calls due for handing out, waiting up to `wait` seconds for one."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        async with self.cond:
+            while True:
+                now = loop.time()
+                due = [c for cid, c in self.calls.items() if self.leased.get(cid, 0.0) <= now]
+                if due or now >= deadline:
+                    break
+                try:
+                    await asyncio.wait_for(self.cond.wait(), deadline - now)
+                except asyncio.TimeoutError:
+                    pass
+            for c in due:
+                self.leased[c["id"]] = now + self.lease
+            return due
+
+    def answer(self, cid: str, status: int, body: Any) -> bool:
+        fut = self.futures.get(cid)
+        if fut is None or fut.done():
+            return False
+        fut.set_result((status, body))
+        return True
+
+
+class PulledPeers(HttpPeers):
+    """The peer API, carried over connections the orchestrator opens."""
+
+    def __init__(self, outbox: PeerOutbox | None = None, timeout: float = 900.0):
+        # spawn_thread can wait on a new worker being created, hence the long timeout
+        self.outbox = outbox or PeerOutbox()
+        self.timeout = timeout
+
+    async def _req(self, method: str, path: str, params: dict | None = None, json: Any = None, **kw) -> Any:
+        try:
+            status, body = await self.outbox.call(method, path, params, json, self.timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"orchestrator did not collect peer call {method} {path} "
+                               f"within {self.timeout:.0f}s") from None
+        if status >= 400:
+            raise RuntimeError(f"peer API {method} {path} failed ({status}): {str(body)[:300]}")
+        return body
 
 
 class LocalPeers:

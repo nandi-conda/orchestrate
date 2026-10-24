@@ -110,6 +110,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         orch = Orchestrator(store, provider or default_provider(), router or default_router(),
                             public_url or "")
         holder["orch"] = orch
+        orch.peer_app = app
         app.state.orch = orch
         try:
             yield

@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from .model import from_spec
-from .peers import HttpPeers
+from .peers import HttpPeers, PulledPeers
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 
@@ -107,6 +107,20 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         backlog = sorted((e for t in host.threads.values() for e in t.events), key=lambda e: e["seq"])
         return sse(None, after_of(req), backlog)
 
+    outbox = host.peers.outbox if isinstance(host.peers, PulledPeers) else None
+
+    async def peer_calls(req: Request):
+        if outbox is None:
+            return JSONResponse([])
+        wait = min(max(float(req.query_params.get("wait") or 25), 0.0), 55.0)
+        return JSONResponse(await outbox.take(wait))
+
+    async def peer_answer(req: Request):
+        b = await req.json()
+        if outbox is None or not outbox.answer(req.path_params["id"], int(b.get("status", 200)), b.get("body")):
+            return JSONResponse({"error": "no such call"}, status_code=404)
+        return JSONResponse({"ok": True})
+
     return Starlette(routes=[
         Route("/health", health),
         Route("/threads", guard(list_threads), methods=["GET"]),
@@ -116,12 +130,19 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         Route("/threads/{id}/messages", guard(post_message), methods=["POST"]),
         Route("/threads/{id}/events", guard(thread_events)),
         Route("/threads/{id}/stop", guard(stop), methods=["POST"]),
+        Route("/peer/calls", guard(peer_calls), methods=["GET"]),
+        Route("/peer/calls/{id}", guard(peer_answer), methods=["POST"]),
     ])
 
 
 def host_from_env() -> ThreadHost:
     orch = os.environ.get("ORCHESTRATOR_URL")
-    peers = HttpPeers(orch, get_secret("ORCHESTRATOR_TOKEN") or "") if orch else None
+    if os.environ.get("RUNNER_PEERS") == "pull":
+        peers = PulledPeers()  # the orchestrator collects calls from /peer/calls
+    elif orch:
+        peers = HttpPeers(orch, get_secret("ORCHESTRATOR_TOKEN") or "")
+    else:
+        peers = None
     return ThreadHost(
         model_factory=from_spec,
         peers=peers,
@@ -136,7 +157,8 @@ def main():
     import sys
 
     import uvicorn
-    require(["DEEPSEEK_API_KEY"] + (["ORCHESTRATOR_TOKEN"] if os.environ.get("ORCHESTRATOR_URL") else []))
+    dials = os.environ.get("ORCHESTRATOR_URL") and os.environ.get("RUNNER_PEERS") != "pull"
+    require(["DEEPSEEK_API_KEY"] + (["ORCHESTRATOR_TOKEN"] if dials else []))
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)

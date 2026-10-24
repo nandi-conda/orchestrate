@@ -81,20 +81,19 @@ What the control plane works out for itself:
 | | How |
 | --- | --- |
 | Where workers run | Sprites whenever `SPRITES_TOKEN` is stored, even when the browser is on this machine. Local only when no token is stored |
-| What the runner calls back on | The address the browser used, taken from `Host` and `X-Forwarded-Host`/`X-Forwarded-Proto`, or `--public-url`. A loopback/private address cannot be reached from a sprite, so that worker is started without the orchestrator peer API (with a warning) unless `--public-url` supplies a reachable address |
+| What the runner calls back on | The address the browser used, taken from `Host` and `X-Forwarded-Host`/`X-Forwarded-Proto`, or `--public-url`. A loopback/private address cannot be reached from a sprite, so that worker runs in pull mode: the control plane long-polls the sprite for its peer calls and posts the answers back, over connections it opens itself |
 | What a sprite checks out | This checkout's `origin` remote and current branch, with a warning when the sprite would not get this exact commit |
 | Which router | The model when `DEEPSEEK_API_KEY` is stored, the rule-based one otherwise |
 | Storage | SQLite in `orchestrator.db`, or `--db postgresql://…` for several control planes |
 
 Flags: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db`,
-`--public-url` (the address a sprite calls back on).
+`--public-url` (an address a sprite can dial directly; optional, see below).
 
 Because the callback address comes from the request, publish the control plane
 behind a proxy you trust and have it forward the original host, and remember
 that only `/api/peer/*` is authenticated — the UI API is not. Reaching the UI
-through a public URL means anyone with that URL can use it. When the browser
-reaches a local control plane on localhost, pass `--public-url` with the tunnel
-URL so the sprites can call the peer API.
+through a public URL means anyone with that URL can use it. A control plane on
+localhost needs no tunnel: sprites reach its peer API in pull mode.
 
 ### Storage
 
@@ -114,19 +113,25 @@ When `SPRITES_TOKEN` is stored, each worker is a sprite named
 localhost. The provider clones this repo to `/opt/orchestrate`, runs
 `runner/deploy/bootstrap.sh`, and registers `runner/deploy/start.sh` as the
 sprite service on port 8080. It also sets a network policy that allows only
-DeepSeek, GitHub, the package mirrors and the orchestrator.
+DeepSeek, GitHub, the package mirrors and, for direct peer calls, the orchestrator.
 
-Runners call the peer API back on the address the request came in on, or on
-`--public-url`. A loopback or private address cannot be dialled from a sprite:
-without `--public-url`, workers still run remotely and the control plane drives
-them, but their peer tools only see threads on that worker. Put a tunnel in
-front of the local control plane and pass its URL to keep cross-thread
-coordination:
+The peer API (other threads, messages, spawning) works whether or not a
+sprite can reach the control plane:
+
+- **Pull mode** (the default for a loopback or private address, such as
+  `127.0.0.1:8000`): the runner starts with `RUNNER_PEERS=pull` and queues its
+  peer calls. The control plane long-polls `GET /peer/calls` on the sprite's
+  URL, runs each call against its own peer API, and posts the answer to
+  `/peer/calls/{id}` (runner/API.md, "Pull mode"). Only the control plane
+  opens connections, so nothing has to be exposed.
+- **Direct**: with a public address, or `--public-url`, the runner dials
+  `/api/peer/*` itself.
 
 ```sh
 cd orchestrator
 pixi run set-key SPRITES_TOKEN
-pixi run serve --public-url https://orch.example.com   # the tunnel's public URL
+pixi run serve                                          # pull mode
+pixi run serve --public-url https://orch.example.com   # direct, via a tunnel or public host
 ```
 
 A laptop session now starts billable sprites as soon as it spawns a thread;
@@ -144,7 +149,7 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | Path | What |
 | --- | --- |
 | `control/app.py` | Starlette app: UI API, SSE streams, runner peer API, static UI |
-| `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, request handling |
+| `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, pull-mode peer calls, request handling |
 | `control/router.py` | `ModelRouter` (DeepSeek), `HeuristicRouter` |
 | `control/store.py` | `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` (Sprites whenever a token is stored, local otherwise) |

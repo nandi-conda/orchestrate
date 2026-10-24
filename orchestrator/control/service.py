@@ -10,6 +10,8 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+import httpx
+
 from .context import request_base_url
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
@@ -37,6 +39,7 @@ class LiveWorker:
     client: RunnerClient
     last_seq: int = 0
     relay: asyncio.Task | None = None
+    pump: asyncio.Task | None = None
     threads: set[str] = field(default_factory=set)
 
 
@@ -52,12 +55,16 @@ class Orchestrator:
         self.by_thread: dict[str, LiveWorker] = {}
         self.by_token: dict[str, LiveWorker] = {}
         self._lock = asyncio.Lock()
+        # The control plane's own ASGI app: pull-mode peer calls are run against
+        # its peer API, so they are checked exactly like calls a worker dials in.
+        self.peer_app = None
 
     async def close(self) -> None:
         for lws in self.workers.values():
             for lw in lws:
-                if lw.relay:
-                    lw.relay.cancel()
+                for task in (lw.relay, lw.pump):
+                    if task:
+                        task.cancel()
                 await lw.client.close()
                 await self.provider.destroy(lw.worker)
 
@@ -82,6 +89,8 @@ class Orchestrator:
             await self.store.upsert_worker(worker.record())
             lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
             lw.relay = asyncio.create_task(self._relay(project["id"], lw))
+            if worker.peers == "pull":
+                lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
             lws.append(lw)
             self.by_token[worker.token] = lw
             await self.store.append_event(project["id"], None, "worker",
@@ -103,6 +112,54 @@ class Orchestrator:
             except Exception as e:
                 log.warning("relay from %s dropped: %s", lw.worker.id, e)
             await asyncio.sleep(1.0)
+
+    async def _pump_peer_calls(self, lw: LiveWorker) -> None:
+        """Collect a pull-mode worker's peer calls and answer them. Every
+        connection is opened from here, so the worker never has to reach us."""
+        if self.peer_app is None:
+            log.warning("worker %s is in pull mode but there is no peer API to run its calls", lw.worker.id)
+            return
+        # A loopback base: a thread spawned by one of these calls goes to a pull-mode worker too.
+        local = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.peer_app), base_url="http://127.0.0.1",
+                                  headers={"authorization": f"Bearer {lw.worker.token}"}, timeout=None)
+        running: set[asyncio.Task] = set()
+        try:
+            while True:
+                try:
+                    calls = await lw.client.peer_calls(wait=25.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.warning("peer calls from %s: %s", lw.worker.id, e)
+                    await asyncio.sleep(1.0)
+                    continue
+                for call in calls:
+                    task = asyncio.create_task(self._answer_peer_call(lw, local, call))
+                    running.add(task)
+                    task.add_done_callback(running.discard)
+        finally:
+            for task in running:
+                task.cancel()
+            await local.aclose()
+
+    async def _answer_peer_call(self, lw: LiveWorker, local: httpx.AsyncClient, call: dict) -> None:
+        method, path = str(call.get("method", "GET")).upper(), str(call.get("path", ""))
+        if not path.startswith("/api/peer/") or ".." in path:
+            status, body = 403, {"error": "only /api/peer/ routes"}
+        else:
+            try:
+                r = await local.request(method, path, params=call.get("params") or None, json=call.get("json"))
+                status = r.status_code
+                try:
+                    body = r.json() if r.content else None
+                except ValueError:
+                    body = r.text
+            except Exception as e:
+                status, body = 500, {"error": f"{type(e).__name__}: {e}"}
+        try:
+            await lw.client.answer_peer_call(call["id"], status, body)
+        except Exception as e:  # the worker hands the call out again after its lease
+            log.warning("answering peer call %s on %s: %s", call.get("id"), lw.worker.id, e)
 
     async def _ingest(self, project_id: str, ev: dict) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}

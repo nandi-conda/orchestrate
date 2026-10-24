@@ -16,6 +16,8 @@ threads. Default port 8080. Every route except `/health` needs
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/events` | | SSE stream for every thread on this worker |
+| GET | `/peer/calls` | `?wait=25` (max 55) | pending peer calls (pull mode, below); `[]` after `wait` seconds with none |
+| POST | `/peer/calls/{id}` | `{"status", "body"}` | `{"ok": true}`; 404 if the call is unknown or already answered |
 
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`.
 - `model` is `{"provider": "deepseek", "model": "deepseek-v4-pro"}` or `{"provider": "openai-compat", "model", "base_url", "api_key_env"}`. Omitted: DeepSeek with `$DEEPSEEK_MODEL`.
@@ -67,6 +69,23 @@ on the same runner.
 | `spawn_thread` | POST | `/api/peer/projects/{project}/threads` | `{"parent", "title", "request"}` | `{"id", "title"}` |
 | `set_summary` | PUT | `/api/peer/threads/{id}/summary` | `{"summary", "files"}` | anything |
 
+### Pull mode
+
+When the worker cannot reach the orchestrator (a control plane on a laptop,
+workers on Sprites), start it with `RUNNER_PEERS=pull` instead of
+`ORCHESTRATOR_URL`. The tools then queue their calls, and the orchestrator,
+which can reach the worker, collects them over plain HTTP:
+
+1. `GET /peer/calls?wait=25` long-polls and returns
+   `[{"id", "method", "path", "params", "json"}]`, with `path` one of the peer
+   routes in the table.
+2. The orchestrator runs each call against its own peer API as this worker.
+3. `POST /peer/calls/{id}` with `{"status": <http status>, "body": <json reply>}`
+   wakes the waiting tool. A status of 400 or more becomes a tool error.
+
+A call that is handed out but not answered within 60 s is handed out again, so
+a lost poll response only delays it. A tool waits up to 15 minutes for its answer.
+
 A thread also calls `set_summary` after each turn, and when it has a `parent`, sends
 `Finished: <summary>` to the parent through `send_message`. The orchestrator routes
 `send_message` to whichever worker holds `to` (`POST /threads/{to}/messages` with
@@ -88,3 +107,4 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, `ORCHESTRATOR_TOKEN`, and an `opena
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 | `RUNNER_MAX_STEPS` | `60` | model calls per turn |
 | `ORCHESTRATOR_URL` / `ORCHESTRATOR_TOKEN` | | peer API above |
+| `RUNNER_PEERS` | | `pull`: serve peer calls on `/peer/calls` instead of dialling `ORCHESTRATOR_URL` |
