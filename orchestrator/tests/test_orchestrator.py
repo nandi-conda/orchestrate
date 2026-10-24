@@ -162,12 +162,28 @@ def postgres(tmp_path):
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("initdb refuses to run as root")
     data, port = tmp_path / "pg", free_port()
-    subprocess.run(["initdb", "-D", str(data), "-U", "postgres", "--auth=trust"], check=True,
-                   capture_output=True)
-    subprocess.run(["pg_ctl", "-D", str(data), "-o", f"-p {port} -k {tmp_path} -c listen_addresses=127.0.0.1",
-                    "-w", "start"], check=True, capture_output=True)
-    yield f"postgresql://postgres@127.0.0.1:{port}/postgres"
-    subprocess.run(["pg_ctl", "-D", str(data), "-m", "fast", "stop"], capture_output=True)
+    log = tmp_path / "postgres.log"
+
+    def run(*args):
+        return subprocess.run(args, check=True, capture_output=True, text=True, timeout=70)
+
+    run("initdb", "-D", str(data), "-U", "postgres", "--auth=trust")
+    try:
+        # `-l` sends the server's output to a file. Without it the daemon inherits
+        # pg_ctl's stdout/stderr pipes and capture_output never sees EOF, so the
+        # call blocks until the server exits.
+        # No Unix socket: its path is capped at 107 bytes and tmp_path can be longer.
+        # The test connects over TCP, so listen_addresses is all it needs.
+        run("pg_ctl", "-D", str(data), "-l", str(log), "-w", "-t", "60", "-o",
+            f"-p {port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=", "start")
+    except subprocess.CalledProcessError as e:
+        pytest.fail(f"postgres failed to start:\n{e.stderr}\n{e.stdout}"
+                    + (f"\nserver log:\n{log.read_text()}" if log.exists() else ""))
+    try:
+        yield f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    finally:
+        subprocess.run(["pg_ctl", "-D", str(data), "-m", "fast", "-w", "-t", "60", "stop"],
+                       capture_output=True, timeout=70)
 
 
 async def test_postgres_store_and_notify(postgres):
