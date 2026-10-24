@@ -32,7 +32,11 @@ focuses the same window. Type a request and press Enter:
 
 The router's decision shows above the request box. **Project activity** in the
 thread list shows every event in the project, and each thread shows its own
-transcript, including messages from other threads.
+transcript, including messages from other threads. A request that spawns
+threads never moves the window into one of them: you stay where you are, the
+new threads show up in the list, and their events stream into Project activity.
+You're only ever talking to the project window, and you open a thread only by
+clicking it.
 
 With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
 orchestrator starts the real runner from `../runner` as a local subprocess,

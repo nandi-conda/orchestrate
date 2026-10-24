@@ -300,10 +300,9 @@ def update(msg: i32, arg: i32) -> None:
                 if s_len(h_t1) > 0:
                     s_add(h_route, " — ")
                     s_add_ref(h_route, h_t1)
-            # Follow a single new thread so the person sees it start.
-            if j_len(arg, "spawned") == 1 and mode != TO_THREAD:
-                jstr(arg, "spawned.0.id", h_sel)
-                fetch_transcript()
+            # A spawned thread never takes the window with it: the person stays
+            # where they put the pane, reads the router's line above the request
+            # box, and opens a thread only by clicking it in the list.
             s_clear(h_err)
         else:
             j_err(arg, h_err)
