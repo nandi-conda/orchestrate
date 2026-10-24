@@ -1,0 +1,58 @@
+# Extra @jscall imports for the orchestrator UI. ui/imports.js implements them
+# and app passes them to ultra's mount(..., { imports }).
+
+from lpython import i32
+
+
+@jscall
+def o_new() -> i32:
+    """A new empty JSON object (a JSON handle) to fill and POST."""
+    pass
+
+@jscall
+def o_str(o: i32, k: str, h: i32) -> None:
+    """Set key k of object o to the string in handle h."""
+    pass
+
+@jscall
+def o_lit(o: i32, k: str, v: str) -> None:
+    pass
+
+@jscall
+def http_post(url: i32, o: i32, msg: i32) -> i32:
+    """POST object o as JSON to the URL in handle url. Like http_get: returns a
+    JSON handle now, and update(msg, handle) runs when the reply arrives."""
+    pass
+
+@jscall
+def sse_open(url: i32, msg: i32) -> i32:
+    """Open an EventSource; update(msg, handle) for each event's JSON data."""
+    pass
+
+@jscall
+def sse_close(id: i32) -> None:
+    pass
+
+@jscall
+def page_project(dst: i32) -> i32:
+    """If this window is a project's main window (/p/<id>), write the id to dst
+    and return 1."""
+    pass
+
+@jscall
+def open_window(url: i32, name: i32) -> None:
+    """window.open(url, name): a named window, so each project has one."""
+    pass
+
+@jscall
+def go(url: str) -> None:
+    pass
+
+@jscall
+def set_title(h: i32) -> None:
+    pass
+
+@jscall
+def scroll_end(id: str) -> None:
+    """Scroll the element with this id to the bottom after the next render."""
+    pass

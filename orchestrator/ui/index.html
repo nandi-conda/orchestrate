@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orchestrator</title>
+  <link rel="stylesheet" href="/ui/ui.css">
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import { mount } from "/ui/ultra.js";
+    import { imports } from "/ui/imports.js";
+    mount("#app", "/ui/app.wasm", { imports }).then((app) => { window.__ultra = app; });
+  </script>
+</body>
+</html>

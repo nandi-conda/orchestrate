@@ -1,0 +1,7 @@
+.pixi/
+ui/dist/
+*.db
+*.db-wal
+*.db-shm
+.orchestrator/
+__pycache__/
