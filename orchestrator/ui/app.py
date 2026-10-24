@@ -86,6 +86,7 @@ h_idle: i32 = 0
 h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
+h_tools: i32 = 0         # tool names in a collapsed run
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -113,7 +114,7 @@ def listen(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, screen, loading
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_tools, screen, loading
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -125,6 +126,7 @@ def init() -> None:
     h_t1 = s_new()
     h_t2 = s_new()
     h_t3 = s_new()
+    h_tools = s_new()
     h_working = s_new()
     s_set(h_working, "working")
     h_idle = s_new()
@@ -530,7 +532,24 @@ def thread_list() -> None:
     end()
 
 
-def event_row(e: i32, i: i32, show_thread: i32) -> None:
+def is_tool(e: i32) -> i32:
+    k: i32
+    k = j_int(e, "kind")
+    if k == K_TOOL_CALL or k == K_TOOL_RESULT:
+        return 1
+    return 0
+
+
+def thread_tag(e: i32, show_thread: i32) -> None:
+    if show_thread == 1:
+        if j_str(e, "thread_id", h_t2) == 1:
+            span("mono muted")
+            text(" · ")
+            text_ref(h_t2)
+            end()
+
+
+def event_row(e: i32, show_thread: i32) -> None:
     k: i32
     k = j_int(e, "kind")
     el("div")
@@ -538,7 +557,6 @@ def event_row(e: i32, i: i32, show_thread: i32) -> None:
     key(j_int(e, "seq"))
     cls_if("ev-user", k == K_USER)
     cls_if("ev-assistant", k == K_ASSISTANT)
-    cls_if("ev-tool", k == K_TOOL_CALL or k == K_TOOL_RESULT)
     cls_if("ev-status", k == K_STATUS)
     cls_if("ev-peer", k == K_PEER)
     cls_if("ev-error", k == K_ERROR)
@@ -546,18 +564,103 @@ def event_row(e: i32, i: i32, show_thread: i32) -> None:
     div("ev-label")
     jstr(e, "label", h_t1)
     text_ref(h_t1)
-    if show_thread == 1:
-        if j_str(e, "thread_id", h_t2) == 1:
-            span("mono muted")
-            text(" · ")
-            text_ref(h_t2)
-            end()
+    thread_tag(e, show_thread)
     end()
     el("div")
     cls("ev-text")
-    cls_if("mono", k == K_TOOL_CALL or k == K_TOOL_RESULT)
     jstr(e, "text", h_t1)
     text_ref(h_t1)
+    end()
+    end()
+
+
+def tool_row(e: i32, show_thread: i32) -> None:
+    """One tool call or result, collapsed to a single line until clicked."""
+    k: i32
+    k = j_int(e, "kind")
+    el("details")
+    cls("tool")
+    cls_if("tool-result", k == K_TOOL_RESULT)
+    key(j_int(e, "seq"))
+    el("summary")
+    span("tool-name mono")
+    jstr(e, "label", h_t1)
+    text_ref(h_t1)
+    end()
+    thread_tag(e, show_thread)
+    span("tool-preview mono")
+    jstr(e, "text", h_t1)
+    text_ref(h_t1)
+    end()
+    end()
+    el("div")
+    cls("tool-body")
+    cls("mono")
+    text_ref(h_t1)
+    end()
+    end()
+
+
+def tool_group(src: i32, start: i32, stop: i32, show_thread: i32) -> None:
+    """A run of tool events [start, stop), collapsed behind one line so the
+    agent's own text stays the focus. Keyed by its first event, so it stays
+    open across refreshes while the run grows."""
+    i: i32
+    e: i32 = 0
+    calls: i32 = 0
+    e = j_idx(src, start)
+    el("details")
+    cls("tools")
+    key(j_int(e, "seq"))
+    j_free(e)
+    s_clear(h_tools)
+    i = start
+    while i < stop:
+        e = j_idx(src, i)
+        if j_int(e, "kind") == K_TOOL_CALL:
+            if calls > 0:
+                s_add(h_tools, ", ")
+            jstr(e, "label", h_t1)
+            s_add_ref(h_tools, h_t1)
+            calls = calls + 1
+        j_free(e)
+        i = i + 1
+    if calls == 0:
+        # Only results here (their calls were interleaved with other events).
+        i = start
+        while i < stop:
+            e = j_idx(src, i)
+            if i > start:
+                s_add(h_tools, ", ")
+            jstr(e, "label", h_t1)
+            s_add_ref(h_tools, h_t1)
+            j_free(e)
+            i = i + 1
+    el("summary")
+    span("tools-count")
+    if calls == 1:
+        text("1 tool call")
+    elif calls == 0:
+        if stop - start == 1:
+            text("1 tool result")
+        else:
+            num(stop - start)
+            text(" tool results")
+    else:
+        num(calls)
+        text(" tool calls")
+    end()
+    span("tools-names mono")
+    text_ref(h_tools)
+    end()
+    end()
+    div("tools-list")
+    i = start
+    while i < stop:
+        e = j_idx(src, i)
+        tool_row(e, show_thread)
+        j_free(e)
+        i = i + 1
     end()
     end()
 
@@ -566,6 +669,7 @@ def pane() -> None:
     n: i32 = 0
     i: i32
     e: i32 = 0
+    run: i32 = 0
     src: i32
     activity: i32
     src = plog
@@ -603,12 +707,31 @@ def pane() -> None:
         else:
             text("Waiting for this thread's first event…")
         end()
-    for i in range(n):
+    i = 0
+    while i < n:
         e = j_idx(src, i)
-        event_row(e, i, activity)
-        j_free(e)
+        if is_tool(e) == 1:
+            j_free(e)
+            run = i + 1
+            while run < n and tool_at(src, run) == 1:
+                run = run + 1
+            tool_group(src, i, run, activity)
+            i = run
+        else:
+            event_row(e, activity)
+            j_free(e)
+            i = i + 1
     end()
     end()
+
+
+def tool_at(src: i32, i: i32) -> i32:
+    e: i32
+    r: i32
+    e = j_idx(src, i)
+    r = is_tool(e)
+    j_free(e)
+    return r
 
 
 def request_box() -> None:
