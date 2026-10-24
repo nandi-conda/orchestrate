@@ -71,8 +71,11 @@ as root, so it is skipped there.
 | `RUNNER_SOURCE` / `RUNNER_REF` | this repo / `main` | what a sprite checks out |
 | `SPRITES_PREFIX` | `orch-` | sprite name prefix |
 
-Missing secrets are printed to the console at startup with the exact name and header
-they're sent as. Store any of them with `pixi run set-key NAME`.
+Missing secrets are printed to the console at startup with the exact name, the header
+they're sent as, and the keyring backend that was searched. Store any of them with
+`pixi run set-key NAME`. A password added by hand in a keyring GUI (for example
+`DEEPSEEK_API_KEY` in the Login keyring) also works: an item labelled exactly like
+the variable is accepted, as long as its collection is unlocked.
 
 ### Storage
 

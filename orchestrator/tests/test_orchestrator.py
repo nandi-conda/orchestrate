@@ -3,8 +3,10 @@ echo runner (control.devrunner), served over real HTTP so the peer API is used."
 
 import asyncio
 import socket
+import sys
 import threading
 import time
+import types
 
 import httpx
 import pytest
@@ -189,3 +191,50 @@ async def test_postgres_store_and_notify(postgres):
     assert (await b.get_thread(t["id"]))["files"] == ["f.py"]
     await a.close()
     await b.close()
+
+
+def test_secrets_accept_an_item_added_in_a_keyring_gui(monkeypatch):
+    """The key someone adds by hand in a keyring GUI (Login keyring, item named
+    after the variable) has no service/username attributes; it is found by its
+    label, skipping locked collections and ignoring other labels."""
+    from control import secrets
+
+    class Item:
+        def __init__(self, label, secret):
+            self.label, self.secret = label, secret
+
+        def get_label(self):
+            return self.label
+
+        def get_secret(self):
+            return self.secret
+
+    class Collection:
+        def __init__(self, locked, items):
+            self.locked, self.items = locked, items
+
+        def is_locked(self):
+            return self.locked
+
+        def get_all_items(self):
+            return self.items
+
+    collections = [Collection(True, [Item("DEEPSEEK_API_KEY", b"locked")]),
+                   Collection(False, [Item("deepseek_api_key", b"wrong-case"),
+                                      Item("DEEPSEEK_API_KEY", b"sk-from-label\n")])]
+    monkeypatch.setitem(sys.modules, "secretstorage", types.SimpleNamespace(
+        dbus_init=lambda: object(), get_all_collections=lambda bus: collections))
+    monkeypatch.setattr(secrets, "_from_keyring", lambda n: None)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert secrets._from_keyring_label("DEEPSEEK_API_KEY") == "sk-from-label"
+    assert secrets._from_keyring_label("SPRITES_TOKEN") is None
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "sk-from-label"
+
+
+def test_missing_secret_message_names_the_keyring_backend(monkeypatch):
+    from control import secrets
+    monkeypatch.setattr(secrets, "keyring_backend", lambda: "x.Keyring")
+    assert "keyring backend: x.Keyring" in secrets.missing_message(["DEEPSEEK_API_KEY"])
+    monkeypatch.setattr(secrets, "keyring_backend", lambda: None)
+    assert "no keyring backend" in secrets.missing_message(["DEEPSEEK_API_KEY"])

@@ -1,5 +1,7 @@
 import asyncio
 import subprocess
+import sys
+import types
 
 import httpx
 import pytest
@@ -129,6 +131,7 @@ def test_secrets_env_then_keyring_then_exit(monkeypatch, capsys):
     from runner import secrets
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(secrets, "_from_keyring", lambda n: "from-ring" if n == "DEEPSEEK_API_KEY" else None)
+    monkeypatch.setattr(secrets, "_from_keyring_label", lambda n: None)
     assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-ring"
     monkeypatch.setenv("DEEPSEEK_API_KEY", "from-env")
     assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-env"
@@ -137,3 +140,49 @@ def test_secrets_env_then_keyring_then_exit(monkeypatch, capsys):
         secrets.require(["DEEPSEEK_API_KEY", "RUNNER_TOKEN"])
     err = capsys.readouterr().err
     assert "RUNNER_TOKEN" in err and "DEEPSEEK_API_KEY" not in err.split("\n\n")[1]
+    assert "keyring backend" in err or "no keyring backend" in err
+
+
+def test_secrets_accept_an_item_added_in_a_keyring_gui(monkeypatch):
+    """A keyring-GUI item has no service/username attributes, only a label, so
+    it is found by label: exactly, unlocked collections only, surrounding
+    whitespace dropped."""
+    from runner import secrets
+
+    class Item:
+        def __init__(self, label, secret):
+            self.label, self.secret = label, secret
+
+        def get_label(self):
+            return self.label
+
+        def get_secret(self):
+            return self.secret
+
+    class Collection:
+        def __init__(self, locked, items):
+            self.locked, self.items = locked, items
+
+        def is_locked(self):
+            return self.locked
+
+        def get_all_items(self):
+            return self.items
+
+    collections = [Collection(True, [Item("DEEPSEEK_API_KEY", b"locked")]),
+                   Collection(False, [Item("deepseek_api_key", b"wrong-case"),
+                                      Item("DEEPSEEK_API_KEY", b"sk-from-label\n")])]
+    monkeypatch.setitem(sys.modules, "secretstorage", types.SimpleNamespace(
+        dbus_init=lambda: object(), get_all_collections=lambda bus: collections))
+    monkeypatch.setattr(secrets, "_from_keyring", lambda n: None)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert secrets._from_keyring_label("DEEPSEEK_API_KEY") == "sk-from-label"
+    assert secrets._from_keyring_label("SPRITES_TOKEN") is None
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "sk-from-label"
+
+
+def test_secrets_without_a_secret_service(monkeypatch):
+    from runner import secrets
+    monkeypatch.setitem(sys.modules, "secretstorage", None)  # import raises ImportError
+    assert secrets._from_keyring_label("DEEPSEEK_API_KEY") is None
