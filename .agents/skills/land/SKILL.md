@@ -125,20 +125,32 @@ git merge-base --is-ancestor local/main HEAD   # must succeed
 git push local HEAD:main
 ```
 
-This is a plain push, never `--force`. Two guards before it:
+This is a plain push, never `--force`. Three guards before it:
 
 - If `local/main` moved since the rebase (the ancestry check fails), fetch and
   rebase again rather than pushing or forcing.
-- The `local` remote pushes into the user's working checkout
-  (`receive.denyCurrentBranch=updateInstead`), which rejects a push while that
-  checkout has uncommitted changes. When `git remote get-url local` is a local
-  path, check it first and stop, naming the paths, if it is dirty:
+- The `local` remote is the user's working checkout, so it has to be clean:
+  git refuses to update a checkout with uncommitted changes, and a push would
+  otherwise run over the user's edits. When `git remote get-url local` is a
+  local path, check it first and stop, naming the paths, if it is dirty:
 
   ```sh
   git --no-optional-locks -C "$(dirname "$(git remote get-url local)")" status --porcelain
   ```
 
   Skip this check when the remote URL is not a local path.
+- A non-bare repository refuses a push into its checked-out branch unless
+  `receive.denyCurrentBranch=updateInstead`. Check the destination and set it
+  when it is missing — once per checkout — then say so in the report:
+
+  ```sh
+  repo="$(dirname "$(git remote get-url local)")"
+  if [ "$(git -C "$repo" config --get receive.denyCurrentBranch)" != updateInstead ]; then
+    git -C "$repo" config receive.denyCurrentBranch updateInstead
+  fi
+  ```
+
+  Skip this too when the remote URL is not a local path.
 
 ### 6. Confirm and report
 
