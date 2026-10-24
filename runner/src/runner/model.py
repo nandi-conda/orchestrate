@@ -14,6 +14,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from .secrets import get_secret
+
 
 @dataclass
 class ToolCall:
@@ -91,9 +93,9 @@ class OpenAICompatModel:
 
 
 def deepseek(model: str | None = None, api_key: str | None = None) -> OpenAICompatModel:
-    key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    key = api_key or get_secret("DEEPSEEK_API_KEY")
     if not key:
-        raise ModelError("DEEPSEEK_API_KEY is not set")
+        raise ModelError("DEEPSEEK_API_KEY is not set (env or keyring)")
     return OpenAICompatModel(
         model=model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
         api_key=key,
@@ -134,7 +136,7 @@ def from_spec(spec: dict | None) -> Model:
     if provider == "openai-compat":
         return OpenAICompatModel(
             model=spec["model"],
-            api_key=os.environ[spec.get("api_key_env", "OPENAI_API_KEY")],
+            api_key=get_secret(spec.get("api_key_env", "OPENAI_API_KEY")) or "",
             base_url=spec["base_url"],
         )
     raise ModelError(f"unknown model provider: {provider}")

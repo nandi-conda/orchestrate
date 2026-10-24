@@ -11,6 +11,7 @@ git = "*"
 httpx = ">=0.27"
 starlette = ">=0.38"
 uvicorn = ">=0.30"
+keyring = ">=25"
 
 [activation.env]
 PYTHONPATH = "$PIXI_PROJECT_ROOT/src"
@@ -30,3 +31,4 @@ prod = { features = [], solve-group = "default" }
 serve = "python -m runner.server"
 run = "python -m runner.cli"
 test = "pytest -q"
+set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }

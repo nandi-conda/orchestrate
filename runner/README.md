@@ -5,6 +5,7 @@ calls a pluggable model (DeepSeek first) and runs tools in a pluggable sandbox
 (a local shell first). Threads can list, read, message and spawn each other.
 
 ```sh
+pixi run set-key DEEPSEEK_API_KEY             # once: store the key in the system keyring
 pixi run test                                   # offline tests (scripted model)
 DEEPSEEK_API_KEY=... pixi run run "add a README" --repo /path/to/git/repo
 DEEPSEEK_API_KEY=... RUNNER_TOKEN=... pixi run serve   # HTTP service on :8080

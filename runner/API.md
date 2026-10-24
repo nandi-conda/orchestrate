@@ -74,6 +74,8 @@ A thread also calls `set_summary` after each turn, and when it has a `parent`, s
 
 ## Environment
 
+Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, `ORCHESTRATOR_TOKEN`, and an `openai-compat` model's `api_key_env`) are read from the environment first, then from the system keyring under service `orchestrate` with the variable name as the username (`pixi run set-key DEEPSEEK_API_KEY`). `serve` and `run` print the missing ones and exit if a required secret is in neither place.
+
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | | required for DeepSeek, sent as `Authorization: Bearer` |

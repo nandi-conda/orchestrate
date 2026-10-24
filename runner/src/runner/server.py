@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from .model import from_spec
 from .peers import HttpPeers
+from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 
 
@@ -120,7 +121,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
 def host_from_env() -> ThreadHost:
     orch = os.environ.get("ORCHESTRATOR_URL")
-    peers = HttpPeers(orch, os.environ.get("ORCHESTRATOR_TOKEN", "")) if orch else None
+    peers = HttpPeers(orch, get_secret("ORCHESTRATOR_TOKEN") or "") if orch else None
     return ThreadHost(
         model_factory=from_spec,
         peers=peers,
@@ -132,8 +133,14 @@ def host_from_env() -> ThreadHost:
 
 
 def main():
+    import sys
+
     import uvicorn
-    app = create_app(host_from_env(), os.environ.get("RUNNER_TOKEN"))
+    require(["DEEPSEEK_API_KEY"] + (["ORCHESTRATOR_TOKEN"] if os.environ.get("ORCHESTRATOR_URL") else []))
+    token = get_secret("RUNNER_TOKEN")
+    if not token:
+        print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)
+    app = create_app(host_from_env(), token)
     uvicorn.run(app, host=os.environ.get("RUNNER_HOST", "0.0.0.0"), port=int(os.environ.get("RUNNER_PORT", "8080")))
 
 

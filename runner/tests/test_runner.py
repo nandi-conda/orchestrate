@@ -121,3 +121,17 @@ async def test_http_api(tmp_path):
         threads = (await c.get("/threads", headers=h)).json()
         assert threads[0]["id"] == tid and threads[0]["state"] == "idle"
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202
+
+
+def test_secrets_env_then_keyring_then_exit(monkeypatch, capsys):
+    from runner import secrets
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(secrets, "_from_keyring", lambda n: "from-ring" if n == "DEEPSEEK_API_KEY" else None)
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-ring"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "from-env")
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-env"
+    monkeypatch.delenv("RUNNER_TOKEN", raising=False)
+    with pytest.raises(SystemExit):
+        secrets.require(["DEEPSEEK_API_KEY", "RUNNER_TOKEN"])
+    err = capsys.readouterr().err
+    assert "RUNNER_TOKEN" in err and "DEEPSEEK_API_KEY" not in err.split("\n\n")[1]

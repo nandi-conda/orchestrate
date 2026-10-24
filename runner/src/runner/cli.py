@@ -8,6 +8,7 @@ import json
 import tempfile
 
 from .model import from_spec
+from .secrets import require
 from .thread import ThreadHost
 
 
@@ -55,7 +56,9 @@ def main():
     ap.add_argument("--project", default="local")
     ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-v4-pro)")
     ap.add_argument("--timeout", type=float, default=1800)
-    asyncio.run(amain(ap.parse_args()))
+    args = ap.parse_args()
+    require(["DEEPSEEK_API_KEY"])
+    asyncio.run(amain(args))
 
 
 if __name__ == "__main__":
