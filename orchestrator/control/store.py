@@ -88,7 +88,7 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS threads (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
         title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
-        state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
+        activity TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
         token TEXT NOT NULL DEFAULT '', created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id)",
@@ -111,7 +111,11 @@ PG_EVENTS = """CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)"""
 EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS events_project ON events(project_id, seq)"
 
-THREAD_FIELDS = ("parent_id", "title", "request", "summary", "state", "worker_id", "files", "token")
+THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token")
+
+# Columns added to tables after their first release: (table, column, definition).
+# open() adds any a database made before them is missing.
+ADDED_COLUMNS = [("threads", "activity", "TEXT NOT NULL DEFAULT ''")]
 
 
 def _thread(row: dict) -> dict:
@@ -169,7 +173,7 @@ class _SqlStore:
                             parent_id: str | None = None) -> dict:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
-               "request": request, "summary": "", "state": "queued", "worker_id": None,
+               "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
                "files": "[]", "token": secrets.token_urlsafe(24), "created_at": t, "updated_at": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
@@ -273,6 +277,11 @@ class SqliteStore(_SqlStore):
         await self.db.execute("PRAGMA journal_mode=WAL")
         for stmt in SCHEMA + [SQLITE_EVENTS, EVENTS_INDEX]:
             await self.db.execute(stmt)
+        for table, column, definition in ADDED_COLUMNS:
+            async with self.db.execute(f"PRAGMA table_info({table})") as cur:
+                have = {r["name"] for r in await cur.fetchall()}
+            if column not in have:
+                await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         await self.db.commit()
 
     async def close(self) -> None:
@@ -320,6 +329,8 @@ class PostgresStore(_SqlStore):
         async with self.pool.acquire() as c:
             for stmt in SCHEMA + [PG_EVENTS, EVENTS_INDEX]:
                 await c.execute(stmt)
+            for table, column, definition in ADDED_COLUMNS:
+                await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
         # A dedicated connection hears appends made by any instance.
         self._listener = await asyncpg.connect(self.dsn)
         await self._listener.add_listener(self.CHANNEL, lambda *a: self.notifier.poke(a[3]))

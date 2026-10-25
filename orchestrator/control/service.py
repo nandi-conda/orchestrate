@@ -7,6 +7,7 @@ event log per project no matter how many workers the project has.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -31,6 +32,32 @@ def peer_entry(t: dict) -> dict:
     """A thread as the runner's directory entry shape (runner/API.md)."""
     return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
             "summary": t["summary"], "files": t["files"], "parent": t["parent_id"]}
+
+
+def tool_arg(args) -> str:
+    """The part of a tool call's arguments worth showing: a command or path, else all of it."""
+    if isinstance(args, dict):
+        return str(args.get("command") or args.get("path") or json.dumps(args))
+    return str(args)
+
+
+def one_line(s: str, n: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[:n] + " …"
+
+
+def activity_of(typ: str, data: dict) -> str | None:
+    """What a thread is doing now, given its latest event; None leaves it as it was.
+
+    It names the running tool while one runs and says "thinking" while the
+    model has the turn. Any state but working clears it."""
+    if typ == "tool_call":
+        return one_line(f"running {data.get('name', 'tool')}: {tool_arg(data.get('arguments'))}", 160)
+    if typ in ("assistant", "tool_result"):
+        return "thinking"
+    if typ == "state":
+        return "thinking" if data.get("state") == "working" else ""
+    return None
 
 
 class PeerCallError(Exception):
@@ -222,10 +249,16 @@ class Orchestrator:
         if typ == "message_in" and tid in self.unechoed:
             if data.get("body") == self.unechoed.pop(tid):
                 return  # the request itself, already shown by "created"
+        fields = {}
+        activity = activity_of(typ, data)
+        if activity is not None:
+            fields["activity"] = activity
         if typ == "state" and data.get("state") in RUNNER_STATES:
-            await self.store.update_thread(tid, state=data["state"])
+            fields["state"] = data["state"]
         elif typ == "turn_done" and data.get("summary"):
-            await self.store.update_thread(tid, summary=data["summary"])
+            fields["summary"] = data["summary"]
+        if fields:
+            await self.store.update_thread(tid, **fields)
         await self.store.append_event(project_id, tid, typ, data)
 
     # ---------------------------------------------------------------- threads
@@ -280,7 +313,7 @@ class Orchestrator:
         lw = self.by_thread.get(thread_id)
         if lw:
             await lw.client.stop(thread_id)
-        await self.store.update_thread(thread_id, state="stopped")
+        await self.store.update_thread(thread_id, state="stopped", activity="")
 
     # ---------------------------------------------------------------- requests
 

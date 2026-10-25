@@ -12,7 +12,7 @@ from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, ke
                    s_copy, http_get_ref, j_ok, j_err, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
-                toggle_group_open, toggle)
+                toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, sse_open, page_project, open_window, go,
                   set_title, scroll_end)
 
@@ -40,6 +40,11 @@ STOPPED: Const[i32] = 20
 HOME: Const[i32] = 21
 GOT_LOG: Const[i32] = 22
 ACTIVITY: Const[i32] = 23
+TAB: Const[i32] = 24
+
+# pane tabs
+DIALOG: Const[i32] = 0
+TOOLS: Const[i32] = 1
 
 # routing modes
 AUTO: Const[i32] = 0
@@ -69,6 +74,7 @@ creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
+pane_tab: i32 = 0        # DIALOG or TOOLS
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -86,7 +92,6 @@ h_idle: i32 = 0
 h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
-h_tools: i32 = 0         # tool names in a collapsed run
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -114,7 +119,7 @@ def listen(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_tools, screen, loading
+    global h_working, h_idle, h_failed, h_queued, h_stopped, screen, loading
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -126,7 +131,6 @@ def init() -> None:
     h_t1 = s_new()
     h_t2 = s_new()
     h_t3 = s_new()
-    h_tools = s_new()
     h_working = s_new()
     s_set(h_working, "working")
     h_idle = s_new()
@@ -196,7 +200,7 @@ def take(old: i32, new: i32) -> i32:
 
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending
+    global mode, pending, pane_tab
     e: i32 = 0
     o: i32 = 0
     if msg == GOT_PROJECTS:
@@ -330,6 +334,9 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == STOPPED:
         j_free(arg)
         fetch_threads()
+    elif msg == TAB:
+        pane_tab = arg
+        scroll_end("pane")
     elif msg == HOME:
         go("/")
 
@@ -514,15 +521,26 @@ def thread_list() -> None:
         jstr(e, "state", h_t2)
         state_badge(h_t2)
         end()
-        el("div")
-        cls("thread-summary")
-        jstr(e, "summary", h_t1)
+        jstr(e, "activity", h_t1)
         if s_len(h_t1) > 0:
+            el("div")
+            cls("thread-activity")
+            span("activity-dot")
+            end()
+            span("mono")
             text_ref(h_t1)
+            end()
+            end()
         else:
-            jstr(e, "request", h_t1)
-            text_ref(h_t1)
-        end()
+            el("div")
+            cls("thread-summary")
+            jstr(e, "summary", h_t1)
+            if s_len(h_t1) > 0:
+                text_ref(h_t1)
+            else:
+                jstr(e, "request", h_t1)
+                text_ref(h_t1)
+            end()
         span("thread-id mono")
         text_ref(h_t3)
         end()
@@ -600,66 +618,87 @@ def tool_row(e: i32, show_thread: i32) -> None:
     end()
 
 
-def tool_group(src: i32, start: i32, stop: i32, show_thread: i32) -> None:
-    """A run of tool events [start, stop), collapsed behind one line so the
-    agent's own text stays the focus. Keyed by its first event, so it stays
-    open across refreshes while the run grows."""
-    i: i32
+def selected_thread() -> i32:
+    """The selected thread's directory entry (a JSON handle the caller frees),
+    or 0 before the directory has it."""
+    n: i32 = 0
+    i: i32 = 0
     e: i32 = 0
-    calls: i32 = 0
-    e = j_idx(src, start)
-    el("details")
-    cls("tools")
-    key(j_int(e, "seq"))
-    j_free(e)
-    s_clear(h_tools)
-    i = start
-    while i < stop:
-        e = j_idx(src, i)
-        if j_int(e, "kind") == K_TOOL_CALL:
-            if calls > 0:
-                s_add(h_tools, ", ")
-            jstr(e, "label", h_t1)
-            s_add_ref(h_tools, h_t1)
-            calls = calls + 1
+    if threads != 0:
+        n = j_len(threads, "")
+    while i < n:
+        e = j_idx(threads, i)
+        jstr(e, "id", h_t3)
+        if s_eq(h_t3, h_sel) == 1:
+            return e
         j_free(e)
         i = i + 1
-    if calls == 0:
-        # Only results here (their calls were interleaved with other events).
-        i = start
-        while i < stop:
-            e = j_idx(src, i)
-            if i > start:
-                s_add(h_tools, ", ")
-            jstr(e, "label", h_t1)
-            s_add_ref(h_tools, h_t1)
-            j_free(e)
-            i = i + 1
-    el("summary")
-    span("tools-count")
-    if calls == 1:
-        text("1 tool call")
-    elif calls == 0:
-        if stop - start == 1:
-            text("1 tool result")
-        else:
-            num(stop - start)
-            text(" tool results")
+    return 0
+
+
+def thread_head(t: i32) -> None:
+    """Title, state and Stop for the selected thread, and a line saying what it
+    is doing right now (the running tool, or "thinking") while it works."""
+    div("pane-head")
+    div("pane-title")
+    span("title")
+    if t != 0:
+        jstr(t, "title", h_t1)
+        text_ref(h_t1)
     else:
-        num(calls)
-        text(" tool calls")
+        text_ref(h_sel)
     end()
-    span("tools-names mono")
-    text_ref(h_tools)
+    if t != 0:
+        jstr(t, "state", h_t2)
+        state_badge(h_t2)
+    span("mono muted")
+    text_ref(h_sel)
     end()
     end()
-    div("tools-list")
-    i = start
-    while i < stop:
-        e = j_idx(src, i)
-        tool_row(e, show_thread)
-        j_free(e)
-        i = i + 1
+    btn_open("ghost", STOP, 0)
+    cls("sm")
+    text("Stop thread")
+    end()
+    end()
+    if t != 0:
+        jstr(t, "activity", h_t1)
+        if s_len(h_t1) > 0:
+            div("now")
+            span("activity-dot")
+            end()
+            span("now-label")
+            text("Now")
+            end()
+            span("now-text mono")
+            text_ref(h_t1)
+            end()
+            end()
+
+
+def tab_open(active: bool, arg: i32) -> None:
+    el("button")
+    cls("tab")
+    attr("role", "tab")
+    aria("aria-selected", active)
+    on_click(TAB, arg)
+
+
+def pane_tabs(dialog: i32, tools: i32) -> None:
+    """Dialog (the conversation) and Tools (calls and their output), with counts."""
+    div("pane-tabs")
+    tabs_list_open()
+    tab_open(pane_tab == DIALOG, DIALOG)
+    text("Dialog")
+    span("tab-count")
+    num(dialog)
+    end()
+    end()
+    tab_open(pane_tab == TOOLS, TOOLS)
+    text("Tools")
+    span("tab-count")
+    num(tools)
+    end()
+    end()
     end()
     end()
 
@@ -668,7 +707,9 @@ def pane() -> None:
     n: i32 = 0
     i: i32
     e: i32 = 0
-    run: i32 = 0
+    t: i32 = 0
+    tools: i32 = 0
+    shown: i32 = 0
     src: i32
     activity: i32
     src = plog
@@ -676,61 +717,55 @@ def pane() -> None:
     if s_len(h_sel) > 0:
         src = transcript
         activity = 0
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        tools = tools + is_tool(e)
+        j_free(e)
     el("section")
     cls("pane")
-    div("pane-head")
     if activity == 1:
+        div("pane-head")
         span("title")
         text("Project activity")
         end()
+        end()
     else:
-        span("title mono")
-        text_ref(h_sel)
-        end()
-        btn_open("ghost", STOP, 0)
-        cls("sm")
-        text("Stop thread")
-        end()
-    end()
+        t = selected_thread()
+        thread_head(t)
+        if t != 0:
+            j_free(t)
+    pane_tabs(n - tools, tools)
     el("div")
     cls("events")
+    cls_if("events-tools", pane_tab == TOOLS)
     attr("id", "pane")
-    if src != 0:
-        n = j_len(src, "")
-    if n == 0:
+    for i in range(n):
+        e = j_idx(src, i)
+        if is_tool(e) == 1:
+            if pane_tab == TOOLS:
+                tool_row(e, activity)
+                shown = shown + 1
+        elif pane_tab == DIALOG:
+            event_row(e, activity)
+            shown = shown + 1
+        j_free(e)
+    if shown == 0:
         el("p")
         cls("muted")
         cls("empty")
-        if activity == 1:
+        if n > 0 and pane_tab == TOOLS:
+            text("No tool calls yet.")
+        elif n > 0:
+            text("Nothing said yet. Tool calls are under Tools.")
+        elif activity == 1:
             text("Nothing yet. Type a request below; the router spawns threads for it.")
         else:
             text("Waiting for this thread's first event…")
         end()
-    i = 0
-    while i < n:
-        e = j_idx(src, i)
-        if is_tool(e) == 1:
-            j_free(e)
-            run = i + 1
-            while run < n and tool_at(src, run) == 1:
-                run = run + 1
-            tool_group(src, i, run, activity)
-            i = run
-        else:
-            event_row(e, activity)
-            j_free(e)
-            i = i + 1
     end()
     end()
-
-
-def tool_at(src: i32, i: i32) -> i32:
-    e: i32
-    r: i32
-    e = j_idx(src, i)
-    r = is_tool(e)
-    j_free(e)
-    return r
 
 
 def request_box() -> None:

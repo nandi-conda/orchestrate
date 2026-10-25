@@ -18,7 +18,7 @@ from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
-from .service import Orchestrator
+from .service import Orchestrator, tool_arg
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -49,9 +49,7 @@ def display(ev: dict) -> dict:
     elif t == "assistant":
         kind, label, text = K_ASSISTANT, "Agent", d.get("content", "")
     elif t == "tool_call":
-        args = d.get("arguments")
-        arg = args.get("command") or args.get("path") or json.dumps(args) if isinstance(args, dict) else str(args)
-        kind, label, text = K_TOOL_CALL, d.get("name", "tool"), short(str(arg), 300)
+        kind, label, text = K_TOOL_CALL, d.get("name", "tool"), short(tool_arg(d.get("arguments")), 300)
     elif t == "tool_result":
         kind, label, text = K_TOOL_RESULT, f"{d.get('name', 'tool')} result", short(str(d.get("result", "")))
     elif t == "state":
@@ -71,7 +69,7 @@ def display(ev: dict) -> dict:
 
 
 def thread_view(t: dict) -> dict:
-    return {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "state",
+    return {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
                               "worker_id", "files", "created_at", "updated_at")}
 
 

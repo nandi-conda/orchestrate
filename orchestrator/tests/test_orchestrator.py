@@ -49,6 +49,66 @@ async def test_store_roundtrip(tmp_path):
     await s.close()
 
 
+async def test_store_adds_activity_to_an_older_database(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "old.sqlite")
+    async with aiosqlite.connect(path) as db:  # threads as created before the activity column
+        await db.execute("""CREATE TABLE threads (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+            title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
+            token TEXT NOT NULL DEFAULT '', created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL)""")
+        await db.execute("INSERT INTO threads (id, project_id, title, created_at, updated_at) "
+                         "VALUES ('t_old', 'p_1', 'Old', 0, 0)")
+        await db.commit()
+    s = SqliteStore(path)
+    await s.open()
+    assert (await s.get_thread("t_old"))["activity"] == ""
+    assert (await s.update_thread("t_old", activity="thinking"))["activity"] == "thinking"
+    await s.close()
+    s = SqliteStore(path)
+    await s.open()  # a second open finds the column and leaves it be
+    assert (await s.get_thread("t_old"))["activity"] == "thinking"
+    await s.close()
+
+
+def test_activity_of_events():
+    act = service.activity_of
+    assert act("state", {"state": "working"}) == "thinking"
+    assert act("tool_call", {"name": "bash", "arguments": {"command": "pytest -q\n  tests"}}) == \
+        "running bash: pytest -q tests"
+    assert act("tool_call", {"name": "read_file", "arguments": {"path": "a.py"}}) == "running read_file: a.py"
+    assert act("tool_call", {"name": "bash", "arguments": {"command": "x" * 400}}).endswith(" …")
+    assert act("tool_result", {"name": "bash", "result": "ok"}) == "thinking"
+    assert act("assistant", {"content": "on it"}) == "thinking"
+    for state in ("idle", "failed", "stopped", "done", "waiting"):
+        assert act("state", {"state": state}) == ""
+    assert act("message_in", {"from": "user", "body": "hi"}) is None
+    assert act("error", {"error": "boom"}) is None
+
+
+async def test_ingest_tracks_what_a_thread_is_doing(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "Fix it", "fix the bug")
+    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+
+    async def doing(typ, data):
+        await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
+        return (await s.get_thread(t["id"]))["activity"]
+
+    assert await doing("state", {"state": "working"}) == "thinking"
+    assert await doing("tool_call", {"name": "bash", "arguments": {"command": "pytest"}}) == "running bash: pytest"
+    assert await doing("message_in", {"from": "t_x", "body": "fyi"}) == "running bash: pytest"
+    assert await doing("tool_result", {"name": "bash", "result": "1 passed"}) == "thinking"
+    assert await doing("state", {"state": "idle"}) == ""
+    assert (await s.get_thread(t["id"]))["state"] == "idle"
+    await s.close()
+
+
 async def test_heuristic_router():
     r = HeuristicRouter()
     one = await r.plan("add a login page", [])
@@ -119,6 +179,8 @@ async def test_end_to_end_with_echo_runner(server):
             ts = (await c.get(f"/api/projects/{pid}/threads")).json()
             return len(ts) == 2 and all(t["state"] == "idle" and t["summary"] for t in ts)
         await wait_for(all_idle)
+        # An idle thread is doing nothing, so it shows no current activity.
+        assert all(t["activity"] == "" for t in (await c.get(f"/api/projects/{pid}/threads")).json())
 
         tr = (await c.get(f"/api/threads/{ids[0]}/transcript")).json()
         assert any(e["type"] == "assistant" and "login page" in e["text"] for e in tr)
@@ -227,8 +289,9 @@ async def test_postgres_store_and_notify(postgres):
     await waiter
     assert asyncio.get_running_loop().time() - start < 2.0
     assert [e["payload"] for e in await b.list_events(p["id"])] == [{"content": "x"}]
-    await a.update_thread(t["id"], files=["f.py"], state="idle")
-    assert (await b.get_thread(t["id"]))["files"] == ["f.py"]
+    await a.update_thread(t["id"], files=["f.py"], state="idle", activity="thinking")
+    got = await b.get_thread(t["id"])
+    assert got["files"] == ["f.py"] and got["activity"] == "thinking"
     await a.close()
     await b.close()
 
