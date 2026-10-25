@@ -16,7 +16,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, set_title, scroll_end)
+                  nav_push, on_nav, set_title, scroll_end, md_parse, md_op, md_str)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -73,6 +73,14 @@ K_ERROR: Const[i32] = 7
 K_ROUTE: Const[i32] = 8
 K_THINKING: Const[i32] = 9
 
+# markdown render ops (ui/markdown.js); codes from 10 open an element
+MD_END: Const[i32] = 0
+MD_TEXT: Const[i32] = 1
+MD_HREF: Const[i32] = 2
+MD_START: Const[i32] = 3
+MD_ALIGN_C: Const[i32] = 4
+MD_ALIGN_R: Const[i32] = 5
+
 # ---- Model
 screen: i32 = 0          # 0 project list, 1 a project
 projects: i32 = 0        # JSON handle: list of projects
@@ -110,6 +118,7 @@ h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
+h_md: i32 = 0            # scratch for markdown text
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -137,7 +146,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -161,6 +170,7 @@ def init() -> None:
     h_stopped = s_new()
     s_set(h_stopped, "stopped")
     h_wlog_err = s_new()
+    h_md = s_new()
     on_nav(NAV)
     show_address()
 
@@ -778,12 +788,110 @@ def event_row(e: i32, show_thread: i32) -> None:
     text_ref(h_t1)
     thread_tag(e, show_thread)
     end()
-    el("div")
-    cls("ev-text")
     jstr(e, "text", h_t1)
-    text_ref(h_t1)
+    if k == K_ASSISTANT or k == K_PEER:
+        el("div")
+        cls("ev-text")
+        cls("md")
+        md(h_t1)
+        end()
+    else:
+        el("div")
+        cls("ev-text")
+        text_ref(h_t1)
+        end()
     end()
-    end()
+
+
+def md(h: i32) -> None:
+    """The markdown in handle h, as elements. A reply still streaming in is
+    parsed whole on each render, so it reads right at every step."""
+    n: i32
+    i: i32
+    op: i32
+    n = md_parse(h)
+    for i in range(n):
+        op = md_op(i)
+        if op == MD_END:
+            end()
+        elif op == MD_TEXT:
+            md_str(i, h_md)
+            text_ref(h_md)
+        elif op == MD_HREF:
+            md_str(i, h_md)
+            attr_ref("href", h_md)
+        elif op == MD_START:
+            md_str(i, h_md)
+            attr_ref("start", h_md)
+        elif op == MD_ALIGN_C:
+            cls("center")
+        elif op == MD_ALIGN_R:
+            cls("right")
+        else:
+            md_open(op)
+
+
+def md_open(op: i32) -> None:
+    """Open the element for markdown op code op (TAGS in ui/markdown.js)."""
+    if op == 10:
+        el("p")
+    elif op == 11:
+        el("h1")
+    elif op == 12:
+        el("h2")
+    elif op == 13:
+        el("h3")
+    elif op == 14:
+        el("h4")
+    elif op == 15:
+        el("h5")
+    elif op == 16:
+        el("h6")
+    elif op == 17:
+        el("ul")
+    elif op == 18:
+        el("ol")
+    elif op == 19:
+        el("li")
+    elif op == 20:
+        el("pre")
+    elif op == 21:
+        el("code")
+    elif op == 22:
+        el("blockquote")
+    elif op == 23:
+        el("hr")
+    elif op == 24:
+        el("table")
+    elif op == 25:
+        el("thead")
+    elif op == 26:
+        el("tbody")
+    elif op == 27:
+        el("tr")
+    elif op == 28:
+        el("th")
+    elif op == 29:
+        el("td")
+    elif op == 30:
+        el("strong")
+    elif op == 31:
+        el("em")
+    elif op == 32:
+        el("del")
+    elif op == 33:
+        el("a")
+    elif op == 34:
+        el("br")
+    elif op == 35:
+        el("div")
+        cls("md-code")
+    elif op == 36:
+        el("div")
+        cls("md-lang")
+    else:
+        el("div")
+        cls("md-table")
 
 
 def thinking_row(e: i32, show_thread: i32) -> None:

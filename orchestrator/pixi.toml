@@ -26,7 +26,7 @@ postgresql = ">=18.4,<19"
 test = ["test"]
 
 [tasks]
-build-ui = { cmd = "python -c \"import os;os.makedirs('ui/dist',exist_ok=True)\" && ultra build ui/app.py -o ui/dist/app.wasm && python -c \"import shutil;[shutil.copy('ui/'+f,'ui/dist/'+f) for f in ('index.html','imports.js','app.css')]\"" }
+build-ui = { cmd = "python -c \"import os;os.makedirs('ui/dist',exist_ok=True)\" && ultra build ui/app.py -o ui/dist/app.wasm && python -c \"import shutil;[shutil.copy('ui/'+f,'ui/dist/'+f) for f in ('index.html','imports.js','markdown.js','app.css')]\"" }
 serve = { cmd = "python -m control --port 8000", depends-on = ["build-ui"] }
 devrunner = "python -m control.devrunner --port 8080"
 set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }

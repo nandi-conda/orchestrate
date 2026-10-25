@@ -1,8 +1,11 @@
 // Extra imports for ui/orch.py, passed to ultra's mount(..., { imports }).
+import { parse } from "./markdown.js";
+
 export function imports({ str, strs, vals, dispatch }) {
   const put = (v) => { vals.push(v); return vals.length - 1; };
   const streams = new Map();
   let nextStream = 1;
+  let doc = { op: [], s: [] }; // the markdown md_parse last parsed
   return {
     o_new: () => put({}),
     o_str: (o, k, h) => { vals[o][str(k)] = strs[h] ?? ""; },
@@ -55,6 +58,9 @@ export function imports({ str, strs, vals, dispatch }) {
     nav_push: (u) => { history.pushState(null, "", strs[u]); },
     on_nav: (msg) => { addEventListener("popstate", () => dispatch(msg, 0)); },
     set_title: (h) => { document.title = strs[h]; },
+    md_parse: (h) => { doc = parse(strs[h] ?? ""); return doc.op.length; },
+    md_op: (i) => doc.op[i],
+    md_str: (i, d) => { strs[d] = doc.s[i]; },
     scroll_end: (id) => {
       const sel = str(id);
       requestAnimationFrame(() => requestAnimationFrame(() => {

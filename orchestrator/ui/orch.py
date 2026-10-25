@@ -63,3 +63,18 @@ def set_title(h: i32) -> None:
 def scroll_end(id: str) -> None:
     """Scroll the element with this id to the bottom after the next render."""
     pass
+
+@jscall
+def md_parse(h: i32) -> i32:
+    """Parse the markdown in handle h (ui/markdown.js) and return how many
+    render ops it made; md_op and md_str read them until the next md_parse."""
+    pass
+
+@jscall
+def md_op(i: i32) -> i32:
+    pass
+
+@jscall
+def md_str(i: i32, dst: i32) -> None:
+    """Write op i's text (its text, href or start) to dst."""
+    pass

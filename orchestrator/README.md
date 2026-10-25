@@ -59,7 +59,7 @@ thread.
 ## Tests
 
 ```sh
-pixi run test             # store, router, the whole loop against the echo runner, Postgres if installed
+pixi run test             # store, router, the whole loop against the echo runner, the markdown renderer, Postgres if installed
 ```
 
 The Postgres test starts a throwaway server with `initdb`, which refuses to run

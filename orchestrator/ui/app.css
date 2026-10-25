@@ -99,3 +99,38 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
   .body { flex-direction: column; }
   .threads { width: auto; max-height: 35vh; border-right: 0; border-bottom: 1px solid var(--border); }
 }
+
+/* Markdown in agent replies (ui/markdown.js). */
+.ev-text.md { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md .md-code, .md .md-table { margin: 0 0 .75em; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 1.1em 0 .45em; line-height: 1.3; font-weight: 600; }
+.md h1 { font-size: 1.4em; }
+.md h2 { font-size: 1.25em; padding-bottom: .2em; border-bottom: 1px solid var(--border); }
+.md h3 { font-size: 1.1em; }
+.md h4, .md h5, .md h6 { font-size: 1em; }
+.md h6 { color: var(--muted-foreground); }
+.md ul, .md ol { padding-left: 1.5em; }
+.md li { margin: .2em 0; }
+.md li > ul, .md li > ol { margin: .2em 0 0; }
+.md li > p { margin: 0 0 .4em; }
+.md strong { font-weight: 600; }
+.md a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+.md a:hover { text-decoration-thickness: 2px; }
+.md hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+.md blockquote { padding: .1em 0 .1em 1em; border-left: 3px solid var(--border); color: var(--muted-foreground); }
+.md code { font-family: var(--font-mono); font-size: .86em; padding: .12em .35em; border-radius: 4px;
+           background: color-mix(in oklch, var(--muted) 80%, transparent); }
+.md .md-code { border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+               background: color-mix(in oklch, var(--muted) 60%, transparent); }
+.md .md-lang { padding: 3px 12px; font: 11px var(--font-mono); color: var(--muted-foreground); border-bottom: 1px solid var(--border); }
+.md pre { margin: 0; padding: 10px 12px; overflow-x: auto; max-height: 480px; overflow-y: auto; }
+.md pre code { padding: 0; background: none; border-radius: 0; font-size: 12.5px; line-height: 1.5; white-space: pre; }
+.md .md-table { overflow-x: auto; }
+.md table { border-collapse: collapse; font-size: .92em; }
+.md th, .md td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; }
+.md th { font-weight: 600; background: var(--muted); }
+.md tbody tr:nth-child(even) td { background: color-mix(in oklch, var(--muted) 40%, transparent); }
+.md th.center, .md td.center { text-align: center; }
+.md th.right, .md td.right { text-align: right; }
