@@ -6,9 +6,11 @@ downloads to the downloads folder."""
 from __future__ import annotations
 
 import html
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, QTimer, QUrl
+from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
 from PySide6.QtWebEngineCore import QWebEngineDownloadRequest, QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QMainWindow
@@ -17,6 +19,16 @@ from .server import DOWN, UP, ControlPlane
 
 # The status page's Retry link; the page never loads it, the window acts on it.
 RETRY = QUrl("http://retry.orchestrate.invalid/")
+
+
+def render_in_software() -> None:
+    """Draw the window and the page on the CPU, with no OpenGL, EGL or Vulkan.
+    The page is a dashboard, and a GL context is what fails on desktops whose
+    drivers don't match the environment's Qt (the window aborts without one).
+    Call before the QApplication is made."""
+    QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Software)
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} --disable-gpu".strip()
 
 
 def free_path(folder: Path, name: str) -> Path:

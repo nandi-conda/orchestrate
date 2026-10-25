@@ -36,8 +36,22 @@ any, it runs threads on the local echo runner.
 - `pixi run desktop --url http://host:8000` shows a control plane someone else
   runs instead of starting one.
 
-If the control plane cannot start or cannot be reached, the window says so
-with the URL, and **Retry** tries again.
+If the control plane cannot start, exits, or cannot be reached, the window
+says so with the URL, and **Retry** tries again. If the port is already taken,
+it does not start one: whatever holds the port would answer in its place. The
+window tells you, and how to free it:
+
+```sh
+fuser -k 8000/tcp              # Linux; or: kill $(lsof -t -i :8000)
+```
+
+On Linux the control plane gets SIGTERM when the window's process ends, even
+when it crashes, so a crashed window leaves nothing holding the port.
+
+The window and the page are drawn in software (Qt Quick's software renderer,
+Chromium with `--disable-gpu`), so it needs no working OpenGL, EGL or Vulkan.
+Without that, a desktop whose GL drivers don't match the environment's Qt
+aborted with "QQuickWidget: Failed to get a QRhi".
 
 Platforms: linux-64, osx-arm64 and win-64. conda-forge has no Qt WebEngine for
 osx-64, and ultra has no linux-aarch64 build.
@@ -54,8 +68,10 @@ as its own process, on the echo runner and the rule-based router
 window in its view, saves a Files download to the downloads folder without
 overwriting, stops the control plane when it closes, and says so with the URL
 when the control plane exits or is not there. They need no credentials and no
-display. Offscreen there is no GPU, so they run Chromium with `--disable-gpu`
-(and without its sandbox, which refuses to run as root).
+display, and render in software exactly as the window does. They run
+Chromium without its sandbox, which refuses to run as root. They also check
+that a taken port is refused, that a control plane dying while up shows as
+down, and (Linux) that it dies with a killed window.
 
 ## Layout
 

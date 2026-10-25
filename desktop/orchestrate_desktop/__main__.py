@@ -6,7 +6,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from .server import ControlPlane, serve_command
-from .window import MainWindow
+from .window import MainWindow, render_in_software
 
 
 def main() -> None:
@@ -15,6 +15,7 @@ def main() -> None:
                    help="port of the control plane this window starts (its UI is in a browser there too)")
     p.add_argument("--url", help="connect to a control plane someone else runs instead of starting one")
     a, rest = p.parse_known_args()
+    render_in_software()
     app = QApplication([sys.argv[0], *rest])
     app.setApplicationName("Orchestrator")
     if a.url:

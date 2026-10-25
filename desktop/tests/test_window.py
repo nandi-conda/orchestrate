@@ -111,3 +111,75 @@ def test_connecting_to_nothing_names_the_url(qtbot):
     qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
     assert w.control.text.startswith(f"No control plane at {url}: ")
     qtbot.waitUntil(lambda: f"No control plane at {url}" in page_text(qtbot, w), timeout=WAIT)
+
+
+def test_a_taken_port_is_refused_not_shown(qtbot, tmp_path):
+    """Something else on the port would answer /health for our control plane."""
+    import socket
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        w = MainWindow(ControlPlane(f"http://127.0.0.1:{port}", [sys.executable, str(SERVE), str(port), str(tmp_path)]))
+        qtbot.addWidget(w)
+        w.show()
+        assert w.control.state == DOWN and w.control.proc is None
+        assert f"Port {port} is already in use" in w.control.text and f"fuser -k {port}/tcp" in w.control.text
+        qtbot.waitUntil(lambda: "already in use" in page_text(qtbot, w), timeout=WAIT)
+
+
+def test_a_control_plane_that_dies_while_up_shows_down(qtbot, owned):
+    w, url = owned
+    w.control.proc.kill()
+    qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
+    assert "exited with code" in w.control.text and w.control.proc is None
+    qtbot.waitUntil(lambda: "exited with code" in page_text(qtbot, w), timeout=WAIT)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux's")
+def test_the_control_plane_dies_with_a_crashed_window(tmp_path):
+    """A window that aborts (as one without a GL context did) takes its
+    control plane with it, so the port is free for the next run."""
+    import subprocess
+    port = free_port()
+    parent = f"""
+import os, subprocess, sys, time
+sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+from orchestrate_desktop.server import die_with_parent
+p = subprocess.Popen([sys.executable, {str(SERVE)!r}, "{port}", {str(tmp_path)!r}], preexec_fn=die_with_parent)
+print(p.pid, flush=True)
+time.sleep(30)
+"""
+    proc = subprocess.Popen([sys.executable, "-c", parent], stdout=subprocess.PIPE, text=True)
+    child = int(proc.stdout.readline())
+    deadline = time.time() + 20
+    while not _up(port):
+        assert time.time() < deadline
+        time.sleep(0.1)
+    proc.kill()  # SIGKILL: no cleanup runs in the parent
+    proc.wait()
+    deadline = time.time() + 10
+    while _alive(child):
+        assert time.time() < deadline, "the control plane outlived its window"
+        time.sleep(0.1)
+
+
+def _up(port: int) -> bool:
+    try:
+        return httpx.get(f"http://127.0.0.1:{port}/health").status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A zombie has exited; its parent is gone, so init reaps it shortly.
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ")[1][0] != "Z"
+    except FileNotFoundError:
+        return False

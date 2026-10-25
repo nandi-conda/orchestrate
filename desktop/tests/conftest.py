@@ -16,8 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 # Chromium's sandbox refuses to run as root, which test containers often are.
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
-# Offscreen there is no OpenGL, and Chromium's GPU process hangs looking for it.
-os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+
+
+def pytest_configure(config):
+    """Render as `pixi run desktop` does, before pytest-qt makes the QApplication."""
+    from orchestrate_desktop.window import render_in_software
+    render_in_software()
 
 
 def free_port() -> int:
