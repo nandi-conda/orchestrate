@@ -72,6 +72,8 @@ K_PEER: Const[i32] = 6
 K_ERROR: Const[i32] = 7
 K_ROUTE: Const[i32] = 8
 K_THINKING: Const[i32] = 9
+K_RESULT: Const[i32] = 10
+K_STATE: Const[i32] = 11
 
 # markdown render ops (ui/markdown.js); codes from 10 open an element
 MD_END: Const[i32] = 0
@@ -119,6 +121,7 @@ h_queued: i32 = 0
 h_stopped: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_md: i32 = 0            # scratch for markdown text
+h_run: i32 = 0           # thread id of the thinking run being grouped
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -146,7 +149,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -171,6 +174,7 @@ def init() -> None:
     s_set(h_stopped, "stopped")
     h_wlog_err = s_new()
     h_md = s_new()
+    h_run = s_new()
     on_nav(NAV)
     show_address()
 
@@ -763,15 +767,12 @@ def thread_tag(e: i32, show_thread: i32) -> None:
 
 
 def event_row(e: i32, show_thread: i32) -> None:
-    """One dialog entry. The model's reasoning folds to a line once its step is
-    done; while the model streams, its reasoning and reply show as they grow."""
+    """One dialog entry. While the model streams, its reasoning and reply show
+    as they grow; finished reasoning is grouped by thinking_group."""
     k: i32
     live: i32
     k = j_int(e, "kind")
     live = j_int(e, "live")
-    if k == K_THINKING and live == 0:
-        thinking_row(e, show_thread)
-        return
     el("div")
     cls("ev")
     key(j_int(e, "seq"))
@@ -782,6 +783,7 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls_if("ev-error", k == K_ERROR)
     cls_if("ev-route", k == K_ROUTE)
     cls_if("ev-thinking", k == K_THINKING)
+    cls_if("ev-result", k == K_RESULT)
     cls_if("ev-live", live == 1)
     div("ev-label")
     jstr(e, "label", h_t1)
@@ -789,7 +791,7 @@ def event_row(e: i32, show_thread: i32) -> None:
     thread_tag(e, show_thread)
     end()
     jstr(e, "text", h_t1)
-    if k == K_ASSISTANT or k == K_PEER:
+    if k == K_ASSISTANT or k == K_PEER or k == K_RESULT:
         el("div")
         cls("ev-text")
         cls("md")
@@ -894,8 +896,60 @@ def md_open(op: i32) -> None:
         cls("md-table")
 
 
-def thinking_row(e: i32, show_thread: i32) -> None:
-    """A finished step's reasoning, collapsed to a line until clicked."""
+def is_thought(e: i32) -> i32:
+    """Finished reasoning (a live row still streams on its own)."""
+    if j_int(e, "kind") == K_THINKING and j_int(e, "live") == 0:
+        return 1
+    return 0
+
+
+def hidden(e: i32) -> i32:
+    """Left out of the Dialog: tool rows (under Tools) and state changes
+    (the badges show them)."""
+    if is_tool(e) == 1 or j_int(e, "kind") == K_STATE:
+        return 1
+    return 0
+
+
+def thought_run(src: i32, a: i32, n: i32) -> i32:
+    """The end (exclusive) of the run of reasoning starting at src[a]: the
+    steps the Dialog shows back to back, with only hidden rows between them,
+    all from one thread."""
+    b: i32
+    i: i32
+    e: i32
+    b = a + 1
+    i = a + 1
+    e = j_idx(src, a)
+    jstr(e, "thread_id", h_run)
+    j_free(e)
+    while i < n:
+        e = j_idx(src, i)
+        if is_thought(e) == 1:
+            jstr(e, "thread_id", h_t2)
+            if s_eq(h_t2, h_run) == 0:
+                j_free(e)
+                return b
+            b = i + 1
+        elif hidden(e) == 0:
+            j_free(e)
+            return b
+        j_free(e)
+        i = i + 1
+    return b
+
+
+def thinking_group(src: i32, a: i32, b: i32, show_thread: i32) -> None:
+    """A run of reasoning steps, collapsed to one line (the latest step) until
+    clicked."""
+    i: i32
+    e: i32
+    steps: i32 = 0
+    for i in range(a, b):
+        e = j_idx(src, i)
+        steps = steps + is_thought(e)
+        j_free(e)
+    e = j_idx(src, a)
     el("details")
     cls("tool")
     cls("thinking")
@@ -904,15 +958,31 @@ def thinking_row(e: i32, show_thread: i32) -> None:
     span("tool-name")
     text("Thinking")
     end()
+    if steps > 1:
+        span("steps")
+        num(steps)
+        text(" steps")
+        end()
     thread_tag(e, show_thread)
+    j_free(e)
+    e = j_idx(src, b - 1)
     span("tool-preview")
     jstr(e, "text", h_t1)
     text_ref(h_t1)
     end()
+    j_free(e)
     end()
-    el("div")
+    el("ol")
     cls("tool-body")
-    text_ref(h_t1)
+    cls("thoughts")
+    for i in range(a, b):
+        e = j_idx(src, i)
+        if is_thought(e) == 1:
+            el("li")
+            jstr(e, "text", h_t1)
+            text_ref(h_t1)
+            end()
+        j_free(e)
     end()
     end()
 
@@ -1095,9 +1165,13 @@ def pane() -> None:
         activity = 0
     if src != 0:
         n = j_len(src, "")
+    states: i32 = 0
+    j: i32
     for i in range(n):
         e = j_idx(src, i)
         tools = tools + is_tool(e)
+        if j_int(e, "kind") == K_STATE:
+            states = states + 1
         j_free(e)
     el("section")
     cls("pane")
@@ -1112,7 +1186,7 @@ def pane() -> None:
         thread_head(t)
         if t != 0:
             j_free(t)
-    pane_tabs(n - tools, tools, activity == 0)
+    pane_tabs(n - tools - states, tools, activity == 0)
     el("div")
     cls("events")
     cls_if("events-tools", pane_tab == TOOLS)
@@ -1122,15 +1196,25 @@ def pane() -> None:
         end()
         end()
         return
-    for i in range(n):
-        e = j_idx(src, i)
-        if is_tool(e) == 1:
-            if pane_tab == TOOLS:
+    j = 0
+    while j < n:
+        e = j_idx(src, j)
+        if pane_tab == TOOLS:
+            if is_tool(e) == 1:
                 tool_row(e, activity)
                 shown = shown + 1
-        elif pane_tab == DIALOG:
+            j = j + 1
+        elif hidden(e) == 1:
+            j = j + 1
+        elif is_thought(e) == 1:
+            i = thought_run(src, j, n)
+            thinking_group(src, j, i, activity)
+            shown = shown + 1
+            j = i
+        else:
             event_row(e, activity)
             shown = shown + 1
+            j = j + 1
         j_free(e)
     if shown == 0:
         el("p")
@@ -1154,6 +1238,7 @@ def request_box() -> None:
     cls("composer")
     if s_len(h_route) > 0:
         div("route")
+        attr_ref("title", h_route)
         span("route-label")
         text("Router")
         end()

@@ -23,8 +23,11 @@ from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
-# Event kinds for the UI, which can't compare strings cheaply.
-K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE, K_THINKING = range(1, 10)
+# Event kinds for the UI, which can't compare strings cheaply. K_RESULT is a
+# turn's summary, shown as its answer; K_STATE is a state change, which the
+# Dialog leaves to the state badges.
+(K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE, K_THINKING,
+ K_RESULT, K_STATE) = range(1, 12)
 
 
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
@@ -61,9 +64,9 @@ def display(ev: dict) -> dict:
     elif t == "tool_result":
         kind, label, text = K_TOOL_RESULT, f"{d.get('name', 'tool')} result", short(str(d.get("result", "")))
     elif t == "state":
-        kind, label, text = K_STATUS, "state", d.get("state", "")
+        kind, label, text = K_STATE, "state", d.get("state", "")
     elif t == "turn_done":
-        kind, label, text = K_STATUS, "turn done", d.get("summary", "")
+        kind, label, text = K_RESULT, "Result", d.get("summary", "")
     elif t in ("error", "dropped"):
         kind, label, text = K_ERROR, t, d.get("error") or d.get("reason", "")
     elif t == "route":

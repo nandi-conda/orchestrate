@@ -203,6 +203,15 @@ def test_fold_drops_deltas_already_ended_by_a_later_event():
     assert [(r["type"], r.get("live")) for r in rows] == [("assistant", None)]
 
 
+def test_turn_summary_is_the_result_and_state_changes_have_their_own_kind():
+    def ev(seq, typ, payload):
+        return {"seq": seq, "project_id": "p", "thread_id": "t", "type": typ, "payload": payload, "created_at": 0}
+    rows = app_mod.fold([ev(1, "state", {"state": "working"}),
+                         ev(2, "turn_done", {"summary": "Built `hello`."})])
+    assert [(r["kind"], r["label"], r["text"]) for r in rows] == [(app_mod.K_STATE, "state", "working"),
+                                                                  (app_mod.K_RESULT, "Result", "Built `hello`.")]
+
+
 async def test_heuristic_router():
     r = HeuristicRouter()
     one = await r.plan("add a login page", [])
