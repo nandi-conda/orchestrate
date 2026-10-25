@@ -67,6 +67,28 @@ async def test_store_lists_archived_threads_apart(tmp_path):
     await s.close()
 
 
+async def test_store_lists_working_threads_first(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    a = await s.create_thread(p["id"], "A", "a")
+    b = await s.create_thread(p["id"], "B", "b")
+    c = await s.create_thread(p["id"], "C", "c")
+    for t in (a, b, c):
+        await s.update_thread(t["id"], state="idle")
+
+    async def order():
+        return [t["title"] for t in await s.list_threads(p["id"])]
+
+    assert await order() == ["C", "B", "A"]
+    await s.update_thread(a["id"], state="working")
+    await s.update_thread(b["id"], state="queued")
+    assert await order() == ["B", "A", "C"]
+    await s.update_thread(b["id"], state="idle")
+    assert await order() == ["A", "C", "B"]
+    await s.close()
+
+
 async def test_store_adds_activity_to_an_older_database(tmp_path):
     import aiosqlite
 

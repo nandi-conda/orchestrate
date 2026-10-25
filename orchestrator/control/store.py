@@ -9,7 +9,9 @@
 
 A thread is archived when `archived_at` is set. `list_threads` lists either
 the live threads (the default: the main list, the router's directory, peers)
-or only the archived ones.
+or only the archived ones. Working threads (queued or working) come first,
+then the rest; each group newest first, so a thread moves up when its turn
+starts and back when it ends, and nothing else reshuffles.
 
 Events carry a project-wide sequence number (`seq`), so a client can resume a
 project or thread stream from `?after=seq`.
@@ -47,7 +49,8 @@ class Store(Protocol):
                             parent_id: str | None = None) -> dict: ...
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         """The project's threads that are not archived, or with archived=True
-        only the archived ones; newest first."""
+        only the archived ones; working (queued or working) threads first,
+        then the rest, each group newest first."""
     async def get_thread(self, thread_id: str) -> dict | None: ...
     async def update_thread(self, thread_id: str, **fields: Any) -> dict | None: ...
 
@@ -191,7 +194,8 @@ class _SqlStore:
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         which = "IS NOT NULL" if archived else "IS NULL"
         rows = await self._fetch(self._q(f"SELECT * FROM threads WHERE project_id = ? AND archived_at {which} "
-                                         "ORDER BY created_at DESC"), project_id)
+                                         "ORDER BY CASE WHEN state IN ('queued', 'working') THEN 0 ELSE 1 END, "
+                                         "created_at DESC"), project_id)
         return [_thread(r) for r in rows]
 
     async def get_thread(self, thread_id: str) -> dict | None:
