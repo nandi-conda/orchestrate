@@ -224,6 +224,10 @@ class _SqlStore:
                                              "ORDER BY seq LIMIT ?"), project_id, after, limit)
         return [_event(r) for r in rows]
 
+    async def delete_events(self, project_id: str, thread_id: str, type: str) -> None:
+        await self._exec(self._q("DELETE FROM events WHERE project_id = ? AND thread_id = ? AND type = ?"),
+                         project_id, thread_id, type)
+
     async def wait_events(self, project_id: str, after: int, timeout: float) -> None:
         await self.notifier.wait(project_id, timeout)
 

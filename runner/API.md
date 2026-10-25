@@ -47,6 +47,8 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `created` | directory entry |
 | `state` | `{"state"}` |
 | `message_in` | `{"from", "body"}` |
+| `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
+| `reasoning` | `{"content"}`: the model's whole reasoning for one step, once it is done |
 | `assistant` | `{"content"}` |
 | `tool_call` | `{"id", "name", "arguments"}` |
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |

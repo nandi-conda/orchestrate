@@ -18,13 +18,13 @@ from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
-from .service import Orchestrator, tool_arg
+from .service import ENDS_STREAM, Orchestrator, tool_arg
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
 # Event kinds for the UI, which can't compare strings cheaply.
-K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE = range(1, 9)
+K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE, K_THINKING = range(1, 10)
 
 
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
@@ -33,6 +33,10 @@ HIDDEN = {"usage"}
 
 def short(s: str, n: int = 600) -> str:
     return s if len(s) <= n else s[:n] + " …"
+
+
+def tail(s: str, n: int = 2000) -> str:
+    return s if len(s) <= n else "… " + s[-n:]
 
 
 def display(ev: dict) -> dict:
@@ -48,6 +52,8 @@ def display(ev: dict) -> dict:
         kind, label, text = K_USER, "Request", d.get("request", "")
     elif t == "assistant":
         kind, label, text = K_ASSISTANT, "Agent", d.get("content", "")
+    elif t == "reasoning":
+        kind, label, text = K_THINKING, "Thinking", d.get("content", "")
     elif t == "tool_call":
         kind, label, text = K_TOOL_CALL, d.get("name", "tool"), short(tool_arg(d.get("arguments")), 300)
     elif t == "tool_result":
@@ -66,6 +72,43 @@ def display(ev: dict) -> dict:
     else:
         kind, label, text = K_STATUS, t, short(json.dumps(d), 300)
     return {**ev, "kind": kind, "label": label, "text": text}
+
+
+def live_row(first: dict, d: dict) -> dict:
+    """One row for a model reply still streaming in: its `delta` events so far."""
+    if d["kind"] == "content":
+        kind, label, text = K_ASSISTANT, "Agent (writing…)", d["text"]
+    elif d["kind"] == "tool":
+        kind, label, text = K_TOOL_CALL, d.get("name") or "tool", short(d["text"], 300) + " …"
+    else:
+        kind, label, text = K_THINKING, "Thinking…", tail(d["text"])
+    return {**first, "kind": kind, "label": label, "text": text, "live": 1}
+
+
+def fold(events: list[dict]) -> list[dict]:
+    """Events for display. A model call's `delta` events become one live row
+    per part (reasoning, reply, each tool call) at the end, until the event
+    that ends the call is in; then the deltas are dropped (the control plane
+    deletes them too) and the call's own events stand."""
+    out: list[dict] = []
+    streaming: dict[str | None, list[tuple[dict, dict]]] = {}
+    for e in events:
+        tid = e["thread_id"]
+        if e["type"] == "delta":
+            d = e["payload"]
+            parts = streaming.setdefault(tid, [])
+            if parts and (parts[-1][1]["kind"], parts[-1][1].get("name")) == (d.get("kind"), d.get("name")):
+                parts[-1][1]["text"] += d.get("text", "")
+            else:
+                parts.append((e, {"kind": d.get("kind"), "name": d.get("name"), "text": d.get("text", "")}))
+            continue
+        if e["type"] in ENDS_STREAM:
+            streaming.pop(tid, None)
+        if e["type"] not in HIDDEN:
+            out.append(display(e))
+    for parts in streaming.values():
+        out.extend(live_row(first, d) for first, d in parts)
+    return out
 
 
 def thread_view(t: dict) -> dict:
@@ -183,12 +226,12 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return JSONResponse({"error": "no such thread"}, 404)
         after = int(req.query_params.get("after", "0") or 0)
         events = await store.list_events(t["project_id"], t["id"], after, limit=2000)
-        return JSONResponse([display(e) for e in events if e["type"] not in HIDDEN])
+        return JSONResponse(fold(events))
 
     async def project_log(req: Request):
         after = int(req.query_params.get("after", "0") or 0)
         events = await store.list_events(req.path_params["pid"], None, after, limit=2000)
-        return JSONResponse([display(e) for e in events if e["type"] not in HIDDEN])
+        return JSONResponse(fold(events))
 
     def sse(project_id: str, thread_id: str | None, after: int):
         async def idle(last: int, seconds: float) -> bool:

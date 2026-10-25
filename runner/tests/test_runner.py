@@ -1,4 +1,5 @@
 import asyncio
+import json
 import subprocess
 import sys
 import types
@@ -6,7 +7,8 @@ import types
 import httpx
 import pytest
 
-from runner import LocalSandbox, ModelResponse, ScriptedModel, ThreadHost, ToolCall
+from runner import LocalSandbox, ModelResponse, OpenAICompatModel, ScriptedModel, ThreadHost, ToolCall
+from runner.model import ModelError
 from runner.server import create_app
 
 
@@ -226,3 +228,87 @@ def test_secrets_without_a_secret_service(monkeypatch):
     from runner import secrets
     monkeypatch.setitem(sys.modules, "secretstorage", None)  # import raises ImportError
     assert secrets._from_keyring_label("DEEPSEEK_API_KEY") is None
+
+
+def sse_body(*chunks, keepalives=0):
+    lines = [": keep-alive\n\n"] * keepalives
+    lines += [f"data: {json.dumps(c)}\n\n" for c in chunks]
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode()
+
+
+async def test_openai_compat_streams_reasoning_text_and_tool_calls():
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse_body(
+            {"choices": [{"delta": {"reasoning_content": "Need a "}}]},
+            {"choices": [{"delta": {"reasoning_content": "file."}}]},
+            {"choices": [{"delta": {"content": "Writing it."}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                                    "function": {"name": "write_file", "arguments": ""}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\": "}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"a.py\"}"}}]}}]},
+            {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 9}},
+            keepalives=2))
+
+    m = OpenAICompatModel("deepseek-v4-pro", "k", "https://x", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    got = []
+    r = await m.complete([{"role": "user", "content": "hi"}], [], lambda k, t, n: got.append((k, t, n)))
+    assert seen["body"]["stream"] is True
+    assert r.content == "Writing it." and r.reasoning == "Need a file."
+    assert [(c.id, c.name, c.arguments) for c in r.tool_calls] == [("call_1", "write_file", {"path": "a.py"})]
+    assert r.message["reasoning_content"] == "Need a file."
+    assert r.message["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
+    assert r.usage == {"prompt_tokens": 3, "completion_tokens": 9}
+    assert got[:3] == [("reasoning", "Need a ", ""), ("reasoning", "file.", ""), ("content", "Writing it.", "")]
+    assert ("tool", "\"a.py\"}", "write_file") in got
+
+
+async def test_openai_compat_reports_http_errors():
+    def handler(req):
+        return httpx.Response(400, json={"error": {"message": "bad model"}})
+    m = OpenAICompatModel("nope", "k", "https://x", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ModelError, match="HTTP 400.*bad model"):
+        await m.complete([{"role": "user", "content": "hi"}], [])
+
+
+async def test_openai_compat_fails_when_only_keepalives_arrive():
+    async def stream():
+        while True:
+            yield b": keep-alive\n\n"
+            await asyncio.sleep(0.02)
+
+    def handler(req):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream())
+    m = OpenAICompatModel("m", "k", "https://x", stall=0.1, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ModelError, match="only keep-alives from POST https://x/chat/completions for 0s"):
+        await m.complete([{"role": "user", "content": "hi"}], [])
+
+
+async def test_thread_streams_deltas_before_the_final_events(tmp_path):
+    host = host_with({"t": [
+        ModelResponse("", [call("bash", command="echo hi")], reasoning="I should run it."),
+        ModelResponse("all done"),
+    ]}, tmp_path)
+    t = await host.start(project="p", title="t", request="run it")
+    await host.wait_idle(t.id)
+    kinds = [(e["type"], (e["data"] or {}).get("kind")) for e in t.events]
+    first_call = kinds.index(("tool_call", None))
+    assert kinds.index(("delta", "reasoning")) < kinds.index(("reasoning", None)) < first_call
+    assert kinds.index(("delta", "tool")) < first_call
+    tool_deltas = [e["data"] for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "tool"]
+    assert tool_deltas[0] == {"kind": "tool", "name": "bash", "text": ""}
+    assert "".join(d["text"] for d in tool_deltas) == '{"command": "echo hi"}'
+    content = [e for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content"]
+    assert content[-1]["data"]["text"] == "all done"
+    assert content[-1]["seq"] < next(e["seq"] for e in t.events if e["type"] == "assistant")
+
+
+async def test_openai_compat_names_the_url_and_timeout_when_reads_time_out():
+    def handler(req):
+        raise httpx.ReadTimeout("", request=req)
+    m = OpenAICompatModel("m", "k", "https://x", stall=300, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ModelError, match=r"m: ReadTimeout: no data from POST https://x/chat/completions for 300s"):
+        await m.complete([{"role": "user", "content": "hi"}], [])

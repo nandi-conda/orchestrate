@@ -11,6 +11,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 
+import httpx
+
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
 from .runner_client import RunnerClient
@@ -21,6 +23,9 @@ log = logging.getLogger("orchestrator")
 MAX_HOPS = 6
 CAPACITY = 16  # running threads per worker before another one starts
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
+# Runner events that end a model call: once one is in, that call's `delta`
+# events (its reply while it streamed) are folded into it and dropped.
+ENDS_STREAM = {"reasoning", "assistant", "tool_call", "turn_done", "state", "error"}
 
 
 def worker_spec(project: dict, index: int) -> WorkerSpec:
@@ -49,15 +54,35 @@ def one_line(s: str, n: int) -> str:
 def activity_of(typ: str, data: dict) -> str | None:
     """What a thread is doing now, given its latest event; None leaves it as it was.
 
-    It names the running tool while one runs and says "thinking" while the
-    model has the turn. Any state but working clears it."""
+    It names the running tool while one runs; while the model has the turn it
+    says what the model is streaming (reasoning, a reply, a tool call). Any
+    state but working clears it."""
+    if typ == "delta":
+        kind = data.get("kind")
+        if kind == "content":
+            return "writing a reply"
+        if kind == "tool":
+            return f"calling {data.get('name') or 'a tool'}"
+        return "thinking"
     if typ == "tool_call":
         return one_line(f"running {data.get('name', 'tool')}: {tool_arg(data.get('arguments'))}", 160)
-    if typ in ("assistant", "tool_result"):
+    if typ in ("reasoning", "assistant", "tool_result"):
         return "thinking"
     if typ == "state":
         return "thinking" if data.get("state") == "working" else ""
     return None
+
+
+def describe(e: Exception) -> str:
+    """An exception as one line that says what failed: httpx's timeouts carry
+    no message, so name the request they were for."""
+    text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+    if isinstance(e, httpx.RequestError):
+        try:
+            text += f" on {e.request.method} {e.request.url}"
+        except RuntimeError:  # no request attached
+            pass
+    return text
 
 
 class PeerCallError(Exception):
@@ -134,7 +159,7 @@ class Orchestrator:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("relay from %s dropped: %s", lw.worker.id, e)
+                log.warning("relay from %s dropped: %s", lw.worker.id, describe(e))
             await asyncio.sleep(1.0)
 
     # ---------------------------------------------------------------- peer calls
@@ -153,7 +178,7 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    log.warning("peer calls from %s: %s", lw.worker.id, e)
+                    log.warning("peer calls from %s: %s", lw.worker.id, describe(e))
                     await asyncio.sleep(1.0)
                     continue
                 for call in calls:
@@ -260,6 +285,8 @@ class Orchestrator:
         if fields:
             await self.store.update_thread(tid, **fields)
         await self.store.append_event(project_id, tid, typ, data)
+        if typ in ENDS_STREAM:
+            await self.store.delete_events(project_id, tid, "delta")
 
     # ---------------------------------------------------------------- threads
 
@@ -284,7 +311,7 @@ class Orchestrator:
             self.unechoed.pop(thread["id"], None)
             await self.store.update_thread(thread["id"], state="failed")
             await self.store.append_event(project_id, thread["id"], "error",
-                                          {"error": f"could not start thread: {e}"})
+                                          {"error": f"could not start thread: {describe(e)}"})
             return await self.store.get_thread(thread["id"])
         lw.threads.add(thread["id"])
         self.by_thread[thread["id"]] = lw

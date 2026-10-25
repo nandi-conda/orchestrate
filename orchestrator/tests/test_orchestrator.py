@@ -12,6 +12,7 @@ import httpx
 import pytest
 import uvicorn
 
+from control import app as app_mod
 from control import service
 from control.app import create_app
 from control.providers import LocalProvider
@@ -85,6 +86,10 @@ def test_activity_of_events():
     assert act("assistant", {"content": "on it"}) == "thinking"
     for state in ("idle", "failed", "stopped", "done", "waiting"):
         assert act("state", {"state": state}) == ""
+    assert act("delta", {"kind": "reasoning", "text": "hm"}) == "thinking"
+    assert act("delta", {"kind": "content", "text": "Sure"}) == "writing a reply"
+    assert act("delta", {"kind": "tool", "name": "write_file", "text": ""}) == "calling write_file"
+    assert act("reasoning", {"content": "hm"}) == "thinking"
     assert act("message_in", {"from": "user", "body": "hi"}) is None
     assert act("error", {"error": "boom"}) is None
 
@@ -107,6 +112,58 @@ async def test_ingest_tracks_what_a_thread_is_doing(tmp_path):
     assert await doing("state", {"state": "idle"}) == ""
     assert (await s.get_thread(t["id"]))["state"] == "idle"
     await s.close()
+
+
+async def test_streamed_reply_shows_live_then_folds_into_its_events(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "Fix it", "fix the bug")
+    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+
+    async def ingest(typ, data):
+        await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
+
+    async def shown():
+        return app_mod.fold(await s.list_events(p["id"], t["id"], 0, limit=2000))
+
+    await ingest("state", {"state": "working"})
+    await ingest("delta", {"kind": "reasoning", "text": "Look at "})
+    await ingest("delta", {"kind": "reasoning", "text": "the file."})
+    await ingest("delta", {"kind": "content", "text": "Fixing"})
+    await ingest("delta", {"kind": "tool", "name": "write_file", "text": ""})
+    await ingest("delta", {"kind": "tool", "name": "write_file", "text": '{"path": "a.py"'})
+    rows = await shown()
+    live = [(r["kind"], r["label"], r["text"]) for r in rows if r.get("live")]
+    assert live == [(app_mod.K_THINKING, "Thinking…", "Look at the file."),
+                    (app_mod.K_ASSISTANT, "Agent (writing…)", "Fixing"),
+                    (app_mod.K_TOOL_CALL, "write_file", '{"path": "a.py" …')]
+    assert (await s.get_thread(t["id"]))["activity"] == "calling write_file"
+
+    await ingest("reasoning", {"content": "Look at the file."})
+    await ingest("assistant", {"content": "Fixing"})
+    await ingest("tool_call", {"id": "c1", "name": "write_file", "arguments": {"path": "a.py"}})
+    rows = await shown()
+    assert not any(r.get("live") for r in rows)
+    assert [r["type"] for r in rows] == ["state", "reasoning", "assistant", "tool_call"]
+    assert rows[1]["kind"] == app_mod.K_THINKING and rows[1]["text"] == "Look at the file."
+    assert not [e for e in await s.list_events(p["id"], t["id"], 0) if e["type"] == "delta"]
+    await s.close()
+
+
+def test_describe_names_the_request_a_timeout_was_for():
+    req = httpx.Request("POST", "http://w:8080/threads")
+    assert service.describe(httpx.ReadTimeout("", request=req)) == "ReadTimeout on POST http://w:8080/threads"
+    assert service.describe(ValueError("bad")) == "ValueError: bad"
+
+
+def test_fold_drops_deltas_already_ended_by_a_later_event():
+    def ev(seq, typ, payload):
+        return {"seq": seq, "project_id": "p", "thread_id": "t", "type": typ, "payload": payload, "created_at": 0}
+    rows = app_mod.fold([ev(1, "delta", {"kind": "content", "text": "hi"}),
+                         ev(2, "assistant", {"content": "hi"}),
+                         ev(3, "usage", {"prompt_tokens": 1})])
+    assert [(r["type"], r.get("live")) for r in rows] == [("assistant", None)]
 
 
 async def test_heuristic_router():

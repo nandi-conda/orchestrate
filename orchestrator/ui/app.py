@@ -60,6 +60,7 @@ K_STATUS: Const[i32] = 5
 K_PEER: Const[i32] = 6
 K_ERROR: Const[i32] = 7
 K_ROUTE: Const[i32] = 8
+K_THINKING: Const[i32] = 9
 
 # ---- Model
 screen: i32 = 0          # 0 project list, 1 project window
@@ -567,8 +568,15 @@ def thread_tag(e: i32, show_thread: i32) -> None:
 
 
 def event_row(e: i32, show_thread: i32) -> None:
+    """One dialog entry. The model's reasoning folds to a line once its step is
+    done; while the model streams, its reasoning and reply show as they grow."""
     k: i32
+    live: i32
     k = j_int(e, "kind")
+    live = j_int(e, "live")
+    if k == K_THINKING and live == 0:
+        thinking_row(e, show_thread)
+        return
     el("div")
     cls("ev")
     key(j_int(e, "seq"))
@@ -578,6 +586,8 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls_if("ev-peer", k == K_PEER)
     cls_if("ev-error", k == K_ERROR)
     cls_if("ev-route", k == K_ROUTE)
+    cls_if("ev-thinking", k == K_THINKING)
+    cls_if("ev-live", live == 1)
     div("ev-label")
     jstr(e, "label", h_t1)
     text_ref(h_t1)
@@ -586,6 +596,29 @@ def event_row(e: i32, show_thread: i32) -> None:
     el("div")
     cls("ev-text")
     jstr(e, "text", h_t1)
+    text_ref(h_t1)
+    end()
+    end()
+
+
+def thinking_row(e: i32, show_thread: i32) -> None:
+    """A finished step's reasoning, collapsed to a line until clicked."""
+    el("details")
+    cls("tool")
+    cls("thinking")
+    key(j_int(e, "seq"))
+    el("summary")
+    span("tool-name")
+    text("Thinking")
+    end()
+    thread_tag(e, show_thread)
+    span("tool-preview")
+    jstr(e, "text", h_t1)
+    text_ref(h_t1)
+    end()
+    end()
+    el("div")
+    cls("tool-body")
     text_ref(h_t1)
     end()
     end()

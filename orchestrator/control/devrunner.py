@@ -82,7 +82,14 @@ class Host:
     async def turn(self, t: dict, text: str) -> None:
         await self.set_state(t, "working")
         await asyncio.sleep(self.delay)
-        await self.emit(t["id"], "assistant", {"content": f"Echo: {text}"})
+        # Stream the reply the way the real runner does (runner/API.md, `delta`).
+        reply = f"Echo: {text}"
+        await self.emit(t["id"], "delta", {"kind": "reasoning", "text": "Echoing the request."})
+        for i in range(0, len(reply), 16):
+            await self.emit(t["id"], "delta", {"kind": "content", "text": reply[i:i + 16]})
+            await asyncio.sleep(self.delay / 4)
+        await self.emit(t["id"], "reasoning", {"content": "Echoing the request."})
+        await self.emit(t["id"], "assistant", {"content": reply})
         for task in SPAWN.findall(text):
             await self.emit(t["id"], "tool_call", {"id": "c1", "name": "spawn_thread",
                                                    "arguments": {"request": task}})

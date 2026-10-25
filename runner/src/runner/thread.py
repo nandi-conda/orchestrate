@@ -36,6 +36,37 @@ class Limits:
     tool_timeout: float = 600.0
 
 
+class DeltaBuffer:
+    """Gathers a streaming reply into `delta` events: one per kind (and tool) at
+    a time, sent every `every` seconds or `size` characters, so the UI follows
+    the model without an event per token."""
+
+    def __init__(self, emit: Callable[[str, Any], None], every: float = 0.25, size: int = 400):
+        self._emit, self.every, self.size = emit, every, size
+        self.kind, self.name, self.parts = "", "", []
+        self.sent = time.monotonic()
+
+    def __call__(self, kind: str, text: str, name: str = "") -> None:
+        if (kind, name) != (self.kind, self.name):
+            self.flush()
+            self.kind, self.name = kind, name
+            if kind == "tool":  # a tool call starts: say which, before its arguments arrive
+                self._emit("delta", {"kind": kind, "name": name, "text": ""})
+        if text:
+            self.parts.append(text)
+        if sum(map(len, self.parts)) >= self.size or time.monotonic() - self.sent >= self.every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.parts:
+            data = {"kind": self.kind, "text": "".join(self.parts)}
+            if self.kind == "tool":
+                data["name"] = self.name
+            self._emit("delta", data)
+            self.parts = []
+        self.sent = time.monotonic()
+
+
 def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
@@ -93,7 +124,7 @@ class AgentThread:
             self.set_state("stopped")
             raise
         except Exception as e:
-            self.emit("error", {"error": f"{type(e).__name__}: {e}"})
+            self.emit("error", {"error": f"{type(e).__name__}: {e or repr(e)}"})
             self.set_state("failed")
 
     async def _turn(self):
@@ -103,8 +134,14 @@ class AgentThread:
         for step in range(self.limits.max_steps):
             while not self.inbox.empty():  # mid-turn messages land before the next model call
                 self._take(self.inbox.get_nowait())
-            resp = await self.model.complete(self.messages, self.tool_schemas)
+            deltas = DeltaBuffer(self.emit)
+            try:
+                resp = await self.model.complete(self.messages, self.tool_schemas, deltas)
+            finally:
+                deltas.flush()
             self.messages.append(resp.message)
+            if resp.reasoning:
+                self.emit("reasoning", {"content": resp.reasoning})
             if resp.content:
                 final = resp.content
                 self.emit("assistant", {"content": resp.content})
