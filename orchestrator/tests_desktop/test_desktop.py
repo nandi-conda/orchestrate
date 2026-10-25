@@ -172,6 +172,41 @@ def click(qtbot, w, element: str) -> None:
     QTest.mouseClick(w.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(x, y))
 
 
+def test_a_request_sent_in_project_activity_shows_there(qtbot, up, tmp_path, monkeypatch):
+    """Project activity is where requests are typed, so a request has to show
+    there. A project worked on for a while has more events than the pane holds:
+    it shows the newest ones, and a request sent now is among them."""
+    import asyncio
+
+    from control import app as app_mod
+    from control.store import SqliteStore
+
+    monkeypatch.setattr(app_mod, "PAGE_EVENTS", 50)
+    w, url = up
+
+    async def seed():
+        s = SqliteStore(str(tmp_path / "db.sqlite"))
+        await s.open()
+        p = await s.create_project("long")
+        for i in range(60):
+            await s.append_event(p["id"], None, "assistant", {"content": f"filler {i}"})
+        await s.close()
+        return p["id"]
+
+    pid = asyncio.run(seed())
+    w.view.load(QUrl(f"{url}/p/{pid}"))
+    qtbot.waitUntil(lambda: "filler 59" in page_text(qtbot, w), timeout=WAIT)
+    assert "filler 0" not in page_text(qtbot, w), "the pane keeps the newest page of the log"
+
+    js(qtbot, w, """const i = document.getElementById('req');
+                    i.value = 'see this in activity';
+                    i.dispatchEvent(new Event('input', {bubbles: true}));
+                    i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); true""")
+    shown = ("[...document.querySelectorAll('#pane .ev-user')]"
+             ".some(e => e.innerText.includes('see this in activity'))")
+    qtbot.waitUntil(lambda: js(qtbot, w, shown), timeout=WAIT)
+
+
 def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path):
     import asyncio
 

@@ -41,7 +41,8 @@ shows above the request box ("routing…" until the model answers). A new thread
 appears in the list right away and says "starting on a worker" until its worker
 is up (a sprite can take a while); messages sent to it meanwhile are delivered,
 in order, once it starts. **Project activity** in the
-thread list shows every event in the project, and each thread shows its own
+thread list shows the project's events, newest last (the newest 2,000: a project
+worked on for a while has more than a pane holds), and each thread shows its own
 transcript, including messages from other threads. A request that spawns
 threads never moves the window into one of them: you stay where you are, the
 new threads show up in the list, and their events stream into Project activity.
@@ -347,10 +348,10 @@ SQLite or Postgres database the first time the control plane opens it.
 | POST | `/api/projects/{id}/settings` | change any of `{name, model, repo_url}`; a remote that cannot be joined is a 400 with git's reason, and nothing changes |
 | POST | `/api/projects/{id}/requests` | `{text?, images?, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan. A request that is only `images` skips the router and starts one new thread |
 | GET/POST | `/api/projects/{id}/threads` | directory of live threads, `?archived=1` for archived ones; force a new thread `{request?, images?, title?}` |
-| GET | `/api/projects/{id}/log` | every event in the project (JSON) |
+| GET | `/api/projects/{id}/log` | the newest events in the project (JSON), oldest first |
 | GET | `/api/projects/{id}/events` | SSE, resumable with `?after=seq` or `Last-Event-ID` |
 | GET | `/api/threads/{id}` | one thread |
-| GET | `/api/threads/{id}/transcript` | its events (JSON) |
+| GET | `/api/threads/{id}/transcript` | its newest events (JSON) |
 | GET | `/api/threads/{id}/worker-logs` | its worker's runner log, `?lines=300` (text) |
 | GET | `/api/threads/{id}/events` | SSE |
 | POST | `/api/threads/{id}/messages` | `{body, images?}` |

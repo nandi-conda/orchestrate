@@ -43,6 +43,11 @@ UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
 HIDDEN = {"usage"}
 
+# How many events a pane shows at once. Project activity and a thread's transcript
+# take the newest: a project worked on for a while has more events than fit in one
+# reply, and its view must show what just happened, not what happened first.
+PAGE_EVENTS = 2000
+
 # A pasted image arrives as a data: URL. Its bytes live in the store; the events
 # and SSE streams carry only its id, so a long transcript and a streaming turn
 # stay small. At most MAX_IMAGES per message, each at most MAX_IMAGE_BYTES.
@@ -452,9 +457,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         t = await store.get_thread(req.path_params["tid"])
         if t is None:
             return JSONResponse({"error": "no such thread"}, 404)
-        after = int(req.query_params.get("after", "0") or 0)
-        events = await store.list_events(t["project_id"], t["id"], after, limit=2000)
-        return JSONResponse(fold(events))
+        return JSONResponse(fold(await store.recent_events(t["project_id"], t["id"], limit=PAGE_EVENTS)))
 
     async def image(req: Request):
         """A pasted image's bytes. Ids never change, so the browser may keep it."""
@@ -467,9 +470,9 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
                                  "x-content-type-options": "nosniff"})
 
     async def project_log(req: Request):
-        after = int(req.query_params.get("after", "0") or 0)
-        events = await store.list_events(req.path_params["pid"], None, after, limit=2000)
-        return JSONResponse(fold(events))
+        """The newest events in the project: what Project activity shows. A long
+        log keeps its newest page, so the pane never freezes on its oldest events."""
+        return JSONResponse(fold(await store.recent_events(req.path_params["pid"], limit=PAGE_EVENTS)))
 
     def sse(project_id: str, thread_id: str | None, after: int):
         async def idle(last: int, seconds: float) -> bool:

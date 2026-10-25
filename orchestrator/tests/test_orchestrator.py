@@ -148,6 +148,22 @@ async def test_store_lists_working_threads_first(tmp_path):
     await s.close()
 
 
+async def test_store_takes_the_newest_events_for_a_pane(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "A", "a")
+    seqs = []
+    for i in range(6):  # alternating: the thread, then the project
+        e = await s.append_event(p["id"], t["id"] if i % 2 == 0 else None, "assistant", {"content": str(i)})
+        seqs.append(e["seq"])
+    # A pane is about what just happened: the newest events, oldest first.
+    assert [e["seq"] for e in await s.recent_events(p["id"], limit=3)] == seqs[-3:]
+    assert [e["seq"] for e in await s.recent_events(p["id"], t["id"], limit=2)] == [seqs[2], seqs[4]]
+    assert [e["seq"] for e in await s.recent_events(p["id"], limit=50)] == seqs
+    await s.close()
+
+
 async def test_store_adds_activity_to_an_older_database(tmp_path):
     import aiosqlite
 
@@ -436,6 +452,38 @@ async def test_end_to_end_with_echo_runner(server):
         async def stopped():
             return (await c.get(f"/api/threads/{ids[1]}")).json()["state"] == "stopped" or None
         await wait_for(stopped)
+
+
+async def test_a_pane_shows_the_newest_events_of_a_long_log(server, monkeypatch):
+    """A project worked on for a while has more events than a pane shows. Project
+    activity and a thread's transcript take the newest ones: a request sent in the
+    activity view used to fall off the end of the page and never show there."""
+    monkeypatch.setattr(app_mod, "PAGE_EVENTS", 4)
+    async with httpx.AsyncClient(base_url=server, timeout=20) as c:
+        pid = (await c.post("/api/projects", json={"name": "long"})).json()["id"]
+        tid = (await c.post(f"/api/projects/{pid}/requests",
+                            json={"text": "first request", "mode": "new"})).json()["spawned"][0]["id"]
+
+        async def idle():
+            return (await c.get(f"/api/threads/{tid}")).json()["state"] == "idle"
+        await wait_for(idle)
+
+        log = (await c.get(f"/api/projects/{pid}/log")).json()
+        assert len(log) == 4, "a pane holds one page of the log"
+        assert [e["seq"] for e in log] == sorted(e["seq"] for e in log), "oldest first"
+        assert not any(e["type"] in ("request", "created") for e in log), "the oldest events slid off"
+
+        # A request sent now is in the window, not beyond the end of it.
+        assert (await c.post(f"/api/projects/{pid}/requests", json={"text": "second request"})).status_code == 202
+
+        async def shown():
+            return any(e["type"] == "request" and e["text"] == "second request"
+                       for e in (await c.get(f"/api/projects/{pid}/log")).json())
+        await wait_for(shown)
+
+        # A thread's transcript is a page of its own events, from the same end.
+        tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+        assert 0 < len(tr) <= 4 and [e["seq"] for e in tr] == sorted(e["seq"] for e in tr)
 
 
 class GatedRouter(HeuristicRouter):
