@@ -7,17 +7,19 @@ request becomes one or more agent threads running on remote workers.
 | --- | --- | --- |
 | [`orchestrator/`](orchestrator) | control plane + ultra UI | [README](orchestrator/README.md) |
 | [`runner/`](runner) | agent runner that hosts many threads per worker | [README](runner/README.md), [API](runner/API.md) |
+| [`desktop/`](desktop) | PySide6 desktop client for the control plane | [README](desktop/README.md) |
 
 They're separate pixi projects and deploy separately. The root
-[`pixi.toml`](pixi.toml) is a front door that delegates to both, so you can
+[`pixi.toml`](pixi.toml) is a front door that delegates to them, so you can
 drive everything from the repo root:
 
 ```sh
-pixi run setup                        # install what both projects need
+pixi run setup                        # install what every project needs
 pixi run set-key DEEPSEEK_API_KEY     # once: store the key in the system keyring
 pixi run set-key SPRITES_TOKEN        # once: run workers on Fly Sprites, even for a local UI
 pixi run serve                        # build the UI, then serve http://127.0.0.1:8000
-pixi run test                         # both test suites: runner, then orchestrator
+pixi run desktop                      # the desktop client, on that control plane
+pixi run test                         # every test suite: runner, orchestrator, desktop
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```
 

@@ -1,0 +1,30 @@
+[workspace]
+name = "orchestrate-desktop"
+version = "0.1.0"
+description = "PySide6 desktop client for the orchestrator's control plane"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+python = "3.12.*"
+pyside6 = ">=6.8"
+
+# The tests run the real control plane (../orchestrator) in-process against its
+# echo runner, so they need its dependencies, but not ultra: no web UI is built.
+[feature.test.dependencies]
+pytest = ">=8"
+pytest-qt = ">=4.4"
+starlette = ">=0.46"
+uvicorn = ">=0.34"
+httpx = ">=0.28"
+aiosqlite = ">=0.21"
+keyring = ">=25"
+
+[environments]
+test = ["test"]
+
+[tasks]
+start = { cmd = "python -m orchestrate_desktop", description = "Open the desktop client; --url picks the control plane (default http://127.0.0.1:8000)" }
+
+[feature.test.tasks]
+test = { cmd = "pytest -q tests", env = { QT_QPA_PLATFORM = "offscreen" } }
