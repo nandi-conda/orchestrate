@@ -30,7 +30,12 @@ focuses the same window. Type a request and press Enter:
 - **This thread**: sends the message straight to the selected thread.
 - **New thread**: always starts a fresh thread.
 
-The router's decision shows above the request box. **Project activity** in the
+Pressing Enter never waits on the router, a worker or the runner: the box
+clears at once and the request shows in the log. The router's decision then
+shows above the request box ("routing…" until the model answers). A new thread
+appears in the list right away and says "starting on a worker" until its worker
+is up (a sprite can take a while); messages sent to it meanwhile are delivered,
+in order, once it starts. **Project activity** in the
 thread list shows every event in the project, and each thread shows its own
 transcript, including messages from other threads. A request that spawns
 threads never moves the window into one of them: you stay where you are, the
@@ -182,7 +187,7 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | Method | Path | |
 | --- | --- | --- |
 | GET/POST | `/api/projects` | list, create `{name, repo_url?, model?}` |
-| POST | `/api/projects/{id}/requests` | `{text, mode: auto\|thread\|new, target?}` → router plan |
+| POST | `/api/projects/{id}/requests` | `{text, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan |
 | GET/POST | `/api/projects/{id}/threads` | directory; force a new thread `{request, title?}` |
 | GET | `/api/projects/{id}/log` | every event in the project (JSON) |
 | GET | `/api/projects/{id}/events` | SSE, resumable with `?after=seq` or `Last-Event-ID` |

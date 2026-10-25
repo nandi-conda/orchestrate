@@ -108,12 +108,37 @@ class Orchestrator:
         self.max_running = max_running
         self.workers: dict[str, list[LiveWorker]] = {}
         self.by_thread: dict[str, LiveWorker] = {}
-        # Spawned threads whose request the runner has yet to echo back as their
-        # first message_in; the "created" event already shows it.
-        self.unechoed: dict[str, str] = {}
+        # Per thread, the messages the control plane logged when it took them
+        # (a spawned thread's request as "created", the rest as "message_in")
+        # and the runner has yet to echo back as message_in; the echo is dropped.
+        self.unechoed: dict[str, list[str]] = {}
+        # Work runs in the background, in order per key: a project's requests
+        # (routing them may ask a model) and a thread's start and deliveries
+        # (starting may create a worker). The API only logs and queues.
+        self.request_chain: dict[str, asyncio.Task] = {}
+        self.thread_chain: dict[str, asyncio.Task] = {}
+        self.starting: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
 
+    def _chain(self, chains: dict[str, asyncio.Task], key: str, work) -> asyncio.Task:
+        """Run `work()` once the work queued before it under `key` has ended,
+        however that ended. `work` reports its own failures as events."""
+        prev = chains.get(key)
+
+        async def run() -> None:
+            if prev is not None:
+                await asyncio.wait({prev})
+            await work()
+
+        task = asyncio.create_task(run())
+        chains[key] = task
+        task.add_done_callback(lambda t: chains.pop(key) if chains.get(key) is t else None)
+        return task
+
     async def close(self) -> None:
+        for chains in (self.request_chain, self.thread_chain):
+            for task in list(chains.values()):
+                task.cancel()
         for lws in self.workers.values():
             for lw in lws:
                 for task in (lw.relay, lw.pump):
@@ -271,9 +296,8 @@ class Orchestrator:
             return
         if typ == "created":
             return  # the control plane already logged the thread
-        if typ == "message_in" and tid in self.unechoed:
-            if data.get("body") == self.unechoed.pop(tid):
-                return  # the request itself, already shown by "created"
+        if typ == "message_in" and self._echoed(tid, data.get("body")):
+            return  # already logged when the control plane took it
         fields = {}
         activity = activity_of(typ, data)
         if activity is not None:
@@ -299,23 +323,51 @@ class Orchestrator:
         if len(running) >= self.max_running:
             raise RuntimeError(f"project has {len(running)} running threads (limit {self.max_running})")
         thread = await self.store.create_thread(project_id, title, request, parent)
-        await self.store.append_event(project_id, thread["id"], "created",
+        tid = thread["id"]
+        await self.store.append_event(project_id, tid, "created",
                                       {"title": title, "request": request, "parent": parent})
-        self.unechoed[thread["id"]] = request
+        self._expect_echo(tid, request)
+        thread = await self.store.update_thread(tid, activity="starting on a worker")
+        self.starting[tid] = self._chain(self.thread_chain, tid,
+                                         lambda: self._start(project, thread, parent))
+        return thread
+
+    async def _start(self, project: dict, thread: dict, parent: str | None) -> None:
+        """Put a spawned thread on a worker, creating one when every worker is full."""
+        tid = thread["id"]
         try:
             lw = await self._pick_worker(project)
             model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
-            await lw.client.create_thread(id=thread["id"], request=request, title=title,
-                                          project=project_id, parent=parent, model=model)
+            await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
+                                          project=project["id"], parent=parent, model=model)
+        except asyncio.CancelledError:  # stopped before it started
+            self.unechoed.pop(tid, None)
+            raise
         except Exception as e:
-            self.unechoed.pop(thread["id"], None)
-            await self.store.update_thread(thread["id"], state="failed")
-            await self.store.append_event(project_id, thread["id"], "error",
+            self.unechoed.pop(tid, None)
+            await self.store.update_thread(tid, state="failed", activity="")
+            await self.store.append_event(project["id"], tid, "error",
                                           {"error": f"could not start thread: {describe(e)}"})
-            return await self.store.get_thread(thread["id"])
-        lw.threads.add(thread["id"])
-        self.by_thread[thread["id"]] = lw
-        return await self.store.update_thread(thread["id"], worker_id=lw.worker.id)
+            return
+        finally:
+            self.starting.pop(tid, None)
+        lw.threads.add(tid)
+        self.by_thread[tid] = lw
+        await self.store.update_thread(tid, worker_id=lw.worker.id)
+
+    def _expect_echo(self, tid: str, body: str) -> None:
+        self.unechoed.setdefault(tid, []).append(body)
+
+    def _echoed(self, tid: str, body) -> bool:
+        """Whether a runner's message_in is the echo of a message already logged;
+        if so it is no longer expected."""
+        pending = self.unechoed.get(tid)
+        if not pending or body not in pending:
+            return False
+        pending.remove(body)
+        if not pending:
+            del self.unechoed[tid]
+        return True
 
     async def send(self, to: str, body: str, sender: str = "user", hops: int = 0,
                    reply_to: str | None = None) -> dict:
@@ -327,14 +379,26 @@ class Orchestrator:
             await self.store.append_event(thread["project_id"], to, "dropped",
                                           {"from": sender, "reason": f"hop limit {MAX_HOPS}"})
             return msg
-        lw = self.by_thread.get(to)
-        if lw is None:
-            await self.store.append_event(thread["project_id"], to, "error",
-                                          {"error": "thread has no live worker"})
-            return msg
-        await lw.client.post_message(to, body, sender, hops)
-        await self.store.mark_read([msg["id"]])
+        await self.store.append_event(thread["project_id"], to, "message_in", {"from": sender, "body": body})
+        self._expect_echo(to, body)
+        self._chain(self.thread_chain, to, lambda: self._deliver(thread["project_id"], msg, hops))
         return msg
+
+    async def _deliver(self, project_id: str, msg: dict, hops: int) -> None:
+        """Hand a logged message to the thread's runner, after the thread's start
+        and the messages before it."""
+        to, body = msg["to_thread"], msg["body"]
+        lw = self.by_thread.get(to)
+        try:
+            if lw is None:
+                raise RuntimeError("the thread has no live worker")
+            await lw.client.post_message(to, body, msg["sender"], hops)
+        except Exception as e:
+            self._echoed(to, body)
+            await self.store.append_event(project_id, to, "error",
+                                          {"error": f"message not delivered: {describe(e)}"})
+            return
+        await self.store.mark_read([msg["id"]])
 
     async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
         """The runner log of the worker a thread runs on (the control plane
@@ -345,12 +409,44 @@ class Orchestrator:
         return await self.provider.logs(lw.worker, lines)
 
     async def stop(self, thread_id: str) -> None:
+        starting = self.starting.get(thread_id)
+        if starting:
+            starting.cancel()
         lw = self.by_thread.get(thread_id)
         if lw:
             await lw.client.stop(thread_id)
         await self.store.update_thread(thread_id, state="stopped", activity="")
 
     # ---------------------------------------------------------------- requests
+
+    async def submit(self, project_id: str, text: str, mode: str = "auto",
+                     target: str | None = None) -> dict:
+        """Take a request typed in a project's main window; it returns at once.
+
+        Sending to a thread or forcing a new one only logs and queues (a
+        thread's start and deliveries run in the background). Letting the
+        router decide may ask a model, so the request is logged and routed in
+        the background, in the order requests came in; its plan arrives as the
+        "route" event."""
+        if await self.store.get_project(project_id) is None:
+            raise KeyError(project_id)
+        if mode == "thread":
+            t = await self.store.get_thread(target) if target else None
+            if t is None or t["project_id"] != project_id:
+                raise KeyError(f"no thread {target} in this project")
+        if mode != "auto":
+            return await self.handle_request(project_id, text, mode, target)
+        await self.store.append_event(project_id, None, "request", {"text": text})
+        self._chain(self.request_chain, project_id, lambda: self._route(project_id, text))
+        return {"request": text, "mode": mode, "queued": True}
+
+    async def _route(self, project_id: str, text: str) -> None:
+        try:
+            await self.handle_request(project_id, text, "auto")
+        except Exception as e:
+            log.exception("request in %s", project_id)
+            await self.store.append_event(project_id, None, "error",
+                                          {"error": f"could not route the request: {describe(e)}"})
 
     async def handle_request(self, project_id: str, text: str, mode: str = "auto",
                              target: str | None = None) -> dict:

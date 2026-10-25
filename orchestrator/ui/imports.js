@@ -24,7 +24,7 @@ export function imports({ str, strs, vals, dispatch }) {
       const es = new EventSource(strs[u]);
       es.onmessage = (e) => { try { dispatch(msg, put(JSON.parse(e.data))); } catch {} };
       // Typed events (event: <type>) don't reach onmessage; listen to the ones we emit.
-      for (const t of ["created", "state", "message_in", "message_out", "delta", "reasoning", "assistant", "tool_call",
+      for (const t of ["request", "created", "state", "message_in", "message_out", "delta", "reasoning", "assistant", "tool_call",
                        "tool_result", "usage", "turn_done", "dropped", "error", "route", "worker"])
         es.addEventListener(t, es.onmessage);
       streams.set(id, es);

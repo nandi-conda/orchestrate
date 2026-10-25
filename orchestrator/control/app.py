@@ -42,7 +42,9 @@ def tail(s: str, n: int = 2000) -> str:
 def display(ev: dict) -> dict:
     """Add `kind` (int) and `text` (one display string) to an event."""
     t, d = ev["type"], ev["payload"]
-    if t == "message_in":
+    if t == "request":
+        kind, label, text = K_USER, "You", d.get("text", "")
+    elif t == "message_in":
         frm = d.get("from", "user")
         kind, label = (K_USER, "You") if frm == "user" else (K_PEER, f"from {frm}")
         text = d.get("body", "")
@@ -177,10 +179,12 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         if mode not in ("auto", "thread", "new"):
             return JSONResponse({"error": "mode is auto, thread or new"}, 400)
         try:
-            result = await orch().handle_request(pid, text, mode, b.get("target") or None)
-        except (KeyError, RuntimeError) as e:
+            result = await orch().submit(pid, text, mode, b.get("target") or None)
+        except KeyError as e:
+            return JSONResponse({"error": str(e.args[0])}, 404)
+        except RuntimeError as e:
             return JSONResponse({"error": str(e)}, 409)
-        return JSONResponse(result)
+        return JSONResponse(result, 200 if mode != "auto" else 202)
 
     async def list_threads(req: Request):
         return JSONResponse([thread_view(t) for t in await store.list_threads(req.path_params["pid"])])

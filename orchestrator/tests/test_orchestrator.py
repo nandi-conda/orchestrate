@@ -159,6 +159,7 @@ async def test_worker_logs_come_from_the_provider(tmp_path):
     orch = service.Orchestrator(s, provider, HeuristicRouter())
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
+        await asyncio.wait({orch.starting[t["id"]]})  # spawn returns before the worker is up
         log = await orch.worker_logs(t["id"], 50)
         assert "devrunner: echo runner on port" in log
         with pytest.raises(KeyError):
@@ -244,10 +245,15 @@ async def test_end_to_end_with_echo_runner(server):
         p = (await c.post("/api/projects", json={"name": "demo"})).json()
         pid = p["id"]
 
-        r = (await c.post(f"/api/projects/{pid}/requests",
-                          json={"text": "- login page\n- export bug"})).json()
-        assert r["summary"] == "spawned 2"
-        ids = [s["id"] for s in r["spawned"]]
+        r = await c.post(f"/api/projects/{pid}/requests", json={"text": "- login page\n- export bug"})
+        assert r.status_code == 202 and r.json()["queued"]
+
+        async def routed():
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            return next((e for e in log if e["type"] == "route"), None)
+        route = await wait_for(routed)
+        assert route["payload"]["summary"] == "spawned 2"
+        ids = [s["id"] for s in route["payload"]["spawned"]]
 
         async def all_idle():
             ts = (await c.get(f"/api/projects/{pid}/threads")).json()
@@ -310,6 +316,86 @@ async def test_end_to_end_with_echo_runner(server):
 
         await c.post(f"/api/threads/{ids[1]}/stop")
         assert (await c.get(f"/api/threads/{ids[1]}")).json()["state"] == "stopped"
+
+
+class GatedRouter(HeuristicRouter):
+    """A router whose model has not answered until `gate` is set."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+
+    async def plan(self, request, directory):
+        await self.gate.wait()
+        return await super().plan(request, directory)
+
+
+class GatedProvider(LocalProvider):
+    """A provider whose workers take until `gate` is set to come up (a sprite being made)."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.gate = asyncio.Event()
+
+    async def create(self, spec):
+        await self.gate.wait()
+        return await super().create(spec)
+
+
+async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
+    router = GatedRouter()
+    provider = GatedProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, router)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+
+            async def post(body):
+                t = time.perf_counter()
+                r = await c.post(f"/api/projects/{pid}/requests", json=body)
+                assert time.perf_counter() - t < 1.0, "a send waited on routing or a worker"
+                return r
+
+            # The router has not answered: the request is taken and shown at once.
+            r = await post({"text": "fix login"})
+            assert r.status_code == 202
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            assert [(e["type"], e["label"], e["text"]) for e in log] == [("request", "You", "fix login")]
+
+            # No worker is up: the thread exists, says it is starting, and takes messages.
+            r = await post({"text": "fix export", "mode": "new"})
+            assert r.status_code == 200 and r.json()["summary"] == "spawned 1"
+            tid = r.json()["spawned"][0]["id"]
+            t = (await c.get(f"/api/threads/{tid}")).json()
+            assert (t["state"], t["activity"]) == ("queued", "starting on a worker")
+            assert (await post({"text": "check csv too", "mode": "thread", "target": tid})).status_code == 200
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            assert [(e["type"], e["text"]) for e in tr] == [("created", "fix export"), ("message_in", "check csv too")]
+
+            # A thread stopped before its worker is up never starts.
+            gone = (await post({"text": "drop me", "mode": "new"})).json()["spawned"][0]["id"]
+            await c.post(f"/api/threads/{gone}/stop")
+
+            assert (await post({"text": "x", "mode": "thread", "target": "t_nope"})).status_code == 404
+
+            provider.gate.set()
+
+            async def delivered():
+                tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+                return any(e["type"] == "assistant" and "check csv too" in e["text"] for e in tr) and tr
+            tr = await wait_for(delivered)
+            # Logged when it was sent; the runner's echo of it is dropped.
+            assert [e["text"] for e in tr if e["type"] == "message_in"] == ["check csv too"]
+
+            router.gate.set()
+
+            async def routed():
+                log = (await c.get(f"/api/projects/{pid}/log")).json()
+                return next((e for e in log if e["type"] == "route"), None)
+            assert (await wait_for(routed))["payload"]["summary"] == "spawned 1"
+            g = (await c.get(f"/api/threads/{gone}")).json()
+            assert (g["state"], g["worker_id"]) == ("stopped", None)
 
 
 @pytest.fixture

@@ -82,6 +82,7 @@ h_sel: i32 = 0           # selected thread id ("" = activity view)
 h_name: i32 = 0
 h_repo: i32 = 0
 h_req: i32 = 0
+h_last: i32 = 0          # the request being sent, put back if the send fails
 h_err: i32 = 0
 h_route: i32 = 0         # last router decision
 h_url: i32 = 0
@@ -119,13 +120,14 @@ def listen(url: i32, msg: i32) -> None:
 
 
 def init() -> None:
-    global h_pid, h_sel, h_name, h_repo, h_req, h_err, h_route, h_url, h_t1, h_t2, h_t3
+    global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_working, h_idle, h_failed, h_queued, h_stopped, screen, loading
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
     h_repo = s_new()
     h_req = s_new()
+    h_last = s_new()
     h_err = s_new()
     h_route = s_new()
     h_url = s_new()
@@ -203,6 +205,7 @@ def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab
     e: i32 = 0
+    k: i32 = 0
     o: i32 = 0
     if msg == GOT_PROJECTS:
         loading = 0
@@ -281,10 +284,15 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == MODE:
         mode = arg
     elif msg == SEND:
+        # The box clears at once: the control plane takes the request and
+        # returns, and what becomes of it arrives on the event stream.
         if s_len(h_req) > 0 and sending == 0:
             sending = 1
+            s_copy(h_last, h_req)
+            s_clear(h_req)
+            s_clear(h_err)
             o = o_new()
-            o_str(o, "text", h_req)
+            o_str(o, "text", h_last)
             if mode == TO_THREAD and s_len(h_sel) > 0:
                 o_lit(o, "mode", "thread")
                 o_str(o, "target", h_sel)
@@ -292,28 +300,27 @@ def update(msg: i32, arg: i32) -> None:
                 o_lit(o, "mode", "new")
             else:
                 o_lit(o, "mode", "auto")
+                s_set(h_route, "routing…")
             s_set(h_url, "/api/projects/")
             s_add_ref(h_url, h_pid)
             s_add(h_url, "/requests")
             post(h_url, o, SENT)
     elif msg == SENT:
+        # The router's line comes from its "route" event. A spawned thread
+        # never takes the window with it: the person stays where they put the
+        # pane and opens a thread only by clicking it in the list.
         sending = 0
-        if j_ok(arg) == 1:
-            s_clear(h_req)
-            jstr(arg, "summary", h_route)
-            if j_str(arg, "why", h_t1) == 1:
-                if s_len(h_t1) > 0:
-                    s_add(h_route, " — ")
-                    s_add_ref(h_route, h_t1)
-            # A spawned thread never takes the window with it: the person stays
-            # where they put the pane, reads the router's line above the request
-            # box, and opens a thread only by clicking it in the list.
-            s_clear(h_err)
-        else:
+        if j_ok(arg) == 0:
             j_err(arg, h_err)
+            if s_len(h_req) == 0:
+                s_copy(h_req, h_last)
         j_free(arg)
-        fetch_threads()
     elif msg == EVENT:
+        k = j_int(arg, "kind")
+        if k == K_ROUTE:
+            jstr(arg, "text", h_route)
+        elif k == K_ERROR and j_has(arg, "thread_id") == 0:
+            jstr(arg, "text", h_err)
         j_free(arg)
         if pending == 0:
             pending = 1
