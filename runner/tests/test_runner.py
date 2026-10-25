@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import subprocess
 import sys
@@ -7,56 +6,36 @@ import types
 
 import httpx
 import pytest
+from conftest import Scripted, Web, in_view, py, results, sh, until
 
-from runner import LocalSandbox, ModelResponse, OpenAICompatModel, ScriptedModel, ThreadHost, ToolCall, View
-from runner.model import ModelError
+from runner import ThreadHost, View
 from runner.sandbox import runner_checkout
 from runner.server import create_app
 
 
-def call(name, **args):
-    return ToolCall(id=f"c_{name}", name=name, arguments=args)
-
-
-def host_with(scripts: dict, tmp_path, repo=None):
-    """scripts maps thread title -> list of responses; one ScriptedModel per thread."""
-    pending = dict(scripts)
-    order = list(scripts)
-
-    def factory(spec):
-        return ScriptedModel(pending.pop(order.pop(0)))
-
-    return ThreadHost(model_factory=factory, workdir=str(tmp_path / "threads"), repo=repo)
+def host_with(*scripts, tmp_path, **kw):
+    return ThreadHost(agent=Scripted(*scripts), web=Web(), workdir=str(tmp_path / "threads"), **kw)
 
 
 def view(tmp_path, **kw):
-    return View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"), **kw)
+    v = View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"), **kw)
+    for d in (v.root, v.home, v.tmp):
+        os.makedirs(d, exist_ok=True)
+    return v
 
 
-async def test_sandbox_confines_paths(tmp_path):
-    sb = LocalSandbox(view(tmp_path))
-    await sb.write_file("a/b.txt", b"hi")
-    assert await sb.read_file("a/b.txt") == b"hi"
-    with pytest.raises(Exception):
-        await sb.read_file("../outside")
-    r = await sb.exec("echo $((2+3)) && ls a")
-    assert r.exit_code == 0 and "5" in r.stdout and "b.txt" in r.stdout
-    r = await sb.exec("sleep 5", timeout=0.2)
-    assert r.timed_out
-
-
-async def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, monkeypatch):
+def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, monkeypatch):
     """The runner's checkout, environment and processes are not in a thread's view."""
     monkeypatch.setenv("RUNNER_TOKEN", "runner-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "model-secret")
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "other-thread.txt").write_text("not yours")
     checkout = str(runner_checkout())
-    sb = LocalSandbox(view(tmp_path, hidden=(checkout, sys.prefix, str(tmp_path / "state"))))
-    await sb.write_file("mine.txt", b"yours")
-    r = await sb.exec("env; echo ---; pwd; cat mine.txt; echo ---; "
-                      f"ls -A {checkout}; ls -A {tmp_path / 'state'}; echo ---; "
-                      "echo kept > /tmp/scratch; ls /proc | grep -c '^[0-9]'")
+    v = view(tmp_path, hidden=(checkout, sys.prefix, str(tmp_path / "state")))
+    (tmp_path / "ws" / "mine.txt").write_text("yours")
+    r = in_view(v, "env; echo ---; pwd; cat mine.txt; echo ---; "
+                   f"ls -A {checkout}; ls -A {tmp_path / 'state'}; echo ---; "
+                   "echo kept > /tmp/scratch; ls /proc | grep -c '^[0-9]'")
     env, here, hidden, procs = r.stdout.split("---\n")
     assert "runner-secret" not in env and "model-secret" not in env and "RUNNER_" not in env
     assert "PIXI" not in env and "CONDA_PREFIX" not in env and sys.prefix not in env
@@ -65,72 +44,166 @@ async def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, mo
     assert hidden == ""  # the runner's checkout and the worker's state are empty
     assert int(procs) < 5  # its own pid namespace: the runner is not in /proc
     assert (tmp_path / "tmp" / "scratch").read_text() == "kept\n"
-    assert (await sb.exec("cat /tmp/scratch")).stdout == "kept\n"  # /tmp lasts across commands
-    with pytest.raises(Exception):
-        await sb.read_file(str(runner_checkout() / "runner" / "pixi.toml"))
+    assert in_view(v, "cat /tmp/scratch").stdout == "kept\n"  # /tmp lasts across commands
 
 
-async def test_thread_uses_tools_and_finishes(tmp_path):
-    host = host_with({"t": [
-        ModelResponse("", [call("write_file", path="hello.py", content="print('hi')\n")]),
-        ModelResponse("", [call("bash", command="python3 hello.py")]),
-        ModelResponse("done", [call("finish", summary="added hello.py")]),
-    ]}, tmp_path)
+def test_readonly_paths_come_back_inside_hidden_ones(tmp_path):
+    (tmp_path / "state" / "env" / "bin").mkdir(parents=True)
+    (tmp_path / "state" / "env" / "bin" / "tool").write_text("tool\n")
+    (tmp_path / "state" / "secret").write_text("no")
+    v = view(tmp_path, hidden=(str(tmp_path / "state"),), readonly=(str(tmp_path / "state" / "env"),))
+    r = in_view(v, f"ls -A {tmp_path / 'state'}; cat {tmp_path / 'state/env/bin/tool'}; "
+                   f"touch {tmp_path / 'state/env/x'} 2>/dev/null || echo read-only")
+    assert r.stdout.split() == ["env", "tool", "read-only"], r.stderr
+
+
+async def test_the_kernel_runs_in_the_sandbox_with_no_secrets(tmp_path, monkeypatch):
+    """Everything the model runs is in the sandbox: the kernel's environment
+    has none of the runner's secrets (the binary holds the model's key), and
+    the runner's checkout and other threads are not there."""
+    monkeypatch.setenv("RUNNER_TOKEN", "runner-secret")
+    host = ThreadHost(agent=Scripted([py("import os, sys\n"
+                                         "print(sorted(os.environ))\n"
+                                         "print(os.environ.get('DEEPSEEK_API_KEY'), os.environ.get('RUNNER_TOKEN'))\n"
+                                         f"print(os.path.exists({str(runner_checkout() / 'runner' / 'src')!r}), "
+                                         f"os.path.exists({str(runner_checkout() / 'runner' / 'pixi.toml')!r}))\n"
+                                         "print(sys.prefix, len([p for p in os.listdir('/proc') if p.isdigit()]))"),
+                                      "done"]),
+                      web=Web(), workdir=str(tmp_path / "threads"))
+    object.__setattr__(host.agent, "env", {"DEEPSEEK_API_KEY": "model-secret"})
+    t = await host.start(project="p", title="t", request="look around")
+    await host.wait_idle(t.id)
+    out = results(t)[0]
+    assert "model-secret" not in out and "runner-secret" not in out, out
+    lines = out.splitlines()
+    # Only the kernel's environment is there of the checkout, read-only.
+    assert lines[1] == "None None" and lines[2] == "False False", out
+    prefix, procs = lines[3].split()
+    assert prefix == str(tmp_path / "threads" / ".home" / t.id / ".venv") and int(procs) < 10
+    await host.stop(t.id)
+
+
+async def test_thread_runs_python_and_finishes(tmp_path):
+    host = host_with([
+        py("open('hello.py', 'w').write(\"print('hi')\\n\")"),
+        sh("python3 hello.py"),
+        py("await team.finish('added hello.py')", text="done"),
+        "all done",
+    ], tmp_path=tmp_path)
     t = await host.start(project="p", title="t", request="add hello.py")
     await host.wait_idle(t.id)
-    types = [e["type"] for e in t.events]
-    assert "turn_done" in types and t.state == "idle"
-    results = [e["data"]["result"] for e in t.events if e["type"] == "tool_result"]
-    assert "hi" in results[1]
-    assert t.summary == "added hello.py" and "hello.py" in t.files
+    assert "turn_done" in [e["type"] for e in t.events] and t.state == "idle"
+    assert results(t)[1].strip() == "0 hi"
+    assert t.summary == "added hello.py" and t.finish_requested
+    await host.stop(t.id)
+
+
+async def test_thread_streams_deltas_before_the_final_events(tmp_path):
+    host = host_with([py("print(1 + 1)", text="Let me add."), "all done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="add")
+    await host.wait_idle(t.id)
+    kinds = [(e["type"], (e["data"] or {}).get("kind")) for e in t.events]
+    first_call = kinds.index(("tool_call", None))
+    assert kinds.index(("delta", "content")) < kinds.index(("assistant", None)) < first_call
+    assert kinds.index(("delta", "tool")) < first_call
+    tool_deltas = [e["data"] for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "tool"]
+    assert tool_deltas[0] == {"kind": "tool", "name": "python_repl", "text": ""}
+    assert "print(1 + 1)" in "".join(d["text"] for d in tool_deltas).replace("\\n", "\n")
+    call = next(e["data"] for e in t.events if e["type"] == "tool_call")
+    assert call["name"] == "python_repl" and call["arguments"] == {"code": "print(1 + 1)"} and call["step"] == 0
+    assert results(t) == ["2\n"]
+    content = [e for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content"]
+    assert content[-1]["data"]["text"].endswith("done")
+    assert any(e["type"] == "usage" for e in t.events)
+    await host.stop(t.id)
+
+
+async def test_a_message_during_a_turn_steers_it(tmp_path):
+    host = host_with([{**py("import asyncio\nawait asyncio.sleep(2)"), "delayMs": 0}, "noted", "done"],
+                     tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="wait")
+    await until(lambda: any(e["type"] == "tool_call" for e in t.events))
+    t.deliver("also do this", sender="t_other")
+    await host.wait_idle(t.id)
+    assert sum(e["type"] == "turn_done" for e in t.events) == 1
+    messages = (await t.harness.command("get_messages"))["messages"]
+    users = [m for m in messages if m["role"] == "user"]
+    assert users[-1]["content"][0]["text"] == "[from t_other] also do this"
+    await host.stop(t.id)
+
+
+async def test_the_step_limit_aborts_a_turn(tmp_path):
+    from runner import Limits
+
+    host = host_with([py("print(1)")] * 5, tmp_path=tmp_path, limits=Limits(max_steps=2))
+    t = await host.start(project="p", title="t", request="loop")
+    await host.wait_idle(t.id)
+    errors = [e["data"]["error"] for e in t.events if e["type"] == "error"]
+    assert errors == ["step limit 2 reached"] and t.state == "idle"
+    assert sum(e["type"] == "tool_call" for e in t.events) < 5  # the abort lands within a call or so
+    await host.stop(t.id)
 
 
 async def test_spawn_and_child_reports_back(tmp_path):
-    host = host_with({
-        "parent": [
-            ModelResponse("", [call("spawn_thread", title="child", request="do the child work")]),
-            ModelResponse("waiting for child", [call("finish", summary="spawned child")]),
-            ModelResponse("child reported", []),
-        ],
-        "child": [ModelResponse("", [call("finish", summary="child work done")])],
-    }, tmp_path)
+    host = host_with(
+        [py("print(await team.spawn_thread('child', 'do the child work'))"),
+         py("await team.finish('spawned child')"), "waiting for child", "child reported"],
+        [py("await team.finish('child work done')"), "done"],
+        tmp_path=tmp_path)
     p = await host.start(project="p", title="parent", request="split this")
-    for _ in range(100):
-        if len(host.threads) == 2:
-            break
-        await asyncio.sleep(0.02)
+    await until(lambda: len(host.threads) == 2)
     child = next(t for t in host.threads.values() if t.id != p.id)
     await host.wait_idle(child.id)
-    await host.wait_idle(p.id)
-    for _ in range(100):  # parent's second turn, triggered by the child's report
-        if sum(e["type"] == "turn_done" for e in p.events) >= 2:
-            break
-        await asyncio.sleep(0.02)
+    await until(lambda: sum(e["type"] == "turn_done" for e in p.events) >= 2)
     ins = [e["data"] for e in p.events if e["type"] == "message_in"]
     assert any(m["from"] == child.id and "child work done" in m["body"] for m in ins)
     assert child.parent == p.id
+    for t in list(host.threads.values()):
+        await host.stop(t.id)
 
 
 async def test_peer_messages_and_directory(tmp_path):
-    host = host_with({
-        "a": [ModelResponse("", [call("set_summary", summary="owns the export page")]), ModelResponse("ok")],
-        "b": [ModelResponse("", [call("list_threads")]), ModelResponse("", [call("send_message", to="PLACEHOLDER", body="hello")]), ModelResponse("ok")],
-    }, tmp_path)
+    host = host_with(
+        [py("await team.set_summary('owns the export page')"), "ok", "got it"],
+        [py("rows = await team.list_threads()\nprint(rows)\n"
+            "print(await team.send_message(rows[0]['id'], 'hello'))"), "ok"],
+        tmp_path=tmp_path)
     a = await host.start(project="p", title="a", request="x")
     await host.wait_idle(a.id)
-    # point b's message at a
     b = await host.start(project="p", title="b", request="y")
-    b.model.responses[1].tool_calls[0].arguments["to"] = a.id  # start() has not yielded yet
-    b.model.responses[1].message = {}
     await host.wait_idle(b.id)
-    listed = [e["data"]["result"] for e in b.events if e["type"] == "tool_result"][0]
-    assert "owns the export page" in listed
-    await asyncio.sleep(0.1)
-    assert any(e["type"] == "message_in" and e["data"]["from"] == b.id for e in a.events)
+    assert "owns the export page" in results(b)[0] and a.id in results(b)[0] and b.id not in results(b)[0]
+    await until(lambda: any(e["type"] == "message_in" and e["data"]["from"] == b.id for e in a.events))
+    await host.stop(a.id)
+    await host.stop(b.id)
+
+
+async def test_team_calls_that_fail_raise_in_the_kernel(tmp_path):
+    host = host_with([py("try:\n    await team.read_thread('t_nope', bogus=1)\nexcept TypeError as e:\n    print('bad', e)\n"
+                         "try:\n    await team._call('format_disk')\nexcept team.TeamError as e:\n    print(e)"),
+                      "done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="x")
+    await host.wait_idle(t.id)
+    out = results(t)[0]
+    assert out.startswith("bad ") and "format_disk: unknown call" in out, out
+    await host.stop(t.id)
+
+
+async def test_thread_searches_and_fetches_the_web(tmp_path):
+    web = Web()
+    host = ThreadHost(agent=Scripted([py("r = await team.web_search('bubblewrap', count=3, question='what is it')\n"
+                                         "print(r[0]['url'])\npage = await team.web_fetch(r[0]['url'])\n"
+                                         "print(page['content'])"), "done"]),
+                      web=web, workdir=str(tmp_path / "threads"))
+    t = await host.start(project="p", title="t", request="look it up")
+    await host.wait_idle(t.id)
+    assert results(t)[0].split("\n")[:2] == ["https://github.com/containers/bubblewrap", "Unprivileged sandboxing tool"]
+    assert web.calls == [("search", "bubblewrap", 3, "what is it"), ("fetch", "https://github.com/containers/bubblewrap")]
+    await host.stop(t.id)
 
 
 async def test_http_api(tmp_path):
-    host = host_with({"hello": [ModelResponse("hi there")]}, tmp_path)
+    host = host_with(["hi there", "again"], tmp_path=tmp_path)
     app = create_app(host, token="secret")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
         assert (await c.get("/health")).json()["capacity"] == 16
@@ -145,17 +218,17 @@ async def test_http_api(tmp_path):
         threads = (await c.get("/threads", headers=h)).json()
         assert threads[0]["id"] == tid and threads[0]["state"] == "idle"
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202
+    await host.stop(tid)
 
 
 async def test_files_of_a_thread_over_http(tmp_path):
-    host = host_with({"build": [ModelResponse("built")]}, tmp_path)
+    host = host_with(["built"], tmp_path=tmp_path)
     app = create_app(host, token="secret")
     h = {"Authorization": "Bearer secret"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
         tid = (await c.post("/threads", json={"request": "build", "title": "build"}, headers=h)).json()["id"]
         await host.wait_idle(tid)
-        root = host.threads[tid].sandbox.root
-        import os
+        root = host.threads[tid].root
         os.makedirs(f"{root}/out")
         open(f"{root}/out/hello", "wb").write(b"\x7fELF\x00binary")
         open(f"{root}/README.md", "w").write("hi")
@@ -175,13 +248,13 @@ async def test_files_of_a_thread_over_http(tmp_path):
             assert r.status_code == status, path
         assert (await c.get(f"/threads/{tid}/files", params={"path": "README.md"}, headers=h)).status_code == 400
         assert (await c.get("/threads/t_nope/files", headers=h)).status_code == 404
+    await host.stop(tid)
 
 
 async def test_peer_calls_over_http(tmp_path):
     from runner.peers import OrchestratorPeers, PeerError
 
-    host = ThreadHost(model_factory=lambda spec: ScriptedModel([]), workdir=str(tmp_path / "t"),
-                      peers=OrchestratorPeers())
+    host = ThreadHost(agent=Scripted(), web=Web(), workdir=str(tmp_path / "t"), peers=OrchestratorPeers())
     app = create_app(host, token="secret")
     h = {"Authorization": "Bearer secret"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
@@ -278,163 +351,76 @@ def test_secrets_without_a_secret_service(monkeypatch):
     assert secrets._from_keyring_label("DEEPSEEK_API_KEY") is None
 
 
-def sse_body(*chunks, keepalives=0):
-    lines = [": keep-alive\n\n"] * keepalives
-    lines += [f"data: {json.dumps(c)}\n\n" for c in chunks]
-    lines.append("data: [DONE]\n\n")
-    return "".join(lines).encode()
+def test_secrets_env_then_keyring_then_exit(monkeypatch, capsys):
+    from runner import secrets
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(secrets, "_from_keyring", lambda n: "from-ring" if n == "DEEPSEEK_API_KEY" else None)
+    monkeypatch.setattr(secrets, "_from_keyring_label", lambda n: None)
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-ring"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "from-env")
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "from-env"
+    monkeypatch.delenv("RUNNER_TOKEN", raising=False)
+    with pytest.raises(SystemExit):
+        secrets.require(["DEEPSEEK_API_KEY", "RUNNER_TOKEN"])
+    err = capsys.readouterr().err
+    assert "RUNNER_TOKEN" in err and "DEEPSEEK_API_KEY" not in err.split("\n\n")[1]
+    assert "keyring backend" in err or "no keyring backend" in err
 
 
-async def test_openai_compat_streams_reasoning_text_and_tool_calls():
-    seen = {}
+def test_secrets_accept_an_item_added_in_a_keyring_gui(monkeypatch):
+    """A keyring-GUI item has no service/username attributes, only a label, so
+    it is found by label: exactly, unlocked collections only, surrounding
+    whitespace dropped."""
+    from runner import secrets
 
-    def handler(req: httpx.Request):
-        seen["body"] = json.loads(req.content)
-        seen["accept-encoding"], seen["accept"] = req.headers["accept-encoding"], req.headers["accept"]
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse_body(
-            {"choices": [{"delta": {"reasoning_content": "Need a "}}]},
-            {"choices": [{"delta": {"reasoning_content": "file."}}]},
-            {"choices": [{"delta": {"content": "Writing it."}}]},
-            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                                                    "function": {"name": "write_file", "arguments": ""}}]}}]},
-            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\": "}}]}}]},
-            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"a.py\"}"}}]}}]},
-            {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 9}},
-            keepalives=2))
+    class Item:
+        def __init__(self, label, secret):
+            self.label, self.secret = label, secret
 
-    m = OpenAICompatModel("deepseek-v4-pro", "k", "https://x", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    got = []
-    r = await m.complete([{"role": "user", "content": "hi"}], [], lambda k, t, n: got.append((k, t, n)))
-    assert seen["body"]["stream"] is True
-    assert seen["accept-encoding"] == "identity" and seen["accept"] == "text/event-stream"
-    assert r.content == "Writing it." and r.reasoning == "Need a file."
-    assert [(c.id, c.name, c.arguments) for c in r.tool_calls] == [("call_1", "write_file", {"path": "a.py"})]
-    assert r.message["reasoning_content"] == "Need a file."
-    assert r.message["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
-    assert r.usage == {"prompt_tokens": 3, "completion_tokens": 9}
-    assert got[:3] == [("reasoning", "Need a ", ""), ("reasoning", "file.", ""), ("content", "Writing it.", "")]
-    assert ("tool", "\"a.py\"}", "write_file") in got
+        def get_label(self):
+            return self.label
 
+        def get_secret(self):
+            return self.secret
 
-async def test_openai_compat_reports_http_errors():
-    def handler(req):
-        return httpx.Response(400, json={"error": {"message": "bad model"}})
-    m = OpenAICompatModel("nope", "k", "https://x", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    with pytest.raises(ModelError, match="HTTP 400.*bad model"):
-        await m.complete([{"role": "user", "content": "hi"}], [])
+    class Collection:
+        def __init__(self, locked, items):
+            self.locked, self.items = locked, items
 
+        def is_locked(self):
+            return self.locked
 
-async def test_openai_compat_fails_when_only_keepalives_arrive():
-    async def stream():
-        while True:
-            yield b": keep-alive\n\n"
-            await asyncio.sleep(0.02)
+        def get_all_items(self):
+            return self.items
 
-    def handler(req):
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream())
-    m = OpenAICompatModel("m", "k", "https://x", stall=0.1, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    with pytest.raises(ModelError, match="only keep-alives from POST https://x/chat/completions for 0s"):
-        await m.complete([{"role": "user", "content": "hi"}], [])
+    collections = [Collection(True, [Item("DEEPSEEK_API_KEY", b"locked")]),
+                   Collection(False, [Item("deepseek_api_key", b"wrong-case"),
+                                      Item("DEEPSEEK_API_KEY", b"sk-from-label\n")])]
+    monkeypatch.setitem(sys.modules, "secretstorage", types.SimpleNamespace(
+        dbus_init=lambda: object(), get_all_collections=lambda bus: collections))
+    monkeypatch.setattr(secrets, "_from_keyring", lambda n: None)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert secrets._from_keyring_label("DEEPSEEK_API_KEY") == "sk-from-label"
+    assert secrets._from_keyring_label("SPRITES_TOKEN") is None
+    assert secrets.get_secret("DEEPSEEK_API_KEY") == "sk-from-label"
 
 
-async def test_thread_streams_deltas_before_the_final_events(tmp_path):
-    host = host_with({"t": [
-        ModelResponse("", [call("bash", command="echo hi")], reasoning="I should run it."),
-        ModelResponse("all done"),
-    ]}, tmp_path)
-    t = await host.start(project="p", title="t", request="run it")
-    await host.wait_idle(t.id)
-    kinds = [(e["type"], (e["data"] or {}).get("kind")) for e in t.events]
-    first_call = kinds.index(("tool_call", None))
-    assert kinds.index(("delta", "reasoning")) < kinds.index(("reasoning", None)) < first_call
-    assert kinds.index(("delta", "tool")) < first_call
-    tool_deltas = [e["data"] for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "tool"]
-    assert tool_deltas[0] == {"kind": "tool", "name": "bash", "text": ""}
-    assert "".join(d["text"] for d in tool_deltas) == '{"command": "echo hi"}'
-    content = [e for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content"]
-    assert content[-1]["data"]["text"] == "all done"
-    assert content[-1]["seq"] < next(e["seq"] for e in t.events if e["type"] == "assistant")
+def test_secrets_without_a_secret_service(monkeypatch):
+    from runner import secrets
+    monkeypatch.setitem(sys.modules, "secretstorage", None)  # import raises ImportError
+    assert secrets._from_keyring_label("DEEPSEEK_API_KEY") is None
 
 
-async def test_openai_compat_names_the_url_and_timeout_when_reads_time_out():
-    def handler(req):
-        raise httpx.ReadTimeout("", request=req)
-    m = OpenAICompatModel("m", "k", "https://x", stall=300, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    with pytest.raises(ModelError, match=r"m: ReadTimeout: nothing from POST https://x/chat/completions for 300s; no response headers"):
-        await m.complete([{"role": "user", "content": "hi"}], [])
-
-
-async def test_stream_is_never_compressed_so_keepalives_arrive_as_sent():
-    """A server (or proxy) that gzips a response buffers small writes until the
-    stream ends. This one does exactly that when asked for gzip, and streams
-    plainly otherwise; the model client must get each line as it is written."""
-    import gzip
-
-    lines = [b": keep-alive\n\n", b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n', b"data: [DONE]\n\n"]
-
-    async def handle(reader, writer):
-        head = (await reader.readuntil(b"\r\n\r\n")).decode().lower()
-        n = int(head.split("content-length:")[1].split("\r\n")[0])
-        await reader.readexactly(n)
-        if "gzip" in head.split("accept-encoding:")[1].split("\r\n")[0]:
-            await asyncio.sleep(1.0)  # a buffering compressor: nothing until the end
-            body = gzip.compress(b"".join(lines))
-            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\n"
-                         b"content-length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-        else:
-            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
-            for line in lines:
-                writer.write(b"%x\r\n%s\r\n" % (len(line), line))
-                await writer.drain()
-                await asyncio.sleep(0.05)
-            writer.write(b"0\r\n\r\n")
-        await writer.drain()
-        writer.close()
-
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    try:
-        m = OpenAICompatModel("m", "k", f"http://127.0.0.1:{port}", stall=0.5)
-        r = await m.complete([{"role": "user", "content": "hi"}], [])
-        assert r.content == "hi"
-    finally:
-        server.close()
-
-
-def test_replay_rebuilds_steps_tool_results_and_senders():
-    from runner.thread import replay
-    ev = lambda type, **data: {"type": type, "data": data}
-    msgs = replay([
-        ev("message_in", **{"from": "user", "body": "hi"}),
-        ev("reasoning", content="think"),
-        ev("assistant", content="looking"),
-        ev("tool_call", id="a", name="bash", arguments={"command": "ls"}, step=0),
-        ev("tool_result", id="a", name="bash", result="x"),
-        ev("tool_call", id="b", name="bash", arguments={"command": "pwd"}, step=0),
-        ev("tool_result", id="b", name="bash", result="/w"),
-        ev("tool_call", id="c", name="read_file", arguments={"path": "x"}, step=1),
-        ev("tool_result", id="c", name="read_file", result="data"),
-        ev("assistant", content="done"),
-        ev("turn_done", summary="s"),
-        ev("message_in", **{"from": "router", "body": "more"}),
-    ])
-    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "tool", "assistant", "tool", "assistant", "user"]
-    assert msgs[1]["reasoning_content"] == "think" and msgs[1]["content"] == "looking"
-    assert [c["id"] for c in msgs[1]["tool_calls"]] == ["a", "b"]
-    assert json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]) == {"command": "ls"}
-    assert msgs[4]["content"] == "" and [c["id"] for c in msgs[4]["tool_calls"]] == ["c"]
-    assert msgs[6] == {"role": "assistant", "content": "done"}
-    assert msgs[7]["content"] == "[from router] more"
-
-
-async def test_http_resume_needs_request_or_history(tmp_path):
-    host = host_with({"t": [ModelResponse("ok")]}, tmp_path)
+async def test_http_bringing_a_thread_back_needs_its_id_or_a_request(tmp_path):
+    host = host_with([], tmp_path=tmp_path)
     app = create_app(host, None)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
-        assert (await c.post("/threads", json={"id": "t_x"})).status_code == 400
-        r = await c.post("/threads", json={"id": "t_x", "title": "t", "history": [], "summary": "was here"})
+        assert (await c.post("/threads", json={"title": "t"})).status_code == 400
+        r = await c.post("/threads", json={"id": "t_x", "title": "t", "summary": "was here"})
         assert r.status_code == 201 and r.json()["state"] == "idle" and r.json()["summary"] == "was here"
-        assert (await c.post("/threads", json={"id": "t_x", "history": []})).status_code == 409
+        assert (await c.post("/threads", json={"id": "t_x"})).status_code == 409
+    await host.stop("t_x")
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="making a user with ambient capabilities needs root")

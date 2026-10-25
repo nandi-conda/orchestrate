@@ -1,45 +1,21 @@
-"""Sandbox interface: where a thread's commands and file edits actually happen."""
+"""The sandbox a thread's agent works in: what it can see of the worker.
+
+A thread's agent runs its code (prime-agent's Python kernel, and every command
+and process the kernel starts) in bubblewrap with a `View` of the worker; see
+harness.py for how the kernel is put in it.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
-
-MAX_OUTPUT = 30_000
-
-
-@dataclass
-class ExecResult:
-    exit_code: int
-    stdout: str
-    stderr: str
-    timed_out: bool = False
-
-
-class Sandbox(Protocol):
-    root: str
-
-    async def exec(self, cmd: str, timeout: float = 120.0) -> ExecResult: ...
-    async def read_file(self, path: str) -> bytes: ...
-    async def write_file(self, path: str, data: bytes) -> None: ...
-    async def list_dir(self, path: str) -> list[str]: ...
 
 
 class SandboxError(RuntimeError):
     pass
-
-
-def _clip(b: bytes) -> str:
-    s = b.decode("utf-8", errors="replace")
-    if len(s) > MAX_OUTPUT:
-        half = MAX_OUTPUT // 2
-        s = s[:half] + f"\n... [{len(s) - MAX_OUTPUT} chars cut] ...\n" + s[-half:]
-    return s
 
 
 @dataclass(frozen=True)
@@ -54,12 +30,15 @@ class View:
     own paths, its own `home`, and its own `tmp` as /tmp. It has its own pid
     namespace, so the runner's processes (and their environments) are not in
     its /proc.
+    `readonly` paths inside hidden ones are put back read-only (the kernel's
+    Python environment, which lives in the runner's checkout).
     """
     root: str                         # the workspace: the project's worktree, where commands start
     home: str                         # the thread's HOME
     tmp: str                          # the thread's /tmp
     writable: tuple[str, ...] = ()    # more of the worker the workspace needs (the clone's .git)
     hidden: tuple[str, ...] = ()
+    readonly: tuple[str, ...] = ()
 
 
 def runner_checkout() -> Path:
@@ -82,7 +61,7 @@ def _under(path: str, roots: tuple[str, ...]) -> bool:
 
 
 def thread_env(view: View) -> dict[str, str]:
-    """A command's environment, made afresh: none of the runner's variables
+    """The sandbox's environment, made afresh: none of the runner's variables
     (tokens, keys, RUNNER_*, the pixi environment's activation), and a PATH
     without the directories the view hides."""
     keep = {k: v for k, v in os.environ.items()
@@ -100,6 +79,7 @@ def bwrap_args(view: View) -> list[str]:
     mounts = [(p, 0, ["--tmpfs", p]) for p in hidden if not _under(str(Path(p).parent), tuple(hidden))]
     mounts += [("/tmp", 1, ["--bind", view.tmp, "/tmp"])]
     mounts += [(p, 1, ["--bind", p, p]) for p in (view.root, view.home, *view.writable)]
+    mounts += [(p, 1, ["--ro-bind", p, p]) for p in view.readonly]
     mounts.sort(key=lambda m: (len(Path(m[0]).parts), m[1]))
     args = ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--die-with-parent"]
     for _, _, a in mounts:
@@ -115,13 +95,13 @@ def bwrap() -> str:
     return path
 
 
-def _no_capabilities() -> None:
-    """Runs in the child before bwrap is exec'd: clear the ambient capability
-    set. A Sprite's services run as a non-root user that holds capabilities in
-    it, which survive exec; bwrap refuses those ("Unexpected capabilities but
-    not setuid"), and a thread's commands have no use for them either. Without
-    ambient capabilities, bwrap starts with none and makes its sandbox from a
-    user namespace."""
+def no_capabilities() -> None:
+    """Runs in a child before it execs whatever starts bwrap (prime-agent, or
+    bwrap itself): clear the ambient capability set. A Sprite's services run as
+    a non-root user that holds capabilities in it, which survive exec; bwrap
+    refuses those ("Unexpected capabilities but not setuid"), and a thread has
+    no use for them either. Without ambient capabilities, bwrap starts with
+    none and makes its sandbox from a user namespace."""
     import ctypes
 
     PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
@@ -135,59 +115,7 @@ def check() -> None:
     import subprocess
 
     r = subprocess.run([bwrap(), "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "true"],
-                       capture_output=True, text=True, preexec_fn=_no_capabilities)
+                       capture_output=True, text=True, preexec_fn=no_capabilities)
     if r.returncode:
         raise SandboxError(f"bubblewrap cannot make a sandbox here: {r.stderr.strip()} (it needs unprivileged "
                            "user namespaces and a /proc with nothing mounted over it; deploy/start.sh unmasks it)")
-
-
-class LocalSandbox:
-    """Runs on this machine, in a bubblewrap view of it (see `View`).
-
-    File tools resolve paths inside the workspace, symlinks included; commands
-    run in the view, where nothing outside it exists to reach.
-    """
-
-    def __init__(self, view: View, env: dict[str, str] | None = None):
-        self.view = view
-        self.root = str(Path(view.root).resolve())
-        for d in (self.root, view.home, view.tmp):
-            Path(d).mkdir(parents=True, exist_ok=True)
-        self.env = env
-        self.bwrap = bwrap()
-
-    def _path(self, path: str) -> Path:
-        p = (Path(self.root) / path).resolve()
-        if p != Path(self.root) and Path(self.root) not in p.parents:
-            raise SandboxError(f"path escapes the workspace: {path}")
-        return p
-
-    async def exec(self, cmd: str, timeout: float = 120.0) -> ExecResult:
-        env = {**thread_env(self.view), **(self.env or {})}
-        proc = await asyncio.create_subprocess_exec(
-            self.bwrap, *bwrap_args(self.view), "bash", "-lc", cmd, env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True, preexec_fn=_no_capabilities,
-        )
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            try:
-                os.killpg(proc.pid, 9)
-            except ProcessLookupError:
-                pass
-            out, err = await proc.communicate()
-            return ExecResult(-1, _clip(out), _clip(err), timed_out=True)
-        return ExecResult(proc.returncode or 0, _clip(out), _clip(err))
-
-    async def read_file(self, path: str) -> bytes:
-        return self._path(path).read_bytes()
-
-    async def write_file(self, path: str, data: bytes) -> None:
-        p = self._path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
-
-    async def list_dir(self, path: str) -> list[str]:
-        p = self._path(path)
-        return sorted(f"{c.name}/" if c.is_dir() else c.name for c in p.iterdir())

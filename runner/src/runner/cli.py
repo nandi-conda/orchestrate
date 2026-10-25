@@ -8,10 +8,9 @@ import json
 import tempfile
 
 from . import sandbox
-from . import tools as T
-from .model import from_spec
+from .harness import PrimeAgent
 from .repo import Repo
-from .secrets import require
+from .secrets import get_secret, require
 from .thread import ThreadHost
 from .web import deepseek_web
 
@@ -35,8 +34,8 @@ async def amain(args):
     if args.repo:
         repo = Repo(f"{workdir}/.repo")
         await repo.seed(args.repo)
-    host = ThreadHost(model_factory=from_spec, repo=repo, workdir=workdir,
-                      tools=T.ALL_TOOLS + T.web_tools(deepseek_web()))
+    host = ThreadHost(agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
+                      web=deepseek_web(), repo=repo, workdir=workdir)
     q = host.subscribe(None)
     spec = {"provider": "deepseek", "model": args.model} if args.model else None
     t = await host.start(project=args.project, title=args.request[:60], request=args.request, model=spec)
@@ -71,6 +70,7 @@ def main():
     args = ap.parse_args()
     require(["DEEPSEEK_API_KEY"])
     sandbox.check()
+    PrimeAgent().check()
     asyncio.run(amain(args))
 
 

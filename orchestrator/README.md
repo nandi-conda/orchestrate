@@ -172,8 +172,9 @@ laptop behind NAT, and it opens every connection. It drives each worker over
 the worker's own URL (create threads, post messages, stream events), and it
 also carries the workers' peer calls:
 
-1. A thread's peer tool (`list_threads`, `read_thread`, `send_message`,
-   `spawn_thread`, `set_summary`) queues the call on its worker.
+1. A thread's team-skill call (`team.list_threads`, `read_thread`,
+   `send_message`, `spawn_thread`, `set_summary`, from its kernel) queues the
+   call on its worker.
 2. The control plane holds a long poll on each worker's `GET /peer/calls`,
    which returns the moment a call is queued.
 3. It runs every call concurrently, scoped to the worker's project
@@ -254,9 +255,10 @@ A thread outlives its worker. When a message (yours, the router's or another
 thread's) is for a thread no live worker runs (the control plane restarted and
 its sprites are gone, its worker died, or the thread stopped or failed), the control plane
 brings it back first: it picks a worker as for a new thread and posts the
-thread to it with its conversation rebuilt from the event log (the request,
-the messages it received, its replies, tool calls and tool results), and the
-runner continues the worktree from the pushed `thread/<id>`. The thread's log
+thread to it after sending its branch, snapshot and session from the hub:
+the runner continues the worktree from `thread/<id>` and the snapshot, and
+prime-agent resumes the session (the conversation as the model last had it,
+compactions and images included) from `sessions/<id>`. The thread's log
 shows a `revived` line, then the message is delivered. `Orchestrator.live_worker`
 is that one path; anything that needs the thread's worker calls it.
 Details: [runner/API.md](../runner/API.md#resuming-a-thread).
@@ -308,9 +310,9 @@ most 4 per message, 8 MB each). The control plane stores its bytes in an
 database) and logs only a reference (`{id, media_type, name, size}`), so
 transcripts and SSE streams stay small. `/api/images/<id>` serves the bytes,
 cacheable for good. A worker cannot reach the control plane, so the images are
-inlined as base64 when a message is delivered and when a thread's history is
-rebuilt to revive it; the runner turns them into image parts of that user
-message ([runner/API.md](../runner/API.md)).
+inlined as base64 when a message is delivered; the runner turns them into
+image parts of that user message, and from then on they are in the thread's
+session ([runner/API.md](../runner/API.md)).
 
 ### Archiving threads
 

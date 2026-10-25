@@ -1,10 +1,7 @@
-"""Agent runner: many agent threads per worker, pluggable model and sandbox."""
+"""Agent runner: many agent threads per worker, each a prime-agent in its own sandbox."""
 
-from .model import Model, ModelResponse, OpenAICompatModel, ScriptedModel, ToolCall, deepseek, from_spec
-from .sandbox import ExecResult, LocalSandbox, Sandbox, View
+from .harness import Harness, HarnessError, PrimeAgent
+from .sandbox import View
 from .thread import AgentThread, Limits, ThreadHost
 
-__all__ = [
-    "AgentThread", "ExecResult", "Limits", "LocalSandbox", "Model", "ModelResponse", "OpenAICompatModel",
-    "Sandbox", "ScriptedModel", "ThreadHost", "ToolCall", "View", "deepseek", "from_spec",
-]
+__all__ = ["AgentThread", "Harness", "HarnessError", "Limits", "PrimeAgent", "ThreadHost", "View"]

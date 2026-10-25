@@ -39,7 +39,6 @@ RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "d
 ENDED = {"done", "failed", "stopped"}
 # The runner events a thread's conversation is rebuilt from when it is
 # brought back on a worker (runner/API.md, "Resuming a thread").
-CONVERSATION = {"message_in", "reasoning", "assistant", "tool_call", "tool_result"}
 # Runner events that end a model call: once one is in, that call's `delta`
 # events (its reply while it streamed) are folded into it and dropped.
 ENDS_STREAM = {"reasoning", "assistant", "tool_call", "turn_done", "state", "error"}
@@ -483,7 +482,7 @@ class Orchestrator:
         return {"ok": True}
 
     async def peer_save(self, lw: LiveWorker, thread_id: str, land: bool = False) -> dict:
-        """A thread's turn ended: take its branch and snapshot into the hub;
+        """A thread's turn ended: take its branch, snapshot and session into the hub;
         with `land`, land the branch there and send the worker the new base
         and branch (runner/API.md, "Repository")."""
         t = await self._own_thread(lw.worker.project_id, thread_id)
@@ -533,7 +532,7 @@ class Orchestrator:
 
     async def _ship(self, lw: LiveWorker, project: dict, tid: str | None = None) -> None:
         """Bring a worker up to the hub: the base (as it is on the project's
-        repository, when there is one), and a thread's branch and snapshot."""
+        repository, when there is one), and a thread's branch, snapshot and session."""
         hub = await self.hub(project)
         await hub.sync()
         data, refs = await hub.pack(tid, list((await lw.client.repo_refs()).values()))
@@ -708,15 +707,14 @@ class Orchestrator:
         """Start the thread again on the worker that ran it (`lw` when it is
         live here, else the one an earlier control plane left), so its
         worktree there is the one it continues in; on a picked worker when
-        that was lost, from its branch and snapshot in the hub."""
+        that was lost, from its branch, snapshot and session in the hub."""
         tid, project = t["id"], await self.store.get_project(t["project_id"])
-        history = await self.history(t)
         if lw is None:
             lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
         await self._ship(lw, project, tid)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
         await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
-                                      model=model, summary=t["summary"], history=history)
+                                      model=model, summary=t["summary"])
         old = self.by_thread.get(tid)
         if old is not None:
             old.threads.discard(tid)
@@ -725,30 +723,6 @@ class Orchestrator:
         await self.store.update_thread(tid, worker_id=lw.worker.id, state="idle", activity="")
         await self.store.append_event(project["id"], tid, "revived", {"worker": lw.worker.id})
         return lw
-
-    async def history(self, t: dict) -> list[dict]:
-        """The thread's conversation so far, as the runner events it is rebuilt
-        from: its request, the messages it received and what its model said and
-        ran. Messages not delivered (this one, later ones, failed ones) are left out."""
-        events, after = [], 0
-        while page := await self.store.list_events(t["project_id"], t["id"], after, limit=1000):
-            events += page
-            after = page[-1]["seq"]
-        undelivered = {m["id"] for m in await self.store.list_messages(t["id"], unread_only=True)}
-        out = []
-        for e in events:
-            typ, d = e["type"], e["payload"]
-            if typ == "created":
-                data = {"from": d.get("parent") or "user", "body": d.get("request", "")}
-                if d.get("images"):
-                    data["images"] = await self._inline_images(d["images"])
-                out.append({"type": "message_in", "data": data})
-            elif typ in CONVERSATION and d.get("message") not in undelivered:
-                data = d
-                if typ == "message_in" and d.get("images"):
-                    data = {**d, "images": await self._inline_images(d["images"])}
-                out.append({"type": typ, "data": data})
-        return out
 
     async def _inline_images(self, refs: list[dict] | None) -> list[dict]:
         """Image references as a runner needs them: the bytes, base64-encoded.
@@ -828,7 +802,7 @@ class Orchestrator:
     # the project's workers, so it holds no compute. Its threads keep their
     # own state and archived flags, its log and its hub (every turn's work is
     # in the hub already). Unarchived, it is as it was: each thread comes back
-    # on a new worker, from its branch and snapshot in the hub, with its next
+    # on a new worker, from its branch, snapshot and session in the hub, with its next
     # message.
 
     async def open_project(self, project_id: str) -> dict:

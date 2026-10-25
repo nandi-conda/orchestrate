@@ -14,8 +14,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from . import files, sandbox
-from . import tools as T
-from .model import from_spec
+from .harness import PrimeAgent
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repo, refs_header
 from .secrets import get_secret, require
@@ -100,15 +99,13 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
     async def create_thread(req: Request):
         b = await req.json()
-        history = b.get("history")
         try:
             images = images_of(b)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        if b.get("request") is None and history is None and not images:
-            return JSONResponse({"error": "request or history is required"}, status_code=400)
-        if history is not None and not isinstance(history, list):
-            return JSONResponse({"error": "history must be a list of events"}, status_code=400)
+        if b.get("request") is None and not b.get("id") and not images:
+            return JSONResponse({"error": "request, or the id of a thread to bring back, is required"},
+                                status_code=400)
         request = b.get("request")
         if request is None and images:
             request = ""  # images only: the thread still gets a turn
@@ -116,7 +113,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             t = await host.start(project=b.get("project", "default"),
                                  title=b.get("title") or (b.get("request") or b.get("id") or "thread")[:60],
                                  request=request, parent=b.get("parent"),
-                                 model=b.get("model"), id=b.get("id"), history=history,
+                                 model=b.get("model"), id=b.get("id"),
                                  summary=b.get("summary") or "", images=images)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=409)
@@ -153,7 +150,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if not t:
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
-            return JSONResponse(files.listing(t.sandbox.root, req.query_params.get("path", "")))
+            return JSONResponse(files.listing(t.root, req.query_params.get("path", "")))
         except files.FileError as e:
             return JSONResponse({"error": str(e)}, status_code=e.status)
 
@@ -162,7 +159,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if not t:
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
-            p = files.file_path(t.sandbox.root, req.query_params.get("path", ""))
+            p = files.file_path(t.root, req.query_params.get("path", ""))
         except files.FileError as e:
             return JSONResponse({"error": str(e)}, status_code=e.status)
         return FileResponse(p, media_type="application/octet-stream")
@@ -262,14 +259,14 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 def host_from_env() -> ThreadHost:
     workdir = os.environ.get("RUNNER_WORKDIR", "/work/threads")
     return ThreadHost(
-        model_factory=from_spec,
+        agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
+        web=deepseek_web(),
         peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
         # The orchestrator brings the project's commits (POST /repo).
         repo=Repo(os.path.join(workdir, ".repo")),
         workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
         limits=Limits(max_steps=int(os.environ.get("RUNNER_MAX_STEPS", "60"))),
-        tools=T.ALL_TOOLS + T.web_tools(deepseek_web()),
     )
 
 
@@ -279,10 +276,11 @@ def main():
     import logging
 
     import uvicorn
-    # Model call timings (runner.model) and thread failures go to the worker log.
+    # prime-agent's own log lines (runner.harness) and thread failures go to the worker log.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     require(["DEEPSEEK_API_KEY"])
     sandbox.check()
+    PrimeAgent().check()
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)

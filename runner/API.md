@@ -10,26 +10,27 @@ threads. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity"}` |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"request"?, "images"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "history"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
+| POST | `/threads` | `{"request"?, "images"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
 | POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
 | GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream` |
-| GET | `/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>` and its snapshot; header `x-git-refs` (below) |
+| GET | `/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>`, its snapshot and its session; header `x-git-refs` (below) |
 | GET | `/repo` | | `{"base", "refs": {"<refname>": "<sha>"}}`: the worker repository's refs |
-| POST | `/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/` and `refs/remotes/origin-snapshots/` |
+| POST | `/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/`, `refs/remotes/origin-snapshots/` and `refs/remotes/origin-sessions/` |
 | GET | `/events` | | SSE stream for every thread on this worker |
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
 
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
-- `request`, `history` or `images` is required. `history` resumes a thread: see [Resuming a thread](#resuming-a-thread).
+- `request`, `id` or `images` is required. An `id` with no `request` brings a thread back: see [Resuming a thread](#resuming-a-thread).
 - `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads, so they need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
-- `model` is `{"provider": "deepseek", "model": "deepseek-v4-pro"}` or `{"provider": "openai-compat", "model", "base_url", "api_key_env"}`. Omitted: DeepSeek with `$DEEPSEEK_MODEL`.
+- `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model` (its built-in providers; the runner gives it `DEEPSEEK_API_KEY` only). Omitted: `deepseek` with `$DEEPSEEK_MODEL`.
+- A message (or `request`) starting with `/` is a prime-agent slash command.
 - `files` paths are relative to the thread's worktree. A path that leaves it (`..`, a symlink out) or names `.git` is 400, as is a file listed as a directory or the reverse; a missing one is 404. `.git` is never listed.
-- `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`.
+- `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`. A message posted while a turn runs steers it: the model reads it before its next call.
 - A message whose `hops` exceeds the limit (6) is dropped with a `dropped` event. The orchestrator should increment `hops` when it forwards a thread-to-thread message.
 
 ### Directory entry
@@ -47,7 +48,7 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 
 ```json
 {"seq": 12, "thread": "t_1a2b3c4d5e", "type": "tool_call", "ts": 1761339600.1,
- "data": {"id": "call_0", "name": "bash", "arguments": {"command": "pytest -q"}}}
+ "data": {"id": "call_0", "name": "python_repl", "arguments": {"code": "r = await bash('pytest -q')"}, "step": 1}}
 ```
 
 | type | data |
@@ -55,12 +56,12 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `created` | directory entry |
 | `state` | `{"state"}` |
 | `message_in` | `{"from", "body"}` |
-| `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
+| `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool, `python_repl`; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
 | `reasoning` | `{"content"}`: the model's whole reasoning for one step, once it is done |
 | `assistant` | `{"content"}` |
-| `tool_call` | `{"id", "name", "arguments", "step"}`: `step` numbers the model call within its turn |
+| `tool_call` | `{"id", "name", "arguments", "step"}`: the model's one tool is `python_repl` (`{"code"}`); `step` numbers the model call within its turn |
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
-| `usage` | provider token counts |
+| `usage` | prime-agent's token counts for one model call |
 | `turn_done` | `{"summary", "final"}` |
 | `saved` | `{"branch", "commit"}`: a turn ended without `finish`; leftovers committed, the orchestrator took the branch and snapshot |
 | `landed` | `{"branch", "base", "commit"}`: a turn ended with `finish` and the branch is now the tip of `base` in the orchestrator's repository |
@@ -70,30 +71,32 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 
 ## Resuming a thread
 
-A thread lives on after its worker: the orchestrator takes its branch and a
-snapshot of its worktree every turn, and keeps its events. To bring it back on any worker (its old one was
+A thread lives on after its worker: the orchestrator takes its branch, a
+snapshot of its worktree and its session every turn. The session is
+prime-agent's: the conversation file (with its compactions) and the kernel's
+harness state, kept in the thread's home and committed by the runner as
+`refs/sessions/<id>` (a commit of those directories, whose parent is the
+previous turn's). To bring a thread back on any worker (its old one was
 deleted, the orchestrator restarted, or the thread stopped or failed), the
-orchestrator posts `/threads` with the thread's `id`, `title`, `parent`,
-`summary` and `history`, and usually no `request`:
+orchestrator sends its refs (`POST /repo`), then posts `/threads` with the
+thread's `id`, `title`, `parent` and `summary`, and usually no `request`:
 
-- `history` is the thread's earlier events, oldest first, in the SSE shape
-  (`{"type", "data"}`; other keys are ignored). `message_in`, `reasoning`,
-  `assistant`, `tool_call` and `tool_result` rebuild the conversation after the
-  system prompt; other types are skipped. Only messages the thread received
-  belongs in it. A `message_in` may also carry `images` (`[{"media_type", "data"}]`, the bytes base64-encoded): the orchestrator inlines a request's and a message's images there, since a worker cannot reach the control plane to fetch them. A tool call with no result is answered as stopped. Tool
-  results are the events' copies, cut to 4000 characters.
 - The worktree is the worker's own for that thread when it still has one
   holding `origin/thread/<id>`; else it is made from `origin/thread/<id>`
-  with the files of `origin-snapshots/<id>` (the orchestrator sends both
-  first, `POST /repo`), else it is a new branch off `origin/<base>`.
+  with the files of `origin-snapshots/<id>`, else it is a new branch off
+  `origin/<base>`.
+- The session is the worker's own when its `refs/sessions/<id>` already
+  contains `origin-sessions/<id>`; else it is checked out from
+  `origin-sessions/<id>`. prime-agent resumes it (`--resume`), so the model
+  sees its whole conversation, images included, as it last stood.
 - Without `request` the thread goes `idle` (a `state` event) and waits for
   its next message; nothing runs until one is posted.
 
 ## Peer calls (collected by the orchestrator)
 
 The orchestrator is never reachable from a worker, by design: it may run on a
-laptop behind NAT, and it opens every connection. The inter-thread tools still
-reach it, by queuing their calls on this runner for the orchestrator to collect:
+laptop behind NAT, and it opens every connection. The team skill's calls
+still reach it, by queuing on this runner for the orchestrator to collect:
 
 1. `GET /peer/calls?wait=25` (max 55) long-polls. It returns as soon as a call
    is queued, with every call due: `[{"id", "op", "args"}]`, or `[]` after
@@ -111,9 +114,15 @@ poll response only delays it. A tool waits up to 15 minutes for its answer
 (spawning can wait on a new worker). With no orchestrator polling, peer tools
 wait and then fail; the CLI (`pixi run run`) uses in-process peers instead.
 
+A thread makes these calls from its kernel with the team skill
+(`skills/team`, `await team.send_message(...)`), over a unix socket of its own
+bound into its sandbox; the runner queues them here. `web_search`,
+`web_fetch` and `finish` go through the same socket but are answered by the
+runner itself.
+
 | `op` (the tool) | `args` | `result` |
 | --- | --- | --- |
-| `list_threads` | `{"project", "query"}` (`query` may be null) | list of directory entries |
+| `list_threads` | `{"project", "query"}` (`query` may be null) | list of directory entries (the thread itself is left out of what it sees) |
 | `read_thread` | `{"thread_id", "last_n"}` | directory entry + `"events"`: recent event list |
 | `send_message` | `{"sender", "to", "body", "reply_to"}` | `{"ok": true}` |
 | `spawn_thread` | `{"parent", "project", "title", "request"}` | `{"id", "title"}` |
@@ -127,43 +136,55 @@ A thread also calls `set_summary` after each turn, and when it has a `parent`, s
 
 ## Environment
 
-Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, and an `openai-compat` model's `api_key_env`) are read from the environment first, then from the system keyring under service `orchestrate` with the variable name as the username (`pixi run set-key DEEPSEEK_API_KEY`). An item added by hand in a keyring GUI is found too when its label is the variable name; only unlocked collections are searched. `serve` and `run` print the missing ones, with the keyring backend in use, and exit if a required secret is in neither place.
+Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`) are read from the environment first, then from the system keyring under service `orchestrate` with the variable name as the username (`pixi run set-key DEEPSEEK_API_KEY`). An item added by hand in a keyring GUI is found too when its label is the variable name; only unlocked collections are searched. `serve` and `run` print the missing ones, with the keyring backend in use, and exit if a required secret is in neither place.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | | required for DeepSeek, sent as `Authorization: Bearer` |
+| `DEEPSEEK_API_KEY` | | required: prime-agent's `deepseek` provider and the web calls send it as `Authorization: Bearer` |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | default model |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | for web search and fetch |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
 | `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repo/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
-| `RUNNER_MAX_STEPS` | `60` | model calls per turn |
+| `RUNNER_MAX_STEPS` | `60` | tool calls per turn; at the limit the turn is aborted with an `error` |
 
 ## Sandbox
 
-A thread works on its project and sees nothing else of the worker. Every `bash`
-command runs in [bubblewrap](https://github.com/containers/bubblewrap)
-(`bwrap`, from the runner's pixi environment) with this view:
+A thread is one [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)
+process (`--mode rpc`, version pinned in `deploy/install-harness.sh`). The
+binary runs the agent loop and holds the model's key, outside the sandbox.
+Everything the model writes runs in its Python kernel (`python_repl`; shell
+commands are `await bash(...)` there), and the kernel runs in
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`, from the
+runner's pixi environment): prime-agent starts the kernel through a wrapper the
+runner writes per thread (`PRIME_AGENT_KERNEL_PYTHON`), which execs bwrap with
+this view:
 
 | Path | In the view |
 | --- | --- |
 | `/` | the machine's system, read-only (its git, compilers, shells) |
-| `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; commands start here |
+| `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; the kernel starts here |
 | `$RUNNER_WORKDIR/.repo/.git` | the worker repository's git dir, writable, so the thread can commit |
-| `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable, kept between commands |
-| `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept between commands |
-| the orchestrate checkout the runner runs from, its pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
+| `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, skills, the session) |
+| `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept for the thread |
+| `runner/.pixi/envs/kernel`, prime-agent's bundled skills | read-only: the kernel's Python and packages |
+| `$RUNNER_WORKDIR/.team/<id>.sock` | the thread's team socket |
+| the rest of the orchestrate checkout and the runner's pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
 | `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |
 
-The environment is made afresh for each command: `PATH` (without the hidden
-directories), `HOME`, `TMPDIR=/tmp`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
-`LC_*`, `TERM`, `TZ`. No token, key, `RUNNER_*` or pixi variable reaches it.
-Processes end with the command that started them.
+The kernel's environment is made afresh: `PATH` (the thread's venv, the kernel
+environment, the system's), `VIRTUAL_ENV`, `HOME`, `TMPDIR=/tmp`, `USER`,
+`LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `ORCHESTRATE_TEAM_SOCKET`,
+and prime-agent's own variables for its kernel (`RLM_*`, `PRIME_AGENT_*`). No
+token, key, `RUNNER_*` or pixi variable reaches it. The venv is the thread's
+(over the kernel environment's packages), so `uv pip install` installs there.
+The kernel ends with the thread's prime-agent.
 
-`read_file`, `write_file`, `edit_file` and `list_dir` resolve paths inside the
-worktree (symlinks included) and refuse anything outside it, as does the
-Files API.
+prime-agent's skills that need its daemon, a Serper key or Prime Intellect
+accounts are turned off (`DROPPED_SKILLS` in `harness.py`); the team skill
+takes their place. The Files API resolves paths inside the worktree (symlinks
+included) and refuses anything outside it.
 
 `serve` and `run` check at startup that bubblewrap can make a sandbox and exit
 with bubblewrap's error if not. It needs unprivileged user namespaces and a
@@ -188,12 +209,13 @@ other side already has.
 - `POST /repo` brings the hub's commits: the default branch as
   `refs/remotes/origin/<base>` (`x-git-base` names it), a thread's branch as
   `refs/remotes/origin/thread/<id>` and its snapshot as
-  `refs/remotes/origin-snapshots/<id>`. The orchestrator sends the base
-  before it starts a thread, and the thread's branch and snapshot before it
+  `refs/remotes/origin-snapshots/<id>`, its session as
+  `refs/remotes/origin-sessions/<id>`. The orchestrator sends the base
+  before it starts a thread, and the thread's branch, snapshot and session before it
   brings one back. It leaves out of the bundle what `GET /repo` says the
   worker has.
-- `GET /threads/{id}/repo?have=...` gives the thread's `refs/heads/thread/<id>`
-  and `refs/snapshots/<id>`, without the commits `have` lists (the hub's tips;
+- `GET /threads/{id}/repo?have=...` gives the thread's `refs/heads/thread/<id>`,
+  `refs/snapshots/<id>` and `refs/sessions/<id>`, without the commits `have` lists (the hub's tips;
   ones the worker does not know are ignored). The body is empty when the hub
   has everything.
 
@@ -203,8 +225,9 @@ own worktree, index and branch. A turn's work leaves the worker on one path:
 1. A thread commits on `thread/<id>` as it likes; there is no remote to push to.
 2. At the end of every turn the runner commits anything left uncommitted and
    makes a snapshot: a commit of the whole worktree, untracked and ignored
-   files included, whose parent is the branch tip (`refs/snapshots/<id>`). It
-   then asks the orchestrator to `save` (a peer call), which takes both with
+   files included, whose parent is the branch tip (`refs/snapshots/<id>`), and
+   commits the session (`refs/sessions/<id>`). It then asks the orchestrator
+   to `save` (a peer call), which takes all three with
    `GET /threads/{id}/repo` (`saved`).
 3. When the turn ended with `finish`, `save` has `land: true`: the
    orchestrator rebases the branch onto the default branch in its hub (and,

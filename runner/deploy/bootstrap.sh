@@ -23,4 +23,6 @@ fi
 
 cd "$HOME_DIR/runner"
 pixi install -e prod
+pixi install -e kernel        # the Python threads' prime-agent kernels run on
+bash deploy/install-harness.sh  # the prime-agent binary, pinned
 echo "runner ready at $HOME_DIR/runner"

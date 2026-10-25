@@ -8,9 +8,11 @@ every connection and moves commits both ways as git bundles (runner/API.md,
 
 - `POST /repo` brings the hub's refs to the worker, as remote-tracking refs:
   the project's default branch as `origin/<base>`, a thread's branch as
-  `origin/thread/<id>` and its snapshot as `origin-snapshots/<id>`.
+  `origin/thread/<id>`, its snapshot as `origin-snapshots/<id>` and its
+  session as `origin-sessions/<id>`.
 - `GET /threads/{id}/repo` hands the orchestrator a thread's branch
-  `thread/<id>` and its snapshot `refs/snapshots/<id>`.
+  `thread/<id>`, its snapshot `refs/snapshots/<id>` and its session
+  `refs/sessions/<id>`.
 
 Every thread gets a worktree on its own branch `thread/<id>`. A new thread's
 branch starts from `origin/<base>`. A thread brought back on a worker keeps
@@ -21,6 +23,11 @@ with the files of its snapshot.
 A snapshot is a commit of the whole worktree, untracked and ignored files
 included (built with an index of its own), whose parent is the branch tip, so
 a thread that moves to another worker finds its build output too.
+
+A session is a commit of the thread's prime-agent session directory (its
+conversation, compaction and local harness state; harness.py), child of the
+thread's previous session commit, so the thread's agent picks up where it
+was on any worker.
 
 At the end of every turn the runner commits whatever the thread left and
 makes a snapshot; the orchestrator takes both (peer call `save`). A turn
@@ -43,7 +50,7 @@ from pathlib import Path
 
 AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
 # The refs the orchestrator may set on a worker.
-SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots)/[\w./-]+$")
+SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots|origin-sessions)/[\w./-]+$")
 THREAD_ID = re.compile(r"^[\w-]+$")
 
 
@@ -61,6 +68,10 @@ class Git:
 
 def snapshot_ref(tid: str) -> str:
     return f"refs/snapshots/{tid}"
+
+
+def session_ref(tid: str) -> str:
+    return f"refs/sessions/{tid}"
 
 
 class Repo:
@@ -136,12 +147,12 @@ class Repo:
                 self.base = base
 
     async def send(self, tid: str, have: list[str]) -> tuple[bytes, dict[str, str]]:
-        """A thread's branch and snapshot as a bundle without the commits in
+        """A thread's branch, snapshot and session as a bundle without the commits in
         `have` (the hub's), and the refs' tips. The bundle is empty when the
         hub has everything; the tips travel apart from it, since a bundle
         leaves out a ref whose tip is in `have`."""
         await self.open()
-        names = [f"refs/heads/thread/{tid}", snapshot_ref(tid)]
+        names = [f"refs/heads/thread/{tid}", snapshot_ref(tid), session_ref(tid)]
         refs = {}
         for name in names:
             r = await self.git("rev-parse", "-q", "--verify", name, check=False)
@@ -172,6 +183,47 @@ class Repo:
         await self.git("fetch", "-q", source, "+refs/heads/*:refs/remotes/origin/*")
         await self.git("config", "orchestrate.base", base)
         self.base = base
+
+    def _session_env(self, tid: str, directory: Path) -> dict:
+        index = self.path / ".git" / "sessions" / f"{tid}.index"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        return {"GIT_DIR": str(self.path / ".git"), "GIT_WORK_TREE": str(directory), "GIT_INDEX_FILE": str(index)}
+
+    async def save_session(self, tid: str, directory: str | os.PathLike, parts: tuple[str, ...]) -> str:
+        """Commit the `parts` of the thread's agent directory (its session) at
+        `refs/sessions/<id>`, on top of its previous session commit."""
+        directory = Path(directory)
+        env = self._session_env(tid, directory)
+        await self.git("read-tree", "--empty", cwd=directory, env=env)
+        present = [p for p in parts if (directory / p).exists()]
+        if present:
+            await self.git("add", "-A", "-f", "--", *present, cwd=directory, env=env)
+        tree = (await self.git("write-tree", cwd=directory, env=env)).out
+        parent = ["-p", session_ref(tid)] if await self.exists(session_ref(tid)) else []
+        commit = (await self.git("commit-tree", tree, *parent, "-m", f"Session of thread/{tid}",
+                                 cwd=directory, env=env)).out
+        await self.git("update-ref", session_ref(tid), commit)
+        return commit
+
+    async def session(self, tid: str, directory: str | os.PathLike, parts: tuple[str, ...]) -> None:
+        """Make the thread's agent directory hold its latest session: the one
+        the worker has, while that holds everything the hub has of it, else
+        the hub's (the thread went on on another worker since)."""
+        directory, theirs = Path(directory), f"refs/remotes/origin-sessions/{tid}"
+        await self.open()
+        async with self.lock:
+            if not await self.exists(theirs):
+                return
+            if await self.exists(session_ref(tid)) and (await self.git(
+                    "merge-base", "--is-ancestor", theirs, session_ref(tid), check=False)).code == 0:
+                return
+            for part in parts:
+                shutil.rmtree(directory / part, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            env = self._session_env(tid, directory)
+            await self.git("read-tree", theirs, cwd=directory, env=env)
+            await self.git("checkout-index", "-a", "-f", cwd=directory, env=env)
+            await self.git("update-ref", session_ref(tid), theirs)
 
     async def worktree(self, path: str | os.PathLike, tid: str) -> "Workspace":
         """The thread's worktree at `path` on `thread/<tid>`. One this worker
@@ -228,6 +280,10 @@ class Workspace:
         if (await self.git("diff", "--cached", "--quiet", check=False)).code:
             await self.git("commit", "-q", "-m", message)
         return (await self.git("rev-parse", "HEAD")).out
+
+    async def changed(self) -> list[str]:
+        """The files the branch changes from the base."""
+        return (await self.git("diff", "--name-only", f"refs/remotes/origin/{self.repo.base}...HEAD")).out.splitlines()
 
     async def index(self, name: str) -> dict:
         p = Path((await self.git("rev-parse", "--git-path", name)).out)

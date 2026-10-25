@@ -794,13 +794,6 @@ async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypa
                 return any(e["type"] == "assistant" and e["seq"] > said["seq"] for e in tr)
             await wait_for(answered)
 
-            # The thread's conversation, as a runner needs it, holds the bytes.
-            history = await app.state.orch.history(await store.get_thread(tid))
-            first = next(h for h in history if h["data"].get("body") == "what is this")
-            inline = first["data"]["images"][0]
-            assert inline["media_type"] == "image/png"
-            assert base64.b64decode(inline["data"]) == PNG_1PX
-
 
 class NoRoutingRouter:
     """A router that must not be asked: an image-only request needs no plan."""
@@ -904,7 +897,7 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     await second.send(t["id"], "can I download it?")
     got = await wait_for(lambda: _second_reply(replies, t["id"]))
     await wait_for(lambda: idle(t["id"]))  # its work is saved before it goes idle
-    assert got == "Echo: can I download it? (resumed with 3 earlier events)"  # request, reasoning, reply
+    assert got == "Echo: can I download it? (resumed after 1 earlier messages)"  # its session came along
     types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
     assert "revived" in types and "error" not in types
     assert types.index("revived") > types.index("message_in")
@@ -998,34 +991,6 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
     assert "error" not in types and types.index("worker_lost") < types.index("revived")
     await orch.close()
     await provider.close()
-    await s.close()
-
-
-async def test_history_is_what_the_thread_received_and_said(tmp_path):
-    from control.service import Orchestrator
-
-    s = SqliteStore(str(tmp_path / "db.sqlite"))
-    await s.open()
-    p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "T", "do it", parent_id="t_parent")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
-    await s.append_event(p["id"], t["id"], "created", {"title": "T", "request": "do it", "parent": "t_parent"})
-    await s.append_event(p["id"], t["id"], "state", {"state": "working"})
-    await s.append_event(p["id"], t["id"], "assistant", {"content": "done"})
-    await s.append_event(p["id"], t["id"], "message_in", {"from": "runner", "body": "conflict"})
-    delivered = await s.add_message(p["id"], "user", t["id"], "next")
-    await s.mark_read([delivered["id"]])
-    await s.append_event(p["id"], t["id"], "message_in", {"from": "user", "body": "next", "message": delivered["id"]})
-    lost = await s.add_message(p["id"], "router", t["id"], "never arrived")
-    await s.append_event(p["id"], t["id"], "message_in", {"from": "router", "body": "never arrived",
-                                                         "message": lost["id"]})
-    await s.append_event(p["id"], t["id"], "error", {"error": "message not delivered: boom"})
-    assert await orch.history(await s.get_thread(t["id"])) == [
-        {"type": "message_in", "data": {"from": "t_parent", "body": "do it"}},
-        {"type": "assistant", "data": {"content": "done"}},
-        {"type": "message_in", "data": {"from": "runner", "body": "conflict"}},
-        {"type": "message_in", "data": {"from": "user", "body": "next", "message": delivered["id"]}},
-    ]
     await s.close()
 
 

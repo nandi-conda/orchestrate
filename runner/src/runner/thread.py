@@ -1,4 +1,10 @@
-"""Agent threads and the host that runs many of them in one process."""
+"""Agent threads and the host that runs many of them in one process.
+
+A thread's agent is prime-agent (harness.py); the thread feeds it its
+messages, turns its events into the runner's (runner/API.md, "SSE"), answers
+its team calls (team.py), and at the end of each turn saves its work and
+session to the orchestrator (repo.py).
+"""
 
 from __future__ import annotations
 
@@ -7,29 +13,35 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import tools as T
-from .model import Model
+from .harness import HARNESS, KERNEL, SESSION, Harness, HarnessError, Place, PrimeAgent
 from .peers import LocalPeers, PeerError, Peers
 from .repo import GitError, Repo, Workspace
-from .sandbox import LocalSandbox, Sandbox, View, worker_private
+from .sandbox import View, worker_private
+from .team import TeamServer
+from .web import DeepSeekWeb
 
-SYSTEM_PROMPT = """You are one thread in a team of agent threads working on the project "{project}".
+PROMPT = """# This thread
+
+You are one thread in a team of agent threads working on the project "{project}".
 Your thread id is {id}. Your title: {title}.
 Your workspace is a git worktree of the project at {root}; your branch is {branch}.
-The project is all there is to work on: your commands run in a sandbox that holds this workspace,
-your own home and /tmp, and the system's tools read-only.
+The project is all there is to work on: your kernel and every command it runs are in a sandbox
+that holds this workspace, your own home and /tmp, and the system's tools read-only.
 
-How the team works:
-- Many threads run at once. Spawn a new thread for independent work instead of doing it yourself.
-- Use list_threads before touching shared areas; if another thread owns it, send_message instead of editing.
+How the team works, through the `team` skill (read its SKILL.md):
+- Many threads run at once. Spawn a new thread (`team.spawn_thread`) for independent work instead
+  of doing it yourself.
+- Use `team.list_threads()` before touching shared areas; if another thread owns one, use
+  `team.send_message` instead of editing it.
 - Messages from other threads, and user requests the project's router passes on, arrive as user
   messages that start with [from <thread id>] or [from router]; the user's own come as they are.
-- Keep your directory entry current with set_summary when your focus changes.
-- When the work for this request is done, call finish with a summary. You may get follow-ups later.
+- Keep your directory entry current with `team.set_summary` when your focus changes.
+- `team.web_search` and `team.web_fetch` search and read the web.
+- When the work for this request is done, `await team.finish(summary)`. You may get follow-ups later.
 
 Commits: commit your work on {branch} with clear messages; there is no remote to push to.
 At the end of every turn the runner commits anything left over and the orchestrator saves your
@@ -42,10 +54,9 @@ resolve, `git rebase --continue`, and call finish again.
 
 @dataclass
 class Limits:
-    max_steps: int = 60
+    max_steps: int = 60  # model calls per turn
     max_spawn: int = 8
     max_hops: int = 6
-    tool_timeout: float = 600.0
 
 
 class DeltaBuffer:
@@ -86,93 +97,26 @@ def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
 
-def user_content(sender: str, body: str, images: list[dict] | None = None):
-    """A message as the model takes it: its text, plus pasted images as
-    OpenAI-style image parts (a data: URL each) when it has any."""
-    text = body if sender == "user" else f"[from {sender}] {body}"
-    if not images:
-        return text
-    parts: list[dict] = []
-    if text:
-        parts.append({"type": "text", "text": text})
-    for im in images:
-        parts.append({"type": "image_url",
-                      "image_url": {"url": f"data:{im['media_type']};base64,{im['data']}"}})
-    return parts
+def user_text(sender: str, body: str) -> str:
+    return body if sender == "user" else f"[from {sender}] {body}"
 
 
-STOPPED_TOOL = "error: the thread stopped before this tool returned"
-
-
-def replay(events: list[dict]) -> list[dict]:
-    """The conversation a thread's events record, as model messages after the
-    system prompt. Brings a thread back on a worker with what it had said and
-    done (runner/API.md, "Resuming a thread").
-
-    One model step is its `reasoning`, its `assistant` reply and its
-    `tool_call`s (which carry the step's number), in that order, each part
-    optional; `tool_result`s answer the calls. A call with no result (the
-    thread stopped while it ran) is answered as stopped. Tool results are the
-    events' copies, cut to 4000 characters."""
-    messages: list[dict] = []
-    step: dict | None = None  # the assistant message being rebuilt, and its step number
-    step_no = None
-    unanswered: list[str] = []
-
-    def close():
-        nonlocal step
-        for cid in unanswered:
-            messages.append({"role": "tool", "tool_call_id": cid, "content": STOPPED_TOOL})
-        unanswered.clear()
-        step = None
-
-    def open_step():
-        nonlocal step
-        close()
-        step = {"role": "assistant", "content": ""}
-        messages.append(step)
-
-    for ev in events:
-        typ, d = ev.get("type"), ev.get("data") or {}
-        if typ == "message_in":
-            close()
-            messages.append({"role": "user",
-                             "content": user_content(d.get("from", "user"), d.get("body", ""),
-                                                     d.get("images"))})
-        elif typ == "reasoning":
-            open_step()
-            step["reasoning_content"] = d.get("content", "")
-        elif typ == "assistant":
-            if step is None or step["content"] or step.get("tool_calls"):
-                open_step()
-            step["content"] = d.get("content", "")
-        elif typ == "tool_call":
-            if step is None or (step.get("tool_calls") and d.get("step") != step_no):
-                open_step()
-            step_no = d.get("step")
-            step.setdefault("tool_calls", []).append(
-                {"id": d["id"], "type": "function",
-                 "function": {"name": d.get("name", ""), "arguments": json.dumps(d.get("arguments") or {})}})
-            unanswered.append(d["id"])
-        elif typ == "tool_result" and d.get("id") in unanswered:
-            unanswered.remove(d["id"])
-            messages.append({"role": "tool", "tool_call_id": d["id"], "content": str(d.get("result", ""))})
-    close()
-    return messages
+def result_text(result: dict | None) -> str:
+    """A tool result's text parts, as the model read them."""
+    return "\n".join(c.get("text", "") for c in (result or {}).get("content") or [] if c.get("type") == "text")
 
 
 class AgentThread:
-    def __init__(self, *, id: str, project: str, title: str, model: Model, sandbox: Sandbox, peers: Peers,
-                 tools: list[T.Tool], limits: Limits, parent: str | None, workspace: Workspace | None,
-                 emit: Callable[["AgentThread", str, Any], None], history: list[dict] | None = None,
-                 summary: str = ""):
+    def __init__(self, *, id: str, project: str, title: str, agent: PrimeAgent, model: dict | None, place: Place,
+                 peers: Peers, web: DeepSeekWeb, limits: Limits, parent: str | None, workspace: Workspace | None,
+                 emit: Callable[["AgentThread", str, Any], None], summary: str = ""):
         self.id, self.project, self.title, self.parent = id, project, title, parent
+        self.agent, self.model, self.place = agent, model, place
+        self.root = place.view.root
         self.workspace = workspace
         self.branch = workspace.branch if workspace else None
         self.conflicts = 0  # landings in a row that hit a conflict
-        self.model, self.sandbox, self.peers, self.limits = model, sandbox, peers, limits
-        self.tools = T.by_name(tools)
-        self.tool_schemas = T.schemas(tools)
+        self.peers, self.web, self.limits = peers, web, limits
         self._emit = emit
         self.state = "queued"
         self.summary = summary
@@ -181,9 +125,8 @@ class AgentThread:
         self.finish_requested = False
         self.events: list[dict] = []
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
-        self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT.format(
-            project=project, id=id, title=title, root=sandbox.root, branch=self.branch or "(none)")}]
-        self.messages += replay(history or [])
+        self.harness: Harness | None = None
+        self.team = TeamServer(self, place.socket)
         self.task: asyncio.Task | None = None
 
     def emit(self, type: str, data: Any = None):
@@ -200,21 +143,26 @@ class AgentThread:
     def deliver(self, body: str, sender: str = "user", hops: int = 0, images: list[dict] | None = None):
         self.inbox.put_nowait({"from": sender, "body": body, "hops": hops, "images": images or []})
 
-    def _take(self, item: dict) -> bool:
+    def prompt(self) -> str:
+        return PROMPT.format(project=self.project, id=self.id, title=self.title, root=self.root,
+                             branch=self.branch or "(none)")
+
+    async def _send(self, item: dict) -> bool:
+        """Hand a message to the agent, unless it has gone round too often."""
         if item["hops"] > self.limits.max_hops:
             self.emit("dropped", {"from": item["from"], "reason": "hop limit"})
             return False
-        self.messages.append({"role": "user", "content": user_content(item["from"], item["body"],
-                                                                        item.get("images"))})
         self.emit("message_in", {"from": item["from"], "body": item["body"]})
+        await self.harness.prompt(user_text(item["from"], item["body"]), item.get("images"))
         return True
 
     async def run(self):
         try:
+            await self.team.start()
+            self.harness = await self.agent.start(self.place, model=self.model, append_prompt=self.prompt())
             while True:
-                if not self._take(await self.inbox.get()):
-                    continue
-                await self._turn()
+                if await self._send(await self.inbox.get()):
+                    await self._turn()
         except asyncio.CancelledError:
             self.set_state("stopped")
             raise
@@ -222,61 +170,60 @@ class AgentThread:
             log.exception("thread %s failed", self.id)
             self.emit("error", {"error": f"{type(e).__name__}: {e or repr(e)}"})
             self.set_state("failed")
+        finally:
+            if self.harness is not None:
+                await self.harness.close()
+            await self.team.close()
 
     async def _turn(self):
+        """One turn: the agent's run from the message just sent until it is idle
+        again. Messages that arrive meanwhile steer it."""
         self.set_state("working")
         self.finish_requested = False
-        final = ""
-        for step in range(self.limits.max_steps):
-            while not self.inbox.empty():  # mid-turn messages land before the next model call
-                self._take(self.inbox.get_nowait())
-            deltas = DeltaBuffer(self.emit)
-            try:
-                resp = await self.model.complete(self.messages, self.tool_schemas, deltas)
-            finally:
-                deltas.flush()
-            self.messages.append(resp.message)
-            if resp.reasoning:
-                self.emit("reasoning", {"content": resp.reasoning})
-            if resp.content:
-                final = resp.content
-                self.emit("assistant", {"content": resp.content})
-            if resp.usage:
-                self.emit("usage", resp.usage)
-            if not resp.tool_calls:
-                break
-            for tc in resp.tool_calls:
-                self.emit("tool_call", {"id": tc.id, "name": tc.name, "arguments": tc.arguments, "step": step})
-                try:
-                    result = await asyncio.wait_for(T.call(self.tools, self, tc.name, tc.arguments), self.limits.tool_timeout)
-                except asyncio.TimeoutError:
-                    result = "error: tool timed out"
-                self.emit("tool_result", {"id": tc.id, "name": tc.name, "result": result[:4000]})
-                self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            if self.finish_requested:
-                break
-        else:
-            self.emit("error", {"error": f"step limit {self.limits.max_steps} reached"})
+        turn = Turn(self)
+        events = self.harness.events
+        ev_get = asyncio.ensure_future(events.get())
+        in_get = asyncio.ensure_future(self.inbox.get())
+        try:
+            while True:
+                done, _ = await asyncio.wait({ev_get, in_get}, return_when=asyncio.FIRST_COMPLETED)
+                if in_get in done:
+                    await self._send(in_get.result())
+                    in_get = asyncio.ensure_future(self.inbox.get())
+                if ev_get in done:
+                    ev = ev_get.result()
+                    if ev is None:
+                        raise HarnessError(f"prime-agent exited: {self.harness.tail()}")
+                    ended = await turn.on(ev)
+                    ev_get = asyncio.ensure_future(events.get())
+                    if ended and not await self.harness.busy() and not in_get.done():
+                        break
+        finally:
+            in_get.cancel()
+            ev_get.cancel()
         if not self.summary:  # the model ended without finish/set_summary: its last words stand in
-            self.summary = (final or self.title)[:500]
+            self.summary = (turn.final or self.title)[:500]
         if self.workspace:
             await self._commit_work()
         self.set_state("idle")
-        self.emit("turn_done", {"summary": self.summary, "final": final})
+        self.emit("turn_done", {"summary": self.summary, "final": turn.final})
         try:
             await self.peers.set_summary(self.id, self.summary, sorted(self.files))
             if self.parent:
-                await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary or final}")
+                await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary or turn.final}")
         except Exception as e:
             self.emit("error", {"error": f"peer update failed: {e}"})
 
     async def _commit_work(self):
-        """Commit the turn's work and snapshot the worktree; the orchestrator
-        saves both, and lands the branch on the default branch after finish."""
+        """Commit the turn's work, snapshot the worktree and save the agent's
+        session; the orchestrator saves all three, and lands the branch after finish."""
         message = f"{self.title}\n\n{self.summary}\n\nThread: {self.id}"
+        repo = self.workspace.repo
         try:
             commit = await self.workspace.commit(message)
+            self.files = set(await self.workspace.changed())
             await self.workspace.snapshot()
+            await repo.save_session(self.id, self.place.agent_dir, SESSION)
             result = await self.peers.save(self.id, land=self.finish_requested)
             if result.get("landed"):
                 await self.workspace.follow()
@@ -301,23 +248,85 @@ class AgentThread:
             self.emit("error", {"error": f"landing {self.branch} failed: {result.get('message') or 'no reason given'}"})
 
 
+class Turn:
+    """One turn's prime-agent events, as the runner's: `delta`s while the model
+    streams, then per model call its `reasoning`, `assistant`, `tool_call`s and
+    `usage`, and a `tool_result` per call it ran."""
+
+    def __init__(self, t: AgentThread):
+        self.t = t
+        self.deltas = DeltaBuffer(t.emit)
+        self.steps = 0
+        self.final = ""
+        self.aborted = False
+
+    async def on(self, ev: dict) -> bool:
+        """Take one event; True when the agent's run has ended."""
+        typ = ev.get("type")
+        if typ == "message_update":
+            self._delta(ev)
+        elif typ == "message_end" and (ev.get("message") or {}).get("role") == "assistant":
+            self.deltas.flush()
+            await self._step(ev["message"])
+        elif typ == "tool_execution_end":
+            self.t.emit("tool_result", {"id": ev.get("toolCallId"), "name": ev.get("toolName"),
+                                        "result": result_text(ev.get("result"))[:4000]})
+        elif typ == "agent_end":
+            self.deltas.flush()
+            return True
+        return False
+
+    def _delta(self, ev: dict):
+        a = ev.get("assistantMessageEvent") or {}
+        kind = a.get("type")
+        if kind == "text_delta":
+            self.deltas("content", a.get("delta", ""))
+        elif kind == "thinking_delta":
+            self.deltas("reasoning", a.get("delta", ""))
+        elif kind in ("toolcall_start", "toolcall_delta"):
+            content = (ev.get("message") or {}).get("content") or []
+            i = a.get("contentIndex", -1)
+            name = content[i].get("name", "") if 0 <= i < len(content) else ""
+            self.deltas("tool", a.get("delta", ""), name)
+
+    async def _step(self, m: dict):
+        blocks = m.get("content") or []
+        reasoning = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if reasoning:
+            self.t.emit("reasoning", {"content": reasoning})
+        if text:
+            self.final = text
+            self.t.emit("assistant", {"content": text})
+        for b in blocks:
+            if b.get("type") == "toolCall":
+                self.t.emit("tool_call", {"id": b.get("id"), "name": b.get("name"),
+                                          "arguments": b.get("arguments") or {}, "step": self.steps})
+        if m.get("usage"):
+            self.t.emit("usage", m["usage"])
+        if m.get("stopReason") == "error":
+            self.t.emit("error", {"error": m.get("errorMessage") or "the model call failed"})
+        self.steps += 1
+        if self.steps >= self.t.limits.max_steps and not self.aborted:
+            self.aborted = True
+            self.t.emit("error", {"error": f"step limit {self.t.limits.max_steps} reached"})
+            await self.t.harness.abort()
+
+
 class ThreadHost:
     """Runs many AgentThreads in one process. One host per worker."""
 
-    def __init__(self, *, model_factory: Callable[[dict | None], Model], peers: Peers | None = None,
+    def __init__(self, *, agent: PrimeAgent, web: DeepSeekWeb, peers: Peers | None = None,
                  repo: Repo | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
-                 sandbox_factory: Callable[[View], Sandbox] = LocalSandbox, capacity: int = 16,
-                 tools: list[T.Tool] | None = None):
-        self.model_factory = model_factory
+                 capacity: int = 16):
+        self.agent, self.web = agent, web
         self.peers = peers or LocalPeers()
         if isinstance(self.peers, LocalPeers):
             self.peers.host = self
         self.repo = repo
         self.workdir = Path(workdir)
         self.limits = limits or Limits()
-        self.sandbox_factory = sandbox_factory
         self.capacity = capacity
-        self.tools = tools or T.ALL_TOOLS
         self.threads: dict[str, AgentThread] = {}
         self.subscribers: dict[str | None, set[asyncio.Queue]] = {}
         self._seq = 0
@@ -343,38 +352,38 @@ class ThreadHost:
     def running(self) -> int:
         return sum(1 for t in self.threads.values() if t.state in ("queued", "working"))
 
-    async def _workspace(self, tid: str) -> tuple[View, Workspace | None]:
-        """The thread's worktree (a plain directory when the worker has no
-        repo) and the view its commands get: that, the repository's git dir,
-        and the thread's own home and /tmp under `.home/` and `.tmp/`."""
-        path = (self.workdir / tid).resolve()
-        view = View(root=str(path), home=str(self.workdir.resolve() / ".home" / tid),
-                    tmp=str(self.workdir.resolve() / ".tmp" / tid),
-                    writable=(str(self.repo.path.resolve() / ".git"),) if self.repo else (),
-                    hidden=worker_private(self.workdir))
-        if not self.repo:
-            path.mkdir(parents=True, exist_ok=True)
-            return view, None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return view, await self.repo.worktree(path, tid)
+    def _place(self, tid: str) -> Place:
+        """Where the thread lives on this worker: its worktree, and the view
+        its kernel gets of the worker: that, the repository's git dir, the
+        thread's own home and /tmp under `.home/` and `.tmp/`, its team socket,
+        and the kernel's Python environment and prime-agent's skills read-only."""
+        work = self.workdir.resolve()
+        socket = str(work / ".team" / f"{tid}.sock")
+        view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
+                    writable=((str(self.repo.path.resolve() / ".git"),) if self.repo else ()) + (socket,),
+                    hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")))
+        return Place(view=view, socket=socket, kernel=str(work / ".team" / f"{tid}.kernel"))
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
-                    model: dict | None = None, id: str | None = None, history: list[dict] | None = None,
-                    summary: str = "", images: list[dict] | None = None) -> AgentThread:
-        """Start a thread on this worker. With `history` (its earlier events) the
-        thread continues a conversation and its saved branch; with no
-        `request` it waits idle for its next message. `images` belong to the
-        request. An id whose thread here has ended (stopped or failed) is
-        started afresh."""
+                    model: dict | None = None, id: str | None = None, summary: str = "",
+                    images: list[dict] | None = None) -> AgentThread:
+        """Start a thread on this worker. A thread the orchestrator brings back
+        continues its branch and its agent's session; with no `request` it
+        waits idle for its next message. `images` belong to the request. An
+        id whose thread here has ended (stopped or failed) is started afresh."""
         tid = id or _id()
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
-        view, workspace = await self._workspace(tid)
-        t = AgentThread(id=tid, project=project, title=title, model=self.model_factory(model),
-                        sandbox=self.sandbox_factory(view), peers=self.peers, tools=self.tools,
-                        limits=self.limits, parent=parent, workspace=workspace, emit=self._emit,
-                        history=history, summary=summary)
+        place = self._place(tid)
+        workspace = None
+        if self.repo:
+            Path(place.view.root).parent.mkdir(parents=True, exist_ok=True)
+            workspace = await self.repo.worktree(place.view.root, tid)
+            await self.repo.session(tid, place.agent_dir, SESSION)
+        t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
+                        peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=workspace,
+                        emit=self._emit, summary=summary)
         if old is not None:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t

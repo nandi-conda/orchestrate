@@ -23,12 +23,51 @@ pytest = "*"
 pytest-asyncio = "*"
 pytest-xdist = "*"
 
+# The Python a thread's prime-agent kernel runs on (runner/src/runner/harness.py),
+# inside the thread's sandbox: prime-agent's kernel runtime, the packages its
+# system prompt promises, the bundled skills we keep, and our team skill.
+[feature.kernel]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.kernel.dependencies]
+python = "3.13.*"
+uv = "*"
+requests = "*"
+httpx = "*"
+pyyaml = "*"
+tomli = "*"
+python-dotenv = "*"
+pandas = "*"
+numpy = "*"
+scipy = "*"
+beautifulsoup4 = "*"
+lxml = "*"
+pydantic = "*"
+tyro = "*"
+dill = "*"
+pillow = ">=10"
+
+[feature.kernel.pypi-dependencies]
+mcp = ">=2,<3"
+prime-agent-runtime = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "prime-agent-runtime" }
+edit = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "skills/edit" }
+compact = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "skills/compact" }
+goal = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "skills/goal" }
+refine = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "skills/refine" }
+prime-agent-skill-attach-image = { git = "https://github.com/PrimeIntellect-ai/prime-agent", tag = "v0.10.1", subdirectory = "skills/attach-image" }
+team = { path = "skills/team", editable = false }
+
+[feature.kernel.tasks]
+kernel = { cmd = "python -c 'import rlm, team'", description = "Install the environment threads' Python kernel runs on" }
+
 [environments]
 default = { features = ["test"], solve-group = "default" }
 prod = { features = [], solve-group = "default" }
+kernel = { features = ["kernel"], no-default-feature = true }
 
 [tasks]
-serve = "python -m runner.server"
-run = "python -m runner.cli"
-test = "pytest -q -n auto"
+harness = { cmd = "bash deploy/install-harness.sh", description = "Install the pinned prime-agent binary into .harness/" }
+serve = { cmd = "python -m runner.server", depends-on = ["harness", { task = "kernel", environment = "kernel" }] }
+run = { cmd = "python -m runner.cli", depends-on = ["harness", { task = "kernel", environment = "kernel" }] }
+test = { cmd = "pytest -q -n auto", depends-on = ["harness", { task = "kernel", environment = "kernel" }] }
 set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }

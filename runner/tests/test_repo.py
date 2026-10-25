@@ -4,14 +4,11 @@ import asyncio
 import subprocess
 
 import pytest
+from conftest import Scripted, Web, in_view, py, sh, types, until
 
-from runner import ModelResponse, ScriptedModel, ThreadHost, ToolCall
+from runner import ThreadHost
 from runner.peers import OrchestratorPeers, PeerOutbox
 from runner.repo import GitError, Repo
-
-
-def call(name, **args):
-    return ToolCall(id=f"c_{name}", name=name, arguments=args)
 
 
 def git(cwd, *args):
@@ -34,34 +31,42 @@ async def seeded(tmp_path, name="threads"):
     return repo
 
 
-async def host(tmp_path, scripts, **kw):
-    pending, order = dict(scripts), list(scripts)
-    return ThreadHost(model_factory=lambda spec: ScriptedModel(pending.pop(order.pop(0))),
-                      workdir=str(tmp_path / "threads"), repo=await seeded(tmp_path), **kw)
+async def host(tmp_path, *scripts, name="threads", **kw):
+    return ThreadHost(agent=Scripted(*scripts), web=Web(), workdir=str(tmp_path / name),
+                      repo=await seeded(tmp_path, name), **kw)
 
 
-def types(t):
-    return [e["type"] for e in t.events]
+async def run(t, command):
+    """A command in the thread's sandbox, once it is up (its team socket is in it)."""
+    await until(lambda: t.harness is not None)
+    return in_view(t.place.view, command)
+
+
+async def stop_all(h):
+    for tid in list(h.threads):
+        await h.stop(tid)
 
 
 async def move(src: Repo, dst: Repo, tid: str):
     """What the orchestrator does when a thread goes to another worker: take
-    its branch and snapshot from one worker, bring them to the other."""
+    its branch, snapshot and session from one worker, bring them to the other."""
     data, refs = await src.send(tid, [])
     names = {f"refs/heads/thread/{tid}": f"refs/remotes/origin/thread/{tid}",
-             f"refs/snapshots/{tid}": f"refs/remotes/origin-snapshots/{tid}"}
+             f"refs/snapshots/{tid}": f"refs/remotes/origin-snapshots/{tid}",
+             f"refs/sessions/{tid}": f"refs/remotes/origin-sessions/{tid}"}
     await dst.receive(data, dst.base, {names[k]: v for k, v in refs.items()})
 
 
 async def test_worktree_per_thread_off_the_base_branch(tmp_path):
     source(tmp_path)
-    h = await host(tmp_path, {"a": [ModelResponse("ok")], "b": [ModelResponse("ok")]})
+    h = await host(tmp_path, ["ok"], ["ok"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
-    assert a.sandbox.root != b.sandbox.root and a.branch == f"thread/{a.id}"
-    assert (await a.sandbox.exec("git branch --show-current")).stdout.strip() == a.branch
-    assert (await a.sandbox.exec("cat notes.txt")).stdout.startswith("one")
+    assert a.root != b.root and a.branch == f"thread/{a.id}"
+    assert (await run(a, "git branch --show-current")).stdout.strip() == a.branch
+    assert (await run(a, "cat notes.txt")).stdout.startswith("one")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
+    await stop_all(h)
 
 
 async def test_no_worktree_before_the_orchestrator_sends_the_repository(tmp_path):
@@ -74,29 +79,29 @@ async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
     """Other threads' worktrees and the repository's checkout are hidden; the
     thread can still commit, since its worktree's git dir is in the view."""
     source(tmp_path)
-    h = await host(tmp_path, {"a": [ModelResponse("ok")], "b": [ModelResponse("ok")]})
+    h = await host(tmp_path, ["ok"], ["ok"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
     threads = tmp_path / "threads"
-    r = await a.sandbox.exec(f"ls -A {threads}; echo ---; ls -A {threads / '.repo'}; echo ---; "
-                             "echo hi > mine.txt && git add mine.txt && git commit -qm mine && git log --format=%s -1")
+    r = (await run(a, f"ls -A {threads}; echo ---; ls -A {threads / '.repo'}; echo ---; "
+               "echo hi > mine.txt && git add mine.txt && git commit -qm mine && git log --format=%s -1"))
     listed, clone, log = r.stdout.split("---\n")
     assert b.id not in listed.split() and a.id in listed.split()
     assert clone.split() == [".git"]
     assert log.strip() == "mine", r.stderr
+    await stop_all(h)
 
 
 async def test_turn_end_commits_leftovers_and_snapshots_the_worktree(tmp_path):
     source(tmp_path)
-    h = await host(tmp_path, {"t": [
-        ModelResponse("", [call("bash", command="printf 'build/\\n' > .gitignore; mkdir -p build; "
-                                                "echo bin > build/app; echo draft > new.txt")]),
-        ModelResponse("stopping here"),
-    ]})
+    h = await host(tmp_path, [sh("printf 'build/\\n' > .gitignore; mkdir -p build; "
+                                 "echo bin > build/app; echo draft > new.txt"), "stopping here"])
     t = await h.start(project="p", title="t", request="draft")
     await h.wait_idle(t.id)
-    assert "saved" in types(t) and "landed" not in types(t) and "error" not in types(t)
+    await h.stop(t.id)
+    assert "saved" in types(t) and "landed" not in types(t) and "error" not in types(t), t.events
+    assert sorted(t.files) == [".gitignore", "new.txt"]
     repo = h.repo.path
     assert git(repo, "show", f"{t.branch}:new.txt") == "draft"
     assert "build" not in git(repo, "ls-tree", "--name-only", t.branch).split()
@@ -104,19 +109,22 @@ async def test_turn_end_commits_leftovers_and_snapshots_the_worktree(tmp_path):
     assert git(repo, "show", f"{snap}:build/app") == "bin"
     assert git(repo, "rev-parse", f"{snap}^") == git(repo, "rev-parse", t.branch)
     assert "new.txt" not in git(repo, "ls-tree", "--name-only", "origin/main")
+    session = f"refs/sessions/{t.id}"
+    files = git(repo, "ls-tree", "-r", "--name-only", session).splitlines()
+    assert any(f.startswith("sessions/") and f.endswith(".jsonl") for f in files), files
+    assert '"draft"' in git(repo, "show", f"{session}:{next(f for f in files if f.endswith('.jsonl'))}")
 
 
 async def test_finish_lands_concurrent_threads_linearly(tmp_path):
     source(tmp_path)
-    h = await host(tmp_path, {
-        "a": [ModelResponse("", [call("write_file", path="a.txt", content="a\n")]),
-              ModelResponse("", [call("finish", summary="added a")])],
-        "b": [ModelResponse("", [call("bash", command="echo b > b.txt && git add b.txt && git commit -qm 'add b'")]),
-              ModelResponse("", [call("finish", summary="added b")])],
-    })
+    h = await host(tmp_path,
+                   [py("open('a.txt', 'w').write('a\\n')"), py("await team.finish('added a')"), "done"],
+                   [sh("echo b > b.txt && git add b.txt && git commit -qm 'add b'"),
+                    py("await team.finish('added b')"), "done"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
+    await stop_all(h)
     assert "landed" in types(a) and "landed" in types(b)
     repo = h.repo.path
     assert set(git(repo, "ls-tree", "--name-only", "origin/main").split()) == {"notes.txt", "a.txt", "b.txt"}
@@ -129,22 +137,17 @@ async def test_conflict_goes_back_to_the_thread(tmp_path):
     source(tmp_path)
     fix = ("git rebase origin/main; printf 'one\\nTWO-b\\nthree\\n' > notes.txt && "
            "git add notes.txt && git rebase --continue")
-    h = await host(tmp_path, {
-        "a": [ModelResponse("", [call("edit_file", path="notes.txt", old="two", new="TWO-a")]),
-              ModelResponse("", [call("finish", summary="a edits two")])],
-        "b": [ModelResponse("", [call("edit_file", path="notes.txt", old="two", new="TWO-b")]),
-              ModelResponse("", [call("bash", command="sleep 1")]),  # let a land first
-              ModelResponse("", [call("finish", summary="b edits two")]),
-              ModelResponse("", [call("bash", command=fix)]),
-              ModelResponse("", [call("finish", summary="b resolved")])],
-    })
+    h = await host(tmp_path,
+                   [py("await edit('notes.txt', 'two', 'TWO-a')"), py("await team.finish('a edits two')"), "done"],
+                   [py("await edit('notes.txt', 'two', 'TWO-b')"),
+                    sh("sleep 2"),  # let a land first
+                    py("await team.finish('b edits two')"), "done",
+                    sh(fix), py("await team.finish('b resolved')"), "done"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
     await h.wait_idle(a.id)
-    for _ in range(300):
-        if "landed" in types(b):
-            break
-        await asyncio.sleep(0.02)
+    await until(lambda: "landed" in types(b))
+    await stop_all(h)
     conflict = next(e["data"] for e in b.events if e["type"] == "land_conflict")
     assert conflict["files"] == ["notes.txt"] and conflict["base"] == "main"
     assert any(e["type"] == "message_in" and e["data"]["from"] == "runner" for e in b.events)
@@ -163,11 +166,9 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     git(tmp_path, "clone", "-q", "--bare", str(src), str(hub))
     outbox = PeerOutbox()
     repo = Repo(tmp_path / "threads" / ".repo")
-    h = ThreadHost(model_factory=lambda spec: ScriptedModel([
-        ModelResponse("", [call("bash", command="echo x > x.txt; printf 'out/\\n' > .gitignore; "
-                                                "mkdir out; echo o > out/o")]),
-        ModelResponse("", [call("finish", summary="added x")])]),
-        peers=OrchestratorPeers(outbox), workdir=str(tmp_path / "threads"), repo=repo)
+    h = ThreadHost(agent=Scripted([sh("echo x > x.txt; printf 'out/\\n' > .gitignore; mkdir out; echo o > out/o"),
+                                   py("await team.finish('added x')"), "done"]),
+                   web=Web(), peers=OrchestratorPeers(outbox), workdir=str(tmp_path / "threads"), repo=repo)
 
     async def ship():
         tip = git(hub, "rev-parse", "main")
@@ -212,58 +213,85 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     try:
         t = await h.start(project="p", title="t", request="x")
         await h.wait_idle(t.id)
+        await h.stop(t.id)
     finally:
         o.cancel()
     assert "landed" in types(t) and "error" not in types(t), t.events
     assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"notes.txt", "y.txt", "x.txt", ".gitignore"}
     assert git(hub, "show", f"refs/snapshots/{t.id}:out/o") == "o"
+    assert git(hub, "rev-parse", "--verify", f"refs/sessions/{t.id}")
     wt = tmp_path / "threads" / t.id
     assert git(wt, "rev-parse", "HEAD") == git(hub, "rev-parse", "main")
     assert (wt / "y.txt").exists() and (wt / "out" / "o").read_text() == "o\n"
 
 
-async def test_resumed_thread_continues_on_a_new_worker_with_its_files(tmp_path):
+async def test_resumed_thread_continues_on_a_new_worker_with_its_files_and_session(tmp_path):
     source(tmp_path)
-    first = ThreadHost(model_factory=lambda spec: ScriptedModel([
-        ModelResponse("", [call("bash", command="echo v1 > draft.txt; printf 'build/\\n' > .gitignore; "
-                                                "mkdir build; echo bin > build/app")]),
-        ModelResponse("saved a draft")]),
-        workdir=str(tmp_path / "w1"), repo=await seeded(tmp_path, "w1"))
+    first = await host(tmp_path, [sh("echo v1 > draft.txt; printf 'build/\\n' > .gitignore; mkdir build; "
+                                     "echo bin > build/app"),
+                                  py("note = 'kept in the kernel'"), "saved a draft"], name="w1")
     t = await first.start(project="p", title="t", request="draft", id="t_resume")
     await first.wait_idle(t.id)
-    # The first worker is gone; another one picks the thread up with its events.
-    model = ScriptedModel([ModelResponse("still here")])
-    second = ThreadHost(model_factory=lambda spec: model, workdir=str(tmp_path / "w2"),
-                        repo=await seeded(tmp_path, "w2"))
+    await first.stop(t.id)
+    # The first worker is gone; another one picks the thread up from what the hub has.
+    second = await host(tmp_path, ["still here"], name="w2")
     await move(first.repo, second.repo, "t_resume")
-    r = await second.start(project="p", title="t", id="t_resume", history=list(t.events))
-    assert r.state == "idle" and (await r.sandbox.exec("cat draft.txt")).stdout == "v1\n"
-    assert (await r.sandbox.exec("cat build/app")).stdout == "bin\n"  # ignored, from the snapshot
-    assert (await r.sandbox.exec("git status --porcelain")).stdout == ""
-    assert (await r.sandbox.exec("git branch --show-current")).stdout.strip() == "thread/t_resume"
+    r = await second.start(project="p", title="t", id="t_resume")
+    assert r.state == "idle" and (await run(r, "cat draft.txt")).stdout == "v1\n"
+    assert (await run(r, "cat build/app")).stdout == "bin\n"  # ignored, from the snapshot
+    assert (await run(r, "git status --porcelain")).stdout == ""
+    assert (await run(r, "git branch --show-current")).stdout.strip() == "thread/t_resume"
     second.deliver(r.id, "and now?")
     await second.wait_idle(r.id)
-    roles = [m["role"] for m in model.seen[0]]
-    assert roles == ["system", "user", "assistant", "tool", "assistant", "user"]
-    assert model.seen[0][-1]["content"] == "and now?"
+    messages = (await r.harness.command("get_messages"))["messages"]
+    said = [(m["role"], b.get("text")) for m in messages if m["role"] in ("user", "assistant")
+            for b in m["content"] if b.get("type") == "text"]
+    assert said == [("user", "draft"), ("assistant", "saved a draft"), ("user", "and now?"), ("assistant", "still here")]
+    await second.stop(r.id)
 
 
-async def test_stopped_thread_restarts_in_the_worktree_it_had(tmp_path):
+async def test_stopped_thread_restarts_in_the_worktree_and_session_it_had(tmp_path):
     source(tmp_path)
-    h = await host(tmp_path, {"a": [ModelResponse("", [call("bash", command="echo wip > wip.txt; sleep 30")])],
-                              "b": [ModelResponse("back")]})
+    h = await host(tmp_path, [sh("echo wip > wip.txt; sleep 30")], ["back"])
     t = await h.start(project="p", title="t", request="x", id="t_stop")
-    for _ in range(300):
-        if (tmp_path / "threads" / "t_stop" / "wip.txt").exists():
-            break
-        await asyncio.sleep(0.02)
+    await until(lambda: (tmp_path / "threads" / "t_stop" / "wip.txt").exists())
     await h.stop(t.id)
-    r = await h.start(project="p", title="t", id="t_stop", history=list(t.events))
-    assert r is not t and (await r.sandbox.exec("cat wip.txt")).stdout == "wip\n"  # never saved, still here
+    r = await h.start(project="p", title="t", id="t_stop")
+    assert r is not t and (await run(r, "cat wip.txt")).stdout == "wip\n"  # never saved, still here
     h.deliver(r.id, "go on")
     await h.wait_idle(r.id)
-    assert r.model.seen[0][3] == {"role": "tool", "tool_call_id": "c_bash",
-                                  "content": "error: the thread stopped before this tool returned"}
+    messages = (await r.harness.command("get_messages"))["messages"]
+    users = [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b.get("type") == "text"]
+    assert users == ["x", "go on"]
+    await h.stop(r.id)
+
+
+async def test_session_left_behind_by_a_thread_that_moved_on_is_replaced(tmp_path):
+    source(tmp_path)
+    old = await seeded(tmp_path, "w1")
+    d1 = tmp_path / "w1" / "agent"
+    (d1 / "sessions").mkdir(parents=True)
+    (d1 / "sessions" / "s.jsonl").write_text("one\n")
+    (d1 / "skills").mkdir()
+    await old.save_session("T", d1, ("sessions", "session-artifacts"))
+    other = await seeded(tmp_path, "w2")
+    ws = await other.worktree(tmp_path / "w2" / "T", "T")  # the branch, so the bundle has refs to send
+    await ws.commit("start")
+    await other.receive((await old.send("T", []))[0], other.base, {
+        "refs/remotes/origin-sessions/T": git(old.path, "rev-parse", "refs/sessions/T")})
+    d2 = tmp_path / "w2" / "agent"
+    await other.session("T", d2, ("sessions", "session-artifacts"))
+    (d2 / "sessions" / "s.jsonl").write_text("one\ntwo\n")
+    await other.save_session("T", d2, ("sessions", "session-artifacts"))
+    await old.receive((await other.send("T", []))[0], old.base, {
+        "refs/remotes/origin-sessions/T": git(other.path, "rev-parse", "refs/sessions/T")})
+    await old.session("T", d1, ("sessions", "session-artifacts"))
+    assert (d1 / "sessions" / "s.jsonl").read_text() == "one\ntwo\n"
+    assert (d1 / "skills").is_dir()  # the rest of the agent dir is the worker's
+    # Up to date: kept as it is.
+    (d1 / "sessions" / "s.jsonl").write_text("local\n")
+    await old.session("T", d1, ("sessions", "session-artifacts"))
+    assert (d1 / "sessions" / "s.jsonl").read_text() == "local\n"
 
 
 async def test_worktree_left_behind_by_a_thread_that_moved_on_is_made_again(tmp_path):
@@ -306,7 +334,7 @@ async def test_bundles_leave_out_what_the_other_side_has(tmp_path):
     await ws.commit("nothing new")
     await ws.snapshot()
     data, refs = await repo.send("T", list(refs_of(repo).values()))
-    assert set(refs) == {"refs/heads/thread/T", "refs/snapshots/T"}
+    assert set(refs) == {"refs/heads/thread/T", "refs/snapshots/T"}  # no session yet
     # The snapshot is new (an empty tree change still makes a commit), so a bundle comes.
     assert data
     data, _ = await repo.send("T", list(refs.values()))

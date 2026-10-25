@@ -11,8 +11,9 @@ It has no model. Each turn it says what it got, and:
 
 Its git flow is the real runner's (runner/API.md, "Repository"): a worktree
 per thread in a repository the control plane fills (`POST /repo`), and at the
-end of every turn a commit and a snapshot that the control plane takes (peer
-call `save`).
+end of every turn a commit, a snapshot and a session that the control plane
+takes (peer call `save`). Its session is the messages a thread received, one
+per line, so a thread brought back on another worker says how many it had.
 
 Peer calls wait on /peer/calls for the control plane to collect, as in
 runner/API.md.
@@ -136,7 +137,12 @@ class Host:
         await self.set_state(t, "working")
         await asyncio.sleep(self.delay)
         # Stream the reply the way the real runner does (runner/API.md, `delta`).
-        reply = f"Echo: {text}" + (f" (resumed with {t['history']} earlier events)" if t["history"] else "")
+        log = self.session_dir(t) / "messages.txt"
+        earlier = log.read_text().count("\n") if log.exists() else 0
+        with log.open("a") as f:
+            f.write(json.dumps(text) + "\n")
+        reply = f"Echo: {text}" + (f" (resumed after {earlier} earlier messages)" if t["resumed"] else "")
+        t["resumed"] = False
         await self.emit(t["id"], "delta", {"kind": "reasoning", "text": "Echoing the request."})
         for i in range(0, len(reply), 16):
             await self.emit(t["id"], "delta", {"kind": "content", "text": reply[i:i + 16]})
@@ -177,6 +183,7 @@ class Host:
         tid, branch = t["id"], f"thread/{t['id']}"
         try:
             commit = await self.repo.save(self.workdir / tid, tid, f"{t['title']}\n\nThread: {tid}")
+            await self.repo.save_session(tid, self.session_dir(t))
             reply = await self.peer("save", thread_id=tid, land=land)
             if not reply.get("ok"):
                 raise GitError(reply.get("error") or "save failed")
@@ -194,6 +201,9 @@ class Host:
             await self.emit(tid, "land_conflict", {"branch": branch, "base": result["base"], "files": result["conflict"]})
         else:
             await self.emit(tid, "error", {"error": f"landing {branch} failed: {result.get('message')}"})
+
+    def session_dir(self, t: dict) -> Path:
+        return self.workdir / ".sessions" / t["id"]
 
     def inside(self, t: dict, path: str) -> Path:
         """`path` in the thread's workspace; ValueError if it leaves it or names .git."""
@@ -225,17 +235,19 @@ def create_app(host: Host, token: str) -> Starlette:
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
         b = await req.json()
-        if not b.get("request") and b.get("history") is None and not b.get("images"):
-            return JSONResponse({"error": "request or history is required"}, 400)
+        if not b.get("request") and not b.get("id") and not b.get("images"):
+            return JSONResponse({"error": "request, or the id of a thread to bring back, is required"}, 400)
         tid = b.get("id") or f"t_{secrets.token_hex(5)}"
         if tid in host.threads and host.threads[tid]["state"] not in ("stopped", "failed"):
             return JSONResponse({"error": "exists"}, 409)
         t = {"id": tid, "project": b.get("project", ""), "title": b.get("title") or (b.get("request") or tid)[:40],
              "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
-             "history": len(b.get("history") or [])}
+             "resumed": not (b.get("request") or b.get("images"))}
         try:
             await host.open()
             await host.repo.worktree(host.workdir / tid, tid)
+            await host.repo.session(tid, host.session_dir(t))
+            host.session_dir(t).mkdir(parents=True, exist_ok=True)
         except GitError as e:
             return JSONResponse({"error": str(e)}, 500)
         host.threads[tid] = t

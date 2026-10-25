@@ -83,9 +83,10 @@ def refs_header(refs: dict[str, str]) -> str:
 class Checkout:
     """A worker's repository, as the echo runner keeps it (the runner's
     repo.Repo does the same): remote-tracking refs the orchestrator sets, a
-    worktree per thread on `thread/<id>`, snapshots of whole worktrees."""
+    worktree per thread on `thread/<id>`, snapshots of whole worktrees, and
+    each thread's session as a commit of its session directory."""
 
-    SHIPPED = ("refs/remotes/origin/", "refs/remotes/origin-snapshots/")
+    SHIPPED = ("refs/remotes/origin/", "refs/remotes/origin-snapshots/", "refs/remotes/origin-sessions/")
 
     def __init__(self, path: str | os.PathLike) -> None:
         self.path = Path(path)
@@ -116,7 +117,7 @@ class Checkout:
             self.base = base
 
     async def send(self, tid: str, have: list[str]) -> tuple[bytes, dict[str, str]]:
-        refs = await tips(self.path, [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}"])
+        refs = await tips(self.path, [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}", f"refs/sessions/{tid}"])
         if not refs:
             raise GitError(f"thread {tid} has no branch on this worker")
         return await bundle(self.path, list(refs), have), refs
@@ -162,6 +163,38 @@ class Checkout:
         snap = (await git(path, "commit-tree", tree, "-p", "HEAD", "-m", f"Snapshot of thread/{tid}")).out
         await git(path, "update-ref", f"refs/snapshots/{tid}", snap)
         return (await git(path, "rev-parse", "HEAD")).out
+
+    def _session_env(self, tid: str, directory: Path) -> dict:
+        index = self.path / ".git" / "sessions" / f"{tid}.index"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        return {"GIT_DIR": str(self.path / ".git"), "GIT_WORK_TREE": str(directory), "GIT_INDEX_FILE": str(index)}
+
+    async def save_session(self, tid: str, directory: Path) -> None:
+        """Commit the thread's session directory at `refs/sessions/<id>`."""
+        env = self._session_env(tid, directory)
+        await git(directory, "add", "-A", "-f", ".", env=env)
+        tree = (await git(directory, "write-tree", env=env)).out
+        ref = f"refs/sessions/{tid}"
+        parent = ["-p", ref] if await has_commit(self.path, ref) else []
+        commit = (await git(directory, "commit-tree", tree, *parent, "-m", f"Session of thread/{tid}", env=env)).out
+        await git(self.path, "update-ref", ref, commit)
+
+    async def session(self, tid: str, directory: Path) -> None:
+        """As the runner's Repo.session: the worker's session while it holds
+        the hub's, else the hub's."""
+        theirs, ours = f"refs/remotes/origin-sessions/{tid}", f"refs/sessions/{tid}"
+        async with self.lock:
+            if not await has_commit(self.path, theirs):
+                return
+            if await has_commit(self.path, ours) and (await git(
+                    self.path, "merge-base", "--is-ancestor", theirs, ours, check=False)).code == 0:
+                return
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True)
+            env = self._session_env(tid, directory)
+            await git(directory, "read-tree", theirs, env=env)
+            await git(directory, "checkout-index", "-a", "-f", env=env)
+            await git(self.path, "update-ref", ours, theirs)
 
     async def follow(self, path: Path, tid: str) -> None:
         await git(path, "reset", "-q", "--keep", f"refs/remotes/origin/thread/{tid}")

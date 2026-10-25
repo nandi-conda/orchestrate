@@ -9,6 +9,9 @@ empty commit ("Start the project"). It holds:
 - `refs/snapshots/<id>`: each thread's whole worktree as of its last turn,
   untracked and ignored files included, as a child of its branch tip. A
   thread brought back on another worker continues with these files.
+- `refs/sessions/<id>`: each thread's agent session as of its last turn
+  (prime-agent's conversation and state; runner/src/runner/harness.py). A
+  thread brought back on another worker continues its conversation from it.
 
 A project may have a remote (its `repo_url`, e.g. a GitHub repository),
 attached, changed or removed at any time from the project's settings
@@ -19,11 +22,11 @@ pushed there first. Without one, the hub is the only copy.
 Workers never reach the hub, nor the remote. The control plane moves commits
 as git bundles over the runner API, each way leaving out what the other side
 has (runner/API.md, "Repository"): it sends the base before a thread starts
-and the thread's branch and snapshot before one comes back; it takes both at
-the end of every turn. A finished thread lands here: its branch is rebased
-onto the base in a worktree of the hub, pushed to the remote first when there
-is one, and only then becomes the hub's base. Thread branches and snapshots
-never leave the machine.
+and the thread's branch, snapshot and session before one comes back; it takes
+all three at the end of every turn. A finished thread lands here: its branch
+is rebased onto the base in a worktree of the hub, pushed to the remote first
+when there is one, and only then becomes the hub's base. Thread branches,
+snapshots and sessions never leave the machine.
 """
 
 from __future__ import annotations
@@ -48,7 +51,14 @@ def worker_ref(ref: str, base: str) -> str:
         return "refs/remotes/origin/" + ref.removeprefix("refs/heads/")
     if ref.startswith("refs/snapshots/"):
         return "refs/remotes/origin-snapshots/" + ref.removeprefix("refs/snapshots/")
+    if ref.startswith("refs/sessions/"):
+        return "refs/remotes/origin-sessions/" + ref.removeprefix("refs/sessions/")
     raise ValueError(f"{ref} does not go to workers")
+
+
+def thread_refs(tid: str) -> list[str]:
+    """A thread's refs in the hub; a worker sends the ones it has."""
+    return [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}", f"refs/sessions/{tid}"]
 
 
 class Hub:
@@ -178,13 +188,12 @@ class Hub:
 
     async def have(self, tid: str) -> list[str]:
         """The hub's tips a worker can leave out of a thread's bundle."""
-        refs = await gitio.tips(self.path, [f"refs/heads/{self.base}", f"refs/heads/thread/{tid}",
-                                            f"refs/snapshots/{tid}"])
+        refs = await gitio.tips(self.path, [f"refs/heads/{self.base}", *thread_refs(tid)])
         return list(refs.values())
 
     async def receive(self, tid: str, data: bytes, refs: dict[str, str]) -> None:
-        """A turn's work from a worker: the thread's branch and snapshot."""
-        allowed = {f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}"}
+        """A turn's work from a worker: the thread's branch, snapshot and session."""
+        allowed = set(thread_refs(tid))
         bad = set(refs) - allowed
         if bad:
             raise GitError(f"a worker may not set {', '.join(sorted(bad))}")
@@ -194,12 +203,12 @@ class Hub:
                 await self.git("update-ref", ref, sha)
 
     async def pack(self, tid: str | None, have: list[str]) -> tuple[bytes, dict[str, str]]:
-        """The base, and a thread's branch and snapshot when `tid` is given, as a
-        bundle without what the worker has (`have`), and the tips as the
-        worker names them."""
+        """The base, and a thread's branch, snapshot and session when `tid` is
+        given, as a bundle without what the worker has (`have`), and the tips
+        as the worker names them."""
         names = [f"refs/heads/{self.base}"]
         if tid:
-            names += [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}"]
+            names += thread_refs(tid)
         async with self.lock:
             refs = await gitio.tips(self.path, names)
             data = await gitio.bundle(self.path, list(refs), have)
