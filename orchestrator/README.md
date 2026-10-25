@@ -79,12 +79,15 @@ http://127.0.0.1:8000 in a browser too. `--port N` and `--db …` are as for
   What the control plane is doing is also printed to the terminal as
   `desktop: …` lines.
 
-The window is drawn on the CPU (Qt Quick's software renderer, Chromium with
-`--disable-gpu`), and on Linux as an X11 window, through XWayland under
-Wayland. The environment's Qt otherwise needs a working OpenGL/EGL that
-matches its own: without one, the window aborted ("QQuickWidget: Failed to get
-a QRhi") or, on Wayland ("qt.qpa.wayland: EGL not available"), never
-appeared. `QT_QPA_PLATFORM` still decides when set.
+The window is drawn on the CPU, with no OpenGL, EGL or GLX in the process:
+Qt Quick's software renderer, Chromium with `--disable-gpu`, and on Linux
+`QT_WAYLAND_CLIENT_BUFFER_INTEGRATION=none` (native Wayland, drawn into
+shared-memory buffers) and `QT_XCB_GL_INTEGRATION=none` (X11 without GLX).
+conda-forge's Mesa has no Wayland EGL platform and the system's GL drivers need
+not match the environment's Qt, so any GL use aborted the window or kept it
+from appearing. Expect two harmless lines at startup:
+`Failed to load client buffer integration: "none"` and
+`Failed to create RHI for backend: OpenGL`. Variables already set still decide.
 
 It runs on linux-64, osx-arm64 and win-64 (the `desktop` environment):
 conda-forge has no Qt WebEngine for osx-64.

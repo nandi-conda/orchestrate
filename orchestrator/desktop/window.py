@@ -27,14 +27,17 @@ RETRY = QUrl("http://retry.orchestrate.invalid/")
 def prepare_qt() -> None:
     """How the window is drawn; call before the QApplication is made.
 
-    On the CPU, with no OpenGL, EGL or Vulkan: the page is a dashboard, and a
-    GL context is what fails on desktops whose drivers don't match the
-    environment's Qt (the window aborts without one). On Linux, as an X11
-    window (XWayland under Wayland): Qt's Wayland plugin needs EGL from the
-    environment too ("qt.qpa.wayland: EGL not available") and the window never
-    appears without it. QT_QPA_PLATFORM, when set, still decides."""
+    With no OpenGL, EGL or GLX in this process at all: Qt Quick's software
+    renderer, Chromium without its GPU process, and on Linux no GL in Qt's
+    platform plugins, so a Wayland window is drawn into shared-memory buffers
+    and an X11 window never touches GLX. The page is a dashboard. The GL this
+    environment's Qt would find is what broke: conda-forge's Mesa has no
+    Wayland EGL ("qt.qpa.wayland: EGL not available"), and the system's GLX
+    can fail to match its Qt ("Could not initialize GLX", then an abort).
+    Variables already set still decide."""
     if sys.platform == "linux":
-        os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+        os.environ.setdefault("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "none")
+        os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
     QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Software)
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} --disable-gpu".strip()
