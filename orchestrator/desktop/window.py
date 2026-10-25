@@ -1,8 +1,9 @@
 """The window: a web view on the control plane's ultra UI, which is the only
 UI. PySide draws the window and does what a browser tab would: it keeps the
 UI's own navigation in this view (window.open and target=_blank included),
-opens links anywhere else in the default browser, and saves downloads to the
-downloads folder."""
+opens links anywhere else in the default browser, saves downloads to the
+downloads folder, and lets the UI write to the clipboard (a reply's copy
+button)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
-from PySide6.QtWebEngineCore import QWebEngineDownloadRequest, QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEngineDownloadRequest, QWebEnginePage, QWebEnginePermission
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QMainWindow
 
@@ -92,6 +93,18 @@ class Page(QWebEnginePage):
         super().__init__(view)
         self.view = view
         self.control = control
+        self.permissionRequested.connect(self._permission)
+
+    def _permission(self, p: QWebEnginePermission) -> None:
+        """The UI may use the clipboard (navigator.clipboard, which a browser
+        grants a localhost page on a click; Qt asks the window instead, and an
+        unanswered request leaves the page's promise pending forever). Anything
+        else, or any other origin, is refused."""
+        if (p.permissionType() == QWebEnginePermission.PermissionType.ClipboardReadWrite
+                and not self.external(p.origin()) and p.origin().scheme() in ("http", "https")):
+            p.grant()
+        else:
+            p.deny()
 
     def external(self, url: QUrl) -> bool:
         """A web or mail link anywhere but the control plane."""

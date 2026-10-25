@@ -89,3 +89,30 @@ def md_op(i: i32) -> i32:
 def md_str(i: i32, dst: i32) -> None:
     """Write op i's text (its text, href or start) to dst."""
     pass
+
+@jscall
+def clip_copy(h: i32, ok: i32, arg: i32, fail: i32) -> None:
+    """Put the string in handle h on the clipboard. update(ok, arg) once it is
+    there; if the browser refuses, h holds why and update(fail, h) runs."""
+    pass
+
+@jscall
+def on_select(text: i32, style: i32, msg: i32) -> None:
+    """Follow the text selection in the pane (#pane): while there is one, its
+    text is in handle text, a style placing a button over it in handle style,
+    and update(msg, 1) runs whenever either changes; update(msg, 0) when it ends."""
+    pass
+
+@jscall
+def sel_clear() -> None:
+    pass
+
+@jscall
+def s_quote(dst: i32, src: i32) -> None:
+    """dst = src as a markdown block quote, "> " before each line."""
+    pass
+
+@jscall
+def focus_end(id: str) -> None:
+    """Focus the input with this id after the next render, caret at the end."""
+    pass

@@ -148,3 +148,47 @@ def test_a_control_plane_that_stops_shows_down(qtbot, up):
     qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
     assert "stopped" in w.control.text
     qtbot.waitUntil(lambda: "stopped" in page_text(qtbot, w), timeout=WAIT)
+
+
+def click(qtbot, w, element: str) -> None:
+    """A real mouse click (a user gesture) on the centre of the element that
+    the JS expression element finds."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    where = (f"(() => {{ const e = {element}; if (!e) return ''; const b = e.getBoundingClientRect();"
+             " return JSON.stringify([b.left + b.width / 2, b.top + b.height / 2]); })()")
+    found = []
+    qtbot.waitUntil(lambda: found.append(js(qtbot, w, where)) or bool(found[-1]), timeout=WAIT)
+    r = json.loads(found[-1])
+    QTest.mouseClick(w.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     QPoint(round(r[0]), round(r[1])))
+
+
+def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path):
+    import asyncio
+
+    from PySide6.QtGui import QGuiApplication
+
+    from control.store import SqliteStore
+
+    w, url = up
+    reply = "## Done\n\nChanged **two** files:\n\n- `a.py`\n- `b.py`"
+
+    async def seed():
+        s = SqliteStore(str(tmp_path / "db.sqlite"))
+        await s.open()
+        p = await s.create_project("copy")
+        t = await s.create_thread(p["id"], "a thread", "do it")
+        await s.append_event(p["id"], t["id"], "assistant", {"content": reply})
+        await s.close()
+        return p["id"]
+
+    pid = asyncio.run(seed())
+    QGuiApplication.clipboard().clear()
+    w.view.load(QUrl(f"{url}/p/{pid}"))
+    qtbot.waitUntil(lambda: "a thread" in page_text(qtbot, w), timeout=WAIT)
+    click(qtbot, w, "document.querySelectorAll('.thread')[1]")
+    qtbot.waitUntil(lambda: js(qtbot, w, "!!document.querySelector('.ev-assistant .ev-copy')"), timeout=WAIT)
+    click(qtbot, w, "document.querySelector('.ev-assistant .ev-copy')")
+    qtbot.waitUntil(lambda: QGuiApplication.clipboard().text() == reply, timeout=WAIT)
+    qtbot.waitUntil(lambda: js(qtbot, w, "!!document.querySelector('.ev-assistant .icon-check')"), timeout=WAIT)

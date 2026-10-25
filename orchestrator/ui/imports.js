@@ -63,6 +63,65 @@ export function imports({ str, strs, vals, dispatch }) {
     md_parse: (h) => { doc = parse(strs[h] ?? ""); return doc.op.length; },
     md_op: (i) => doc.op[i],
     md_str: (i, d) => { strs[d] = doc.s[i]; },
+    // Copy: one path, the async Clipboard API. A click is a user gesture and
+    // the page is served from localhost (a secure context), in a browser and
+    // in the desktop window alike.
+    clip_copy: (h, ok, arg, fail) => {
+      navigator.clipboard.writeText(strs[h] ?? "").then(
+        () => dispatch(ok, arg),
+        (e) => { strs[h] = String(e && e.message || e); dispatch(fail, h); });
+    },
+    // Text selected inside the pane (#pane): its text goes to th, a style
+    // that puts the Reply button over it to sh, and update(msg, 1). When the
+    // selection goes away (or leaves the pane), update(msg, 0).
+    on_select: (th, sh, msg) => {
+      let last = "", queued = false;
+      const inPane = (n) => !!(n && (n.nodeType === 1 ? n : n.parentElement)?.closest("#pane"));
+      const check = () => {
+        queued = false;
+        const sel = getSelection();
+        let txt = "", style = "";
+        if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+          const r = sel.getRangeAt(0);
+          if (inPane(r.startContainer) && inPane(r.endContainer)) {
+            txt = sel.toString().trim();
+            const b = r.getBoundingClientRect();
+            const pane = document.getElementById("pane").getBoundingClientRect();
+            const x = Math.round(Math.min(Math.max(b.left + b.width / 2, pane.left + 48), pane.right - 48));
+            // Above the selection, or below it when that would leave the pane.
+            const above = b.top - 40 >= pane.top;
+            const y = Math.round(above ? b.top - 40 : Math.min(b.bottom + 6, pane.bottom - 36));
+            style = `top:${y}px;left:${x}px`;
+          }
+        }
+        const k = txt ? txt + "\u0000" + style : "";
+        if (k === last) return;
+        last = k;
+        strs[th] = txt;
+        strs[sh] = style;
+        dispatch(msg, txt ? 1 : 0);
+      };
+      const soon = () => { if (!queued) { queued = true; requestAnimationFrame(check); } };
+      document.addEventListener("selectionchange", soon);
+      document.addEventListener("scroll", soon, true);
+      addEventListener("resize", soon);
+      // Pressing the Reply button must not collapse the selection it acts on.
+      document.addEventListener("mousedown", (e) => {
+        if (e.target.closest && e.target.closest(".sel-reply")) e.preventDefault();
+      }, true);
+    },
+    sel_clear: () => { getSelection().removeAllRanges(); },
+    // dst = each line of src as a markdown quote ("> line").
+    s_quote: (d, h) => { strs[d] = (strs[h] ?? "").split("\n").map((l) => (l ? "> " + l : ">")).join("\n"); },
+    focus_end: (id) => {
+      const sel = str(id);
+      requestAnimationFrame(() => {
+        const el = document.getElementById(sel);
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      });
+    },
     scroll_end: (id) => {
       const sel = str(id);
       requestAnimationFrame(() => requestAnimationFrame(() => {

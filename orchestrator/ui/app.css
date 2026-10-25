@@ -179,3 +179,26 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .working-row:hover { background: var(--muted); }
 .working-title { font-weight: 500; flex-shrink: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .working-now { color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+/* Icons are masks, so they take the text colour (lucide: copy, check, reply, x). */
+.icon { display: inline-block; width: 14px; height: 14px; flex-shrink: 0; background: currentColor;
+        -webkit-mask: var(--i) center / contain no-repeat; mask: var(--i) center / contain no-repeat; }
+.icon-copy { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='14' height='14' x='8' y='8' rx='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E"); }
+.icon-check { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E"); }
+.icon-reply { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 17-5-5 5-5'/%3E%3Cpath d='M20 18v-2a4 4 0 0 0-4-4H4'/%3E%3C/svg%3E"); }
+.icon-x { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 6 6 18'/%3E%3Cpath d='m6 6 12 12'/%3E%3C/svg%3E"); }
+
+/* A reply's copy button, in its top-right corner. */
+.ev { position: relative; }
+.ev-copy { position: absolute; top: 4px; right: 4px; color: var(--muted-foreground); opacity: .55; }
+.ev:hover .ev-copy, .ev-copy:focus-visible { opacity: 1; }
+.ev-copy:has(.icon-check) { opacity: 1; color: hsl(142 60% 38%); }
+.ev:has(> .ev-copy) > .ev-label { padding-right: 32px; }
+
+/* Reply to selected text: a button over the selection, then a quote above the input. */
+.sel-reply { position: fixed; z-index: 50; transform: translateX(-50%); box-shadow: var(--shadow-md, 0 4px 12px rgb(0 0 0 / .15)); }
+.quote { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 4px 4px 10px; border-left: 3px solid var(--primary);
+         border-radius: 6px; background: var(--muted); font-size: 13px; color: var(--muted-foreground); }
+.quote-text { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+              white-space: pre-wrap; word-break: break-word; }
+.ev-user .md blockquote { color: inherit; opacity: .75; border-left-color: hsl(221 83% 53% / .5); }

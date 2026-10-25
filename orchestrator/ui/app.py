@@ -16,7 +16,8 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc)
+                  nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
+                  clip_copy, on_select, sel_clear, s_quote, focus_end)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -55,6 +56,13 @@ GOT_FILES: Const[i32] = 33
 FILE_OPEN: Const[i32] = 34
 FILES_UP: Const[i32] = 35
 FILES_REFRESH: Const[i32] = 36
+COPY: Const[i32] = 37
+COPIED: Const[i32] = 38
+COPY_FAILED: Const[i32] = 39
+COPIED_DONE: Const[i32] = 40
+SELECTED: Const[i32] = 41
+QUOTE: Const[i32] = 42
+UNQUOTE: Const[i32] = 43
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -110,6 +118,8 @@ files: i32 = 0           # JSON handle: a directory of the selected thread's wor
 files_loading: i32 = 0
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
+copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
+selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -134,6 +144,12 @@ h_files_err: i32 = 0     # why the files could not be read
 h_md: i32 = 0            # scratch for markdown text
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
+h_clip: i32 = 0          # the text being copied
+h_seltext: i32 = 0       # the text selected in the pane
+h_selpos: i32 = 0        # style placing the Reply button over the selection
+h_quote: i32 = 0         # the selection the next request replies to ("" = none)
+h_lastq: i32 = 0         # the quote being sent, put back if the send fails
+h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -162,6 +178,7 @@ def get_text(url: i32, msg: i32) -> None:
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
+    global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -190,7 +207,14 @@ def init() -> None:
     h_md = s_new()
     h_run = s_new()
     h_tid = s_new()
+    h_clip = s_new()
+    h_seltext = s_new()
+    h_selpos = s_new()
+    h_quote = s_new()
+    h_lastq = s_new()
+    h_body = s_new()
     on_nav(NAV)
+    on_select(h_seltext, h_selpos, SELECTED)
     show_address()
 
 
@@ -231,6 +255,7 @@ def leave_project() -> None:
     s_clear(h_route)
     s_clear(h_err)
     s_clear(h_wlog_err)
+    s_clear(h_quote)
     mode = AUTO
     pane_tab = DIALOG
     sending = 0
@@ -345,6 +370,27 @@ def take_none(old: i32) -> i32:
     return 0
 
 
+def find_text(seq: i32, dst: i32) -> i32:
+    """Write the text of the shown event with this seq (in the transcript, or
+    in project activity) to dst; 1 if it is there."""
+    src: i32 = plog
+    n: i32 = 0
+    i: i32
+    e: i32
+    found: i32 = 0
+    if s_len(h_sel) > 0:
+        src = transcript
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        if found == 0 and j_int(e, "seq") == seq:
+            jstr(e, "text", dst)
+            found = 1
+        j_free(e)
+    return found
+
+
 def take(old: i32, new: i32) -> i32:
     """Swap in a fresh JSON reply, freeing the old one. On error keep the old
     one and put the error text in h_err."""
@@ -375,6 +421,7 @@ def land() -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
+    global copied, selecting
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -462,10 +509,18 @@ def update(msg: i32, arg: i32) -> None:
         if s_len(h_req) > 0 and sending == 0:
             sending = 1
             s_copy(h_last, h_req)
+            s_copy(h_lastq, h_quote)
             s_clear(h_req)
+            s_clear(h_quote)
             s_clear(h_err)
+            # A reply to a selection goes out as markdown: the quote, then the reply.
+            s_clear(h_body)
+            if s_len(h_lastq) > 0:
+                s_quote(h_body, h_lastq)
+                s_add(h_body, "\n\n")
+            s_add_ref(h_body, h_last)
             o = o_new()
-            o_str(o, "text", h_last)
+            o_str(o, "text", h_body)
             if mode == TO_THREAD and s_len(h_sel) > 0:
                 o_lit(o, "mode", "thread")
                 o_str(o, "target", h_sel)
@@ -487,7 +542,33 @@ def update(msg: i32, arg: i32) -> None:
             j_err(arg, h_err)
             if s_len(h_req) == 0:
                 s_copy(h_req, h_last)
+            if s_len(h_quote) == 0:
+                s_copy(h_quote, h_lastq)
         j_free(arg)
+    elif msg == COPY:
+        # arg is the reply's seq; its raw markdown is what gets copied.
+        if find_text(arg, h_clip) == 1:
+            clip_copy(h_clip, COPIED, arg, COPY_FAILED)
+    elif msg == COPIED:
+        copied = arg
+        after(1500, COPIED_DONE, arg)
+    elif msg == COPIED_DONE:
+        if copied == arg:
+            copied = -1
+    elif msg == COPY_FAILED:
+        s_set(h_err, "Could not copy: ")
+        s_add_ref(h_err, arg)
+    elif msg == SELECTED:
+        selecting = arg
+    elif msg == QUOTE:
+        s_copy(h_quote, h_seltext)
+        if s_len(h_sel) > 0 and show_archived == 0:
+            mode = TO_THREAD
+        sel_clear()
+        focus_end("req")
+    elif msg == UNQUOTE:
+        s_clear(h_quote)
+        focus_end("req")
     elif msg == EVENT:
         k = j_int(arg, "kind")
         if k == K_ROUTE:
@@ -939,7 +1020,11 @@ def event_row(e: i32, show_thread: i32) -> None:
     thread_tag(e, show_thread)
     end()
     jstr(e, "text", h_t1)
-    if k == K_ASSISTANT or k == K_PEER or k == K_RESULT:
+    if k == K_ASSISTANT or k == K_PEER or k == K_RESULT or k == K_USER:
+        # Replies get a copy button; V's own messages render as markdown too,
+        # so a reply to a selection shows its quote as a quote.
+        if live == 0 and k != K_USER:
+            copy_button(j_int(e, "seq"))
         el("div")
         cls("ev-text")
         cls("md")
@@ -950,6 +1035,61 @@ def event_row(e: i32, show_thread: i32) -> None:
         cls("ev-text")
         text_ref(h_t1)
         end()
+    end()
+
+
+def copy_button(seq: i32) -> None:
+    """The reply's copy icon (its raw markdown), a check for a moment after."""
+    btn_open("ghost", COPY, seq)
+    cls("icon")
+    cls("sm")
+    cls("ev-copy")
+    if copied == seq:
+        attr("title", "Copied")
+        attr("aria-label", "Copied")
+        span("icon icon-check")
+        end()
+    else:
+        attr("title", "Copy")
+        attr("aria-label", "Copy")
+        span("icon icon-copy")
+        end()
+    end()
+
+
+def reply_button() -> None:
+    """Over text selected in the pane: reply to it, quoted in the request box."""
+    if selecting == 0:
+        return
+    btn_open("", QUOTE, 0)
+    cls("sm")
+    cls("sel-reply")
+    attr_ref("style", h_selpos)
+    span("icon icon-reply")
+    end()
+    text("Reply")
+    end()
+
+
+def quote_chip() -> None:
+    """The selection the request replies to, with a button to drop it."""
+    if s_len(h_quote) == 0:
+        return
+    div("quote")
+    span("icon icon-reply")
+    end()
+    span("quote-text")
+    attr_ref("title", h_quote)
+    text_ref(h_quote)
+    end()
+    btn_open("ghost", UNQUOTE, 0)
+    cls("icon")
+    cls("sm")
+    attr("title", "Don't quote this")
+    attr("aria-label", "Don't quote this")
+    span("icon icon-x")
+    end()
+    end()
     end()
 
 
@@ -1513,6 +1653,7 @@ def request_box() -> None:
         text_ref(h_route)
         end()
     error_banner()
+    quote_chip()
     div("composer-row")
     toggle_group_open()
     toggle("Router decides", mode == AUTO, MODE, AUTO)
@@ -1525,7 +1666,10 @@ def request_box() -> None:
     el("input")
     cls("input")
     cls("grow")
-    if mode == TO_THREAD and s_len(h_sel) > 0:
+    attr("id", "req")
+    if s_len(h_quote) > 0:
+        attr("placeholder", "Reply to the quote…")
+    elif mode == TO_THREAD and s_len(h_sel) > 0:
         attr("placeholder", "Message this thread…")
     else:
         attr("placeholder", "What should get done? A list fans out into one thread per item.")
@@ -1578,6 +1722,7 @@ def project_window() -> None:
     request_box()
     end()
     end()
+    reply_button()
     end()
 
 
