@@ -486,7 +486,8 @@ class Orchestrator:
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds
-        it (the control plane asks; the worker never sends files on its own)."""
+        it (the control plane asks; the worker never sends files on its own).
+        A thread with no live worker is revived first, from its pushed branch."""
         lw = await self.live_worker(thread_id)
         return await lw.client.list_files(thread_id, path)
 
