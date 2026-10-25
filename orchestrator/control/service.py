@@ -123,9 +123,13 @@ class Orchestrator:
         self.router = router
         self.max_running = max_running
         self.workers: dict[str, list[LiveWorker]] = {}
-        # Workers made per project so far; numbers new ones, so a worker made
-        # after one was lost never takes a live worker's name.
-        self.made: dict[str, int] = {}
+        # Per project, the indexes of the workers it ever made (from the
+        # store, on first use) and of those lost. A worker outlives the
+        # control plane: its disk holds the threads' worktrees, so a later
+        # control plane attaches to it again by its index. A new worker takes
+        # an index never used, so it never takes a lost worker's name.
+        self.made: dict[str, set[int]] = {}
+        self.lost: dict[str, set[int]] = {}
         self.by_thread: dict[str, LiveWorker] = {}
         # Per thread, the messages the control plane logged when it took them
         # (a spawned thread's request as "created", the rest as "message_in")
@@ -156,6 +160,9 @@ class Orchestrator:
         return task
 
     async def close(self) -> None:
+        """Let go of the workers. They are not destroyed: what the threads
+        left on them (files never committed, ignored build output) is there
+        for the next control plane, which attaches to them again."""
         for chains in (self.request_chain, self.thread_chain):
             for task in list(chains.values()):
                 task.cancel()
@@ -165,7 +172,6 @@ class Orchestrator:
                     if task:
                         task.cancel()
                 await lw.client.close()
-                await self.provider.destroy(lw.worker)
 
     # ---------------------------------------------------------------- workers
 
@@ -183,18 +189,46 @@ class Orchestrator:
                     best, best_load = lw, running
             if best is not None:
                 return best
-            self.made[project["id"]] = self.made.get(project["id"], 0) + 1
-            spec = worker_spec(project, self.made[project["id"]])
-            worker = await self.provider.create(spec)
-            await self.store.upsert_worker(worker.record())
-            lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
-            lw.relay = asyncio.create_task(self._relay(project["id"], lw))
-            lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
-            lw.watch = asyncio.create_task(self._watch(lw))
-            lws.append(lw)
-            await self.store.append_event(project["id"], None, "worker",
-                                          {"id": worker.id, "provider": worker.provider, "url": worker.url})
-            return lw
+            made = await self._made(project["id"])
+            live = {lw.worker.index for lw in lws}
+            idle = sorted(made - live - self.lost[project["id"]])  # left by an earlier control plane
+            return await self._attach(project, idle[0] if idle else max(made, default=0) + 1)
+
+    async def _made(self, project_id: str) -> set[int]:
+        if project_id not in self.made:
+            workers = await self.store.list_workers(project_id)
+            self.made[project_id] = {w["idx"] for w in workers}
+            self.lost[project_id] = {w["idx"] for w in workers if w["lost_at"] is not None}
+        return self.made[project_id]
+
+    async def _attach(self, project: dict, index: int) -> LiveWorker:
+        """The project's worker `index`, started: made new, or the one an
+        earlier control plane made, with its disk. Callers hold self._lock."""
+        worker = await self.provider.create(worker_spec(project, index))
+        await self.store.upsert_worker(worker.record())
+        (await self._made(project["id"])).add(index)
+        lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
+        lw.relay = asyncio.create_task(self._relay(project["id"], lw))
+        lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
+        lw.watch = asyncio.create_task(self._watch(lw))
+        self.workers.setdefault(project["id"], []).append(lw)
+        await self.store.append_event(project["id"], None, "worker",
+                                      {"id": worker.id, "provider": worker.provider, "url": worker.url})
+        return lw
+
+    async def _home(self, project: dict, worker_id: str | None) -> LiveWorker | None:
+        """The worker a thread ran on, attached again if an earlier control
+        plane left it; None when it has none or that worker was lost."""
+        if worker_id is None:
+            return None
+        async with self._lock:
+            for lw in self.workers.get(project["id"], []):
+                if lw.worker.id == worker_id:
+                    return lw
+            for w in await self.store.list_workers(project["id"]):
+                if w["id"] == worker_id and w["lost_at"] is None:
+                    return await self._attach(project, w["idx"])
+        return None
 
     async def _health(self, lw: LiveWorker) -> dict | None:
         """The worker's /health, or None when it failed HEALTH_TRIES times in a row."""
@@ -244,6 +278,9 @@ class Orchestrator:
         if not lw.threads:
             await self.store.append_event(project_id, None, "worker_lost",
                                           {"worker": wid, "error": f"worker {wid} stopped answering"})
+        await self._made(project_id)
+        self.lost[project_id].add(lw.worker.index)
+        await self.store.lose_worker(wid)
         try:
             await self.provider.destroy(lw.worker)
         except Exception as e:
@@ -513,13 +550,14 @@ class Orchestrator:
         return await asyncio.shield(task)
 
     async def _revive(self, t: dict, lw: LiveWorker | None) -> LiveWorker:
-        """Start the thread again on `lw`, the live worker that ran it, so its
-        worktree there (with what it never pushed, like ignored build output)
-        is the one it continues in; on a picked worker when it has none."""
+        """Start the thread again on the worker that ran it (`lw` when it is
+        live here, else the one an earlier control plane left), so its
+        worktree there, with what it never pushed like ignored build output,
+        is the one it continues in; on a picked worker when that was lost."""
         tid, project = t["id"], await self.store.get_project(t["project_id"])
         history = await self.history(t)
         if lw is None:
-            lw = await self._pick_worker(project)
+            lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
         await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
                                       model=model, summary=t["summary"], history=history)

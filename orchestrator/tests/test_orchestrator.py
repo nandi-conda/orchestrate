@@ -723,6 +723,43 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     await s.close()
 
 
+async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_restart(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    t = await first.spawn(p["id"], "T", "write build/app: binary")
+
+    async def idle():
+        return (await s.get_thread(t["id"]))["state"] == "idle" or None
+    await wait_for(idle)
+    ran_on = (await s.get_thread(t["id"]))["worker_id"]
+    await first.close()
+    await first.provider.close()
+
+    # The next control plane attaches to the same worker, files and all.
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    second = Orchestrator(s, provider, HeuristicRouter())
+    listing = await second.list_files(t["id"], "build")
+    assert [e["name"] for e in listing["entries"]] == ["app"]
+    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
+    assert [e["payload"]["worker"] for e in revived] == [ran_on]
+    # A new thread goes to that worker too rather than a new one.
+    u = await second.spawn(p["id"], "U", "hello")
+    await wait_for(lambda: idle_of(s, u["id"]))
+    assert (await s.get_thread(u["id"]))["worker_id"] == ran_on
+    await second.close()
+    await provider.close()
+    await s.close()
+
+
+async def idle_of(s, tid):
+    return (await s.get_thread(tid))["state"] == "idle" or None
+
+
 def test_only_what_the_person_typed_is_a_user_row():
     def kind(t, d):
         return app_mod.display({"type": t, "payload": d})["kind"]

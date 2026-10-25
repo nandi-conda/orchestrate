@@ -67,7 +67,11 @@ class Store(Protocol):
     async def mark_read(self, message_ids: list[str]) -> None: ...
 
     async def upsert_worker(self, worker: dict) -> None: ...
-    async def list_workers(self, project_id: str) -> list[dict]: ...
+    async def lose_worker(self, worker_id: str) -> None:
+        """Mark a worker lost (destroyed); it is never attached to again."""
+    async def list_workers(self, project_id: str) -> list[dict]:
+        """Every worker made for the project; `idx` is the number its worker
+        spec was made with, `lost_at` is set once it was lost."""
 
 
 class Notifier:
@@ -109,7 +113,8 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS workers (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, provider TEXT NOT NULL,
         handle TEXT NOT NULL, url TEXT NOT NULL, token TEXT NOT NULL DEFAULT '',
-        capacity INTEGER NOT NULL DEFAULT 16, created_at DOUBLE PRECISION NOT NULL)""",
+        capacity INTEGER NOT NULL DEFAULT 16, idx INTEGER NOT NULL DEFAULT 0,
+        created_at DOUBLE PRECISION NOT NULL, lost_at DOUBLE PRECISION)""",
 ]
 
 SQLITE_EVENTS = """CREATE TABLE IF NOT EXISTS events (
@@ -126,7 +131,9 @@ THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state"
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
 ADDED_COLUMNS = [("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
-                 ("threads", "archived_at", "DOUBLE PRECISION")]
+                 ("threads", "archived_at", "DOUBLE PRECISION"),
+                 ("workers", "idx", "INTEGER NOT NULL DEFAULT 0"),
+                 ("workers", "lost_at", "DOUBLE PRECISION")]
 
 
 def _thread(row: dict) -> dict:
@@ -269,11 +276,15 @@ class _SqlStore:
     async def upsert_worker(self, worker: dict) -> None:
         w = {"id": worker["id"], "project_id": worker["project_id"], "provider": worker["provider"],
              "handle": worker["handle"], "url": worker["url"], "token": worker.get("token", ""),
-             "capacity": worker.get("capacity", 16), "created_at": worker.get("created_at", now())}
+             "capacity": worker.get("capacity", 16), "idx": worker.get("index", 0),
+             "created_at": worker.get("created_at", now())}
         await self._exec(self._q("DELETE FROM workers WHERE id = ?"), w["id"])
         cols = ", ".join(w)
         marks = ", ".join("?" for _ in w)
         await self._exec(self._q(f"INSERT INTO workers ({cols}) VALUES ({marks})"), *w.values())
+
+    async def lose_worker(self, worker_id: str) -> None:
+        await self._exec(self._q("UPDATE workers SET lost_at = ? WHERE id = ?"), now(), worker_id)
 
     async def list_workers(self, project_id: str) -> list[dict]:
         return await self._fetch(self._q("SELECT * FROM workers WHERE project_id = ? ORDER BY created_at"),
