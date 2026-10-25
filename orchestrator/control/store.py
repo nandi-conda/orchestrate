@@ -58,6 +58,7 @@ class Store(Protocol):
                            payload: dict) -> dict: ...
     async def list_events(self, project_id: str, thread_id: str | None = None,
                           after: int = 0, limit: int = 500) -> list[dict]: ...
+    async def get_event(self, seq: int) -> dict | None: ...
     async def wait_events(self, project_id: str, after: int, timeout: float) -> None:
         """Return when an event with seq > after may exist, or on timeout."""
 
@@ -243,6 +244,10 @@ class _SqlStore:
             rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND seq > ? "
                                              "ORDER BY seq LIMIT ?"), project_id, after, limit)
         return [_event(r) for r in rows]
+
+    async def get_event(self, seq: int) -> dict | None:
+        r = await self._fetchone(self._q("SELECT * FROM events WHERE seq = ?"), seq)
+        return _event(r) if r else None
 
     async def delete_events(self, project_id: str, thread_id: str, type: str) -> None:
         await self._exec(self._q("DELETE FROM events WHERE project_id = ? AND thread_id = ? AND type = ?"),

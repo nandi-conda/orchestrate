@@ -48,6 +48,21 @@ new threads show up in the list, and their events stream into Project activity.
 You're only ever talking to the project, and you open a thread only by
 clicking it.
 
+**Editing a message.** Your own messages (the blue bubbles: requests and
+messages you sent straight to a thread) have an edit button. Save, and the
+bubble shows the new text marked edited, while the router re-assesses it in
+the background, after any routing still queued for the original:
+
+- every thread the message reached (the threads its routing spawned or told,
+  or the thread you messaged) gets a correction from you with both versions,
+  and decides itself what to keep, drop or undo. Nothing is stopped: a thread
+  mid-turn reads the correction before its next model call, and a finished one
+  comes back and acts on it;
+- the router plans the new text knowing those threads, so it starts threads
+  only for parts none of them covers (without a model: one per list item that
+  is new in the edit), and can tell a thread what changed for it. Its decision
+  shows as an "edit:" line in Project activity.
+
 With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
 orchestrator starts the real runner from `../runner` as a local subprocess,
 one worker per project, and the router uses `deepseek-flash`. Without the key it

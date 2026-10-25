@@ -22,7 +22,7 @@ from starlette.staticfiles import StaticFiles
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
 from .runner_client import FileError
-from .service import ENDS_STREAM, ArchivedError, Orchestrator, describe, tool_arg
+from .service import ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, tool_arg
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -55,6 +55,8 @@ def display(ev: dict) -> dict:
     elif t == "message_in":
         frm = d.get("from", "user")
         kind, label = (K_USER, "You") if frm == "user" else (K_PEER, f"from {frm}")
+        if "edit" in d:
+            label = "You · edit"
         text = d.get("body", "")
     elif t == "message_out":
         kind, label, text = K_PEER, f"to {d.get('to', '?')}", d.get("body", "")
@@ -92,9 +94,11 @@ def display(ev: dict) -> dict:
     elif t == "land_conflict":
         kind, label = K_ERROR, "land conflict"
         text = f"{d.get('branch')} conflicts with {d.get('base')} in {', '.join(d.get('files') or [])}; the thread resolves it"
+    elif t == "edited":
+        kind, label, text = K_STATUS, "edited", "you edited a message"
     else:
         kind, label, text = K_STATUS, t, short(json.dumps(d), 300)
-    return {**ev, "kind": kind, "label": label, "text": text}
+    return {**ev, "kind": kind, "label": label, "text": text, "editable": int(editable(ev))}
 
 
 def live_row(first: dict, d: dict) -> dict:
@@ -114,9 +118,16 @@ def fold(events: list[dict]) -> list[dict]:
     that ends the call is in; then the deltas are dropped (the control plane
     deletes them too) and the call's own events stand."""
     out: list[dict] = []
+    by_seq: dict[int, dict] = {}
     streaming: dict[str | None, list[tuple[dict, dict]]] = {}
     for e in events:
         tid = e["thread_id"]
+        if e["type"] == "edited":
+            # An edit shows on the message it edits: its text now, marked edited.
+            target = by_seq.get(e["payload"].get("of"))
+            if target is not None:
+                target["text"], target["label"], target["edited"] = e["payload"].get("text", ""), "You · edited", 1
+            continue
         if e["type"] == "delta":
             d = e["payload"]
             parts = streaming.setdefault(tid, [])
@@ -129,6 +140,7 @@ def fold(events: list[dict]) -> list[dict]:
             streaming.pop(tid, None)
         if e["type"] not in HIDDEN:
             out.append(display(e))
+            by_seq[e["seq"]] = out[-1]
     for parts in streaming.values():
         out.extend(live_row(first, d) for first, d in parts)
     return out
@@ -206,6 +218,24 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         except (RuntimeError, ArchivedError) as e:
             return JSONResponse({"error": str(e)}, 409)
         return JSONResponse(result, 200 if mode != "auto" else 202)
+
+    async def edit_message(req: Request):
+        """Edit one of the person's messages, named by its event's seq; the router
+        re-assesses it in the background."""
+        pid, seq = req.path_params["pid"], req.path_params["seq"]
+        b = await body(req)
+        text = str(b.get("text", "")).strip()
+        if not text:
+            return JSONResponse({"error": "text is required"}, 400)
+        try:
+            result = await orch().edit(pid, seq, text)
+        except KeyError as e:
+            return JSONResponse({"error": str(e.args[0])}, 404)
+        except EditError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        except ArchivedError as e:
+            return JSONResponse({"error": str(e)}, 409)
+        return JSONResponse(result, 202 if result["changed"] else 200)
 
     async def list_threads(req: Request):
         """Live threads; ?archived=1 lists the archived ones instead."""
@@ -383,6 +413,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/requests", post_request, methods=["POST"]),
+        Route("/api/projects/{pid}/messages/{seq:int}/edit", edit_message, methods=["POST"]),
         Route("/api/projects/{pid}/threads", list_threads, methods=["GET"]),
         Route("/api/projects/{pid}/threads", create_thread, methods=["POST"]),
         Route("/api/projects/{pid}/log", project_log, methods=["GET"]),

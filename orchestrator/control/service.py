@@ -104,6 +104,31 @@ class ArchivedError(Exception):
     """The thread is archived: it takes no messages until it is unarchived."""
 
 
+class EditError(Exception):
+    """An edit the control plane refuses: not one of the person's own messages."""
+
+
+def quote(text: str) -> str:
+    return "\n".join(f"> {line}" if line else ">" for line in text.splitlines())
+
+
+def correction(kind: str, previous: str, text: str) -> str:
+    """What a thread is told when the person edits a message that reached it:
+    both versions, and that the new one is what counts."""
+    what = "my message to you" if kind == "message_in" else "a request you're working from"
+    return (f"I edited {what}. It now reads:\n\n{quote(text)}\n\nIt read:\n\n{quote(previous)}\n\n"
+            "Work from the new version: keep what it still asks for, and drop or undo what it no longer does.")
+
+
+def editable(ev: dict) -> bool:
+    """The person's own messages: requests typed in the project, and messages
+    sent straight to a thread (not the corrections an edit sends)."""
+    d = ev["payload"]
+    if ev["type"] == "request":
+        return True
+    return ev["type"] == "message_in" and d.get("from") == "user" and "edit" not in d
+
+
 @dataclass
 class LiveWorker:
     worker: Worker
@@ -486,7 +511,9 @@ class Orchestrator:
         return True
 
     async def send(self, to: str, body: str, sender: str = "user", hops: int = 0,
-                   reply_to: str | None = None) -> dict:
+                   reply_to: str | None = None, edit: int | None = None) -> dict:
+        """Log a message to a thread and queue its delivery. `edit` is the seq
+        of the person's message this one corrects, when it is an edit's correction."""
         thread = await self.store.get_thread(to)
         if thread is None:
             raise KeyError(to)
@@ -497,8 +524,10 @@ class Orchestrator:
             await self.store.append_event(thread["project_id"], to, "dropped",
                                           {"from": sender, "reason": f"hop limit {MAX_HOPS}"})
             return msg
-        await self.store.append_event(thread["project_id"], to, "message_in",
-                                      {"from": sender, "body": body, "message": msg["id"]})
+        payload = {"from": sender, "body": body, "message": msg["id"]}
+        if edit is not None:
+            payload["edit"] = edit
+        await self.store.append_event(thread["project_id"], to, "message_in", payload)
         self._expect_echo(to, body)
         self._chain(self.thread_chain, to, lambda: self._deliver(thread["project_id"], msg, hops))
         return msg
@@ -662,21 +691,23 @@ class Orchestrator:
                 raise KeyError(f"no thread {target} in this project")
         if mode != "auto":
             return await self.handle_request(project_id, text, mode, target)
-        await self.store.append_event(project_id, None, "request", {"text": text})
-        self._chain(self.request_chain, project_id, lambda: self._route(project_id, text))
-        return {"request": text, "mode": mode, "queued": True}
+        ev = await self.store.append_event(project_id, None, "request", {"text": text})
+        self._chain(self.request_chain, project_id, lambda: self._route(project_id, text, ev["seq"]))
+        return {"request": text, "mode": mode, "queued": True, "seq": ev["seq"]}
 
-    async def _route(self, project_id: str, text: str) -> None:
+    async def _route(self, project_id: str, text: str, of: int) -> None:
         try:
-            await self.handle_request(project_id, text, "auto")
+            await self.handle_request(project_id, text, "auto", of=of)
         except Exception as e:
             log.exception("request in %s", project_id)
             await self.store.append_event(project_id, None, "error",
                                           {"error": f"could not route the request: {describe(e)}"})
 
     async def handle_request(self, project_id: str, text: str, mode: str = "auto",
-                             target: str | None = None) -> dict:
-        """mode: auto (router decides), thread (send to target), new (force a new thread)."""
+                             target: str | None = None, of: int | None = None) -> dict:
+        """mode: auto (router decides), thread (send to target), new (force a new thread).
+        `of` is the seq of the request event it routes; the route event names it,
+        so an edit of the request knows which threads it reached."""
         directory = await self.store.list_threads(project_id)
         if mode == "thread" and target:
             plan = {"spawn": [], "send": [{"thread": target, "message": text}], "why": "sent directly"}
@@ -703,5 +734,105 @@ class Orchestrator:
             parts.append("told " + ", ".join(f"“{titles.get(tid, tid)}”" for tid in sent))
         result = {"request": text, "mode": mode, "spawned": spawned, "sent": sent, "why": plan.get("why", ""),
                   "summary": ", ".join(parts) or "nothing to do"}
+        if of is not None:
+            result["of"] = of
         await self.store.append_event(project_id, None, "route", result)
         return result
+
+    # ---------------------------------------------------------------- edits
+    #
+    # The person can edit a message they sent: a request typed in the project
+    # or a message sent straight to a thread. The edit is logged at once (the
+    # UI shows the new text on the message, marked edited) and re-assessed in
+    # the background, after any routing queued before it, so the original's
+    # own routing has always run first:
+    #
+    # - every live thread the message reached (the threads its routes, and
+    #   earlier edits' routes, spawned or told; the thread a direct message
+    #   went to) gets a correction from the person with both versions, and
+    #   decides itself what to keep, drop or undo. Nothing is stopped: a
+    #   thread mid-turn reads it before its next model call, an ended one is
+    #   brought back and acts on it;
+    # - the router revises the plan for the new text knowing those threads,
+    #   spawning threads only for parts none of them covers.
+
+    async def edit(self, project_id: str, seq: int, text: str) -> dict:
+        """Take an edit of the person's message `seq`; it returns at once."""
+        ev = await self.store.get_event(seq)
+        if ev is None or ev["project_id"] != project_id:
+            raise KeyError(f"no message {seq} in this project")
+        if not editable(ev):
+            raise EditError("only your own messages can be edited")
+        if ev["thread_id"] is not None:
+            t = await self.store.get_thread(ev["thread_id"])
+            if t["archived_at"] is not None:
+                raise ArchivedError(f"thread {t['id']} is archived; unarchive it to edit messages to it")
+        previous = await self.current_text(ev)
+        if text == previous:
+            return {"seq": seq, "text": text, "changed": False}
+        await self.store.append_event(project_id, ev["thread_id"], "edited",
+                                      {"of": seq, "text": text, "previous": previous})
+        self._chain(self.request_chain, project_id, lambda: self._reassess(ev, previous, text))
+        return {"seq": seq, "text": text, "changed": True, "queued": True}
+
+    async def current_text(self, ev: dict) -> str:
+        """The message's text after its edits so far."""
+        text = ev["payload"].get("text" if ev["type"] == "request" else "body", "")
+        for e in await self._all_events(ev["project_id"], ev["seq"]):
+            if e["type"] == "edited" and e["payload"].get("of") == ev["seq"]:
+                text = e["payload"].get("text", text)
+        return text
+
+    async def reached(self, ev: dict) -> list[str]:
+        """The threads a message reached so far, in the order it reached them."""
+        out = [ev["thread_id"]] if ev["thread_id"] else []
+        for e in await self._all_events(ev["project_id"], ev["seq"]):
+            if e["type"] == "route" and e["payload"].get("of") == ev["seq"]:
+                d = e["payload"]
+                out += [s["id"] for s in d.get("spawned") or []] + list(d.get("sent") or [])
+        return list(dict.fromkeys(out))
+
+    async def _all_events(self, project_id: str, after: int) -> list[dict]:
+        events = []
+        while page := await self.store.list_events(project_id, None, after, limit=1000):
+            events += page
+            after = page[-1]["seq"]
+        return events
+
+    async def _reassess(self, ev: dict, previous: str, text: str) -> None:
+        project_id, seq = ev["project_id"], ev["seq"]
+        try:
+            await self._revise(ev, previous, text)
+        except Exception as e:
+            log.exception("edit of %s in %s", seq, project_id)
+            await self.store.append_event(project_id, None, "error",
+                                          {"error": f"could not re-route the edited message: {describe(e)}"})
+
+    async def _revise(self, ev: dict, previous: str, text: str) -> None:
+        project_id, seq = ev["project_id"], ev["seq"]
+        directory = await self.store.list_threads(project_id)
+        live = {t["id"] for t in directory}
+        reached = [tid for tid in await self.reached(ev) if tid in live]
+        plan = await self.router.revise(text, previous, reached, directory)
+        body = correction(ev["type"], previous, text)
+        for tid in reached:
+            await self.send(tid, body, "user", edit=seq)
+        spawned, told = [], []
+        for s in plan["spawn"]:
+            t = await self.spawn(project_id, s["title"], s["request"])
+            spawned.append({"id": t["id"], "title": t["title"]})
+        for s in plan["send"]:
+            await self.send(s["thread"], s["message"], "router")
+            told.append(s["thread"])
+        titles = {t["id"]: t["title"] for t in directory}
+        parts = []
+        if reached:
+            parts.append("corrected " + ", ".join(f"“{titles[tid]}”" for tid in reached))
+        if spawned:
+            parts.append("started " + ", ".join(f"“{t['title']}”" for t in spawned))
+        if told:
+            parts.append("told " + ", ".join(f"“{titles.get(tid, tid)}”" for tid in told))
+        await self.store.append_event(project_id, None, "route", {
+            "request": text, "mode": "edit", "of": seq, "corrected": reached, "spawned": spawned,
+            "sent": list(dict.fromkeys(reached + told)), "why": plan.get("why", ""),
+            "summary": "edit: " + (", ".join(parts) or "nothing to do")})

@@ -10,7 +10,8 @@
 
 from lpython import i32, Const
 from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, key, autofocus,
-                   on_click, on_enter, on_input, value_ref, after, s_new, s_set, s_add, s_add_ref, s_clear, s_len, s_eq,
+                   on_click, on_enter, on_escape, on_input, value_ref, after, s_new, s_set, s_add, s_add_ref, s_add_num,
+                   s_clear, s_len, s_eq,
                    s_copy, http_get_ref, j_ok, j_err, j_at, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
@@ -68,6 +69,11 @@ GOT_FVIEW: Const[i32] = 45
 FVIEW_CLOSE: Const[i32] = 46
 ARCHIVE_ROW: Const[i32] = 47
 UNARCHIVE_ROW: Const[i32] = 48
+EDIT: Const[i32] = 49
+EDIT_IN: Const[i32] = 50
+EDIT_SAVE: Const[i32] = 51
+EDIT_CANCEL: Const[i32] = 52
+EDITED: Const[i32] = 53
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -127,6 +133,8 @@ show_archived: i32 = 0   # the thread list shows archived threads instead of liv
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
+editing: i32 = 0         # seq of the message of yours being edited, 0 when none
+edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -160,6 +168,7 @@ h_quote: i32 = 0         # the selection the next request replies to ("" = none)
 h_lastq: i32 = 0         # the quote being sent, put back if the send fails
 h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
+h_edit: i32 = 0          # the text of the message being edited
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -189,7 +198,7 @@ def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err
-    global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act
+    global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -227,6 +236,7 @@ def init() -> None:
     h_lastq = s_new()
     h_body = s_new()
     h_act = s_new()
+    h_edit = s_new()
     on_nav(NAV)
     on_select(h_seltext, h_selpos, SELECTED)
     show_address()
@@ -253,7 +263,7 @@ def open_project(id: i32) -> None:
 
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
-    global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived
+    global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived, editing
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -275,6 +285,7 @@ def leave_project() -> None:
     pane_tab = DIALOG
     sending = 0
     show_archived = 0
+    editing = 0
 
 
 def enter_project() -> None:
@@ -326,8 +337,9 @@ def row_id(i: i32, id: i32) -> None:
 
 def show_activity() -> None:
     """Select nothing: the pane shows the project's activity."""
-    global mode, pane_tab, jump
+    global mode, pane_tab, jump, editing
     s_clear(h_sel)
+    editing = 0
     if mode == TO_THREAD:
         mode = AUTO
     if pane_tab == WLOG or pane_tab == FILES:
@@ -465,7 +477,7 @@ def land() -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting, fview_req
+    global copied, selecting, fview_req, editing, edit_sent
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -526,6 +538,7 @@ def update(msg: i32, arg: i32) -> None:
         j_free(e)
         if mode == AUTO and show_archived == 0:
             mode = TO_THREAD
+        editing = 0
         jump = 1
         fetch_transcript()
         wlog = take_none(wlog)
@@ -614,6 +627,35 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == UNQUOTE:
         s_clear(h_quote)
         focus_end("req")
+    elif msg == EDIT:
+        # arg is the seq of one of your messages; it opens for editing in place.
+        if find_text(arg, h_edit) == 1:
+            editing = arg
+    elif msg == EDIT_IN:
+        s_copy(h_edit, arg)
+    elif msg == EDIT_CANCEL:
+        editing = 0
+    elif msg == EDIT_SAVE:
+        # Like sending: the control plane takes the edit and returns; the
+        # message shows its new text once the "edited" event is in, and the
+        # router's re-assessment arrives as a "route" event.
+        if editing != 0 and s_len(h_edit) > 0:
+            o = o_new()
+            o_str(o, "text", h_edit)
+            s_set(h_url, "/api/projects/")
+            s_add_ref(h_url, h_pid)
+            s_add(h_url, "/messages/")
+            s_add_num(h_url, editing)
+            s_add(h_url, "/edit")
+            edit_sent = editing
+            editing = 0
+            post(h_url, o, EDITED)
+    elif msg == EDITED:
+        if j_ok(arg) == 0:
+            j_err(arg, h_err)
+            if editing == 0:
+                editing = edit_sent
+        j_free(arg)
     elif msg == EVENT:
         k = j_int(arg, "kind")
         if k == K_ROUTE:
@@ -1117,17 +1159,23 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls_if("ev-thinking", k == K_THINKING)
     cls_if("ev-result", k == K_RESULT)
     cls_if("ev-live", live == 1)
+    cls_if("ev-editing", editing != 0 and editing == j_int(e, "seq"))
     div("ev-label")
     jstr(e, "label", h_t1)
     text_ref(h_t1)
     thread_tag(e, show_thread)
     end()
     jstr(e, "text", h_t1)
-    if k == K_ASSISTANT or k == K_PEER or k == K_RESULT or k == K_USER:
-        # Replies get a copy button; V's own messages render as markdown too,
-        # so a reply to a selection shows its quote as a quote.
+    if editing != 0 and editing == j_int(e, "seq"):
+        edit_box()
+    elif k == K_ASSISTANT or k == K_PEER or k == K_RESULT or k == K_USER:
+        # Replies get a copy button and your own messages an edit button; your
+        # messages render as markdown too, so a reply to a selection shows its
+        # quote as a quote.
         if live == 0 and k != K_USER:
             copy_button(j_int(e, "seq"))
+        if j_int(e, "editable") == 1:
+            edit_button(j_int(e, "seq"))
         el("div")
         cls("ev-text")
         cls("md")
@@ -1157,6 +1205,47 @@ def copy_button(seq: i32) -> None:
         attr("aria-label", "Copy")
         span("icon icon-copy")
         end()
+    end()
+
+
+def edit_button(seq: i32) -> None:
+    """Your message's edit icon: it opens the message for editing in place."""
+    btn_open("ghost", EDIT, seq)
+    cls("icon")
+    cls("sm")
+    cls("ev-edit")
+    attr("title", "Edit")
+    attr("aria-label", "Edit")
+    span("icon icon-pencil")
+    end()
+    end()
+
+
+def edit_box() -> None:
+    """Your message open for editing: Save has the router re-assess it, and
+    the threads it reached are told what changed. Escape or Cancel keeps it as it was."""
+    el("textarea")
+    cls("input")
+    cls("edit-box")
+    attr("id", "edit-box")
+    attr("rows", "3")
+    value_ref(h_edit)
+    on_input(EDIT_IN)
+    on_escape(EDIT_CANCEL, 0)
+    autofocus()
+    end()
+    div("edit-actions")
+    span("muted edit-hint")
+    text("Threads already on it get the edit as a correction; the router re-assesses the rest.")
+    end()
+    btn_open("ghost", EDIT_CANCEL, 0)
+    cls("sm")
+    text("Cancel")
+    end()
+    btn_open("", EDIT_SAVE, 0)
+    cls("sm")
+    text("Save")
+    end()
     end()
 
 

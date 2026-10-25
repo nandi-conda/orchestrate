@@ -897,3 +897,87 @@ def test_missing_secret_message_names_the_keyring_backend(monkeypatch):
     assert "keyring backend: x.Keyring" in secrets.missing_message(["DEEPSEEK_API_KEY"])
     monkeypatch.setattr(secrets, "keyring_backend", lambda: None)
     assert "no keyring backend" in secrets.missing_message(["DEEPSEEK_API_KEY"])
+
+
+async def test_heuristic_revision_spawns_only_new_items():
+    r = HeuristicRouter()
+    plan = await r.revise("- fix login\n- fix export", "- fix login\n- fix signup", ["t_a"], [])
+    assert [s["request"] for s in plan["spawn"]] == ["fix export"] and not plan["send"]
+    plan = await r.revise("fix login, not signup", "fix signup", ["t_a"], [])
+    assert not plan["spawn"] and not plan["send"]
+    # An edit that reached no thread is planned like a new request.
+    plan = await r.revise("fix login", "fix signup", [], [])
+    assert [s["request"] for s in plan["spawn"]] == ["fix login"]
+
+
+async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monkeypatch):
+    """An edited request shows its new text, every thread it reached gets a
+    correction from the person, and the router plans only what is new."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
+    router = GatedRouter()
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), router)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "- fix login\n- fix signup"})
+            seq = r.json()["seq"]
+
+            # Edited before the router answered: the edit is taken at once, and
+            # re-assessed only after the original's routing.
+            t0 = time.perf_counter()
+            r = await c.post(f"/api/projects/{pid}/messages/{seq}/edit",
+                             json={"text": "- fix login\n- fix export"})
+            assert time.perf_counter() - t0 < 1.0, "an edit waited on routing"
+            assert r.status_code == 202 and r.json()["changed"]
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            mine = [e for e in log if e["seq"] == seq][0]
+            assert (mine["text"], mine["label"], mine["edited"], mine["editable"]) == \
+                ("- fix login\n- fix export", "You · edited", 1, 1)
+            assert not any(e["type"] == "edited" for e in log)
+            router.gate.set()
+
+            async def routes():
+                log = (await c.get(f"/api/projects/{pid}/log")).json()
+                rs = [e["payload"] for e in log if e["type"] == "route"]
+                return rs if len(rs) == 2 else None
+            first, again = await wait_for(routes)
+            assert first["of"] == seq and len(first["spawned"]) == 2
+            reached = [t["id"] for t in first["spawned"]]
+            assert again["mode"] == "edit" and again["of"] == seq and again["corrected"] == reached
+            assert [t["title"] for t in again["spawned"]] == ["fix export"]
+            assert again["summary"].startswith("edit: corrected “fix login”, “fix signup”")
+
+            # Each reached thread got the person's correction, with both versions.
+            for tid in reached:
+                tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+                fix = [e for e in tr if e["type"] == "message_in" and e["payload"].get("edit") == seq]
+                assert len(fix) == 1 and fix[0]["label"] == "You · edit" and fix[0]["editable"] == 0
+                assert "> - fix export" in fix[0]["text"] and "> - fix signup" in fix[0]["text"]
+
+            # The same text again changes nothing; machine rows can't be edited.
+            r = await c.post(f"/api/projects/{pid}/messages/{seq}/edit",
+                             json={"text": "- fix login\n- fix export"})
+            assert r.status_code == 200 and not r.json()["changed"]
+            route_seq = [e for e in (await c.get(f"/api/projects/{pid}/log")).json() if e["type"] == "route"][0]["seq"]
+            r = await c.post(f"/api/projects/{pid}/messages/{route_seq}/edit", json={"text": "x"})
+            assert r.status_code == 400
+            assert (await c.post(f"/api/projects/{pid}/messages/999999/edit", json={"text": "x"})).status_code == 404
+
+            # A message sent straight to a thread: its thread is corrected.
+            tid = reached[0]
+            await c.post(f"/api/projects/{pid}/requests", json={"text": "use OAuth", "mode": "thread", "target": tid})
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            msg = [e for e in tr if e["type"] == "message_in" and e["text"] == "use OAuth"][0]
+            assert msg["editable"] == 1
+            r = await c.post(f"/api/projects/{pid}/messages/{msg['seq']}/edit", json={"text": "use passkeys"})
+            assert r.status_code == 202
+
+            async def corrected():
+                tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+                return [e for e in tr if e["payload"].get("edit") == msg["seq"]] or None
+            fix = (await wait_for(corrected))[0]
+            assert fix["text"].startswith("I edited my message to you. It now reads:\n\n> use passkeys")
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            assert [e["text"] for e in tr if e["seq"] == msg["seq"]] == ["use passkeys"]
