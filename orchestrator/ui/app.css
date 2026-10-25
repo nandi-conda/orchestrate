@@ -41,6 +41,7 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 /* What the selected thread is doing right now. */
 .now { display: flex; align-items: center; gap: 8px; padding: 6px 16px; border-bottom: 1px solid var(--border); font-size: 13px; min-width: 0;
        background: color-mix(in oklch, var(--primary) 6%, transparent); }
+.now:empty { display: none; }
 .now-label { font-weight: 600; flex-shrink: 0; }
 .now-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .activity-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: hsl(142 71% 45%); animation: pulse 1.4s ease-in-out infinite; }

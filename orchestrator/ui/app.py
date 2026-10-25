@@ -1425,10 +1425,13 @@ def thread_head(t: i32) -> None:
         end()
     end()
     end()
+    # Always there (empty, hidden by CSS, while idle): the pane's children
+    # keep their places, so a thread starting work doesn't rebuild the
+    # events list below and throw away its scroll position.
+    div("now")
     if t != 0:
         jstr(t, "activity", h_t1)
         if s_len(h_t1) > 0:
-            div("now")
             span("activity-dot")
             end()
             span("now-label")
@@ -1437,7 +1440,7 @@ def thread_head(t: i32) -> None:
             span("now-text mono")
             text_ref(h_t1)
             end()
-            end()
+    end()
 
 
 def tab_open(active: bool, arg: i32) -> None:
