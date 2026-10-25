@@ -7,6 +7,8 @@
   control plane instances can share it; appends are announced with
   LISTEN/NOTIFY so every instance wakes its SSE streams and inboxes.
 
+A project is archived when its `archived_at` is set: `list_projects` lists
+the live projects (the default) or only the archived ones, oldest first.
 A thread is archived when `archived_at` is set. `list_threads` lists either
 the live threads (the default: the main list, the router's directory, peers)
 or only the archived ones. Working threads (queued or working) come first,
@@ -48,11 +50,14 @@ class Store(Protocol):
     async def close(self) -> None: ...
 
     async def create_project(self, name: str, model: str = "") -> dict: ...
-    async def list_projects(self) -> list[dict]: ...
+    async def list_projects(self, archived: bool = False) -> list[dict]:
+        """The projects that are not archived, or with archived=True only the
+        archived ones; oldest first."""
     async def get_project(self, project_id: str) -> dict | None: ...
     async def update_project(self, project_id: str, **fields: Any) -> dict | None:
         """Change a project's name, model or repo_url (its remote; the
-        control plane connects the hub to it first, Orchestrator.update_project)."""
+        control plane connects the hub to it first, Orchestrator.update_project),
+        or archived_at (Orchestrator.archive_project)."""
 
     async def create_thread(self, project_id: str, title: str, request: str,
                             parent_id: str | None = None) -> dict: ...
@@ -112,7 +117,7 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, repo_url TEXT NOT NULL DEFAULT '',
         model TEXT NOT NULL DEFAULT '', settings TEXT NOT NULL DEFAULT '{}',
-        created_at DOUBLE PRECISION NOT NULL)""",
+        archived_at DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS threads (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
         title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
@@ -140,7 +145,7 @@ PG_EVENTS = """CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)"""
 EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS events_project ON events(project_id, seq)"
 
-PROJECT_FIELDS = {"name", "model", "repo_url"}
+PROJECT_FIELDS = {"name", "model", "repo_url", "archived_at"}
 
 # The two databases spell binary differently.
 SQLITE_IMAGES = """CREATE TABLE IF NOT EXISTS images (
@@ -156,7 +161,8 @@ THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state"
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
-ADDED_COLUMNS = [("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
+ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
+                 ("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
                  ("threads", "archived_at", "DOUBLE PRECISION"),
                  ("workers", "idx", "INTEGER NOT NULL DEFAULT 0"),
                  ("workers", "lost_at", "DOUBLE PRECISION")]
@@ -200,13 +206,16 @@ class _SqlStore:
     # projects
     async def create_project(self, name: str, model: str = "") -> dict:
         p = {"id": new_id("p"), "name": name, "repo_url": "", "model": model,
-             "settings": "{}", "created_at": now()}
-        await self._exec(self._q("INSERT INTO projects (id, name, repo_url, model, settings, created_at) "
-                                 "VALUES (?, ?, ?, ?, ?, ?)"), *p.values())
+             "settings": "{}", "archived_at": None, "created_at": now()}
+        cols = ", ".join(p)
+        marks = ", ".join("?" for _ in p)
+        await self._exec(self._q(f"INSERT INTO projects ({cols}) VALUES ({marks})"), *p.values())
         return _project(p)
 
-    async def list_projects(self) -> list[dict]:
-        return [_project(r) for r in await self._fetch("SELECT * FROM projects ORDER BY created_at")]
+    async def list_projects(self, archived: bool = False) -> list[dict]:
+        which = "IS NOT NULL" if archived else "IS NULL"
+        return [_project(r) for r in
+                await self._fetch(f"SELECT * FROM projects WHERE archived_at {which} ORDER BY created_at")]
 
     async def get_project(self, project_id: str) -> dict | None:
         r = await self._fetchone(self._q("SELECT * FROM projects WHERE id = ?"), project_id)

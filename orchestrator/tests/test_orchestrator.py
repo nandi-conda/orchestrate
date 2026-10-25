@@ -93,6 +93,38 @@ async def test_store_lists_archived_threads_apart(tmp_path):
     await s.close()
 
 
+async def test_store_lists_archived_projects_apart(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    keep = await s.create_project("keep")
+    old = await s.create_project("old")
+    assert keep["archived_at"] is None
+    assert (await s.update_project(old["id"], archived_at=7.0))["archived_at"] == 7.0
+    assert [p["id"] for p in await s.list_projects()] == [keep["id"]]
+    assert [p["id"] for p in await s.list_projects(archived=True)] == [old["id"]]
+    await s.update_project(old["id"], archived_at=None)
+    assert [p["id"] for p in await s.list_projects()] == [keep["id"], old["id"]]
+    with pytest.raises(ValueError):
+        await s.update_project(old["id"], bogus="x")
+    await s.close()
+
+
+async def test_store_adds_project_archived_at_to_an_older_database(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "db.sqlite")
+    async with aiosqlite.connect(path) as db:
+        await db.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                         "repo_url TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', "
+                         "settings TEXT NOT NULL DEFAULT '{}', created_at DOUBLE PRECISION NOT NULL)")
+        await db.execute("INSERT INTO projects (id, name, created_at) VALUES ('p_old', 'old', 1.0)")
+        await db.commit()
+    s = SqliteStore(path)
+    await s.open()
+    assert [(p["id"], p["archived_at"]) for p in await s.list_projects()] == [("p_old", None)]
+    await s.close()
+
+
 async def test_store_lists_working_threads_first(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
@@ -518,6 +550,77 @@ async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
             assert tid in live and (await c.get(f"/api/projects/{pid}/threads?archived=1")).json() == []
             assert (await c.post("/api/threads/t_nope/archive")).status_code == 404
             provider.gate.set()
+
+
+async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tmp_path, monkeypatch):
+    """An archived project leaves the list, holds no workers and takes no work;
+    unarchived, its threads come back on a new worker with their next message."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "1.5")  # a turn is long enough to archive during it
+    provider = LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
+    destroyed = []
+    destroy = provider.destroy
+
+    async def recording_destroy(worker):
+        destroyed.append(worker.id)
+        await destroy(worker)
+    provider.destroy = recording_destroy
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            other = (await c.post("/api/projects", json={"name": "other"})).json()["id"]
+            done = (await c.post(f"/api/projects/{pid}/requests",
+                                 json={"text": "build hello", "mode": "new"})).json()["spawned"][0]["id"]
+
+            async def idle():
+                return (await c.get(f"/api/threads/{done}")).json()["state"] == "idle"
+            await wait_for(idle)
+            busy = (await c.post(f"/api/projects/{pid}/requests",
+                                 json={"text": "sleep 30", "mode": "new"})).json()["spawned"][0]["id"]
+
+            async def working():
+                return (await c.get(f"/api/threads/{busy}")).json()["state"] == "working"
+            await wait_for(working)
+            workers = [w["id"] for w in await app.state.orch.store.list_workers(pid)]
+            assert workers
+
+            r = await c.post(f"/api/projects/{pid}/archive")
+            assert r.status_code == 200 and r.json()["archived_at"] is not None
+            assert [p["id"] for p in (await c.get("/api/projects")).json()] == [other]
+            assert [p["id"] for p in (await c.get("/api/projects?archived=1")).json()] == [pid]
+            assert {(await c.get(f"/api/threads/{t}")).json()["state"] for t in (done, busy)} == {"stopped"}
+            assert sorted(destroyed) == sorted(workers)
+            assert all(w["lost_at"] is not None for w in await app.state.orch.store.list_workers(pid))
+            assert app.state.orch.workers.get(pid) is None
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            assert [e["type"] for e in log if e["type"].startswith("project_")] == ["project_archived"]
+
+            # It takes no work, from any door.
+            for r in (await c.post(f"/api/projects/{pid}/requests", json={"text": "more"}),
+                      await c.post(f"/api/projects/{pid}/threads", json={"request": "more"}),
+                      await c.post(f"/api/threads/{done}/messages", json={"body": "hi"}),
+                      await c.get(f"/api/threads/{done}/files")):
+                assert r.status_code == 409 and "archived" in r.json()["error"]
+            # Archiving it again changes nothing.
+            assert (await c.post(f"/api/projects/{pid}/archive")).status_code == 200
+            assert len(destroyed) == len(workers)
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            assert [e["type"] for e in log if e["type"].startswith("project_")] == ["project_archived"]
+
+            r = await c.post(f"/api/projects/{pid}/unarchive")
+            assert r.status_code == 200 and r.json()["archived_at"] is None
+            assert {p["id"] for p in (await c.get("/api/projects")).json()} == {pid, other}
+            await c.post(f"/api/threads/{done}/messages", json={"body": "again"})
+
+            async def revived():
+                tr = (await c.get(f"/api/threads/{done}/transcript")).json()
+                return [e for e in tr if e["type"] == "revived"] or None
+            back = (await wait_for(revived))[0]
+            assert back["payload"]["worker"] not in workers  # a new worker: the old ones are gone
+            assert (await c.post("/api/projects/p_nope/archive")).status_code == 404
+            assert (await c.post("/api/projects/p_nope/unarchive")).status_code == 404
 
 
 async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
@@ -1043,6 +1146,11 @@ async def test_postgres_store_and_notify(postgres):
     assert [x["archived_at"] for x in await b.list_threads(p["id"], archived=True)] == [5.0]
     await a.update_thread(t["id"], archived_at=None)
     assert [x["id"] for x in await b.list_threads(p["id"])] == [t["id"]]
+    await a.update_project(p["id"], archived_at=6.0)
+    assert await b.list_projects() == []
+    assert [x["archived_at"] for x in await b.list_projects(archived=True)] == [6.0]
+    await a.update_project(p["id"], archived_at=None)
+    assert [x["id"] for x in await b.list_projects()] == [p["id"]]
     await a.close()
     await b.close()
 

@@ -129,6 +129,9 @@ def display(ev: dict) -> dict:
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")
     elif t in ("archived", "unarchived"):
         kind, label, text = K_STATUS, t, f"thread {t}"
+    elif t in ("project_archived", "project_unarchived"):
+        kind, label = K_STATUS, t.removeprefix("project_")
+        text = f"project {label}"
     elif t == "worker_lost":
         kind, label, text = K_ERROR, "worker lost", d.get("error", "")
     elif t == "revived":
@@ -242,7 +245,9 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve())}
 
     async def list_projects(req: Request):
-        return JSONResponse([project_view(p) for p in await store.list_projects()])
+        """Live projects; ?archived=1 lists the archived ones instead."""
+        archived = req.query_params.get("archived", "0") == "1"
+        return JSONResponse([project_view(p) for p in await store.list_projects(archived)])
 
     async def create_project(req: Request):
         b = await body(req)
@@ -270,6 +275,22 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
         return JSONResponse(project_view(p)) if p else JSONResponse({"error": "no such project"}, 404)
+
+    async def project_archive(req: Request):
+        try:
+            p = await orch().archive_project(req.path_params["pid"])
+        except KeyError:
+            return JSONResponse({"error": "no such project"}, 404)
+        except Exception as e:
+            return JSONResponse({"error": f"could not destroy the project's workers: {describe(e)}"}, 502)
+        return JSONResponse(project_view(p))
+
+    async def project_unarchive(req: Request):
+        try:
+            p = await orch().unarchive_project(req.path_params["pid"])
+        except KeyError:
+            return JSONResponse({"error": "no such project"}, 404)
+        return JSONResponse(project_view(p))
 
     async def post_request(req: Request):
         pid = req.path_params["pid"]
@@ -333,7 +354,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             t = await orch().spawn(pid, title, request, images=images)
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
-        except RuntimeError as e:
+        except (RuntimeError, ArchivedError) as e:
             return JSONResponse({"error": str(e)}, 409)
         return JSONResponse(thread_view(t), 201)
 
@@ -512,6 +533,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
+        Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),
+        Route("/api/projects/{pid}/unarchive", project_unarchive, methods=["POST"]),
         Route("/api/projects/{pid}/requests", post_request, methods=["POST"]),
         Route("/api/projects/{pid}/messages/{seq:int}/edit", edit_message, methods=["POST"]),
         Route("/api/projects/{pid}/threads", list_threads, methods=["GET"]),

@@ -83,6 +83,10 @@ SETTINGS_SAVE: Const[i32] = 58
 SETTINGS_SAVED: Const[i32] = 59
 PASTED: Const[i32] = 60
 IMG_DROP: Const[i32] = 61
+PROJ_SHOW_ARCHIVED: Const[i32] = 62
+PROJ_ARCHIVE: Const[i32] = 63
+PROJ_UNARCHIVE: Const[i32] = 64
+PROJ_ARCHIVED: Const[i32] = 65
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -139,6 +143,7 @@ files_loading: i32 = 0
 fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text})
 fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
+proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
@@ -338,8 +343,29 @@ def show_projects() -> None:
     loading = 1
     s_set(h_t1, "Orchestrator")
     set_title(h_t1)
+    fetch_projects()
+
+
+def fetch_projects() -> None:
     s_set(h_url, "/api/projects")
+    if proj_archived == 1:
+        s_add(h_url, "?archived=1")
     get(h_url, GOT_PROJECTS)
+
+
+def post_project(i: i32, action: str) -> None:
+    """POST /api/projects/<id of the project list's card i>/<action>."""
+    e: i32
+    o: i32
+    e = j_idx(projects, i)
+    jstr(e, "id", h_t1)
+    j_free(e)
+    o = o_new()
+    s_set(h_url, "/api/projects/")
+    s_add_ref(h_url, h_t1)
+    s_add(h_url, "/")
+    s_add(h_url, action)
+    post(h_url, o, PROJ_ARCHIVED)
 
 
 # ---- requests
@@ -503,7 +529,7 @@ def land() -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings
+    global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -516,6 +542,25 @@ def update(msg: i32, arg: i32) -> None:
         jstr(e, "id", h_t1)
         j_free(e)
         open_project(h_t1)
+    elif msg == PROJ_SHOW_ARCHIVED:
+        proj_archived = arg
+        loading = 1
+        projects = take_none(projects)
+        s_clear(h_err)
+        fetch_projects()
+    elif msg == PROJ_ARCHIVE:
+        post_project(arg, "archive")
+    elif msg == PROJ_UNARCHIVE:
+        post_project(arg, "unarchive")
+    elif msg == PROJ_ARCHIVED:
+        # Either way the project leaves the list on screen.
+        if j_ok(arg) == 1:
+            s_clear(h_err)
+            if screen == 0:
+                fetch_projects()
+        else:
+            j_err(arg, h_err)
+        j_free(arg)
     elif msg == NEW_SHOW:
         show_new = 1
     elif msg == NEW_HIDE:
@@ -925,9 +970,18 @@ def project_list() -> None:
     div("page")
     div("topbar")
     el("h1")
-    text("Projects")
+    if proj_archived == 1:
+        text("Archived projects")
+    else:
+        text("Projects")
     end()
-    btn("New project", "", NEW_SHOW, 0)
+    div("topbar-actions")
+    if proj_archived == 1:
+        btn("← Projects", "ghost", PROJ_SHOW_ARCHIVED, 0)
+    else:
+        btn("Archived", "ghost", PROJ_SHOW_ARCHIVED, 1)
+        btn("New project", "", NEW_SHOW, 0)
+    end()
     end()
     error_banner()
     if projects != 0:
@@ -936,6 +990,11 @@ def project_list() -> None:
         el("p")
         cls("muted")
         text("Loading…")
+        end()
+    elif n == 0 and proj_archived == 1:
+        el("p")
+        cls("muted")
+        text("No archived projects.")
         end()
     elif n == 0:
         card_open()
@@ -948,10 +1007,14 @@ def project_list() -> None:
     for i in range(n):
         e = j_idx(projects, i)
         jstr(e, "id", h_t3)
+        # The card opens the project; the archive button sits beside it rather
+        # than inside it, so a click there archives without opening.
+        el("div")
+        cls("project-item")
+        key(i + 1)
         el("div")
         cls("card")
         cls("project-card")
-        key(i + 1)
         on_click(OPEN, i)
         el("div")
         cls("card-header")
@@ -978,6 +1041,20 @@ def project_list() -> None:
         cls("sm")
         text("Open")
         end()
+        end()
+        end()
+        el("button")
+        cls("project-archive")
+        if proj_archived == 1:
+            on_click(PROJ_UNARCHIVE, i)
+            attr("title", "Unarchive")
+            attr("aria-label", "Unarchive")
+            text("Unarchive")
+        else:
+            on_click(PROJ_ARCHIVE, i)
+            attr("title", "Stops its running threads, destroys its workers and hides it from the list")
+            attr("aria-label", "Archive")
+            text("Archive")
         end()
         end()
         j_free(e)
@@ -2100,6 +2177,13 @@ def project_window() -> None:
     else:
         text("Project")
     end()
+    if project != 0 and j_has(project, "archived_at") == 1:
+        el("span")
+        cls("badge")
+        cls("secondary")
+        attr("title", "Unarchive it from the project list to use it")
+        text("Archived")
+        end()
     span("muted mono")
     if project != 0:
         jstr(project, "repo_url", h_t1)

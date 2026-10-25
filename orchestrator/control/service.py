@@ -56,6 +56,12 @@ def attachable(w: dict) -> bool:
     return w["idx"] >= 1
 
 
+def stored_worker(w: dict) -> Worker:
+    """A worker as the store keeps it, for the provider."""
+    return Worker(id=w["id"], project_id=w["project_id"], provider=w["provider"], handle=w["handle"],
+                  url=w["url"], token=w["token"], capacity=w["capacity"], index=w["idx"])
+
+
 def peer_entry(t: dict) -> dict:
     """A thread as the runner's directory entry shape (runner/API.md)."""
     return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
@@ -119,7 +125,7 @@ class PeerCallError(Exception):
 
 
 class ArchivedError(Exception):
-    """The thread is archived: it takes no messages until it is unarchived."""
+    """The thread, or its project, is archived: it takes no work until it is unarchived."""
 
 
 class EditError(Exception):
@@ -463,7 +469,7 @@ class Orchestrator:
         from .router import title_for
         try:
             t = await self.spawn(project_id, title or title_for(request), request, parent)
-        except RuntimeError as e:
+        except (RuntimeError, ArchivedError) as e:
             raise PeerCallError(str(e)) from None
         return {"id": t["id"], "title": t["title"]}
 
@@ -559,9 +565,7 @@ class Orchestrator:
 
     async def spawn(self, project_id: str, title: str, request: str, parent: str | None = None,
                     images: list[dict] | None = None) -> dict:
-        project = await self.store.get_project(project_id)
-        if project is None:
-            raise KeyError(project_id)
+        project = await self.open_project(project_id)
         running = [t for t in await self.store.list_threads(project_id)
                    if t["state"] in ("queued", "working")]
         if len(running) >= self.max_running:
@@ -631,6 +635,7 @@ class Orchestrator:
             raise KeyError(to)
         if thread["archived_at"] is not None:
             raise ArchivedError(f"thread {to} is archived; unarchive it to message it")
+        await self.open_project(thread["project_id"])
         msg = await self.store.add_message(thread["project_id"], sender, to, body, reply_to, hops)
         if hops > MAX_HOPS:
             await self.store.append_event(thread["project_id"], to, "dropped",
@@ -671,12 +676,14 @@ class Orchestrator:
         its worktree and its conversation, idle until its next message.
         Concurrent callers share one revival.
 
-        Raises KeyError for an unknown thread, ArchivedError for an archived one."""
+        Raises KeyError for an unknown thread, ArchivedError for an archived
+        one or one in an archived project."""
         t = await self.store.get_thread(thread_id)
         if t is None:
             raise KeyError(thread_id)
         if t["archived_at"] is not None:
             raise ArchivedError(f"thread {thread_id} is archived; unarchive it to use it")
+        await self.open_project(t["project_id"])
         starting = self.starting.get(thread_id)
         if starting is not None:
             await asyncio.wait({starting})
@@ -764,10 +771,7 @@ class Orchestrator:
         t = await self.store.get_thread(thread_id)
         for w in await self.store.list_workers(t["project_id"]) if t else []:
             if w["id"] == t["worker_id"]:  # down now, or left by an earlier control plane
-                return await self.provider.logs(Worker(id=w["id"], project_id=w["project_id"],
-                                                       provider=w["provider"], handle=w["handle"],
-                                                       url=w["url"], token=w["token"],
-                                                       capacity=w["capacity"], index=w["idx"]), lines)
+                return await self.provider.logs(stored_worker(w), lines)
         raise KeyError(thread_id)
 
     async def list_files(self, thread_id: str, path: str) -> dict:
@@ -816,6 +820,74 @@ class Orchestrator:
         await self.store.append_event(t["project_id"], thread_id, "unarchived", {})
         return t
 
+    # ---------------------------------------------------------------- projects
+    #
+    # An archived project leaves the project list and takes no work: no
+    # requests, messages, edits, spawns or file reads, from the person or from
+    # a peer. Archiving it stops every thread still on a runner and destroys
+    # the project's workers, so it holds no compute. Its threads keep their
+    # own state and archived flags, its log and its hub (every turn's work is
+    # in the hub already). Unarchived, it is as it was: each thread comes back
+    # on a new worker, from its branch and snapshot in the hub, with its next
+    # message.
+
+    async def open_project(self, project_id: str) -> dict:
+        """The project, if it can take work: KeyError for an unknown one,
+        ArchivedError for an archived one."""
+        p = await self.store.get_project(project_id)
+        if p is None:
+            raise KeyError(project_id)
+        if p["archived_at"] is not None:
+            raise ArchivedError(f"project {p['name']} is archived; unarchive it to use it")
+        return p
+
+    async def archive_project(self, project_id: str) -> dict:
+        """Archive a project: it is marked first, so nothing new starts (requests
+        still queued for routing fail, and say so in its log), then its running
+        threads are stopped and its workers destroyed. Archiving an
+        archived project finishes that (a worker whose destroy failed is
+        destroyed again) without logging it twice."""
+        p = await self.store.get_project(project_id)
+        if p is None:
+            raise KeyError(project_id)
+        if p["archived_at"] is None:
+            p = await self.store.update_project(project_id, archived_at=now())
+            await self.store.append_event(project_id, None, "project_archived", {})
+        for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
+            if t["state"] not in ENDED:
+                await self.stop(t["id"])
+        await self._destroy_workers(project_id)
+        return p
+
+    async def _destroy_workers(self, project_id: str) -> None:
+        """Let go of every worker the project has and destroy it. Each is marked
+        lost, so its index (and its sprite's name) is never used again."""
+        async with self._lock:
+            for lw in self.workers.pop(project_id, []):
+                for task in (lw.relay, lw.pump, lw.watch):
+                    if task:
+                        task.cancel()
+                for tid in lw.threads:
+                    if self.by_thread.get(tid) is lw:
+                        del self.by_thread[tid]
+                await lw.client.close()
+            await self._made(project_id)
+            for w in await self.store.list_workers(project_id):
+                if w["lost_at"] is None and attachable(w):
+                    await self.provider.destroy(stored_worker(w))
+                    self.lost[project_id].add(w["idx"])
+                    await self.store.lose_worker(w["id"])
+
+    async def unarchive_project(self, project_id: str) -> dict:
+        p = await self.store.get_project(project_id)
+        if p is None:
+            raise KeyError(project_id)
+        if p["archived_at"] is None:
+            return p
+        p = await self.store.update_project(project_id, archived_at=None)
+        await self.store.append_event(project_id, None, "project_unarchived", {})
+        return p
+
     # ---------------------------------------------------------------- requests
 
     async def submit(self, project_id: str, text: str, mode: str = "auto",
@@ -828,8 +900,7 @@ class Orchestrator:
         the background, in the order requests came in; its plan arrives as the
         "route" event. A request that is only images needs no router: there is
         no text to route, so it starts one thread."""
-        if await self.store.get_project(project_id) is None:
-            raise KeyError(project_id)
+        await self.open_project(project_id)
         if mode == "thread":
             t = await self.store.get_thread(target) if target else None
             if t is None or t["project_id"] != project_id:
@@ -917,6 +988,7 @@ class Orchestrator:
             raise KeyError(f"no message {seq} in this project")
         if not editable(ev):
             raise EditError("only your own messages can be edited")
+        await self.open_project(project_id)
         if ev["thread_id"] is not None:
             t = await self.store.get_thread(ev["thread_id"])
             if t["archived_at"] is not None:
