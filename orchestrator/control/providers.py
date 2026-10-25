@@ -316,7 +316,13 @@ class SpritesProvider:
             s.raise_for_status()
             async for _ in s.aiter_lines():
                 pass
-        await wait_healthy(worker.url, timeout=300)
+        try:
+            await wait_healthy(worker.url, timeout=300)
+        except TimeoutError:
+            # A runner that refuses to start (exits, and the service with it)
+            # says why in the service log.
+            raise RuntimeError(f"worker {name}'s runner did not answer in 300s; its log ends:\n"
+                               f"{await self.logs(worker, 20)}") from None
         return worker
 
     async def exec(self, name: str, script: str, env: dict | None = None) -> str:
