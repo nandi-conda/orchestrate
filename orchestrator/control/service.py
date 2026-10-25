@@ -239,7 +239,10 @@ class Orchestrator:
         for lw in self.workers.get(project["id"], []):
             if lw.worker.index == index:
                 return lw
-        worker = await self.provider.create(worker_spec(project, index))
+        spec = worker_spec(project, index)
+        spec.token = next((w["token"] for w in await self.store.list_workers(project["id"])
+                           if w["idx"] == index and attachable(w)), "")
+        worker = await self.provider.create(spec)
         await self.store.upsert_worker(worker.record())
         (await self._made(project["id"])).add(index)
         lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))

@@ -737,6 +737,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
         return (await s.get_thread(t["id"]))["state"] == "idle" or None
     await wait_for(idle)
     ran_on = (await s.get_thread(t["id"]))["worker_id"]
+    token = first.by_thread[t["id"]].worker.token
     await first.close()
     await first.provider.close()
 
@@ -748,6 +749,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     assert [e["name"] for e in listing["entries"]] == ["app"]
     revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
     assert [e["payload"]["worker"] for e in revived] == [ran_on]
+    assert second.by_thread[t["id"]].worker.token == token  # a runner still going answers to it
     # A new thread goes to that worker too rather than a new one.
     u = await second.spawn(p["id"], "U", "hello")
     await wait_for(lambda: idle_of(s, u["id"]))

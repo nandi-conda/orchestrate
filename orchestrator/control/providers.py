@@ -56,6 +56,9 @@ class WorkerSpec:
     repo_url: str = ""
     capacity: int = 16
     env: dict = field(default_factory=dict)
+    # The token of the worker this index names, when one was made before: a
+    # runner still going from an earlier control plane keeps answering to it.
+    token: str = ""
 
 
 
@@ -65,7 +68,8 @@ class WorkerProvider(Protocol):
     async def create(self, spec: WorkerSpec) -> Worker:
         """Start a runner and return once its /health answers. A spec whose
         index was made before (and not destroyed) names the same worker: its
-        disk, with the threads' worktrees, is kept and its runner restarted."""
+        disk, with the threads' worktrees, is kept, and its runner answers to
+        spec.token."""
 
     async def destroy(self, worker: Worker) -> None: ...
 
@@ -178,6 +182,7 @@ class LocalProvider:
         wid = f"{spec.project_id}-w{spec.index}"
         worker = Worker(id=wid, project_id=spec.project_id, provider=self.name, handle="",
                         url=f"http://127.0.0.1:{port}", capacity=spec.capacity, index=spec.index)
+        worker.token = spec.token or worker.token
         wdir = (self.workdir / wid).resolve()
         wdir.mkdir(parents=True, exist_ok=True)
         env = {**os.environ, **passthrough_env(), **spec.env,
@@ -296,6 +301,7 @@ class SpritesProvider:
         info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
         worker = Worker(id=name, project_id=spec.project_id, provider=self.name, handle=name,
                         url=info["url"].rstrip("/"), capacity=spec.capacity, index=spec.index)
+        worker.token = spec.token or worker.token
 
         await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_REF": self.ref})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
@@ -306,9 +312,7 @@ class SpritesProvider:
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        # Restart: a sprite made before still runs the last control plane's
-        # runner, with its old token; a new sprite's service just starts.
-        async with self.http.stream("POST", f"/sprites/{name}/services/runner/restart") as s:
+        async with self.http.stream("POST", f"/sprites/{name}/services/runner/start") as s:
             s.raise_for_status()
             async for _ in s.aiter_lines():
                 pass
