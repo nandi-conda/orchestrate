@@ -8,7 +8,8 @@ import json
 import tempfile
 
 from .model import from_spec
-from .secrets import require
+from .repo import Repo
+from .secrets import get_secret, require
 from .thread import ThreadHost
 
 
@@ -26,8 +27,9 @@ def _print(ev: dict):
 
 
 async def amain(args):
-    host = ThreadHost(model_factory=from_spec, repo=args.repo,
-                      workdir=args.workdir or tempfile.mkdtemp(prefix="runner-"))
+    workdir = args.workdir or tempfile.mkdtemp(prefix="runner-")
+    repo = Repo(args.repo, f"{workdir}/.repo", get_secret("GITHUB_TOKEN")) if args.repo else None
+    host = ThreadHost(model_factory=from_spec, repo=repo, workdir=workdir)
     q = host.subscribe(None)
     spec = {"provider": "deepseek", "model": args.model} if args.model else None
     t = await host.start(project=args.project, title=args.request[:60], request=args.request, model=spec)
@@ -51,7 +53,7 @@ async def amain(args):
 def main():
     ap = argparse.ArgumentParser(prog="runner")
     ap.add_argument("request")
-    ap.add_argument("--repo", help="git repo to make worktrees from")
+    ap.add_argument("--repo", help="git URL or bare repo path to clone; threads land on its default branch")
     ap.add_argument("--workdir")
     ap.add_argument("--project", default="local")
     ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-v4-pro)")

@@ -14,6 +14,7 @@ from typing import Any, Callable
 from . import tools as T
 from .model import Model
 from .peers import LocalPeers, Peers
+from .repo import GitError, Repo, Workspace
 from .sandbox import LocalSandbox, Sandbox
 
 SYSTEM_PROMPT = """You are one thread in a team of agent threads working on the project "{project}".
@@ -26,6 +27,12 @@ How the team works:
 - Messages from other threads and the user arrive as user messages that start with [from ...].
 - Keep your directory entry current with set_summary when your focus changes.
 - When the work for this request is done, call finish with a summary. You may get follow-ups later.
+
+Commits: commit your work on {branch} with clear messages; do not push. At the end of every
+turn the runner commits anything left over and pushes your branch. When you call finish it
+lands your branch on the project's main branch (rebase, fast-forward push). If that rebase
+conflicts you get a message from "runner" listing the files: rebase onto the named branch
+yourself, resolve, `git rebase --continue`, and call finish again.
 """
 
 
@@ -77,9 +84,12 @@ def _id() -> str:
 
 class AgentThread:
     def __init__(self, *, id: str, project: str, title: str, model: Model, sandbox: Sandbox, peers: Peers,
-                 tools: list[T.Tool], limits: Limits, parent: str | None, branch: str | None,
+                 tools: list[T.Tool], limits: Limits, parent: str | None, workspace: Workspace | None,
                  emit: Callable[["AgentThread", str, Any], None]):
-        self.id, self.project, self.title, self.parent, self.branch = id, project, title, parent, branch
+        self.id, self.project, self.title, self.parent = id, project, title, parent
+        self.workspace = workspace
+        self.branch = workspace.branch if workspace else None
+        self.conflicts = 0  # landings in a row that hit a conflict
         self.model, self.sandbox, self.peers, self.limits = model, sandbox, peers, limits
         self.tools = T.by_name(tools)
         self.tool_schemas = T.schemas(tools)
@@ -92,7 +102,7 @@ class AgentThread:
         self.events: list[dict] = []
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
         self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT.format(
-            project=project, id=id, title=title, root=sandbox.root, branch=branch or "(none)")}]
+            project=project, id=id, title=title, root=sandbox.root, branch=self.branch or "(none)")}]
         self.task: asyncio.Task | None = None
 
     def emit(self, type: str, data: Any = None):
@@ -168,6 +178,8 @@ class AgentThread:
             self.emit("error", {"error": f"step limit {self.limits.max_steps} reached"})
         if not self.summary:  # the model ended without finish/set_summary: its last words stand in
             self.summary = (final or self.title)[:500]
+        if self.workspace:
+            await self._commit_work()
         self.set_state("idle")
         self.emit("turn_done", {"summary": self.summary, "final": final})
         try:
@@ -177,12 +189,37 @@ class AgentThread:
         except Exception as e:
             self.emit("error", {"error": f"peer update failed: {e}"})
 
+    async def _commit_work(self):
+        """Save the turn's work to origin; land it on the default branch after finish."""
+        message = f"{self.title}\n\n{self.summary}\n\nThread: {self.id}"
+        try:
+            if not self.finish_requested:
+                self.emit("saved", {"branch": self.branch, "commit": await self.workspace.save(message)})
+                return
+            landing = await self.workspace.land(message)
+        except GitError as e:
+            self.emit("error", {"error": str(e)})
+            return
+        if landing.ok:
+            self.conflicts = 0
+            self.emit("landed", {"branch": self.branch, "base": landing.base, "commit": landing.commit})
+        elif landing.conflict is not None:
+            self.conflicts += 1
+            self.emit("land_conflict", {"branch": self.branch, "base": landing.base, "files": landing.conflict})
+            # Another turn for the thread; the hop limit ends a run of conflicts it cannot resolve.
+            self.deliver(f"Landing {self.branch} on {landing.base} failed: rebasing onto origin/{landing.base} "
+                         f"conflicts in {', '.join(landing.conflict) or 'some files'}. Run "
+                         f"`git rebase origin/{landing.base}`, resolve the conflicts, `git rebase --continue`, "
+                         "then call finish again.", sender="runner", hops=self.conflicts)
+        else:
+            self.emit("error", {"error": f"landing {self.branch} failed: {landing.message}"})
+
 
 class ThreadHost:
     """Runs many AgentThreads in one process. One host per worker."""
 
     def __init__(self, *, model_factory: Callable[[dict | None], Model], peers: Peers | None = None,
-                 repo: str | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
+                 repo: Repo | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
                  sandbox_factory: Callable[[str], Sandbox] = LocalSandbox, capacity: int = 16,
                  tools: list[T.Tool] | None = None):
         self.model_factory = model_factory
@@ -220,30 +257,23 @@ class ThreadHost:
     def running(self) -> int:
         return sum(1 for t in self.threads.values() if t.state in ("queued", "working"))
 
-    async def _workspace(self, tid: str) -> tuple[str, str | None]:
+    async def _workspace(self, tid: str) -> tuple[str, Workspace | None]:
         path = self.workdir / tid
         if not self.repo:
             path.mkdir(parents=True, exist_ok=True)
             return str(path), None
-        branch = f"thread/{tid}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        proc = await asyncio.create_subprocess_exec(
-            "git", "-C", self.repo, "worktree", "add", "-b", branch, str(path), "HEAD",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"git worktree add failed: {err.decode().strip()}")
-        return str(path), branch
+        return str(path), await self.repo.worktree(path, f"thread/{tid}")
 
     async def start(self, *, project: str, title: str, request: str, parent: str | None = None,
                     model: dict | None = None, id: str | None = None) -> AgentThread:
         tid = id or _id()
         if tid in self.threads:
             raise ValueError(f"thread {tid} exists")
-        root, branch = await self._workspace(tid)
+        root, workspace = await self._workspace(tid)
         t = AgentThread(id=tid, project=project, title=title, model=self.model_factory(model),
                         sandbox=self.sandbox_factory(root), peers=self.peers, tools=self.tools,
-                        limits=self.limits, parent=parent, branch=branch, emit=self._emit)
+                        limits=self.limits, parent=parent, workspace=workspace, emit=self._emit)
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
         t.deliver(request, sender="user" if parent is None else parent)

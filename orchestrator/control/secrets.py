@@ -22,6 +22,9 @@ KNOWN = {
                          "Authorization: Bearer <key> to https://api.deepseek.com"),
     "SPRITES_TOKEN": ("Fly Sprites org token; stored, workers always run on Sprites",
                       "Authorization: Bearer <token> to https://api.sprites.dev/v1"),
+    "GITHUB_TOKEN": ("GitHub fine-grained token, Contents: Read and write on the project repos; "
+                     "workers clone, push thread/<id> branches and land on the default branch",
+                     'git http.<repo url>.extraHeader "Authorization: Basic base64(x-access-token:<token>)"'),
 }
 
 

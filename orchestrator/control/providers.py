@@ -96,7 +96,7 @@ def free_port() -> int:
 
 
 def passthrough_env() -> dict:
-    """Model credentials a runner needs; never the Sprites token.
+    """Model and git credentials a runner needs; never the Sprites token.
 
     Look each one up with `get_secret` rather than reading the environment
     directly: a key stored only in the keyring is copied into `os.environ` when
@@ -105,7 +105,7 @@ def passthrough_env() -> dict:
     """
     from .secrets import get_secret
 
-    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS")
+    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS", "GITHUB_TOKEN")
     found = {k: get_secret(k) for k in keep}
     return {k: v for k, v in found.items() if v}
 

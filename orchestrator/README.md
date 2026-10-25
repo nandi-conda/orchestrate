@@ -67,7 +67,7 @@ as root, so it is skipped there.
 
 ## Configuration
 
-There are no environment variables to set. Two secrets come from the system
+There are no environment variables to set. Three secrets come from the system
 keyring (service `orchestrate`, username = the name), and everything else is
 worked out at runtime.
 
@@ -75,6 +75,7 @@ worked out at runtime.
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | router model, and passed to every worker. Sprites need it; the local fallback (used only when `SPRITES_TOKEN` is absent) runs the echo runner without it | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
 | `SPRITES_TOKEN` | stored, workers always run on Sprites; without it they fall back to this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
+| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Passed to every worker, which clones the project's `repo_url`, pushes `thread/<id>` branches and lands finished work on the default branch | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 
 Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
 the exact name, the header they're sent as, and the keyring backend that was
@@ -146,8 +147,18 @@ A laptop session now starts billable sprites as soon as it spawns a thread;
 that is the point of storing the token. Remove `SPRITES_TOKEN` to fall back to
 local workers (the echo runner when `DEEPSEEK_API_KEY` is absent). The sprite
 checks out this checkout's `origin` and current branch, so push before
-expecting local commits to be there; a sprite has no git credentials, so the
-repository must be publicly readable.
+expecting local commits to be there; that clone of the orchestrate code uses no
+credentials, so this repository must be publicly readable.
+
+### Project repos and commits
+
+A project's `repo_url` is cloned once per worker; each thread works in its own
+worktree on `thread/<id>`. Every turn ends with the thread's branch pushed to
+origin, and a turn that ends with `finish` lands it on the default branch
+(rebase, fast-forward push; conflicts go back to the thread). So destroying
+sprites when the control plane stops loses nothing a thread had at the end of
+its last turn; only a turn still running then is cut short.
+Details: [runner/API.md](../runner/API.md#commits).
 
 ### Worker logs
 

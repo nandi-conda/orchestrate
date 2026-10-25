@@ -80,6 +80,7 @@ def test_passthrough_env_never_includes_the_sprites_token(env):
     env.setattr(secrets, "get_secret", lambda name: f"value-{name}")
     kept = providers.passthrough_env()
     assert "SPRITES_TOKEN" not in kept
+    assert kept["GITHUB_TOKEN"] == "value-GITHUB_TOKEN"  # workers push and land with it
 
 
 def test_worker_spec_carries_no_control_plane_address():

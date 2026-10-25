@@ -54,19 +54,6 @@ async def test_thread_uses_tools_and_finishes(tmp_path):
     assert t.summary == "added hello.py" and "hello.py" in t.files
 
 
-async def test_worktree_per_thread(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    for cmd in (["git", "init", "-q"], ["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "init"]):
-        subprocess.run(cmd, cwd=repo, check=True)
-    host = host_with({"a": [ModelResponse("ok")], "b": [ModelResponse("ok")]}, tmp_path, repo=str(repo))
-    a = await host.start(project="p", title="a", request="x")
-    b = await host.start(project="p", title="b", request="y")
-    assert a.sandbox.root != b.sandbox.root and a.branch == f"thread/{a.id}"
-    r = await a.sandbox.exec("git branch --show-current")
-    assert r.stdout.strip() == a.branch
-
-
 async def test_spawn_and_child_reports_back(tmp_path):
     host = host_with({
         "parent": [

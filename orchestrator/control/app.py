@@ -73,6 +73,13 @@ def display(ev: dict) -> dict:
         kind, label, text = K_STATUS, t, f"thread {t}"
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
+    elif t == "saved":
+        kind, label, text = K_STATUS, "saved", f"pushed {d.get('branch')} at {str(d.get('commit', ''))[:10]}"
+    elif t == "landed":
+        kind, label, text = K_STATUS, "landed", f"{d.get('branch')} is on {d.get('base')} at {str(d.get('commit', ''))[:10]}"
+    elif t == "land_conflict":
+        kind, label = K_ERROR, "land conflict"
+        text = f"{d.get('branch')} conflicts with {d.get('base')} in {', '.join(d.get('files') or [])}; the thread resolves it"
     else:
         kind, label, text = K_STATUS, t, short(json.dumps(d), 300)
     return {**ev, "kind": kind, "label": label, "text": text}

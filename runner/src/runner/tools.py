@@ -108,7 +108,8 @@ WORK_TOOLS = [
     Tool("edit_file", "Replace exact text in a file. `old` must be unique unless all=true.",
          _obj({"path": S, "old": S, "new": S, "all": {"type": "boolean"}}, ["path", "old", "new"]), _edit),
     Tool("list_dir", "List a directory.", _obj({"path": S}, []), _ls),
-    Tool("finish", "End this turn. Give a one-paragraph summary of what you did and the state you left things in.",
+    Tool("finish", "End this turn and land your branch on the project's main branch. Give a one-paragraph "
+         "summary of what you did and the state you left things in.",
          _obj({"summary": S}, ["summary"]), _finish),
 ]
 

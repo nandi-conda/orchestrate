@@ -54,6 +54,9 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | provider token counts |
 | `turn_done` | `{"summary", "final"}` |
+| `saved` | `{"branch", "commit"}`: a turn ended without `finish`; leftovers committed and `thread/<id>` pushed |
+| `landed` | `{"branch", "base", "commit"}`: a turn ended with `finish` and the branch is now the tip of `base` |
+| `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
 | `dropped` | `{"from", "reason"}` |
 | `error` | `{"error"}` |
 
@@ -101,7 +104,24 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, and an `openai-compat` model's `api
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
-| `RUNNER_REPO` | | git repo to make one worktree per thread from (branch `thread/<id>`) |
+| `RUNNER_REPO` | | git URL of the project; cloned once to `$RUNNER_WORKDIR/.repo`, one worktree per thread (branch `thread/<id>`) off the remote's default branch. See [Commits](#commits) |
+| `GITHUB_TOKEN` | | fine-grained token with Contents: Read and write on `RUNNER_REPO`. Git sends it as `Authorization: Basic base64("x-access-token:<token>")` via `http.<RUNNER_REPO>.extraHeader`; it is removed from the environment threads' shells inherit |
 | `RUNNER_WORKDIR` | `/work/threads` | where workspaces go |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 | `RUNNER_MAX_STEPS` | `60` | model calls per turn |
+
+## Commits
+
+Threads on one worker share the clone's objects and refs; each has its own
+worktree, index and branch. Commits leave the worker on one path:
+
+1. A thread commits on `thread/<id>` as it likes (it should not push).
+2. At the end of every turn the runner commits anything left uncommitted and
+   pushes `thread/<id>` to origin (`saved`), so deleting a worker loses nothing.
+3. When the turn ended with `finish`, the runner lands it: fetch, rebase onto
+   `origin/<default>`, fast-forward push to `<default>` (`landed`). A push
+   rejected because another thread landed first is retried on the new tip, up
+   to 5 times. No merge commits, no force pushes to `<default>`.
+4. A conflicting rebase is aborted and handed back as a message from `runner`
+   (`land_conflict`); the thread rebases, resolves, and calls `finish` again.
+   A run of conflicts ends at the hop limit.

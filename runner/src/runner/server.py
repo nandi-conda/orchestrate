@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from .model import from_spec
 from .peers import OrchestratorPeers
+from .repo import Repo
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 
@@ -135,12 +136,23 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
     ])
 
 
+def repo_from_env(workdir: str) -> Repo | None:
+    """The project repo to clone into `<workdir>/.repo`, if RUNNER_REPO names one.
+    GITHUB_TOKEN goes to the runner's own git commands only: it is taken out of
+    the environment the threads' shells inherit."""
+    url = os.environ.get("RUNNER_REPO")
+    token = get_secret("GITHUB_TOKEN")
+    os.environ.pop("GITHUB_TOKEN", None)
+    return Repo(url, os.path.join(workdir, ".repo"), token) if url else None
+
+
 def host_from_env() -> ThreadHost:
+    workdir = os.environ.get("RUNNER_WORKDIR", "/work/threads")
     return ThreadHost(
         model_factory=from_spec,
         peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
-        repo=os.environ.get("RUNNER_REPO") or None,
-        workdir=os.environ.get("RUNNER_WORKDIR", "/work/threads"),
+        repo=repo_from_env(workdir),
+        workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
         limits=Limits(max_steps=int(os.environ.get("RUNNER_MAX_STEPS", "60"))),
     )
