@@ -3,23 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 MAX_OUTPUT = 30_000
-
-log = logging.getLogger(__name__)
-
-# Which bwrap option mounts /proc: `--proc` (a fresh procfs) or `--tmpfs` (an
-# empty directory). The latter is the fallback on kernels that refuse to mount
-# procfs in an unprivileged user namespace (Sprites' does). `check()` picks one.
-_proc_mount = "proc"
 
 
 @dataclass
@@ -110,8 +101,7 @@ def bwrap_args(view: View) -> list[str]:
     mounts += [("/tmp", 1, ["--bind", view.tmp, "/tmp"])]
     mounts += [(p, 1, ["--bind", p, p]) for p in (view.root, view.home, *view.writable)]
     mounts.sort(key=lambda m: (len(Path(m[0]).parts), m[1]))
-    args = ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid",
-            f"--{_proc_mount}", "/proc", "--die-with-parent"]
+    args = ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--die-with-parent"]
     for _, _, a in mounts:
         args += a
     return args + ["--chdir", view.root]
@@ -139,31 +129,16 @@ def _no_capabilities() -> None:
         raise OSError(ctypes.get_errno(), "prctl(PR_CAP_AMBIENT_CLEAR_ALL) failed")
 
 
-def _probe(proc_mount: str) -> subprocess.CompletedProcess:
-    return subprocess.run([bwrap(), "--ro-bind", "/", "/", "--unshare-pid",
-                           f"--{proc_mount}", "/proc", "true"],
-                          capture_output=True, text=True, preexec_fn=_no_capabilities)
-
-
 def check() -> None:
-    """Prepare the sandbox and fail now, not at a thread's first command, when
-    this machine cannot run it (no user namespaces for this user, for one).
+    """Fail now, not at a thread's first command, when this machine cannot run
+    the sandbox (no user namespaces for this user, for one)."""
+    import subprocess
 
-    It also picks how /proc is mounted: a fresh procfs, or an empty tmpfs where
-    the kernel refuses to mount procfs in a user namespace (Sprites' does)."""
-    global _proc_mount
-    procfs = _probe("proc")
-    if procfs.returncode == 0:
-        _proc_mount = "proc"
-        return
-    empty = _probe("tmpfs")
-    if empty.returncode == 0:
-        _proc_mount = "tmpfs"
-        log.warning("cannot mount procfs in a user namespace here; threads get an empty /proc instead "
-                    "(bubblewrap: %s)", procfs.stderr.strip())
-        return
-    raise SandboxError(f"bubblewrap cannot make a sandbox here: {procfs.stderr.strip()}; "
-                       f"nor without a procfs: {empty.stderr.strip()}")
+    r = subprocess.run([bwrap(), "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "true"],
+                       capture_output=True, text=True, preexec_fn=_no_capabilities)
+    if r.returncode:
+        raise SandboxError(f"bubblewrap cannot make a sandbox here: {r.stderr.strip()} (it needs unprivileged "
+                           "user namespaces and a /proc with nothing mounted over it; deploy/start.sh unmasks it)")
 
 
 class LocalSandbox:

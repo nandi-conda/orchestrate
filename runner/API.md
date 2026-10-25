@@ -148,7 +148,7 @@ command runs in [bubblewrap](https://github.com/containers/bubblewrap)
 | `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable, kept between commands |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept between commands |
 | the orchestrate checkout the runner runs from, its pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
-| `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it. Where the kernel refuses to mount procfs in a user namespace (Sprites' does), an empty tmpfs instead |
+| `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |
 
 The environment is made afresh for each command: `PATH` (without the hidden
 directories), `HOME`, `TMPDIR=/tmp`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
@@ -159,12 +159,15 @@ Processes end with the command that started them.
 worktree (symlinks included) and refuse anything outside it, as does the
 Files API.
 
-`serve` and `run` check at startup that bubblewrap can make a sandbox (it needs
-unprivileged user namespaces) and exit with bubblewrap's error if not. Before
-starting bubblewrap they clear the ambient capabilities a non-root service may
-hold, since bubblewrap refuses those (Sprites gives its user a set), and they
-fall back to an empty `/proc` when the kernel cannot mount procfs in a user
-namespace. The runner is Linux-only for this reason.
+`serve` and `run` check at startup that bubblewrap can make a sandbox and exit
+with bubblewrap's error if not. It needs unprivileged user namespaces and a
+fully visible `/proc`: the kernel refuses a user namespace its own `/proc` while
+anything is mounted over parts of the machine's. Container runtimes do that
+(crun on Sprites masks `/proc/kcore`, `keys`, `timer_list`, `scsi`), so
+`deploy/start.sh` unmounts whatever is mounted under `/proc` (with `sudo`)
+before it starts the service. They also clear the ambient capabilities a
+non-root service may hold before starting bubblewrap, which refuses them
+(Sprites gives its user a set). The runner is Linux-only for this reason.
 
 ## Commits
 

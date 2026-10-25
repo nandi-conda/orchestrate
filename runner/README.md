@@ -37,7 +37,7 @@ and environment variables are in [API.md](API.md).
 
 ## Deploying a worker
 
-On any Linux box with git, curl and unprivileged user namespaces (bubblewrap needs them): `deploy/bootstrap.sh` installs pixi, checks out
+On any Linux box with git, curl, unprivileged user namespaces and, if a container runtime masks parts of `/proc`, passwordless sudo (bubblewrap needs them, see [API.md](API.md#sandbox)): `deploy/bootstrap.sh` installs pixi, checks out
 this repo and installs the `prod` environment; `deploy/start.sh` runs the service in
 the foreground. On Sprites, run bootstrap once through exec, checkpoint, then register
 `deploy/start.sh` as a sprite service with `http_port` 8080 and the env vars from API.md.
