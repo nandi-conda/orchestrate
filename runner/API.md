@@ -147,7 +147,6 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`) are read from the environment first
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
 | `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repo/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
-| `RUNNER_MAX_STEPS` | `60` | tool calls per turn; at the limit the turn is aborted with an `error` |
 
 ## Sandbox
 

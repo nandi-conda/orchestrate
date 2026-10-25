@@ -132,18 +132,6 @@ async def test_a_message_during_a_turn_steers_it(tmp_path):
     await host.stop(t.id)
 
 
-async def test_the_step_limit_aborts_a_turn(tmp_path):
-    from runner import Limits
-
-    host = host_with([py("print(1)")] * 5, tmp_path=tmp_path, limits=Limits(max_steps=2))
-    t = await host.start(project="p", title="t", request="loop")
-    await host.wait_idle(t.id)
-    errors = [e["data"]["error"] for e in t.events if e["type"] == "error"]
-    assert errors == ["step limit 2 reached"] and t.state == "idle"
-    assert sum(e["type"] == "tool_call" for e in t.events) < 5  # the abort lands within a call or so
-    await host.stop(t.id)
-
-
 async def test_spawn_and_child_reports_back(tmp_path):
     host = host_with(
         [py("print(await team.spawn_thread('child', 'do the child work'))"),

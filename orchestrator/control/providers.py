@@ -123,7 +123,7 @@ def passthrough_env() -> dict:
     """
     from .secrets import get_secret
 
-    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS")
+    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL")
     found = {k: get_secret(k) for k in keep}
     return {k: v for k, v in found.items() if v}
 

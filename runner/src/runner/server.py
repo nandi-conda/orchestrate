@@ -18,7 +18,7 @@ from .harness import PrimeAgent
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repo, refs_header
 from .secrets import get_secret, require
-from .thread import Limits, ThreadHost, dumps
+from .thread import ThreadHost, dumps
 from .web import deepseek_web
 
 # The same limits the control plane enforces; a worker is reachable on its own,
@@ -266,7 +266,6 @@ def host_from_env() -> ThreadHost:
         repo=Repo(os.path.join(workdir, ".repo")),
         workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
-        limits=Limits(max_steps=int(os.environ.get("RUNNER_MAX_STEPS", "60"))),
     )
 
 

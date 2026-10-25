@@ -54,7 +54,6 @@ resolve, `git rebase --continue`, and call finish again.
 
 @dataclass
 class Limits:
-    max_steps: int = 60  # model calls per turn
     max_spawn: int = 8
     max_hops: int = 6
 
@@ -258,7 +257,6 @@ class Turn:
         self.deltas = DeltaBuffer(t.emit)
         self.steps = 0
         self.final = ""
-        self.aborted = False
 
     async def on(self, ev: dict) -> bool:
         """Take one event; True when the agent's run has ended."""
@@ -267,7 +265,7 @@ class Turn:
             self._delta(ev)
         elif typ == "message_end" and (ev.get("message") or {}).get("role") == "assistant":
             self.deltas.flush()
-            await self._step(ev["message"])
+            self._step(ev["message"])
         elif typ == "tool_execution_end":
             self.t.emit("tool_result", {"id": ev.get("toolCallId"), "name": ev.get("toolName"),
                                         "result": result_text(ev.get("result"))[:4000]})
@@ -289,7 +287,7 @@ class Turn:
             name = content[i].get("name", "") if 0 <= i < len(content) else ""
             self.deltas("tool", a.get("delta", ""), name)
 
-    async def _step(self, m: dict):
+    def _step(self, m: dict):
         blocks = m.get("content") or []
         reasoning = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -307,10 +305,6 @@ class Turn:
         if m.get("stopReason") == "error":
             self.t.emit("error", {"error": m.get("errorMessage") or "the model call failed"})
         self.steps += 1
-        if self.steps >= self.t.limits.max_steps and not self.aborted:
-            self.aborted = True
-            self.t.emit("error", {"error": f"step limit {self.t.limits.max_steps} reached"})
-            await self.t.harness.abort()
 
 
 class ThreadHost:
