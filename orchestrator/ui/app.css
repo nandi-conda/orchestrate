@@ -23,7 +23,12 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .thread { display: block; width: 100%; text-align: left; border: 1px solid transparent; background: none; border-radius: 8px; padding: 8px 10px; margin-bottom: 4px; cursor: pointer; font: inherit; color: inherit; }
 .thread:hover { background: var(--muted); }
 .thread.active { background: var(--muted); border-color: var(--border); }
-.thread.child { margin-left: 14px; width: calc(100% - 14px); }
+.thread-row { position: relative; }
+.thread-row.child { margin-left: 14px; }
+.thread-archive { position: absolute; right: 8px; bottom: 10px; border: 1px solid var(--border); background: var(--background); color: var(--muted-foreground); border-radius: 6px; padding: 1px 8px; font: inherit; font-size: 12px; cursor: pointer; opacity: 0; }
+.thread-row:hover .thread-archive, .thread-archive:focus-visible { opacity: 1; }
+.thread-archive:hover { color: var(--foreground); background: var(--muted); }
+@media (hover: none) { .thread-archive { opacity: 1; } }
 .thread-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .thread-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-summary { font-size: 13px; color: var(--muted-foreground); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

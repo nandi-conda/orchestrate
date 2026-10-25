@@ -66,6 +66,8 @@ UNQUOTE: Const[i32] = 43
 FILE_VIEW: Const[i32] = 44
 GOT_FVIEW: Const[i32] = 45
 FVIEW_CLOSE: Const[i32] = 46
+ARCHIVE_ROW: Const[i32] = 47
+UNARCHIVE_ROW: Const[i32] = 48
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -156,6 +158,7 @@ h_seltext: i32 = 0       # the text selected in the pane
 h_selpos: i32 = 0        # style placing the Reply button over the selection
 h_quote: i32 = 0         # the selection the next request replies to ("" = none)
 h_lastq: i32 = 0         # the quote being sent, put back if the send fails
+h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 
 
@@ -186,7 +189,7 @@ def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err
-    global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body
+    global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -223,6 +226,7 @@ def init() -> None:
     h_quote = s_new()
     h_lastq = s_new()
     h_body = s_new()
+    h_act = s_new()
     on_nav(NAV)
     on_select(h_seltext, h_selpos, SELECTED)
     show_address()
@@ -312,6 +316,14 @@ def fetch_threads() -> None:
     get(h_url, GOT_THREADS)
 
 
+def row_id(i: i32, id: i32) -> None:
+    """Copy the id of the thread list's row i into id."""
+    e: i32
+    e = j_idx(threads, i)
+    jstr(e, "id", id)
+    j_free(e)
+
+
 def show_activity() -> None:
     """Select nothing: the pane shows the project's activity."""
     global mode, pane_tab, jump
@@ -324,12 +336,12 @@ def show_activity() -> None:
     fetch_log()
 
 
-def post_thread(action: str, msg: i32) -> None:
-    """POST /api/threads/<selected>/<action>."""
+def post_thread(id: i32, action: str, msg: i32) -> None:
+    """POST /api/threads/<id>/<action>."""
     o: i32
     o = o_new()
     s_set(h_url, "/api/threads/")
-    s_add_ref(h_url, h_sel)
+    s_add_ref(h_url, id)
     s_add(h_url, "/")
     s_add(h_url, action)
     post(h_url, o, msg)
@@ -629,25 +641,36 @@ def update(msg: i32, arg: i32) -> None:
             post(h_url, o, STOPPED)
     elif msg == ARCHIVE:
         if s_len(h_sel) > 0:
-            post_thread("archive", ARCHIVED)
+            s_copy(h_act, h_sel)
+            post_thread(h_act, "archive", ARCHIVED)
+    elif msg == ARCHIVE_ROW:
+        row_id(arg, h_act)
+        post_thread(h_act, "archive", ARCHIVED)
     elif msg == ARCHIVED:
         # The control plane stopped the thread if it was running; it leaves
-        # the list, so the pane goes back to the project's activity.
+        # the list, so if it was open the pane goes back to the project's activity.
         if j_ok(arg) == 1:
-            show_activity()
+            if s_eq(h_act, h_sel) == 1:
+                show_activity()
             fetch_threads()
         else:
             j_err(arg, h_err)
         j_free(arg)
     elif msg == UNARCHIVE:
         if s_len(h_sel) > 0:
-            post_thread("unarchive", UNARCHIVED)
+            s_copy(h_act, h_sel)
+            post_thread(h_act, "unarchive", UNARCHIVED)
+    elif msg == UNARCHIVE_ROW:
+        row_id(arg, h_act)
+        post_thread(h_act, "unarchive", UNARCHIVED)
     elif msg == UNARCHIVED:
-        # Back to the live list, with the thread still selected.
+        # The open thread goes back to the live list, still selected; one
+        # unarchived from its row just leaves the archived list.
         if j_ok(arg) == 1:
-            show_archived = 0
+            if s_eq(h_act, h_sel) == 1:
+                show_archived = 0
+                fetch_transcript()
             fetch_threads()
-            fetch_transcript()
         else:
             j_err(arg, h_err)
         j_free(arg)
@@ -929,11 +952,15 @@ def thread_list() -> None:
     for i in range(n):
         e = j_idx(threads, i)
         jstr(e, "id", h_t3)
+        # The row holds the thread's button and, beside it rather than inside
+        # it, the archive button: a click there archives without opening.
+        el("div")
+        cls("thread-row")
+        cls_if("child", j_has(e, "parent_id") == 1)
+        key(i + 1)
         el("button")
         cls("thread")
         cls_if("active", s_eq(h_t3, h_sel) == 1)
-        cls_if("child", j_has(e, "parent_id") == 1)
-        key(i + 1)
         on_click(SELECT, i)
         div("thread-top")
         span("thread-title")
@@ -965,6 +992,20 @@ def thread_list() -> None:
             end()
         span("thread-id mono")
         text_ref(h_t3)
+        end()
+        end()
+        el("button")
+        cls("thread-archive")
+        if show_archived == 1:
+            on_click(UNARCHIVE_ROW, i)
+            attr("title", "Unarchive")
+            attr("aria-label", "Unarchive")
+            text("Unarchive")
+        else:
+            on_click(ARCHIVE_ROW, i)
+            attr("title", "Stops the thread if it is running and hides it from the list")
+            attr("aria-label", "Archive")
+            text("Archive")
         end()
         end()
         j_free(e)
