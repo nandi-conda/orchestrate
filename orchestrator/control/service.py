@@ -484,6 +484,18 @@ class Orchestrator:
             raise KeyError(thread_id)
         return await self.provider.logs(lw.worker, lines)
 
+    async def list_files(self, thread_id: str, path: str) -> dict:
+        """A directory of the thread's worktree, read from the worker that holds
+        it (the control plane asks; the worker never sends files on its own)."""
+        lw = await self.live_worker(thread_id)
+        return await lw.client.list_files(thread_id, path)
+
+    async def open_file(self, thread_id: str, path: str) -> httpx.Response:
+        """A file of the thread's worktree, streaming from its worker; the
+        caller closes the response."""
+        lw = await self.live_worker(thread_id)
+        return await lw.client.open_file(thread_id, path)
+
     async def stop(self, thread_id: str) -> None:
         starting = self.starting.get(thread_id)
         if starting:

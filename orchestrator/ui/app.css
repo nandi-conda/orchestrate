@@ -81,6 +81,13 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .tool-body { white-space: pre-wrap; word-break: break-word; margin: 2px 0 6px 12px; padding: 6px 10px; border-radius: 6px;
              background: color-mix(in oklch, var(--muted) 60%, transparent); color: var(--foreground); max-height: 360px; overflow: auto; }
 /* The Worker log tab: the runner's own output, as it wrote it. */
+.files { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; max-width: 860px; }
+.file { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-top: 1px solid var(--border); font-size: 13px;
+  background: none; border-left: 0; border-right: 0; border-bottom: 0; text-align: left; color: inherit; text-decoration: none; cursor: pointer; }
+.file:first-child { border-top: 0; }
+.file:hover { background: var(--muted); }
+.file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-size { font-variant-numeric: tabular-nums; }
 .wlog-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
 .wlog { margin: 0; flex: 1; overflow: auto; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
         background: color-mix(in oklch, var(--muted) 60%, transparent); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;

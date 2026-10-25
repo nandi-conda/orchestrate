@@ -4,6 +4,8 @@ It has no model. Each turn it says what it got, and:
 - a line `spawn: <task>` in a request spawns a child thread through the peer API,
 - a line `tell t_xxx: <text>` sends that thread a message,
 - a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
+- a line `write <path>: <text>` writes text to that file of the thread's workspace
+  (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
 Peer calls wait on /peer/calls for the control plane to collect, as in
@@ -22,24 +24,28 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
+from pathlib import Path
 
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 SPAWN = re.compile(r"^\s*spawn:\s*(.+)$", re.M)
 TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
 LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
+WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
 
 
 class Host:
-    def __init__(self, capacity: int, delay: float) -> None:
+    def __init__(self, capacity: int, delay: float, workdir: str) -> None:
         self.capacity = capacity
         self.delay = delay
+        self.workdir = Path(workdir).resolve()
         self.threads: dict[str, dict] = {}
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
@@ -97,6 +103,10 @@ class Host:
             r = await self.peer_call("spawn_thread", parent=t["id"], project=t["project"], title=task[:40],
                                      request=task)
             await self.emit(t["id"], "tool_result", {"id": "c1", "name": "spawn_thread", "result": r})
+        for path, body in WRITE.findall(text):
+            f = self.inside(t, path)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(body + "\n")
         for to, body in TELL.findall(text):
             await self.peer_call("send_message", sender=t["id"], to=to, body=body)
         for query in LIST.findall(text):
@@ -113,6 +123,14 @@ class Host:
             await self.peer_call("send_message", sender=t["id"], to=t["parent"], body=f"Finished: {summary}")
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
+
+    def inside(self, t: dict, path: str) -> Path:
+        """`path` in the thread's workspace; ValueError if it leaves it or names .git."""
+        root = (self.workdir / t["id"]).resolve()
+        p = (root / path).resolve()
+        if (p != root and root not in p.parents) or ".git" in Path(path).parts:
+            raise ValueError(f"path escapes the workspace: {path}")
+        return p
 
     def entry(self, t: dict) -> dict:
         return {k: t[k] for k in ("id", "project", "title", "state", "summary", "files", "parent")}
@@ -145,6 +163,7 @@ def create_app(host: Host, token: str) -> Starlette:
              "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
              "history": len(b.get("history") or [])}
         host.threads[tid] = t
+        (host.workdir / tid).mkdir(parents=True, exist_ok=True)
         await host.emit(tid, "created", host.entry(t))
         if b.get("request"):
             await host.emit(tid, "message_in", {"from": "user", "body": b["request"]})
@@ -172,6 +191,43 @@ def create_app(host: Host, token: str) -> Starlette:
             return JSONResponse({"error": "no such thread"}, 404)
         await host.set_state(t, "stopped")
         return JSONResponse({"ok": True})
+
+    def file_of(req: Request):
+        """(thread, path in its workspace), or an error response."""
+        t = host.threads.get(req.path_params["tid"])
+        if t is None:
+            return None, JSONResponse({"error": "no such thread"}, 404)
+        try:
+            p = host.inside(t, req.query_params.get("path", ""))
+        except ValueError as e:
+            return None, JSONResponse({"error": str(e)}, 400)
+        if not p.exists():
+            return None, JSONResponse({"error": "no such file or directory"}, 404)
+        return p, None
+
+    async def list_files(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        p, err = file_of(req)
+        if err:
+            return err
+        if not p.is_dir():
+            return JSONResponse({"error": "not a directory"}, 400)
+        root = (host.workdir / req.path_params["tid"]).resolve()
+        entries = sorted(({"name": c.name, "dir": c.is_dir(), "size": 0 if c.is_dir() else c.stat().st_size}
+                          for c in p.iterdir() if c.name != ".git"), key=lambda e: (not e["dir"], e["name"]))
+        rel = p.relative_to(root).as_posix()
+        return JSONResponse({"path": "" if rel == "." else rel, "entries": entries})
+
+    async def raw_file(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        p, err = file_of(req)
+        if err:
+            return err
+        if not p.is_file():
+            return JSONResponse({"error": "not a file"}, 400)
+        return FileResponse(p, media_type="application/octet-stream")
 
     def stream(tid: str | None, after: int):
         async def gen():
@@ -225,6 +281,8 @@ def create_app(host: Host, token: str) -> Starlette:
         Route("/threads/{tid}/messages", message, methods=["POST"]),
         Route("/threads/{tid}/stop", stop, methods=["POST"]),
         Route("/threads/{tid}/events", thread_events),
+        Route("/threads/{tid}/files", list_files),
+        Route("/threads/{tid}/files/raw", raw_file),
         Route("/events", all_events),
     ])
 
@@ -233,7 +291,8 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=int(os.environ.get("RUNNER_PORT", "8080")))
     a = p.parse_args()
-    host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")))
+    host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")),
+                os.environ.get("RUNNER_WORKDIR") or tempfile.mkdtemp(prefix="devrunner-"))
     print(f"devrunner: echo runner on port {a.port}", file=sys.stderr, flush=True)
     uvicorn.run(create_app(host, os.environ.get("RUNNER_TOKEN", "")),
                 host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning")

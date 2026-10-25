@@ -40,6 +40,11 @@ def http_get_text(url: i32, msg: i32) -> i32:
     pass
 
 @jscall
+def s_add_enc(dst: i32, src: i32) -> None:
+    """Append the string in src to dst, encoded for a URL query (encodeURIComponent)."""
+    pass
+
+@jscall
 def page_project(dst: i32) -> i32:
     """If the address is a project's page (/p/<id>), write the id to dst and
     return 1."""

@@ -50,6 +50,7 @@ export function imports({ str, strs, vals, dispatch }) {
       return id;
     },
     sse_close: (id) => { const es = streams.get(id); if (es) { es.close(); streams.delete(id); } },
+    s_add_enc: (d, h) => { strs[d] = (strs[d] ?? "") + encodeURIComponent(strs[h] ?? ""); },
     page_project: (d) => {
       const m = location.pathname.match(/^\/p\/([^/]+)/);
       if (!m) return 0;

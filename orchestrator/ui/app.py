@@ -1,8 +1,8 @@
 # Orchestrator UI: one window that shows the project list at / and a project at
 # /p/<id>. Opening a project, going back to the list, Back and Forward all
 # happen in place (history.pushState), never in a new tab or window. A project
-# shows its threads on the left, the selected thread's transcript, tool calls
-# or worker log (or the project's activity) in the middle, and a request box at
+# shows its threads on the left, the selected thread's transcript, tool calls,
+# files or worker log (or the project's activity) in the middle, and a request box at
 # the bottom that goes to the router.
 #
 # Text lives in ultra's JS string store; this module holds handles. JSON
@@ -11,12 +11,12 @@
 from lpython import i32, Const
 from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, key, autofocus,
                    on_click, on_enter, on_input, value_ref, after, s_new, s_set, s_add, s_add_ref, s_clear, s_len, s_eq,
-                   s_copy, http_get_ref, j_ok, j_err, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
+                   s_copy, http_get_ref, j_ok, j_err, j_at, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, set_title, scroll_end, md_parse, md_op, md_str)
+                  nav_push, on_nav, set_title, scroll_end, md_parse, md_op, md_str, s_add_enc)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -51,11 +51,16 @@ UNARCHIVE: Const[i32] = 29
 ARCHIVED: Const[i32] = 30
 UNARCHIVED: Const[i32] = 31
 SHOW_ARCHIVED: Const[i32] = 32
+GOT_FILES: Const[i32] = 33
+FILE_OPEN: Const[i32] = 34
+FILES_UP: Const[i32] = 35
+FILES_REFRESH: Const[i32] = 36
 
 # pane tabs
 DIALOG: Const[i32] = 0
 TOOLS: Const[i32] = 1
 WLOG: Const[i32] = 2
+FILES: Const[i32] = 3
 
 # routing modes
 AUTO: Const[i32] = 0
@@ -96,10 +101,12 @@ creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
-pane_tab: i32 = 0        # DIALOG, TOOLS or WLOG
+pane_tab: i32 = 0        # DIALOG, TOOLS, FILES or WLOG
 stream: i32 = 0          # the open project's event stream, 0 when none
 wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
 wlog_loading: i32 = 0
+files: i32 = 0           # JSON handle: a directory of the selected thread's worktree ({path, entries})
+files_loading: i32 = 0
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 
 h_pid: i32 = 0           # project id
@@ -120,6 +127,8 @@ h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
+h_fpath: i32 = 0         # the worktree directory the Files tab shows ("" = its root)
+h_files_err: i32 = 0     # why the files could not be read
 h_md: i32 = 0            # scratch for markdown text
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
@@ -150,7 +159,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -174,6 +183,8 @@ def init() -> None:
     h_stopped = s_new()
     s_set(h_stopped, "stopped")
     h_wlog_err = s_new()
+    h_fpath = s_new()
+    h_files_err = s_new()
     h_md = s_new()
     h_run = s_new()
     h_tid = s_new()
@@ -202,7 +213,7 @@ def open_project(id: i32) -> None:
 
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
-    global stream, project, threads, transcript, plog, wlog, mode, pane_tab, sending, show_archived
+    global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -211,6 +222,9 @@ def leave_project() -> None:
     transcript = take_none(transcript)
     plog = take_none(plog)
     wlog = take_none(wlog)
+    files = take_none(files)
+    s_clear(h_fpath)
+    s_clear(h_files_err)
     s_clear(h_sel)
     s_clear(h_route)
     s_clear(h_err)
@@ -265,7 +279,7 @@ def show_activity() -> None:
     s_clear(h_sel)
     if mode == TO_THREAD:
         mode = AUTO
-    if pane_tab == WLOG:
+    if pane_tab == WLOG or pane_tab == FILES:
         pane_tab = DIALOG
     fetch_log()
 
@@ -308,6 +322,19 @@ def fetch_wlog() -> None:
     get_text(h_url, GOT_WLOG)
 
 
+def fetch_files() -> None:
+    """The directory h_fpath of the selected thread's worktree, from its worker."""
+    global files_loading
+    if s_len(h_sel) == 0:
+        return
+    files_loading = 1
+    s_set(h_url, "/api/threads/")
+    s_add_ref(h_url, h_sel)
+    s_add(h_url, "/files?path=")
+    s_add_enc(h_url, h_fpath)
+    get(h_url, GOT_FILES)
+
+
 def take_none(old: i32) -> i32:
     if old != 0:
         j_free(old)
@@ -331,7 +358,7 @@ def take(old: i32, new: i32) -> i32:
 
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending, pane_tab, wlog, wlog_loading, show_archived
+    global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -397,6 +424,11 @@ def update(msg: i32, arg: i32) -> None:
         s_clear(h_wlog_err)
         if pane_tab == WLOG:
             fetch_wlog()
+        files = take_none(files)
+        s_clear(h_fpath)
+        s_clear(h_files_err)
+        if pane_tab == FILES:
+            fetch_files()
     elif msg == ACTIVITY:
         show_activity()
     elif msg == GOT_TRANSCRIPT:
@@ -499,6 +531,8 @@ def update(msg: i32, arg: i32) -> None:
         pane_tab = arg
         if pane_tab == WLOG and wlog == 0:
             fetch_wlog()
+        if pane_tab == FILES and files == 0:
+            fetch_files()
         scroll_end("pane")
     elif msg == WLOG_REFRESH:
         fetch_wlog()
@@ -514,6 +548,35 @@ def update(msg: i32, arg: i32) -> None:
             j_err(arg, h_wlog_err)
             j_free(arg)
         scroll_end("pane")
+    elif msg == GOT_FILES:
+        # Like the worker log: a late reply for another thread is replaced by
+        # the next fetch. The listing names its own (normalized) path.
+        files_loading = 0
+        if j_ok(arg) == 1:
+            s_clear(h_files_err)
+            files = take_none(files)
+            files = arg
+            jstr(files, "path", h_fpath)
+        else:
+            j_err(arg, h_files_err)
+            j_free(arg)
+    elif msg == FILE_OPEN:
+        # arg indexes a directory entry of the listing shown; files download
+        # through their link instead.
+        o = j_at(files, "entries")
+        e = j_idx(o, arg)
+        jstr(e, "name", h_t1)
+        j_free(e)
+        j_free(o)
+        if s_len(h_fpath) > 0:
+            s_add(h_fpath, "/")
+        s_add_ref(h_fpath, h_t1)
+        fetch_files()
+    elif msg == FILES_UP:
+        s_add(h_fpath, "/..")
+        fetch_files()
+    elif msg == FILES_REFRESH:
+        fetch_files()
     elif msg == HOME:
         s_set(h_url, "/")
         nav_push(h_url)
@@ -1164,7 +1227,8 @@ def tab_open(active: bool, arg: i32) -> None:
 
 def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
     """Dialog (the conversation) and Tools (calls and their output), with
-    counts, and Worker log (the runner's stdout and stderr) when logs is set."""
+    counts, and for a thread (logs set) Files (its worktree) and Worker log
+    (the runner's stdout and stderr)."""
     div("pane-tabs")
     tabs_list_open()
     tab_open(pane_tab == DIALOG, DIALOG)
@@ -1180,6 +1244,9 @@ def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
     end()
     end()
     if logs:
+        tab_open(pane_tab == FILES, FILES)
+        text("Files")
+        end()
         tab_open(pane_tab == WLOG, WLOG)
         text("Worker log")
         end()
@@ -1217,6 +1284,107 @@ def worker_log() -> None:
         else:
             text("(empty)")
         end()
+
+
+def size_text(n: i32) -> None:
+    if n < 1024:
+        num(n)
+        text(" B")
+    elif n < 1048576:
+        num(n // 1024)
+        text(" KB")
+    else:
+        num(n // 1048576)
+        text(" MB")
+
+
+def file_list() -> None:
+    """The selected thread's worktree, one directory at a time, read from the
+    worker that holds it. A directory opens in place; a file is a download link
+    (the browser saves it; the page stays)."""
+    i: i32
+    n: i32 = 0
+    e: i32
+    ents: i32
+    div("wlog-bar")
+    span("mono")
+    text("/")
+    text_ref(h_fpath)
+    end()
+    div("pane-actions")
+    if s_len(h_fpath) > 0:
+        btn_open("ghost", FILES_UP, 0)
+        cls("sm")
+        text("Up")
+        end()
+    btn_open("ghost", FILES_REFRESH, 0)
+    cls("sm")
+    if files_loading == 1:
+        text("Loading…")
+    else:
+        text("Refresh")
+    end()
+    end()
+    end()
+    if s_len(h_files_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_files_err)
+        end()
+        return
+    if files == 0:
+        return
+    ents = j_at(files, "entries")
+    n = j_len(ents, "")
+    if n == 0:
+        j_free(ents)
+        el("p")
+        cls("muted")
+        cls("empty")
+        text("This directory is empty.")
+        end()
+        return
+    div("files")
+    for i in range(n):
+        e = j_idx(ents, i)
+        jstr(e, "name", h_t1)
+        if j_int(e, "dir") == 1:
+            el("button")
+            cls("file")
+            key(i)
+            on_click(FILE_OPEN, i)
+            span("file-name")
+            text_ref(h_t1)
+            text("/")
+            end()
+            end()
+        else:
+            s_set(h_t2, "/api/threads/")
+            s_add_ref(h_t2, h_sel)
+            s_add(h_t2, "/files/raw?path=")
+            s_copy(h_t3, h_fpath)
+            if s_len(h_fpath) > 0:
+                s_add(h_t3, "/")
+            s_add_ref(h_t3, h_t1)
+            s_add_enc(h_t2, h_t3)
+            el("a")
+            cls("file")
+            key(i)
+            attr_ref("href", h_t2)
+            attr_ref("download", h_t1)
+            attr("title", "Download")
+            span("file-name")
+            text_ref(h_t1)
+            end()
+            span("file-size muted")
+            size_text(j_int(e, "size"))
+            end()
+            end()
+        j_free(e)
+    end()
+    j_free(ents)
 
 
 def pane() -> None:
@@ -1265,6 +1433,11 @@ def pane() -> None:
     attr("id", "pane")
     if pane_tab == WLOG:
         worker_log()
+        end()
+        end()
+        return
+    if pane_tab == FILES:
+        file_list()
         end()
         end()
         return

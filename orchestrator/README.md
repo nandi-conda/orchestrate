@@ -1,8 +1,8 @@
 # orchestrator
 
 The control plane and the ultra UI. Everything happens in one browser window:
-the project list, each project, and each thread's transcript, tool calls and
-worker log. A request typed in a project goes to a router, which spawns new threads or messages
+the project list, each project, and each thread's transcript, tool calls,
+files and worker log. A request typed in a project goes to a router, which spawns new threads or messages
 existing ones. Threads run on runner workers (see `../runner`), and the control
 plane relays their events back to the window as they happen.
 
@@ -191,6 +191,17 @@ curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \
 
 The spawn path has been exercised against the live API: create, bootstrap,
 `/health`, an agent turn, and destroy.
+
+### Files
+
+Each thread's pane has a **Files** tab: the thread's worktree, one directory at
+a time. Click a directory to open it (Up goes back); click a file to download
+it, in the same window. The control plane reads them from the worker that holds
+the thread (runner `GET /threads/<id>/files` and `/files/raw`; the worker never
+connects in) and serves them at `/api/threads/<id>/files?path=<dir>` (JSON) and
+`/api/threads/<id>/files/raw?path=<file>` (a download). `.git` is not shown.
+A thread whose worker is gone is revived first: a worker checks out its pushed
+`thread/<id>` branch, so its files are as of the end of its last turn.
 
 ### Archiving threads
 

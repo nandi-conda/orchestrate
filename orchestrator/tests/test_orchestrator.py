@@ -470,6 +470,43 @@ async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
             provider.gate.set()
 
 
+async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
+    """The Files tab: the control plane reads a thread's worktree from its
+    worker and serves a file as a download."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter())
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            text = "build hello\nwrite out/hello world: compiled\nwrite README.md: hi"
+            tid = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": text, "mode": "new"})).json()["spawned"][0]["id"]
+
+            async def idle():
+                return (await c.get(f"/api/threads/{tid}")).json()["state"] == "idle"
+            await wait_for(idle)
+
+            top = (await c.get(f"/api/threads/{tid}/files")).json()
+            assert top == {"path": "", "entries": [{"name": "out", "dir": True, "size": 0},
+                                                   {"name": "README.md", "dir": False, "size": 3}]}
+            sub = (await c.get(f"/api/threads/{tid}/files", params={"path": "out/x/.."})).json()
+            assert sub["path"] == "out" and [e["name"] for e in sub["entries"]] == ["hello world"]
+
+            r = await c.get(f"/api/threads/{tid}/files/raw", params={"path": "out/hello world"})
+            assert r.status_code == 200 and r.content == b"compiled\n"
+            assert r.headers["content-type"] == "application/octet-stream"
+            assert r.headers["content-disposition"] == "attachment; filename*=UTF-8''hello%20world"
+
+            # The runner's refusals keep their status and words.
+            r = await c.get(f"/api/threads/{tid}/files/raw", params={"path": "../../etc/passwd"})
+            assert r.status_code == 400 and "escapes" in r.json()["error"]
+            assert (await c.get(f"/api/threads/{tid}/files/raw", params={"path": "nope"})).status_code == 404
+            assert (await c.get(f"/api/threads/{tid}/files", params={"path": "README.md"})).status_code == 400
+            assert (await c.get("/api/threads/t_nope/files")).status_code == 404
+
+
 async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):
     from control.service import Orchestrator
 

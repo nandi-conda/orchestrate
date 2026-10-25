@@ -10,7 +10,10 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from urllib.parse import quote
+
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
@@ -18,6 +21,7 @@ from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
+from .runner_client import FileError
 from .service import ENDS_STREAM, ArchivedError, Orchestrator, describe, tool_arg
 from .store import Store, store_from_url
 
@@ -271,6 +275,36 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return PlainTextResponse(f"could not read the worker log: {describe(e)}\n", 502)
         return PlainTextResponse(text)
 
+    def files_error(e: Exception) -> Response:
+        if isinstance(e, KeyError):
+            return JSONResponse({"error": "no such thread"}, 404)
+        if isinstance(e, ArchivedError):
+            return JSONResponse({"error": str(e)}, 409)
+        if isinstance(e, FileError):
+            return JSONResponse({"error": str(e)}, e.status)
+        return JSONResponse({"error": f"could not read the thread's files: {describe(e)}"}, 502)
+
+    async def thread_files(req: Request):
+        """A directory of the thread's worktree: ?path=<dir>, the root by default."""
+        try:
+            return JSONResponse(await orch().list_files(req.path_params["tid"], req.query_params.get("path", "")))
+        except Exception as e:
+            return files_error(e)
+
+    async def thread_file(req: Request):
+        """One file of the thread's worktree, as a download (?path=<file>)."""
+        tid, path = req.path_params["tid"], req.query_params.get("path", "")
+        try:
+            r = await orch().open_file(tid, path)
+        except Exception as e:
+            return files_error(e)
+        name = path.rstrip("/").rsplit("/", 1)[-1] or "file"
+        headers = {"content-disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
+        if "content-length" in r.headers:
+            headers["content-length"] = r.headers["content-length"]
+        return StreamingResponse(r.aiter_raw(), media_type="application/octet-stream", headers=headers,
+                                 background=BackgroundTask(r.aclose))
+
     async def transcript(req: Request):
         t = await store.get_thread(req.path_params["tid"])
         if t is None:
@@ -358,6 +392,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/threads/{tid}/transcript", transcript, methods=["GET"]),
         Route("/api/threads/{tid}/worker-logs", worker_logs, methods=["GET"]),
         Route("/api/threads/{tid}/events", thread_events, methods=["GET"]),
+        Route("/api/threads/{tid}/files", thread_files, methods=["GET"]),
+        Route("/api/threads/{tid}/files/raw", thread_file, methods=["GET"]),
         Route("/", index),
         Route("/p/{pid}", index),
     ]

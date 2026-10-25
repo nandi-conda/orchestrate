@@ -15,6 +15,8 @@ threads. Default port 8080. Every route except `/health` needs
 | POST | `/threads/{id}/messages` | `{"body", "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
+| GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
+| GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream` |
 | GET | `/events` | | SSE stream for every thread on this worker |
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
@@ -22,6 +24,7 @@ threads. Default port 8080. Every route except `/health` needs
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
 - `request` or `history` is required. `history` resumes a thread: see [Resuming a thread](#resuming-a-thread).
 - `model` is `{"provider": "deepseek", "model": "deepseek-v4-pro"}` or `{"provider": "openai-compat", "model", "base_url", "api_key_env"}`. Omitted: DeepSeek with `$DEEPSEEK_MODEL`.
+- `files` paths are relative to the thread's worktree. A path that leaves it (`..`, a symlink out) or names `.git` is 400, as is a file listed as a directory or the reverse; a missing one is 404. `.git` is never listed.
 - `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`.
 - A message whose `hops` exceeds the limit (6) is dropped with a `dropped` event. The orchestrator should increment `hops` when it forwards a thread-to-thread message.
 

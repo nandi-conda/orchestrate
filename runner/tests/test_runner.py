@@ -116,6 +116,36 @@ async def test_http_api(tmp_path):
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202
 
 
+async def test_files_of_a_thread_over_http(tmp_path):
+    host = host_with({"build": [ModelResponse("built")]}, tmp_path)
+    app = create_app(host, token="secret")
+    h = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
+        tid = (await c.post("/threads", json={"request": "build", "title": "build"}, headers=h)).json()["id"]
+        await host.wait_idle(tid)
+        root = host.threads[tid].sandbox.root
+        import os
+        os.makedirs(f"{root}/out")
+        open(f"{root}/out/hello", "wb").write(b"\x7fELF\x00binary")
+        open(f"{root}/README.md", "w").write("hi")
+        os.makedirs(f"{root}/.git")
+        os.symlink("/etc/passwd", f"{root}/leak")
+        assert (await c.get(f"/threads/{tid}/files")).status_code == 401
+        top = (await c.get(f"/threads/{tid}/files", headers=h)).json()
+        assert top["path"] == ""
+        assert [(e["name"], e["dir"]) for e in top["entries"]] == [("out", True), ("README.md", False), ("leak", False)]
+        sub = (await c.get(f"/threads/{tid}/files", params={"path": "out"}, headers=h)).json()
+        assert sub == {"path": "out", "entries": [{"name": "hello", "dir": False, "size": 11}]}
+        raw = await c.get(f"/threads/{tid}/files/raw", params={"path": "out/hello"}, headers=h)
+        assert raw.status_code == 200 and raw.content == b"\x7fELF\x00binary"
+        assert raw.headers["content-type"] == "application/octet-stream"
+        for path, status in (("../x", 400), ("leak", 400), (".git", 400), ("nope", 404), ("out", 400)):
+            r = await c.get(f"/threads/{tid}/files/raw", params={"path": path}, headers=h)
+            assert r.status_code == status, path
+        assert (await c.get(f"/threads/{tid}/files", params={"path": "README.md"}, headers=h)).status_code == 400
+        assert (await c.get("/threads/t_nope/files", headers=h)).status_code == 404
+
+
 async def test_peer_calls_over_http(tmp_path):
     from runner.peers import OrchestratorPeers, PeerError
 

@@ -8,9 +8,10 @@ import os
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from . import files
 from .model import from_spec
 from .peers import OrchestratorPeers
 from .repo import Repo
@@ -79,6 +80,25 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         await host.stop(req.path_params["id"])
         return JSONResponse({"ok": True})
 
+    async def list_files(req: Request):
+        t = thread_or_404(req)
+        if not t:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            return JSONResponse(files.listing(t.sandbox.root, req.query_params.get("path", "")))
+        except files.FileError as e:
+            return JSONResponse({"error": str(e)}, status_code=e.status)
+
+    async def raw_file(req: Request):
+        t = thread_or_404(req)
+        if not t:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            p = files.file_path(t.sandbox.root, req.query_params.get("path", ""))
+        except files.FileError as e:
+            return JSONResponse({"error": str(e)}, status_code=e.status)
+        return FileResponse(p, media_type="application/octet-stream")
+
     def sse(thread_id: str | None, after: int, backlog: list[dict]):
         q = host.subscribe(thread_id)
 
@@ -136,6 +156,8 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         Route("/threads/{id}/messages", guard(post_message), methods=["POST"]),
         Route("/threads/{id}/events", guard(thread_events)),
         Route("/threads/{id}/stop", guard(stop), methods=["POST"]),
+        Route("/threads/{id}/files", guard(list_files)),
+        Route("/threads/{id}/files/raw", guard(raw_file)),
         Route("/peer/calls", guard(peer_calls), methods=["GET"]),
         Route("/peer/calls/{id}", guard(peer_answer), methods=["POST"]),
     ])
