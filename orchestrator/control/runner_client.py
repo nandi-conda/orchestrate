@@ -33,8 +33,8 @@ class RunnerClient:
     async def close(self) -> None:
         await self.http.aclose()
 
-    async def health(self) -> dict:
-        r = await self.http.get("/health")
+    async def health(self, timeout: float | None = None) -> dict:
+        r = await self.http.get("/health", **({"timeout": timeout} if timeout else {}))
         r.raise_for_status()
         return r.json()
 

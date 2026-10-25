@@ -21,6 +21,12 @@ from .store import Store, now
 log = logging.getLogger("orchestrator")
 
 MAX_HOPS = 6
+# A worker is watched every HEALTH_EVERY seconds; one whose /health fails
+# HEALTH_TRIES times in a row (HEALTH_GAP seconds apart) is lost.
+HEALTH_EVERY = 10.0
+HEALTH_TRIES = 3
+HEALTH_GAP = 1.0
+HEALTH_TIMEOUT = 5.0
 CAPACITY = 16  # running threads per worker before another one starts
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
 # States in which a thread is done with its runner; archiving any other thread stops it first.
@@ -105,6 +111,7 @@ class LiveWorker:
     last_seq: int = 0
     relay: asyncio.Task | None = None
     pump: asyncio.Task | None = None
+    watch: asyncio.Task | None = None
     threads: set[str] = field(default_factory=set)
 
 
@@ -116,6 +123,9 @@ class Orchestrator:
         self.router = router
         self.max_running = max_running
         self.workers: dict[str, list[LiveWorker]] = {}
+        # Workers made per project so far; numbers new ones, so a worker made
+        # after one was lost never takes a live worker's name.
+        self.made: dict[str, int] = {}
         self.by_thread: dict[str, LiveWorker] = {}
         # Per thread, the messages the control plane logged when it took them
         # (a spawned thread's request as "created", the rest as "message_in")
@@ -151,7 +161,7 @@ class Orchestrator:
                 task.cancel()
         for lws in self.workers.values():
             for lw in lws:
-                for task in (lw.relay, lw.pump):
+                for task in (lw.relay, lw.pump, lw.watch):
                     if task:
                         task.cancel()
                 await lw.client.close()
@@ -163,26 +173,82 @@ class Orchestrator:
         async with self._lock:
             lws = self.workers.setdefault(project["id"], [])
             best, best_load = None, None
-            for lw in lws:
-                try:
-                    h = await lw.client.health()
-                except Exception:  # an unreachable worker takes no new threads
+            for lw in list(lws):
+                h = await self._health(lw)
+                if h is None:
+                    await self._lose(lw)
                     continue
                 running = h.get("running", 0)
                 if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
                     best, best_load = lw, running
             if best is not None:
                 return best
-            spec = worker_spec(project, len(lws) + 1)
+            self.made[project["id"]] = self.made.get(project["id"], 0) + 1
+            spec = worker_spec(project, self.made[project["id"]])
             worker = await self.provider.create(spec)
             await self.store.upsert_worker(worker.record())
             lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
             lw.relay = asyncio.create_task(self._relay(project["id"], lw))
             lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
+            lw.watch = asyncio.create_task(self._watch(lw))
             lws.append(lw)
             await self.store.append_event(project["id"], None, "worker",
                                           {"id": worker.id, "provider": worker.provider, "url": worker.url})
             return lw
+
+    async def _health(self, lw: LiveWorker) -> dict | None:
+        """The worker's /health, or None when it failed HEALTH_TRIES times in a row."""
+        for attempt in range(HEALTH_TRIES):
+            try:
+                return await lw.client.health(timeout=HEALTH_TIMEOUT)
+            except Exception as e:
+                last = e
+            if attempt + 1 < HEALTH_TRIES:
+                await asyncio.sleep(HEALTH_GAP)
+        log.warning("worker %s is lost: %s", lw.worker.id, describe(last))
+        return None
+
+    async def _watch(self, lw: LiveWorker) -> None:
+        """Notice a worker that died while nothing was sent to it, so its
+        threads stop showing as running."""
+        while True:
+            await asyncio.sleep(HEALTH_EVERY)
+            if await self._health(lw) is None:
+                await self._lose(lw)
+                return
+
+    async def _lose(self, lw: LiveWorker) -> None:
+        """Drop a worker that stopped answering: no thread runs on it any more,
+        so each comes back on another worker with its next message (live_worker).
+        It is destroyed too, so it can never run a thread a second time."""
+        lws = self.workers.get(lw.worker.project_id, [])
+        if lw not in lws:
+            return
+        lws.remove(lw)
+        me = asyncio.current_task()
+        for task in (lw.relay, lw.pump, lw.watch):
+            if task and task is not me:
+                task.cancel()
+        project_id, wid = lw.worker.project_id, lw.worker.id
+        reason = f"worker {wid} stopped answering; the thread comes back on another worker with its next message"
+        for tid in sorted(lw.threads):
+            if self.by_thread.get(tid) is not lw:
+                continue
+            del self.by_thread[tid]
+            t = await self.store.get_thread(tid)
+            fields = {"worker_id": None, "activity": ""}
+            if t["state"] in ("queued", "working"):  # its turn was cut short
+                fields["state"] = "failed"
+            await self.store.update_thread(tid, **fields)
+            await self.store.append_event(project_id, tid, "worker_lost", {"worker": wid, "error": reason})
+        if not lw.threads:
+            await self.store.append_event(project_id, None, "worker_lost",
+                                          {"worker": wid, "error": f"worker {wid} stopped answering"})
+        try:
+            await self.provider.destroy(lw.worker)
+        except Exception as e:
+            log.warning("destroying lost worker %s: %s", wid, describe(e))
+        await lw.client.close()
 
     async def _relay(self, project_id: str, lw: LiveWorker) -> None:
         """Copy a worker's event stream into the store; reconnect on drops."""
@@ -433,7 +499,9 @@ class Orchestrator:
             t = await self.store.get_thread(thread_id)
         lw = self.by_thread.get(thread_id)
         if lw is not None and t["state"] not in ENDED:
-            return lw
+            if await self._health(lw) is not None:
+                return lw
+            await self._lose(lw)
         task = self.reviving.get(thread_id)
         if task is None:
             task = asyncio.create_task(self._revive(t))

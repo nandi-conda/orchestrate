@@ -565,6 +565,83 @@ async def _second_reply(replies, tid):
     return r[1] if len(r) > 1 else None
 
 
+async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path, monkeypatch):
+    """A worker dies while the control plane runs: the watch notices it, its
+    working thread fails, and both its threads come back on a new worker with
+    their next message."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.2)
+    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter())
+    idle_one = await orch.spawn(p["id"], "Idle", "first")
+
+    async def state(tid, want):
+        return (await s.get_thread(tid))["state"] == want or None
+    await wait_for(lambda: state(idle_one["id"], "idle"))
+    old = orch.by_thread[idle_one["id"]]
+    await s.update_thread(idle_one["id"], state="idle")
+    busy = await orch.spawn(p["id"], "Busy", "second")
+    await wait_for(lambda: state(busy["id"], "idle"))
+    await s.update_thread(busy["id"], state="working")  # as if killed mid-turn
+    provider.procs[old.worker.id].kill()
+
+    async def lost():
+        types = [e["type"] for e in await s.list_events(p["id"], busy["id"])]
+        return "worker_lost" in types or None
+    await wait_for(lost)
+    assert (await s.get_thread(busy["id"]))["state"] == "failed"
+    assert (await s.get_thread(idle_one["id"]))["state"] == "idle"
+    assert orch.workers[p["id"]] == [] and busy["id"] not in orch.by_thread
+
+    for t in (idle_one, busy):
+        await orch.send(t["id"], f"still there, {t['title']}?")
+
+    async def answered(t):
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith(f"Echo: still there, {t['title']}?")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    for t in (idle_one, busy):
+        await wait_for(lambda: answered(t))
+    new = orch.by_thread[busy["id"]]
+    assert new is orch.by_thread[idle_one["id"]] and new.worker.id != old.worker.id
+    await orch.close()
+    await s.close()
+
+
+async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 3600)
+    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter())
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def idle():
+        return (await s.get_thread(t["id"]))["state"] == "idle" or None
+    await wait_for(idle)
+    provider.procs[orch.by_thread[t["id"]].worker.id].kill()
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    assert "error" not in types and types.index("worker_lost") < types.index("revived")
+    await orch.close()
+    await s.close()
+
+
 async def test_history_is_what_the_thread_received_and_said(tmp_path):
     from control.service import Orchestrator
 

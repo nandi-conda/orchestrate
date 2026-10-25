@@ -78,6 +78,8 @@ def display(ev: dict) -> dict:
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")
     elif t in ("archived", "unarchived"):
         kind, label, text = K_STATUS, t, f"thread {t}"
+    elif t == "worker_lost":
+        kind, label, text = K_ERROR, "worker lost", d.get("error", "")
     elif t == "revived":
         kind, label, text = K_STATUS, "revived", f"back on worker {d.get('worker')}, idle until its next message"
     elif t == "worker":
@@ -270,7 +272,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             text = await orch().worker_logs(tid, lines)
         except KeyError:
             return PlainTextResponse(f"thread {tid} has no live worker in this control plane "
-                                     "(its worker is gone once the control plane restarts)\n", 404)
+                                     "(its worker is gone: the control plane restarted or the worker stopped answering)\n", 404)
         except Exception as e:
             return PlainTextResponse(f"could not read the worker log: {describe(e)}\n", 502)
         return PlainTextResponse(text)

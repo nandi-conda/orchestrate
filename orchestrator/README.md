@@ -164,7 +164,7 @@ Details: [runner/API.md](../runner/API.md#commits).
 
 A thread outlives its worker. When a message (yours, the router's or another
 thread's) is for a thread no live worker runs (the control plane restarted and
-its sprites are gone, or the thread stopped or failed), the control plane
+its sprites are gone, its worker died, or the thread stopped or failed), the control plane
 brings it back first: it picks a worker as for a new thread and posts the
 thread to it with its conversation rebuilt from the event log (the request,
 the messages it received, its replies, tool calls and tool results), and the
@@ -172,6 +172,13 @@ runner continues the worktree from the pushed `thread/<id>`. The thread's log
 shows a `revived` line, then the message is delivered. `Orchestrator.live_worker`
 is that one path; anything that needs the thread's worker calls it.
 Details: [runner/API.md](../runner/API.md#resuming-a-thread).
+
+A worker is lost when its `/health` fails 3 times in a row, 1 s apart. The
+control plane checks every worker every 10 s, before every delivery to it and
+when picking one for a thread. A lost worker is dropped and destroyed (so it
+never runs a thread twice). Each of its threads gets a `worker lost` line,
+a thread that was mid-turn goes `failed`, and every one of them comes back on
+another worker with its next message.
 
 ### Worker logs
 
