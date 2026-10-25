@@ -314,15 +314,14 @@ class SpritesProvider:
         info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
         worker = Worker(id=name, project_id=spec.project_id, provider=self.name, handle=name,
                         url=info["url"].rstrip("/"), capacity=spec.capacity, index=spec.index)
-        # A service an earlier control plane started keeps the token it was
-        # started with: starting it again does not replace a running process.
-        # Adopt that token, or the control plane and the runner disagree and
-        # every call is a 401.
-        existing = await self.http.get(f"/sprites/{name}/services/runner")
-        token = ""
-        if existing.status_code == 200:
-            token = (existing.json().get("env") or {}).get("RUNNER_TOKEN", "")
-        worker.token = token or spec.token or worker.token
+        worker.token = spec.token or worker.token
+        # A sprite an earlier control plane made still has its runner service,
+        # and `start` does not replace a running process: that runner would go
+        # on with the code and environment (the model key) it was started
+        # with. So a service already there is restarted from the definition
+        # put below, and the runner serving the worker is always this
+        # checkout's, with this control plane's key and token.
+        defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
 
         await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_REF": self.ref})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
@@ -331,18 +330,11 @@ class SpritesProvider:
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        await self.service_action(name, "start")
+        await self.service_action(name, "restart" if defined else "start")
         await self.wait_ready(worker)
         if not await self.accepts_token(worker):
-            # The sprite was already there, running a runner an earlier control
-            # plane started. It holds a token this one does not know, so
-            # /health answers but every real call is a 401. Restart it from the
-            # definition, and token, stored just above.
-            await self.service_action(name, "restart")
-            await self.wait_ready(worker)
-            if not await self.accepts_token(worker):
-                raise RuntimeError(f"worker {name}'s runner does not accept the token the control "
-                                   f"plane stored for it; its log ends:\n{await self.logs(worker, 20)}")
+            raise RuntimeError(f"worker {name}'s runner does not accept the token it was started "
+                               f"with; its log ends:\n{await self.logs(worker, 20)}")
         return worker
 
     async def service_action(self, name: str, action: str, timeout: float = 300.0) -> None:

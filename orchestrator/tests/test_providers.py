@@ -153,57 +153,14 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
         await p.close()
 
 
-async def test_sprites_create_keeps_the_token_a_running_service_uses(env, monkeypatch):
-    """A reattached sprite's runner still answers to the token it was started
-    with; PUT + start does not replace a running process. Using the token in
-    the worker spec instead made every call to the runner a 401."""
-    env.setattr(secrets, "get_secret", lambda name: "tok")
-
-    async def healthy(url, timeout=120.0):
-        return None
-    monkeypatch.setattr(providers, "wait_healthy", healthy)
-
-    service = {}
-
-    def handler(req):
-        path = req.url.path
-        if req.method == "POST" and path.endswith("/sprites"):
-            return httpx.Response(201, json={})
-        if req.method == "GET" and path.endswith("/services/runner"):
-            return httpx.Response(200, json={"env": {"RUNNER_TOKEN": "running-token"}})
-        if req.method == "PUT" and path.endswith("/services/runner"):
-            service.update(json.loads(req.content))
-            return httpx.Response(200, json={})
-        if req.method == "POST" and path.endswith("/services/runner/start"):
-            return httpx.Response(200, text="")
-        if req.method == "POST" and path.endswith("/exec"):
-            return httpx.Response(200, text="")
-        if req.method == "GET" and path.endswith("/orch-p-1-w1"):
-            return httpx.Response(200, json={"url": "https://w.invalid"})
-        raise AssertionError(f"unexpected {req.method} {path}")
-
-    p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
-    try:
-        await p.http.aclose()
-        p.http = httpx.AsyncClient(base_url=p.API, transport=httpx.MockTransport(handler))
-
-        async def accepts(worker):
-            return True
-        monkeypatch.setattr(p, "accepts_token", accepts)
-
-        worker = await p.create(providers.WorkerSpec(project_id="p_1", index=1, token="stored-token"))
-        assert worker.token == "running-token"  # the running service's, not the stored one
-        assert service["env"]["RUNNER_TOKEN"] == "running-token"
-    finally:
-        await p.close()
-
-
 class FakeSprites:
     """The Sprites API surface `SpritesProvider.create` uses, for a sprite that
-    already exists and whose runner this control plane cannot talk to."""
+    already exists, with or without a runner service defined."""
 
-    def __init__(self) -> None:
+    def __init__(self, defined: bool) -> None:
+        self.defined = defined
         self.actions: list[str] = []
+        self.service: dict = {}
 
     async def post(self, url, **kw):
         assert url == "/sprites"
@@ -211,10 +168,13 @@ class FakeSprites:
 
     async def get(self, url, **kw):
         assert url.startswith("/sprites/")
-        return httpx.Response(200, json={"url": "https://worker.invalid"},
+        if url.endswith("/services/runner") and not self.defined:
+            return httpx.Response(404, request=httpx.Request("GET", url))
+        return httpx.Response(200, json={"url": "https://worker.invalid", "env": {"RUNNER_TOKEN": "old"}},
                               request=httpx.Request("GET", url))
 
     async def put(self, url, **kw):
+        self.service = kw["json"]
         return httpx.Response(200, request=httpx.Request("PUT", url))
 
     def stream(self, method, url, **kw):
@@ -239,12 +199,11 @@ class FakeStream:
         yield '{"type": "complete"}'
 
 
-async def _sprites_create(env, accepted_before_restart: bool):
+async def _sprites_create(env, defined: bool):
     env.setattr(secrets, "get_secret", lambda name: "key")
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
-    fake = FakeSprites()
+    fake = FakeSprites(defined)
     p.http = fake
-    checks = []
 
     async def no_exec(name, script, env=None):
         return ""
@@ -253,8 +212,7 @@ async def _sprites_create(env, accepted_before_restart: bool):
         return None
 
     async def accepts(worker):
-        checks.append(worker.token)
-        return accepted_before_restart or len(checks) > 1
+        return True
 
     env.setattr(p, "exec", no_exec)
     env.setattr(providers, "wait_healthy", healthy)
@@ -265,14 +223,17 @@ async def _sprites_create(env, accepted_before_restart: bool):
         await fake.aclose()
 
 
-async def test_sprites_create_restarts_a_runner_holding_another_token(env):
-    worker, fake = await _sprites_create(env, accepted_before_restart=False)
-    assert fake.actions == ["start", "restart"]
-    assert worker.token == "stored"
+async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started(env):
+    """`start` leaves a running runner as it was: its old code and its old
+    model key. A service already defined is restarted from the new definition."""
+    worker, fake = await _sprites_create(env, defined=True)
+    assert fake.actions == ["restart"]
+    assert worker.token == "stored" and fake.service["env"]["RUNNER_TOKEN"] == "stored"
+    assert fake.service["env"]["DEEPSEEK_API_KEY"] == "key"
 
 
-async def test_sprites_create_leaves_a_runner_that_accepts_its_token_alone(env):
-    _, fake = await _sprites_create(env, accepted_before_restart=True)
+async def test_sprites_create_starts_a_new_service(env):
+    _, fake = await _sprites_create(env, defined=False)
     assert fake.actions == ["start"]
 
 
