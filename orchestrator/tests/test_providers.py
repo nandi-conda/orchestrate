@@ -4,8 +4,10 @@ No network and no keyring: `control.secrets.get_secret` is patched, so these
 run anywhere.
 """
 
+import json
 import subprocess
 
+import httpx
 import pytest
 
 from control import providers, secrets
@@ -147,6 +149,46 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
     try:
         with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
             await p.create(providers.WorkerSpec(project_id="p_1", index=1))
+    finally:
+        await p.close()
+
+
+async def test_sprites_create_keeps_the_token_a_running_service_uses(env, monkeypatch):
+    """A reattached sprite's runner still answers to the token it was started
+    with; PUT + start does not replace a running process. Using the token in
+    the worker spec instead made every call to the runner a 401."""
+    env.setattr(secrets, "get_secret", lambda name: "tok")
+
+    async def healthy(url, timeout=120.0):
+        return None
+    monkeypatch.setattr(providers, "wait_healthy", healthy)
+
+    service = {}
+
+    def handler(req):
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/sprites"):
+            return httpx.Response(201, json={})
+        if req.method == "GET" and path.endswith("/services/runner"):
+            return httpx.Response(200, json={"env": {"RUNNER_TOKEN": "running-token"}})
+        if req.method == "PUT" and path.endswith("/services/runner"):
+            service.update(json.loads(req.content))
+            return httpx.Response(200, json={})
+        if req.method == "POST" and path.endswith("/services/runner/start"):
+            return httpx.Response(200, text="")
+        if req.method == "POST" and path.endswith("/exec"):
+            return httpx.Response(200, text="")
+        if req.method == "GET" and path.endswith("/orch-p-1-w1"):
+            return httpx.Response(200, json={"url": "https://w.invalid"})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
+    try:
+        await p.http.aclose()
+        p.http = httpx.AsyncClient(base_url=p.API, transport=httpx.MockTransport(handler))
+        worker = await p.create(providers.WorkerSpec(project_id="p_1", index=1, token="stored-token"))
+        assert worker.token == "running-token"  # the running service's, not the stored one
+        assert service["env"]["RUNNER_TOKEN"] == "running-token"
     finally:
         await p.close()
 

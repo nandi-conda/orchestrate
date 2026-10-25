@@ -301,7 +301,15 @@ class SpritesProvider:
         info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
         worker = Worker(id=name, project_id=spec.project_id, provider=self.name, handle=name,
                         url=info["url"].rstrip("/"), capacity=spec.capacity, index=spec.index)
-        worker.token = spec.token or worker.token
+        # A service an earlier control plane started keeps the token it was
+        # started with: starting it again does not replace a running process.
+        # Adopt that token, or the control plane and the runner disagree and
+        # every call is a 401.
+        existing = await self.http.get(f"/sprites/{name}/services/runner")
+        token = ""
+        if existing.status_code == 200:
+            token = (existing.json().get("env") or {}).get("RUNNER_TOKEN", "")
+        worker.token = token or spec.token or worker.token
 
         await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_REF": self.ref})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
