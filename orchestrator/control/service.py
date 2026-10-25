@@ -54,6 +54,9 @@ class Orchestrator:
         self.workers: dict[str, list[LiveWorker]] = {}
         self.by_thread: dict[str, LiveWorker] = {}
         self.by_token: dict[str, LiveWorker] = {}
+        # Spawned threads whose request the runner has yet to echo back as their
+        # first message_in; the "created" event already shows it.
+        self.unechoed: dict[str, str] = {}
         self._lock = asyncio.Lock()
         # The control plane's own ASGI app: pull-mode peer calls are run against
         # its peer API, so they are checked exactly like calls a worker dials in.
@@ -167,6 +170,9 @@ class Orchestrator:
             return
         if typ == "created":
             return  # the control plane already logged the thread
+        if typ == "message_in" and tid in self.unechoed:
+            if data.get("body") == self.unechoed.pop(tid):
+                return  # the request itself, already shown by "created"
         if typ == "state" and data.get("state") in RUNNER_STATES:
             await self.store.update_thread(tid, state=data["state"])
         elif typ == "turn_done" and data.get("summary"):
@@ -186,12 +192,14 @@ class Orchestrator:
         thread = await self.store.create_thread(project_id, title, request, parent)
         await self.store.append_event(project_id, thread["id"], "created",
                                       {"title": title, "request": request, "parent": parent})
+        self.unechoed[thread["id"]] = request
         try:
             lw = await self._pick_worker(project)
             model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
             await lw.client.create_thread(id=thread["id"], request=request, title=title,
                                           project=project_id, parent=parent, model=model)
         except Exception as e:
+            self.unechoed.pop(thread["id"], None)
             await self.store.update_thread(thread["id"], state="failed")
             await self.store.append_event(project_id, thread["id"], "error",
                                           {"error": f"could not start thread: {e}"})

@@ -129,6 +129,9 @@ async def test_end_to_end_with_echo_runner(server):
 
         tr = (await c.get(f"/api/threads/{ids[0]}/transcript")).json()
         assert any(e["type"] == "assistant" and "login page" in e["text"] for e in tr)
+        # The request shows once, as "created"; the runner's echo of it is dropped.
+        assert [e["type"] for e in tr if "login page" in e["text"]].count("created") == 1
+        assert not any(e["type"] == "message_in" for e in tr)
 
         # A thread spawns a child through the peer API; the child reports back.
         await c.post(f"/api/projects/{pid}/requests",
