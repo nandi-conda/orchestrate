@@ -7,6 +7,10 @@
   control plane instances can share it; appends are announced with
   LISTEN/NOTIFY so every instance wakes its SSE streams and inboxes.
 
+A thread is archived when `archived_at` is set. `list_threads` lists either
+the live threads (the default: the main list, the router's directory, peers)
+or only the archived ones.
+
 Events carry a project-wide sequence number (`seq`), so a client can resume a
 project or thread stream from `?after=seq`.
 """
@@ -41,7 +45,9 @@ class Store(Protocol):
 
     async def create_thread(self, project_id: str, title: str, request: str,
                             parent_id: str | None = None) -> dict: ...
-    async def list_threads(self, project_id: str) -> list[dict]: ...
+    async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
+        """The project's threads that are not archived, or with archived=True
+        only the archived ones; newest first."""
     async def get_thread(self, thread_id: str) -> dict | None: ...
     async def update_thread(self, thread_id: str, **fields: Any) -> dict | None: ...
 
@@ -89,7 +95,7 @@ SCHEMA = [
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
         title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
         activity TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
-        token TEXT NOT NULL DEFAULT '', created_at DOUBLE PRECISION NOT NULL,
+        token TEXT NOT NULL DEFAULT '', archived_at DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id)",
     """CREATE TABLE IF NOT EXISTS messages (
@@ -111,11 +117,13 @@ PG_EVENTS = """CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)"""
 EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS events_project ON events(project_id, seq)"
 
-THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token")
+THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
+                 "archived_at")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
-ADDED_COLUMNS = [("threads", "activity", "TEXT NOT NULL DEFAULT ''")]
+ADDED_COLUMNS = [("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
+                 ("threads", "archived_at", "DOUBLE PRECISION")]
 
 
 def _thread(row: dict) -> dict:
@@ -174,14 +182,15 @@ class _SqlStore:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
-               "files": "[]", "token": secrets.token_urlsafe(24), "created_at": t, "updated_at": t}
+               "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         await self._exec(self._q(f"INSERT INTO threads ({cols}) VALUES ({marks})"), *row.values())
         return _thread(row)
 
-    async def list_threads(self, project_id: str) -> list[dict]:
-        rows = await self._fetch(self._q("SELECT * FROM threads WHERE project_id = ? "
+    async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
+        which = "IS NOT NULL" if archived else "IS NULL"
+        rows = await self._fetch(self._q(f"SELECT * FROM threads WHERE project_id = ? AND archived_at {which} "
                                          "ORDER BY created_at DESC"), project_id)
         return [_thread(r) for r in rows]
 

@@ -18,7 +18,7 @@ from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
-from .service import ENDS_STREAM, Orchestrator, describe, tool_arg
+from .service import ENDS_STREAM, ArchivedError, Orchestrator, describe, tool_arg
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -69,6 +69,8 @@ def display(ev: dict) -> dict:
     elif t == "route":
         kind, label = K_ROUTE, "router"
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")
+    elif t in ("archived", "unarchived"):
+        kind, label, text = K_STATUS, t, f"thread {t}"
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     else:
@@ -115,7 +117,7 @@ def fold(events: list[dict]) -> list[dict]:
 
 def thread_view(t: dict) -> dict:
     return {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
-                              "worker_id", "files", "created_at", "updated_at")}
+                              "worker_id", "files", "archived_at", "created_at", "updated_at")}
 
 
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
@@ -182,12 +184,14 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             result = await orch().submit(pid, text, mode, b.get("target") or None)
         except KeyError as e:
             return JSONResponse({"error": str(e.args[0])}, 404)
-        except RuntimeError as e:
+        except (RuntimeError, ArchivedError) as e:
             return JSONResponse({"error": str(e)}, 409)
         return JSONResponse(result, 200 if mode != "auto" else 202)
 
     async def list_threads(req: Request):
-        return JSONResponse([thread_view(t) for t in await store.list_threads(req.path_params["pid"])])
+        """Live threads; ?archived=1 lists the archived ones instead."""
+        archived = req.query_params.get("archived", "0") == "1"
+        return JSONResponse([thread_view(t) for t in await store.list_threads(req.path_params["pid"], archived)])
 
     async def create_thread(req: Request):
         b = await body(req)
@@ -216,6 +220,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             await orch().send(req.path_params["tid"], text, "user")
         except KeyError:
             return JSONResponse({"error": "no such thread"}, 404)
+        except ArchivedError as e:
+            return JSONResponse({"error": str(e)}, 409)
         return JSONResponse({"ok": True}, 202)
 
     async def thread_stop(req: Request):
@@ -223,6 +229,20 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return JSONResponse({"error": "no such thread"}, 404)
         await orch().stop(req.path_params["tid"])
         return JSONResponse({"ok": True})
+
+    async def thread_archive(req: Request):
+        try:
+            t = await orch().archive(req.path_params["tid"])
+        except KeyError:
+            return JSONResponse({"error": "no such thread"}, 404)
+        return JSONResponse(thread_view(t))
+
+    async def thread_unarchive(req: Request):
+        try:
+            t = await orch().unarchive(req.path_params["tid"])
+        except KeyError:
+            return JSONResponse({"error": "no such thread"}, 404)
+        return JSONResponse(thread_view(t))
 
     async def worker_logs(req: Request):
         tid = req.path_params["tid"]
@@ -321,6 +341,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/threads/{tid}", get_thread, methods=["GET"]),
         Route("/api/threads/{tid}/messages", thread_message, methods=["POST"]),
         Route("/api/threads/{tid}/stop", thread_stop, methods=["POST"]),
+        Route("/api/threads/{tid}/archive", thread_archive, methods=["POST"]),
+        Route("/api/threads/{tid}/unarchive", thread_unarchive, methods=["POST"]),
         Route("/api/threads/{tid}/transcript", transcript, methods=["GET"]),
         Route("/api/threads/{tid}/worker-logs", worker_logs, methods=["GET"]),
         Route("/api/threads/{tid}/events", thread_events, methods=["GET"]),

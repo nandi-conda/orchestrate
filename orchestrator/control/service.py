@@ -16,13 +16,15 @@ import httpx
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
 from .runner_client import RunnerClient
-from .store import Store
+from .store import Store, now
 
 log = logging.getLogger("orchestrator")
 
 MAX_HOPS = 6
 CAPACITY = 16  # running threads per worker before another one starts
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
+# States in which a thread is done with its runner; archiving any other thread stops it first.
+ENDED = {"done", "failed", "stopped"}
 # Runner events that end a model call: once one is in, that call's `delta`
 # events (its reply while it streamed) are folded into it and dropped.
 ENDS_STREAM = {"reasoning", "assistant", "tool_call", "turn_done", "state", "error"}
@@ -87,6 +89,10 @@ def describe(e: Exception) -> str:
 
 class PeerCallError(Exception):
     """A peer call the orchestrator refuses; its text goes back to the tool."""
+
+
+class ArchivedError(Exception):
+    """The thread is archived: it takes no messages until it is unarchived."""
 
 
 @dataclass
@@ -258,7 +264,10 @@ class Orchestrator:
                                 reply_to: str | None = None, hops: int = 0) -> dict:
         t = await self._own_thread(project_id, to)
         src = await self.store.get_thread(sender) if sender else None
-        await self.send(t["id"], str(body), sender or "unknown", int(hops or 0) + 1, reply_to)
+        try:
+            await self.send(t["id"], str(body), sender or "unknown", int(hops or 0) + 1, reply_to)
+        except ArchivedError as e:
+            raise PeerCallError(str(e)) from None
         if src and src["project_id"] == project_id:
             await self.store.append_event(project_id, sender, "message_out", {"to": to, "body": body})
         return {"ok": True}
@@ -374,6 +383,8 @@ class Orchestrator:
         thread = await self.store.get_thread(to)
         if thread is None:
             raise KeyError(to)
+        if thread["archived_at"] is not None:
+            raise ArchivedError(f"thread {to} is archived; unarchive it to message it")
         msg = await self.store.add_message(thread["project_id"], sender, to, body, reply_to, hops)
         if hops > MAX_HOPS:
             await self.store.append_event(thread["project_id"], to, "dropped",
@@ -416,6 +427,30 @@ class Orchestrator:
         if lw:
             await lw.client.stop(thread_id)
         await self.store.update_thread(thread_id, state="stopped", activity="")
+
+    async def archive(self, thread_id: str) -> dict:
+        """Hide a thread from the main list, the router and its peers. A thread
+        still on its runner is stopped first."""
+        t = await self.store.get_thread(thread_id)
+        if t is None:
+            raise KeyError(thread_id)
+        if t["archived_at"] is not None:
+            return t
+        if t["state"] not in ENDED:
+            await self.stop(thread_id)
+        t = await self.store.update_thread(thread_id, archived_at=now())
+        await self.store.append_event(t["project_id"], thread_id, "archived", {})
+        return t
+
+    async def unarchive(self, thread_id: str) -> dict:
+        t = await self.store.get_thread(thread_id)
+        if t is None:
+            raise KeyError(thread_id)
+        if t["archived_at"] is None:
+            return t
+        t = await self.store.update_thread(thread_id, archived_at=None)
+        await self.store.append_event(t["project_id"], thread_id, "unarchived", {})
+        return t
 
     # ---------------------------------------------------------------- requests
 

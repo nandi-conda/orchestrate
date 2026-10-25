@@ -50,6 +50,23 @@ async def test_store_roundtrip(tmp_path):
     await s.close()
 
 
+async def test_store_lists_archived_threads_apart(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    keep = await s.create_thread(p["id"], "Keep", "k")
+    old = await s.create_thread(p["id"], "Old", "o")
+    assert keep["archived_at"] is None
+    await s.update_thread(old["id"], archived_at=123.0)
+    assert [t["id"] for t in await s.list_threads(p["id"])] == [keep["id"]]
+    assert [t["id"] for t in await s.list_threads(p["id"], archived=True)] == [old["id"]]
+    assert (await s.get_thread(old["id"]))["archived_at"] == 123.0
+    await s.update_thread(old["id"], archived_at=None)
+    assert {t["id"] for t in await s.list_threads(p["id"])} == {keep["id"], old["id"]}
+    assert await s.list_threads(p["id"], archived=True) == []
+    await s.close()
+
+
 async def test_store_adds_activity_to_an_older_database(tmp_path):
     import aiosqlite
 
@@ -67,6 +84,8 @@ async def test_store_adds_activity_to_an_older_database(tmp_path):
     s = SqliteStore(path)
     await s.open()
     assert (await s.get_thread("t_old"))["activity"] == ""
+    assert (await s.get_thread("t_old"))["archived_at"] is None
+    assert [t["id"] for t in await s.list_threads("p_1")] == ["t_old"]
     assert (await s.update_thread("t_old", activity="thinking"))["activity"] == "thinking"
     await s.close()
     s = SqliteStore(path)
@@ -398,6 +417,66 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
             assert (g["state"], g["worker_id"]) == ("stopped", None)
 
 
+async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
+    provider = GatedProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter())
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            tid = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": "fix login", "mode": "new"})).json()["spawned"][0]["id"]
+            assert (await c.get(f"/api/threads/{tid}")).json()["state"] == "queued"
+
+            # Archiving a thread that has not finished stops it first.
+            r = await c.post(f"/api/threads/{tid}/archive")
+            assert r.status_code == 200
+            assert (r.json()["state"], r.json()["archived_at"] is not None) == ("stopped", True)
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            assert [e["type"] for e in tr][-1] == "archived"
+            assert (await c.get(f"/api/projects/{pid}/threads")).json() == []
+            assert [t["id"] for t in (await c.get(f"/api/projects/{pid}/threads?archived=1")).json()] == [tid]
+
+            # Archived threads take no messages, and the router does not see them:
+            # naming one spawns a new thread instead of sending to it.
+            r = await c.post(f"/api/projects/{pid}/requests",
+                             json={"text": "more", "mode": "thread", "target": tid})
+            assert r.status_code == 409 and "archived" in r.json()["error"]
+            assert (await c.post(f"/api/threads/{tid}/messages", json={"body": "hi"})).status_code == 409
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": f"@{tid} more"})
+            assert r.status_code == 202
+
+            async def routed():
+                log = (await c.get(f"/api/projects/{pid}/log")).json()
+                return next((e for e in log if e["type"] == "route"), None)
+            route = (await wait_for(routed))["payload"]
+            assert route["sent"] == [] and len(route["spawned"]) == 1
+
+            r = await c.post(f"/api/threads/{tid}/unarchive")
+            assert r.status_code == 200 and r.json()["archived_at"] is None
+            live = {t["id"] for t in (await c.get(f"/api/projects/{pid}/threads")).json()}
+            assert tid in live and (await c.get(f"/api/projects/{pid}/threads?archived=1")).json() == []
+            assert (await c.post("/api/threads/t_nope/archive")).status_code == 404
+            provider.gate.set()
+
+
+async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):
+    from control.service import Orchestrator
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "Done", "d")
+    await s.update_thread(t["id"], state="done")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    got = await orch.archive(t["id"])
+    assert got["state"] == "done" and got["archived_at"] is not None
+    assert await orch.archive(t["id"]) == got  # archiving twice changes nothing
+    assert [e["type"] for e in await s.list_events(p["id"], t["id"])] == ["archived"]
+    await s.close()
+
+
 @pytest.fixture
 def postgres(tmp_path):
     import shutil
@@ -454,6 +533,11 @@ async def test_postgres_store_and_notify(postgres):
     await a.update_thread(t["id"], files=["f.py"], state="idle", activity="thinking")
     got = await b.get_thread(t["id"])
     assert got["files"] == ["f.py"] and got["activity"] == "thinking"
+    await a.update_thread(t["id"], archived_at=5.0)
+    assert await b.list_threads(p["id"]) == []
+    assert [x["archived_at"] for x in await b.list_threads(p["id"], archived=True)] == [5.0]
+    await a.update_thread(t["id"], archived_at=None)
+    assert [x["id"] for x in await b.list_threads(p["id"])] == [t["id"]]
     await a.close()
     await b.close()
 
