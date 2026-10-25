@@ -24,7 +24,8 @@ and environment variables are in [API.md](API.md).
 | --- | --- |
 | `src/runner/model.py` | `Model` protocol, `OpenAICompatModel` (DeepSeek), `ScriptedModel` for tests |
 | `src/runner/sandbox.py` | `Sandbox` protocol, `LocalSandbox` |
-| `src/runner/tools.py` | work tools (bash, files) and peer tools (threads, messages) |
+| `src/runner/tools.py` | work tools (bash, files), peer tools (threads, messages), web tools (search, fetch) |
+| `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` loop and `ThreadHost` (workspaces, events, capacity) |
 | `src/runner/repo.py` | the project clone, per-thread worktrees, saving and landing commits |
 | `src/runner/peers.py` | `OrchestratorPeers` (queued for the orchestrator to collect) and `LocalPeers` (same process) |

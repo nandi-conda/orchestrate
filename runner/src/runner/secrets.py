@@ -18,7 +18,7 @@ SERVICE = "orchestrate"
 
 # name -> (what it is for, how it is sent)
 KNOWN = {
-    "DEEPSEEK_API_KEY": ("DeepSeek API key", "Authorization: Bearer <key> to https://api.deepseek.com"),
+    "DEEPSEEK_API_KEY": ("DeepSeek API key", "Authorization: Bearer <key> to https://api.deepseek.com (chat model and web search/fetch)"),
     "RUNNER_TOKEN": ("token the orchestrator uses to call this runner", "Authorization: Bearer <token> on every route but /health"),
 }
 

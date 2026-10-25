@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from .thread import AgentThread
+    from .web import DeepSeekWeb
 
 Handler = Callable[["AgentThread", dict], Awaitable[str]]
 
@@ -127,6 +128,41 @@ PEER_TOOLS = [
 ]
 
 ALL_TOOLS = WORK_TOOLS + PEER_TOOLS
+
+FETCH_LIMIT = 50_000  # characters of a fetched page handed to the model
+
+
+def _result(i: int, r: dict) -> str:
+    meta = [m for m in (r.get("site_name"), (r.get("date") or "")[:10], f"score {r.get('rerank_score')}") if m]
+    return f"{i}. {r['title']}\n   {r['url']}\n   {' · '.join(meta)}\n   {r.get('summary') or r.get('snippet', '')}"
+
+
+def web_tools(web: "DeepSeekWeb") -> list[Tool]:
+    """web_search and web_fetch, answered by `web`."""
+
+    async def _search(t: "AgentThread", a: dict) -> str:
+        results = await web.search(a["query"], int(a.get("count", 10)), a.get("question"))
+        if not results:
+            return "no results"
+        return "\n\n".join(_result(i, r) for i, r in enumerate(results, 1))
+
+    async def _fetch(t: "AgentThread", a: dict) -> str:
+        page = await web.fetch(a["url"])
+        content = page["content"]
+        if len(content) > FETCH_LIMIT:
+            content = content[:FETCH_LIMIT] + f"\n\n[truncated: {len(page['content'])} chars, showing the first {FETCH_LIMIT}]"
+        return f"# {page['title']}\n\n{content}" if page.get("title") else content
+
+    return [
+        Tool("web_search", "Search the web. Returns ranked results with title, URL, date and a summary. The query is "
+             "at most 128 characters and supports operators: site:, -site:, \"exact phrase\", -term, lang:en, "
+             "after:2025-01-01, before:2026. Use web_fetch to read a result in full.",
+             _obj({"query": S, "count": {"type": "integer", "description": "results, 1 to 50, default 10"},
+                   "question": {"type": "string", "description": "the question behind the search (at most 128 "
+                                "characters); it helps the engine understand the query"}}, ["query"]), _search),
+        Tool("web_fetch", "Fetch a web page (http or https URL) and return its content as Markdown.",
+             _obj({"url": S}, ["url"]), _fetch),
+    ]
 
 
 async def call(tools: dict[str, Tool], t: "AgentThread", name: str, args: dict) -> str:

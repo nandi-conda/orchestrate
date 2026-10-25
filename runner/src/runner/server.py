@@ -12,11 +12,13 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from . import files
+from . import tools as T
 from .model import from_spec
 from .peers import OrchestratorPeers
 from .repo import Repo
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
+from .web import deepseek_web
 
 
 def create_app(host: ThreadHost, token: str | None) -> Starlette:
@@ -182,6 +184,7 @@ def host_from_env() -> ThreadHost:
         workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
         limits=Limits(max_steps=int(os.environ.get("RUNNER_MAX_STEPS", "60"))),
+        tools=T.ALL_TOOLS + T.web_tools(deepseek_web()),
     )
 
 

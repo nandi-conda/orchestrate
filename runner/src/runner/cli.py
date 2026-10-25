@@ -7,10 +7,12 @@ import asyncio
 import json
 import tempfile
 
+from . import tools as T
 from .model import from_spec
 from .repo import Repo
 from .secrets import get_secret, require
 from .thread import ThreadHost
+from .web import deepseek_web
 
 
 def _print(ev: dict):
@@ -29,7 +31,8 @@ def _print(ev: dict):
 async def amain(args):
     workdir = args.workdir or tempfile.mkdtemp(prefix="runner-")
     repo = Repo(args.repo, f"{workdir}/.repo", get_secret("GITHUB_TOKEN")) if args.repo else None
-    host = ThreadHost(model_factory=from_spec, repo=repo, workdir=workdir)
+    host = ThreadHost(model_factory=from_spec, repo=repo, workdir=workdir,
+                      tools=T.ALL_TOOLS + T.web_tools(deepseek_web()))
     q = host.subscribe(None)
     spec = {"provider": "deepseek", "model": args.model} if args.model else None
     t = await host.start(project=args.project, title=args.request[:60], request=args.request, model=spec)
