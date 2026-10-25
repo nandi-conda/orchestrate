@@ -2,6 +2,8 @@
 echo runner (control.devrunner), served over real HTTP so the peer API is used."""
 
 import asyncio
+import base64
+import json
 import socket
 import subprocess
 import sys
@@ -26,6 +28,12 @@ pytestmark = pytest.mark.anyio
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# A 1x1 PNG, small enough to paste in a test.
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+PNG_URL = "data:image/png;base64," + base64.b64encode(PNG_1PX).decode()
 
 
 async def test_store_roundtrip(tmp_path):
@@ -53,6 +61,18 @@ async def test_store_roundtrip(tmp_path):
     assert await s.list_messages(t["id"], unread_only=True) == []
     with pytest.raises(ValueError):
         await s.update_thread(t["id"], state="bogus")
+    await s.close()
+
+
+async def test_store_roundtrips_pasted_images(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    ref = await s.add_image(p["id"], "image/png", PNG_1PX, name="shot.png")
+    assert (ref["media_type"], ref["size"], ref["name"]) == ("image/png", len(PNG_1PX), "shot.png")
+    row = await s.get_image(ref["id"])
+    assert row["data"] == PNG_1PX and row["project_id"] == p["id"]
+    assert await s.get_image("i_nope") is None
     await s.close()
 
 
@@ -564,6 +584,118 @@ async def test_project_settings_change_name_model_and_remote(tmp_path):
             r = await c.post(f"/api/projects/{pid}/settings", json={"repo_url": ""})
             assert r.status_code == 200 and r.json()["repo_url"] == ""
             assert (await c.post("/api/projects/p_nope/settings", json={"name": "x"})).status_code == 404
+
+
+async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypatch):
+    """An image's bytes live in the store: events and the transcript carry only
+    its id, /api/images/<id> serves the bytes, and the runner gets them base64
+    inside the conversation it is rebuilt from."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    app = create_app(store, LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
+                     NoRoutingRouter(), repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            r = await c.post(f"/api/projects/{pid}/requests",
+                             json={"text": "what is this", "images": [PNG_URL], "mode": "new"})
+            assert r.status_code == 200, r.text
+            tid = r.json()["spawned"][0]["id"]
+
+            # The request shows in the transcript with the image's id, not its bytes.
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            ref = next(e for e in tr if e["type"] == "created")["images"][0]
+            assert (ref["media_type"], ref["size"]) == ("image/png", len(PNG_1PX))
+            assert "data" not in ref
+            assert base64.b64encode(PNG_1PX).decode() not in json.dumps(
+                (await c.get(f"/api/projects/{pid}/log")).json())
+
+            # The bytes come from their own endpoint, cacheable for good.
+            img = await c.get(f"/api/images/{ref['id']}")
+            assert img.status_code == 200 and img.content == PNG_1PX
+            assert img.headers["content-type"] == "image/png"
+            assert "immutable" in img.headers["cache-control"]
+            assert (await c.get("/api/images/i_nope")).status_code == 404
+
+            # A message to the thread carries its image the same way, as its own paste.
+            r = await c.post(f"/api/threads/{tid}/messages", json={"body": "", "images": [PNG_URL]})
+            assert r.status_code == 202, r.text
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            said = next(e for e in tr if e["type"] == "message_in")
+            assert said["images"][0]["id"] != ref["id"]
+
+            # Let the turn end before the store closes under its delivery.
+            async def answered():
+                tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+                return any(e["type"] == "assistant" and e["seq"] > said["seq"] for e in tr)
+            await wait_for(answered)
+
+            # The thread's conversation, as a runner needs it, holds the bytes.
+            history = await app.state.orch.history(await store.get_thread(tid))
+            first = next(h for h in history if h["data"].get("body") == "what is this")
+            inline = first["data"]["images"][0]
+            assert inline["media_type"] == "image/png"
+            assert base64.b64decode(inline["data"]) == PNG_1PX
+
+
+class NoRoutingRouter:
+    """A router that must not be asked: an image-only request needs no plan."""
+
+    async def plan(self, request, directory):
+        raise AssertionError("the router was asked to plan a request with no text")
+
+
+async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
+                     NoRoutingRouter(), repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            r = await c.post(f"/api/projects/{pid}/requests", json={"images": [PNG_URL, PNG_URL]})
+            assert r.status_code == 202, r.text
+            plan = r.json()
+            # An image-only request skips the router: it always starts one new thread.
+            assert plan["mode"] == "new" and [t["title"] for t in plan["spawned"]] == ["2 pasted images"]
+            # The logged request names the images by id; the row shows them.
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            req = next(e for e in log if e["type"] == "request")
+            assert len(req["images"]) == 2
+            assert base64.b64encode(PNG_1PX).decode() not in json.dumps(req)
+
+            r = await c.post(f"/api/projects/{pid}/requests", json={"images": [PNG_URL], "mode": "new"})
+            assert r.status_code == 200 and r.json()["spawned"][0]["title"] == "Pasted image"
+
+
+async def test_the_image_api_refuses_what_it_cannot_take(tmp_path):
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    app = create_app(store, LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
+                     NoRoutingRouter(), repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+
+            async def refused(body, why):
+                r = await c.post(f"/api/projects/{pid}/requests", json=body)
+                assert r.status_code == 400, r.text
+                assert why in r.json()["error"], r.text
+
+            await refused({"text": "x", "images": "nope"}, "list")
+            await refused({"text": "x", "images": [PNG_URL] * 5}, "at most 4")
+            await refused({"text": "x", "images": ["nope"]}, "data: URL")
+            await refused({"text": "x", "images": ["data:text/plain;base64,aGk="]}, "png, jpeg, webp or gif")
+            await refused({"text": "x", "images": ["data:image/png;base64,!!!!"]}, "base64")
+            await refused({"text": "x", "images": ["data:image/png;base64,"]}, "empty")
+            await refused({"text": "   "}, "text or an image")
+
+            # A message to a thread needs text or an image too.
+            t = await store.create_thread(pid, "demo", "go")
+            r = await c.post(f"/api/threads/{t['id']}/messages", json={"body": ""})
+            assert r.status_code == 400 and "body or an image" in r.json()["error"]
 
 
 async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):

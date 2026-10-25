@@ -86,8 +86,19 @@ def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
 
-def user_content(sender: str, body: str) -> str:
-    return body if sender == "user" else f"[from {sender}] {body}"
+def user_content(sender: str, body: str, images: list[dict] | None = None):
+    """A message as the model takes it: its text, plus pasted images as
+    OpenAI-style image parts (a data: URL each) when it has any."""
+    text = body if sender == "user" else f"[from {sender}] {body}"
+    if not images:
+        return text
+    parts: list[dict] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for im in images:
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:{im['media_type']};base64,{im['data']}"}})
+    return parts
 
 
 STOPPED_TOOL = "error: the thread stopped before this tool returned"
@@ -125,7 +136,9 @@ def replay(events: list[dict]) -> list[dict]:
         typ, d = ev.get("type"), ev.get("data") or {}
         if typ == "message_in":
             close()
-            messages.append({"role": "user", "content": user_content(d.get("from", "user"), d.get("body", ""))})
+            messages.append({"role": "user",
+                             "content": user_content(d.get("from", "user"), d.get("body", ""),
+                                                     d.get("images"))})
         elif typ == "reasoning":
             open_step()
             step["reasoning_content"] = d.get("content", "")
@@ -184,14 +197,15 @@ class AgentThread:
         return {"id": self.id, "project": self.project, "title": self.title, "state": self.state,
                 "summary": self.summary, "files": sorted(self.files), "parent": self.parent}
 
-    def deliver(self, body: str, sender: str = "user", hops: int = 0):
-        self.inbox.put_nowait({"from": sender, "body": body, "hops": hops})
+    def deliver(self, body: str, sender: str = "user", hops: int = 0, images: list[dict] | None = None):
+        self.inbox.put_nowait({"from": sender, "body": body, "hops": hops, "images": images or []})
 
     def _take(self, item: dict) -> bool:
         if item["hops"] > self.limits.max_hops:
             self.emit("dropped", {"from": item["from"], "reason": "hop limit"})
             return False
-        self.messages.append({"role": "user", "content": user_content(item["from"], item["body"])})
+        self.messages.append({"role": "user", "content": user_content(item["from"], item["body"],
+                                                                        item.get("images"))})
         self.emit("message_in", {"from": item["from"], "body": item["body"]})
         return True
 
@@ -346,11 +360,12 @@ class ThreadHost:
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
                     model: dict | None = None, id: str | None = None, history: list[dict] | None = None,
-                    summary: str = "") -> AgentThread:
+                    summary: str = "", images: list[dict] | None = None) -> AgentThread:
         """Start a thread on this worker. With `history` (its earlier events) the
         thread continues a conversation and its saved branch; with no
-        `request` it waits idle for its next message. An id whose thread here
-        has ended (stopped or failed) is started afresh."""
+        `request` it waits idle for its next message. `images` belong to the
+        request. An id whose thread here has ended (stopped or failed) is
+        started afresh."""
         tid = id or _id()
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
@@ -364,15 +379,16 @@ class ThreadHost:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
-        if request:
-            t.deliver(request, sender="user" if parent is None else parent)
+        if request is not None:
+            t.deliver(request, sender="user" if parent is None else parent, images=images)
         else:
             t.set_state("idle")
         t.task = asyncio.create_task(t.run(), name=tid)
         return t
 
-    def deliver(self, thread_id: str, body: str, sender: str = "user", hops: int = 0):
-        self.threads[thread_id].deliver(body, sender=sender, hops=hops)
+    def deliver(self, thread_id: str, body: str, sender: str = "user", hops: int = 0,
+                images: list[dict] | None = None):
+        self.threads[thread_id].deliver(body, sender=sender, hops=hops, images=images)
 
     async def stop(self, thread_id: str):
         t = self.threads[thread_id]

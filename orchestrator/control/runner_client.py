@@ -45,9 +45,12 @@ class RunnerClient:
         r.raise_for_status()
         return r.json()
 
-    async def post_message(self, thread_id: str, body: str, sender: str = "user", hops: int = 0) -> None:
-        r = await self.http.post(f"/threads/{thread_id}/messages",
-                                 json={"body": body, "from": sender, "hops": hops})
+    async def post_message(self, thread_id: str, body: str, sender: str = "user", hops: int = 0,
+                           images: list[dict] | None = None) -> None:
+        payload: dict[str, Any] = {"body": body, "from": sender, "hops": hops}
+        if images:
+            payload["images"] = images
+        r = await self.http.post(f"/threads/{thread_id}/messages", json=payload)
         r.raise_for_status()
 
     async def stop(self, thread_id: str) -> None:

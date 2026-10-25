@@ -19,6 +19,11 @@ def o_lit(o: i32, k: str, v: str) -> None:
     pass
 
 @jscall
+def o_images(o: i32, k: str) -> None:
+    """Set key k of object o to the images attached to the request being composed."""
+    pass
+
+@jscall
 def http_post(url: i32, o: i32, msg: i32) -> i32:
     """POST object o as JSON to the URL in handle url. Like http_get: returns a
     JSON handle now, and update(msg, handle) runs when the reply arrives."""
@@ -42,6 +47,11 @@ def http_get_text(url: i32, msg: i32) -> i32:
 @jscall
 def s_add_enc(dst: i32, src: i32) -> None:
     """Append the string in src to dst, encoded for a URL query (encodeURIComponent)."""
+    pass
+
+@jscall
+def is_md(h: i32) -> i32:
+    """1 if the file name in h is markdown (ends in .md or .markdown, any case)."""
     pass
 
 @jscall
@@ -118,6 +128,42 @@ def focus_end(id: str) -> None:
     pass
 
 @jscall
-def is_md(h: i32) -> i32:
-    """1 if the file name in handle h is markdown (.md or .markdown, any case)."""
+def on_paste(msg: i32) -> None:
+    """Follow image pastes: an image on the clipboard (a screenshot, a copied
+    picture) is added to the request being composed and update(msg, 1) runs.
+    Pasting text is left to the input."""
+    pass
+
+@jscall
+def img_count() -> i32:
+    """How many images are attached to the request being composed."""
+    pass
+
+@jscall
+def img_url(i: i32, dst: i32) -> None:
+    """Write attached image i's data: URL to dst."""
+    pass
+
+@jscall
+def img_drop(i: i32) -> None:
+    pass
+
+@jscall
+def img_stash() -> None:
+    """Set the attached images aside while their request is in flight."""
+    pass
+
+@jscall
+def img_restore() -> None:
+    """Put the images set aside by img_stash back (the send failed)."""
+    pass
+
+@jscall
+def img_clear() -> None:
+    pass
+
+@jscall
+def on_zoom() -> None:
+    """Clicking an image with the `zoom` class shows it enlarged, and again
+    puts it back."""
     pass

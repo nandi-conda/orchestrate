@@ -109,7 +109,7 @@ class Host:
         t["state"] = state
         await self.emit(t["id"], "state", {"state": state})
 
-    async def turn(self, t: dict, text: str) -> None:
+    async def turn(self, t: dict, text: str, images: list | None = None) -> None:
         await self.set_state(t, "working")
         await asyncio.sleep(self.delay)
         # Stream the reply the way the real runner does (runner/API.md, `delta`).
@@ -202,7 +202,7 @@ def create_app(host: Host, token: str) -> Starlette:
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
         b = await req.json()
-        if not b.get("request") and b.get("history") is None:
+        if not b.get("request") and b.get("history") is None and not b.get("images"):
             return JSONResponse({"error": "request or history is required"}, 400)
         tid = b.get("id") or f"t_{secrets.token_hex(5)}"
         if tid in host.threads and host.threads[tid]["state"] not in ("stopped", "failed"):
@@ -217,9 +217,10 @@ def create_app(host: Host, token: str) -> Starlette:
             return JSONResponse({"error": str(e)}, 500)
         host.threads[tid] = t
         await host.emit(tid, "created", host.entry(t))
-        if b.get("request"):
-            await host.emit(tid, "message_in", {"from": "user", "body": b["request"]})
-            asyncio.create_task(host.turn(t, b["request"]))
+        if b.get("request") or b.get("images"):
+            await host.emit(tid, "message_in", {"from": "user", "body": b.get("request") or "",
+                                                "images": b.get("images") or []})
+            asyncio.create_task(host.turn(t, b.get("request") or "", b.get("images") or []))
         else:  # resumed: idle until its next message (runner/API.md, "Resuming a thread")
             await host.set_state(t, "idle")
         return JSONResponse(host.entry(t), 201)
@@ -231,8 +232,9 @@ def create_app(host: Host, token: str) -> Starlette:
         if t is None:
             return JSONResponse({"error": "no such thread"}, 404)
         b = await req.json()
-        await host.emit(t["id"], "message_in", {"from": b.get("from", "user"), "body": b["body"]})
-        asyncio.create_task(host.turn(t, b["body"]))
+        await host.emit(t["id"], "message_in", {"from": b.get("from", "user"), "body": b["body"],
+                                                "images": b.get("images") or []})
+        asyncio.create_task(host.turn(t, b["body"], b.get("images") or []))
         return JSONResponse({"ok": True}, 202)
 
     async def stop(req: Request):

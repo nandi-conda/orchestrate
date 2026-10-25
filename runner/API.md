@@ -10,9 +10,9 @@ threads. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity"}` |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"request"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "history"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
+| POST | `/threads` | `{"request"?, "images"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "history"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
-| POST | `/threads/{id}/messages` | `{"body", "from"? = "user", "hops"? = 0}` | 202 |
+| POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
@@ -25,7 +25,8 @@ threads. Default port 8080. Every route except `/health` needs
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
 
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
-- `request` or `history` is required. `history` resumes a thread: see [Resuming a thread](#resuming-a-thread).
+- `request`, `history` or `images` is required. `history` resumes a thread: see [Resuming a thread](#resuming-a-thread).
+- `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads, so they need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
 - `model` is `{"provider": "deepseek", "model": "deepseek-v4-pro"}` or `{"provider": "openai-compat", "model", "base_url", "api_key_env"}`. Omitted: DeepSeek with `$DEEPSEEK_MODEL`.
 - `files` paths are relative to the thread's worktree. A path that leaves it (`..`, a symlink out) or names `.git` is 400, as is a file listed as a directory or the reverse; a missing one is 404. `.git` is never listed.
 - `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`.
@@ -79,7 +80,7 @@ orchestrator posts `/threads` with the thread's `id`, `title`, `parent`,
   (`{"type", "data"}`; other keys are ignored). `message_in`, `reasoning`,
   `assistant`, `tool_call` and `tool_result` rebuild the conversation after the
   system prompt; other types are skipped. Only messages the thread received
-  belong in it. A tool call with no result is answered as stopped. Tool
+  belongs in it. A `message_in` may also carry `images` (`[{"media_type", "data"}]`, the bytes base64-encoded): the orchestrator inlines a request's and a message's images there, since a worker cannot reach the control plane to fetch them. A tool call with no result is answered as stopped. Tool
   results are the events' copies, cut to 4000 characters.
 - The worktree is the worker's own for that thread when it still has one
   holding `origin/thread/<id>`; else it is made from `origin/thread/<id>`

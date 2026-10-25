@@ -9,6 +9,7 @@ project's commits gather in its hub, a git repository on this machine
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from dataclasses import dataclass, field
@@ -71,6 +72,12 @@ def tool_arg(args) -> str:
 def one_line(s: str, n: int) -> str:
     s = " ".join(s.split())
     return s if len(s) <= n else s[:n] + " …"
+
+
+def image_title(images: list[dict] | None) -> str:
+    """A thread title for a request that is only images."""
+    n = len(images or [])
+    return "Pasted image" if n == 1 else f"{n} pasted images"
 
 
 def activity_of(typ: str, data: dict) -> str | None:
@@ -550,7 +557,8 @@ class Orchestrator:
 
     # ---------------------------------------------------------------- threads
 
-    async def spawn(self, project_id: str, title: str, request: str, parent: str | None = None) -> dict:
+    async def spawn(self, project_id: str, title: str, request: str, parent: str | None = None,
+                    images: list[dict] | None = None) -> dict:
         project = await self.store.get_project(project_id)
         if project is None:
             raise KeyError(project_id)
@@ -560,15 +568,18 @@ class Orchestrator:
             raise RuntimeError(f"project has {len(running)} running threads (limit {self.max_running})")
         thread = await self.store.create_thread(project_id, title, request, parent)
         tid = thread["id"]
-        await self.store.append_event(project_id, tid, "created",
-                                      {"title": title, "request": request, "parent": parent})
+        created = {"title": title, "request": request, "parent": parent}
+        if images:
+            created["images"] = images
+        await self.store.append_event(project_id, tid, "created", created)
         self._expect_echo(tid, request)
         thread = await self.store.update_thread(tid, activity="starting on a worker")
         self.starting[tid] = self._chain(self.thread_chain, tid,
-                                         lambda: self._start(project, thread, parent))
+                                         lambda: self._start(project, thread, parent, images))
         return thread
 
-    async def _start(self, project: dict, thread: dict, parent: str | None) -> None:
+    async def _start(self, project: dict, thread: dict, parent: str | None,
+                     images: list[dict] | None = None) -> None:
         """Put a spawned thread on a worker, creating one when every worker is full."""
         tid = thread["id"]
         try:
@@ -577,7 +588,8 @@ class Orchestrator:
                 await self._ship(lw, project)
                 model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
                 await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
-                                              project=project["id"], parent=parent, model=model)
+                                              project=project["id"], parent=parent, model=model,
+                                              images=await self._inline_images(images) or None)
             finally:
                 lw.starting -= 1
         except asyncio.CancelledError:  # stopped before it started
@@ -610,7 +622,8 @@ class Orchestrator:
         return True
 
     async def send(self, to: str, body: str, sender: str = "user", hops: int = 0,
-                   reply_to: str | None = None, edit: int | None = None) -> dict:
+                   reply_to: str | None = None, edit: int | None = None,
+                   images: list[dict] | None = None) -> dict:
         """Log a message to a thread and queue its delivery. `edit` is the seq
         of the person's message this one corrects, when it is an edit's correction."""
         thread = await self.store.get_thread(to)
@@ -626,19 +639,24 @@ class Orchestrator:
         payload = {"from": sender, "body": body, "message": msg["id"]}
         if edit is not None:
             payload["edit"] = edit
+        if images:
+            payload["images"] = images
         await self.store.append_event(thread["project_id"], to, "message_in", payload)
         self._expect_echo(to, body)
-        self._chain(self.thread_chain, to, lambda: self._deliver(thread["project_id"], msg, hops))
+        self._chain(self.thread_chain, to,
+                    lambda: self._deliver(thread["project_id"], msg, hops, images))
         return msg
 
-    async def _deliver(self, project_id: str, msg: dict, hops: int) -> None:
+    async def _deliver(self, project_id: str, msg: dict, hops: int,
+                       images: list[dict] | None = None) -> None:
         """Hand a logged message to the thread's runner, after the thread's start
         and the messages before it. A thread on no live worker is brought back
         on one first."""
         to, body = msg["to_thread"], msg["body"]
         try:
             lw = await self.live_worker(to)
-            await lw.client.post_message(to, body, msg["sender"], hops)
+            await lw.client.post_message(to, body, msg["sender"], hops,
+                                         images=await self._inline_images(images) or None)
         except Exception as e:
             self._echoed(to, body)
             await self.store.append_event(project_id, to, "error",
@@ -714,10 +732,26 @@ class Orchestrator:
         for e in events:
             typ, d = e["type"], e["payload"]
             if typ == "created":
-                out.append({"type": "message_in", "data": {"from": d.get("parent") or "user",
-                                                           "body": d.get("request", "")}})
+                data = {"from": d.get("parent") or "user", "body": d.get("request", "")}
+                if d.get("images"):
+                    data["images"] = await self._inline_images(d["images"])
+                out.append({"type": "message_in", "data": data})
             elif typ in CONVERSATION and d.get("message") not in undelivered:
-                out.append({"type": typ, "data": d})
+                data = d
+                if typ == "message_in" and d.get("images"):
+                    data = {**d, "images": await self._inline_images(d["images"])}
+                out.append({"type": typ, "data": data})
+        return out
+
+    async def _inline_images(self, refs: list[dict] | None) -> list[dict]:
+        """Image references as a runner needs them: the bytes, base64-encoded.
+        A worker cannot reach this control plane, so they travel in the message."""
+        out = []
+        for ref in refs or []:
+            row = await self.store.get_image(ref.get("id")) if isinstance(ref, dict) else None
+            if row is not None:
+                out.append({"media_type": row["media_type"],
+                            "data": base64.b64encode(row["data"]).decode("ascii")})
         return out
 
     async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
@@ -785,14 +819,15 @@ class Orchestrator:
     # ---------------------------------------------------------------- requests
 
     async def submit(self, project_id: str, text: str, mode: str = "auto",
-                     target: str | None = None) -> dict:
+                     target: str | None = None, images: list[dict] | None = None) -> dict:
         """Take a request typed in a project's main window; it returns at once.
 
         Sending to a thread or forcing a new one only logs and queues (a
         thread's start and deliveries run in the background). Letting the
         router decide may ask a model, so the request is logged and routed in
         the background, in the order requests came in; its plan arrives as the
-        "route" event."""
+        "route" event. A request that is only images needs no router: there is
+        no text to route, so it starts one thread."""
         if await self.store.get_project(project_id) is None:
             raise KeyError(project_id)
         if mode == "thread":
@@ -800,21 +835,29 @@ class Orchestrator:
             if t is None or t["project_id"] != project_id:
                 raise KeyError(f"no thread {target} in this project")
         if mode != "auto":
-            return await self.handle_request(project_id, text, mode, target)
-        ev = await self.store.append_event(project_id, None, "request", {"text": text})
-        self._chain(self.request_chain, project_id, lambda: self._route(project_id, text, ev["seq"]))
+            return await self.handle_request(project_id, text, mode, target, images)
+        payload = {"text": text}
+        if images:
+            payload["images"] = images
+        ev = await self.store.append_event(project_id, None, "request", payload)
+        if images and not text:
+            return await self.handle_request(project_id, text, "new", None, images, of=ev["seq"])
+        self._chain(self.request_chain, project_id,
+                    lambda: self._route(project_id, text, ev["seq"], images))
         return {"request": text, "mode": mode, "queued": True, "seq": ev["seq"]}
 
-    async def _route(self, project_id: str, text: str, of: int) -> None:
+    async def _route(self, project_id: str, text: str, of: int,
+                     images: list[dict] | None = None) -> None:
         try:
-            await self.handle_request(project_id, text, "auto", of=of)
+            await self.handle_request(project_id, text, "auto", None, images, of=of)
         except Exception as e:
             log.exception("request in %s", project_id)
             await self.store.append_event(project_id, None, "error",
                                           {"error": f"could not route the request: {describe(e)}"})
 
     async def handle_request(self, project_id: str, text: str, mode: str = "auto",
-                             target: str | None = None, of: int | None = None) -> dict:
+                             target: str | None = None, images: list[dict] | None = None,
+                             of: int | None = None) -> dict:
         """mode: auto (router decides), thread (send to target), new (force a new thread).
         `of` is the seq of the request event it routes; the route event names it,
         so an edit of the request knows which threads it reached."""
@@ -823,17 +866,18 @@ class Orchestrator:
             plan = {"spawn": [], "send": [{"thread": target, "message": text}], "why": "sent directly"}
         elif mode == "new":
             from .router import title_for
-            plan = {"spawn": [{"title": title_for(text), "request": text}], "send": [], "why": "new thread requested"}
+            title = title_for(text) if text else image_title(images)
+            plan = {"spawn": [{"title": title, "request": text}], "send": [], "why": "new thread requested"}
         else:
             plan = await self.router.plan(text, directory)
         spawned, sent = [], []
         for s in plan["spawn"]:
-            t = await self.spawn(project_id, s["title"], s["request"])
+            t = await self.spawn(project_id, s["title"], s["request"], images=images)
             spawned.append({"id": t["id"], "title": t["title"]})
         # A message the router wrote is from the router; one sent directly is the user's own.
         sender = "user" if mode == "thread" else "router"
         for s in plan["send"]:
-            await self.send(s["thread"], s["message"], sender)
+            await self.send(s["thread"], s["message"], sender, images=images)
             sent.append(s["thread"])
         # The summary names threads by title; the ids stay in spawned and sent.
         titles = {t["id"]: t["title"] for t in directory}

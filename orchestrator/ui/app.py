@@ -16,9 +16,10 @@ from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, ke
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
-from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
+from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, focus_end, is_md)
+                  clip_copy, on_select, sel_clear, s_quote, focus_end, is_md, on_paste, img_count, img_url,
+                  img_drop, img_stash, img_restore, img_clear, on_zoom)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -80,6 +81,8 @@ SET_NAME_IN: Const[i32] = 56
 SET_MODEL_IN: Const[i32] = 57
 SETTINGS_SAVE: Const[i32] = 58
 SETTINGS_SAVED: Const[i32] = 59
+PASTED: Const[i32] = 60
+IMG_DROP: Const[i32] = 61
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -180,6 +183,7 @@ h_lastq: i32 = 0         # the quote being sent, put back if the send fails
 h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 h_edit: i32 = 0          # the text of the message being edited
+h_img: i32 = 0           # scratch for an image's URL while it is drawn
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -211,6 +215,7 @@ def init() -> None:
     global h_fview, h_fview_err
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_set_name, h_set_model, h_set_err
+    global h_img
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -252,8 +257,11 @@ def init() -> None:
     h_body = s_new()
     h_act = s_new()
     h_edit = s_new()
+    h_img = s_new()
     on_nav(NAV)
     on_select(h_seltext, h_selpos, SELECTED)
+    on_paste(PASTED)
+    on_zoom()
     show_address()
 
 
@@ -578,7 +586,8 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == SEND:
         # The box clears at once: the control plane takes the request and
         # returns, and what becomes of it arrives on the event stream.
-        if s_len(h_req) > 0 and sending == 0:
+        # Images are the request too: a pasted screenshot with no words still sends.
+        if (s_len(h_req) > 0 or img_count() > 0) and sending == 0:
             sending = 1
             s_copy(h_last, h_req)
             s_copy(h_lastq, h_quote)
@@ -593,6 +602,9 @@ def update(msg: i32, arg: i32) -> None:
             s_add_ref(h_body, h_last)
             o = o_new()
             o_str(o, "text", h_body)
+            if img_count() > 0:
+                o_images(o, "images")
+                img_stash()
             if mode == TO_THREAD and s_len(h_sel) > 0:
                 o_lit(o, "mode", "thread")
                 o_str(o, "target", h_sel)
@@ -616,7 +628,12 @@ def update(msg: i32, arg: i32) -> None:
                 s_copy(h_req, h_last)
             if s_len(h_quote) == 0:
                 s_copy(h_quote, h_lastq)
+            img_restore()
+        else:
+            img_clear()
         j_free(arg)
+    elif msg == IMG_DROP:
+        img_drop(arg)
     elif msg == COPY:
         # arg is the reply's seq; its raw markdown is what gets copied.
         if find_text(arg, h_clip) == 1:
@@ -1191,6 +1208,38 @@ def working_now() -> None:
     end()
 
 
+def event_images(e: i32) -> None:
+    """The images a message carried, from /api/images/<id>. The log names them
+    by id; the bytes come from the control plane once and the browser keeps them."""
+    n: i32
+    i: i32
+    imgs: i32
+    one: i32
+    n = j_len(e, "images")
+    if n == 0:
+        return
+    imgs = j_at(e, "images")
+    div("ev-images")
+    i = 0
+    while i < n:
+        one = j_idx(imgs, i)
+        jstr(one, "id", h_t1)
+        s_set(h_img, "/api/images/")
+        s_add_ref(h_img, h_t1)
+        el("img")
+        cls("ev-image")
+        cls("zoom")
+        attr("loading", "lazy")
+        attr("alt", "attached image")
+        attr("title", "Click to enlarge")
+        attr_ref("src", h_img)
+        end()
+        j_free(one)
+        i = i + 1
+    end()
+    j_free(imgs)
+
+
 def event_row(e: i32, show_thread: i32) -> None:
     """One dialog entry. While the model streams, its reasoning and reply show
     as they grow; finished reasoning is grouped by thinking_group."""
@@ -1217,6 +1266,7 @@ def event_row(e: i32, show_thread: i32) -> None:
     text_ref(h_t1)
     thread_tag(e, show_thread)
     end()
+    event_images(e)
     jstr(e, "text", h_t1)
     if editing != 0 and editing == j_int(e, "seq"):
         edit_box()
@@ -1945,6 +1995,39 @@ def pane() -> None:
     end()
 
 
+def attachments() -> None:
+    """Images pasted into the request box, each with a button to drop it."""
+    n: i32
+    i: i32
+    n = img_count()
+    if n == 0:
+        return
+    div("attachments")
+    i = 0
+    while i < n:
+        div("attachment")
+        img_url(i, h_img)
+        el("img")
+        cls("attach-img")
+        cls("zoom")
+        attr("alt", "attached image")
+        attr("title", "Click to enlarge")
+        attr_ref("src", h_img)
+        end()
+        btn_open("ghost", IMG_DROP, i)
+        cls("icon")
+        cls("sm")
+        cls("attach-x")
+        attr("title", "Remove this image")
+        attr("aria-label", "Remove this image")
+        span("icon icon-x")
+        end()
+        end()
+        end()
+        i = i + 1
+    end()
+
+
 def request_box() -> None:
     el("footer")
     cls("composer")
@@ -1960,6 +2043,7 @@ def request_box() -> None:
         end()
     error_banner()
     quote_chip()
+    attachments()
     div("composer-row")
     toggle_group_open()
     toggle("Router decides", mode == AUTO, MODE, AUTO)
@@ -1975,6 +2059,8 @@ def request_box() -> None:
     attr("id", "req")
     if s_len(h_quote) > 0:
         attr("placeholder", "Reply to the quote…")
+    elif img_count() > 0:
+        attr("placeholder", "Say what the image is about (optional)…")
     elif mode == TO_THREAD and s_len(h_sel) > 0:
         attr("placeholder", "Message this thread…")
     else:

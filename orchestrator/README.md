@@ -63,6 +63,13 @@ the background, after any routing still queued for the original:
   is new in the edit), and can tell a thread what changed for it. Its decision
   shows as an "edit:" line in Project activity.
 
+**Pasted images.** Paste a screenshot or a copied picture into the request box
+and it becomes an attachment above it: up to 4, each up to 8 MB, and a huge
+screenshot is scaled down in the browser before it is sent. Send it with words
+or on its own — an image-only request skips the router and starts one new
+thread, titled for the image. Images show in the transcript and open enlarged
+on a click.
+
 With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
 orchestrator starts the real runner from `../runner` as a local subprocess,
 one worker per project, and the router uses `deepseek-flash`. Without the key it
@@ -90,8 +97,9 @@ http://127.0.0.1:8000 in a browser too. `--port N` and `--db …` are as for
 
 - The UI's own links, `window.open` and `target=_blank` stay in the window.
 - Links anywhere else (a URL in an agent's reply) open in your default browser.
-- Downloads (the Files tab) are saved to your downloads folder, never over an
-  existing file (`name (1)`, …), with a line at the bottom saying where.
+- Markdown files in the Files tab open rendered in the pane; other files
+  download to your downloads folder, never over an existing file
+  (`name (1)`, …), with a line at the bottom saying where.
 - If the port is taken, the window says so, and how to free it
   (`fuser -k 8000/tcp`, or `kill $(lsof -t -i :8000)`), with a Retry.
   What the control plane is doing is also printed to the terminal as
@@ -278,13 +286,27 @@ The spawn path has been exercised against the live API: create, bootstrap,
 ### Files
 
 Each thread's pane has a **Files** tab: the thread's worktree, one directory at
-a time. Click a directory to open it (Up goes back); click a file to download
-it, in the same window. The control plane reads them from the worker that holds
+a time. Click a directory to open it (Up goes back); click a markdown file
+(`.md` or `.markdown`) to read it rendered in the pane (Back returns to the
+directory, and Download stays available there). Any other file downloads, in
+the same window. The control plane reads them from the worker that holds
 the thread (runner `GET /threads/<id>/files` and `/files/raw`; the worker never
 connects in) and serves them at `/api/threads/<id>/files?path=<dir>` (JSON) and
 `/api/threads/<id>/files/raw?path=<file>` (a download). `.git` is not shown.
 A thread whose worker is gone is revived first: a worker checks out its pushed
 `thread/<id>` branch, so its files are as of the end of its last turn.
+
+### Pasted images
+
+An image the browser sends is a `data:` URL (`png`, `jpeg`, `webp` or `gif`; at
+most 4 per message, 8 MB each). The control plane stores its bytes in an
+`images` table (SQLite or Postgres, created the first time it opens an existing
+database) and logs only a reference (`{id, media_type, name, size}`), so
+transcripts and SSE streams stay small. `/api/images/<id>` serves the bytes,
+cacheable for good. A worker cannot reach the control plane, so the images are
+inlined as base64 when a message is delivered and when a thread's history is
+rebuilt to revive it; the runner turns them into image parts of that user
+message ([runner/API.md](../runner/API.md)).
 
 ### Archiving threads
 
@@ -320,15 +342,16 @@ SQLite or Postgres database the first time the control plane opens it.
 | --- | --- | --- |
 | GET/POST | `/api/projects` | list, create `{name, model?}`; a project has `repo_path` (its hub) and `repo_url` (its remote, `""` for none) |
 | POST | `/api/projects/{id}/settings` | change any of `{name, model, repo_url}`; a remote that cannot be joined is a 400 with git's reason, and nothing changes |
-| POST | `/api/projects/{id}/requests` | `{text, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan |
-| GET/POST | `/api/projects/{id}/threads` | directory of live threads, `?archived=1` for archived ones; force a new thread `{request, title?}` |
+| POST | `/api/projects/{id}/requests` | `{text?, images?, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan. A request that is only `images` skips the router and starts one new thread |
+| GET/POST | `/api/projects/{id}/threads` | directory of live threads, `?archived=1` for archived ones; force a new thread `{request?, images?, title?}` |
 | GET | `/api/projects/{id}/log` | every event in the project (JSON) |
 | GET | `/api/projects/{id}/events` | SSE, resumable with `?after=seq` or `Last-Event-ID` |
 | GET | `/api/threads/{id}` | one thread |
 | GET | `/api/threads/{id}/transcript` | its events (JSON) |
 | GET | `/api/threads/{id}/worker-logs` | its worker's runner log, `?lines=300` (text) |
 | GET | `/api/threads/{id}/events` | SSE |
-| POST | `/api/threads/{id}/messages` | `{body}` |
+| POST | `/api/threads/{id}/messages` | `{body, images?}` |
 | POST | `/api/threads/{id}/stop` | |
 | POST | `/api/threads/{id}/archive` | stops it if running, then archives it; the thread |
 | POST | `/api/threads/{id}/unarchive` | the thread |
+| GET | `/api/images/{id}` | a pasted image's bytes (`image/png`, `jpeg`, `webp` or `gif`), cacheable for good |

@@ -6,7 +6,10 @@ Workers never call in here: the control plane opens every connection to them
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,7 +26,8 @@ from .providers import WorkerProvider, default_provider
 from .gitio import GitError
 from .router import Router, default_router
 from .runner_client import FileError
-from .service import ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, tool_arg
+from .service import (ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, image_title,
+                      tool_arg)
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -38,6 +42,49 @@ UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
 HIDDEN = {"usage"}
+
+# A pasted image arrives as a data: URL. Its bytes live in the store; the events
+# and SSE streams carry only its id, so a long transcript and a streaming turn
+# stay small. At most MAX_IMAGES per message, each at most MAX_IMAGE_BYTES.
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+IMAGE_ALIASES = {"image/jpg": "image/jpeg"}
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+DATA_URL = re.compile(r"^data:([a-z]+/[a-z0-9.+-]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def decode_images(raw) -> list[tuple[str, bytes]]:
+    """The (media_type, bytes) pairs in a request's `images`, a list of data:
+    URLs. Raises ValueError with a message fit for the person who pasted them."""
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("images must be a list of data: URLs")
+    if len(raw) > MAX_IMAGES:
+        raise ValueError(f"at most {MAX_IMAGES} images per message")
+    out = []
+    for item in raw:
+        m = DATA_URL.match(item.strip()) if isinstance(item, str) else None
+        if m is None:
+            raise ValueError("each image must be a data: URL holding base64 image bytes")
+        media_type = IMAGE_ALIASES.get(m.group(1).lower(), m.group(1).lower())
+        if media_type not in IMAGE_TYPES:
+            raise ValueError("images must be png, jpeg, webp or gif")
+        try:
+            data = base64.b64decode(m.group(2).strip(), validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError("an image is not valid base64") from None
+        if not data:
+            raise ValueError("an image is empty")
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError(f"each image must be under {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+        out.append((media_type, data))
+    return out
+
+
+async def save_images(store: Store, project_id: str, raw) -> list[dict]:
+    """Store a request's images and return the references its events carry."""
+    return [await store.add_image(project_id, media_type, data) for media_type, data in decode_images(raw)]
 
 
 def short(s: str, n: int = 600) -> str:
@@ -99,7 +146,11 @@ def display(ev: dict) -> dict:
         kind, label, text = K_STATUS, "edited", "you edited a message"
     else:
         kind, label, text = K_STATUS, t, short(json.dumps(d), 300)
-    return {**ev, "kind": kind, "label": label, "text": text, "editable": int(editable(ev))}
+    out = {**ev, "kind": kind, "label": label, "text": text, "editable": int(editable(ev))}
+    images = d.get("images") or []
+    if images:
+        out["images"] = images
+    return out
 
 
 def live_row(first: dict, d: dict) -> dict:
@@ -226,13 +277,17 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return JSONResponse({"error": "no such project"}, 404)
         b = await body(req)
         text = str(b.get("text", "")).strip()
-        if not text:
-            return JSONResponse({"error": "text is required"}, 400)
+        try:
+            images = await save_images(store, pid, b.get("images"))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        if not text and not images:
+            return JSONResponse({"error": "text or an image is required"}, 400)
         mode = b.get("mode", "auto")
         if mode not in ("auto", "thread", "new"):
             return JSONResponse({"error": "mode is auto, thread or new"}, 400)
         try:
-            result = await orch().submit(pid, text, mode, b.get("target") or None)
+            result = await orch().submit(pid, text, mode, b.get("target") or None, images)
         except KeyError as e:
             return JSONResponse({"error": str(e.args[0])}, 404)
         except (RuntimeError, ArchivedError) as e:
@@ -265,11 +320,17 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     async def create_thread(req: Request):
         b = await body(req)
         request = str(b.get("request", "")).strip()
-        if not request:
-            return JSONResponse({"error": "request is required"}, 400)
-        from .router import title_for
+        pid = req.path_params["pid"]
         try:
-            t = await orch().spawn(req.path_params["pid"], b.get("title") or title_for(request), request)
+            images = await save_images(store, pid, b.get("images"))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        if not request and not images:
+            return JSONResponse({"error": "request or an image is required"}, 400)
+        from .router import title_for
+        title = b.get("title") or (title_for(request) if request else image_title(images))
+        try:
+            t = await orch().spawn(pid, title, request, images=images)
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
         except RuntimeError as e:
@@ -281,12 +342,20 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         return JSONResponse(thread_view(t)) if t else JSONResponse({"error": "no such thread"}, 404)
 
     async def thread_message(req: Request):
+        tid = req.path_params["tid"]
+        t = await store.get_thread(tid)
+        if t is None:
+            return JSONResponse({"error": "no such thread"}, 404)
         b = await body(req)
         text = str(b.get("body") or b.get("text") or "").strip()
-        if not text:
-            return JSONResponse({"error": "body is required"}, 400)
         try:
-            await orch().send(req.path_params["tid"], text, "user")
+            images = await save_images(store, t["project_id"], b.get("images"))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        if not text and not images:
+            return JSONResponse({"error": "body or an image is required"}, 400)
+        try:
+            await orch().send(tid, text, "user", images=images)
         except KeyError:
             return JSONResponse({"error": "no such thread"}, 404)
         except ArchivedError as e:
@@ -366,6 +435,16 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         events = await store.list_events(t["project_id"], t["id"], after, limit=2000)
         return JSONResponse(fold(events))
 
+    async def image(req: Request):
+        """A pasted image's bytes. Ids never change, so the browser may keep it."""
+        row = await store.get_image(req.path_params["iid"])
+        if row is None:
+            return JSONResponse({"error": "no such image"}, 404)
+        return Response(row["data"], media_type=row["media_type"],
+                        headers={"cache-control": "public, max-age=31536000, immutable",
+                                 "content-length": str(row["size"]),
+                                 "x-content-type-options": "nosniff"})
+
     async def project_log(req: Request):
         after = int(req.query_params.get("after", "0") or 0)
         events = await store.list_events(req.path_params["pid"], None, after, limit=2000)
@@ -439,6 +518,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/projects/{pid}/threads", create_thread, methods=["POST"]),
         Route("/api/projects/{pid}/log", project_log, methods=["GET"]),
         Route("/api/projects/{pid}/events", project_events, methods=["GET"]),
+        Route("/api/images/{iid}", image, methods=["GET"]),
         Route("/api/threads/{tid}", get_thread, methods=["GET"]),
         Route("/api/threads/{tid}/messages", thread_message, methods=["POST"]),
         Route("/api/threads/{tid}/stop", thread_stop, methods=["POST"]),

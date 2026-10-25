@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import os
@@ -20,6 +21,37 @@ from .repo import THREAD_ID, GitError, Repo, refs_header
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 from .web import deepseek_web
+
+# The same limits the control plane enforces; a worker is reachable on its own,
+# so it checks what it accepts.
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def images_of(b: dict) -> list[dict]:
+    """A message's `images`, each `{"media_type", "data"}` with base64 data.
+    Raises ValueError for anything a model call could not take."""
+    raw = b.get("images")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_IMAGES:
+        raise ValueError(f"images must be a list of at most {MAX_IMAGES}")
+    out = []
+    for im in raw:
+        if (not isinstance(im, dict) or im.get("media_type") not in IMAGE_TYPES
+                or not isinstance(im.get("data"), str)):
+            raise ValueError("each image needs a media_type (png, jpeg, webp or gif) and base64 data")
+        try:
+            size = len(base64.b64decode(im["data"], validate=True))
+        except ValueError:
+            raise ValueError("an image is not valid base64") from None
+        if not size:
+            raise ValueError("an image is empty")
+        if size > MAX_IMAGE_BYTES:
+            raise ValueError(f"each image must be under {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+        out.append({"media_type": im["media_type"], "data": im["data"]})
+    return out
 
 
 def create_app(host: ThreadHost, token: str | None) -> Starlette:
@@ -48,15 +80,23 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
     async def create_thread(req: Request):
         b = await req.json()
         history = b.get("history")
-        if not b.get("request") and history is None:
+        try:
+            images = images_of(b)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        if b.get("request") is None and history is None and not images:
             return JSONResponse({"error": "request or history is required"}, status_code=400)
         if history is not None and not isinstance(history, list):
             return JSONResponse({"error": "history must be a list of events"}, status_code=400)
+        request = b.get("request")
+        if request is None and images:
+            request = ""  # images only: the thread still gets a turn
         try:
             t = await host.start(project=b.get("project", "default"),
                                  title=b.get("title") or (b.get("request") or b.get("id") or "thread")[:60],
-                                 request=b.get("request"), parent=b.get("parent"), model=b.get("model"),
-                                 id=b.get("id"), history=history, summary=b.get("summary") or "")
+                                 request=request, parent=b.get("parent"),
+                                 model=b.get("model"), id=b.get("id"), history=history,
+                                 summary=b.get("summary") or "", images=images)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         except Exception as e:
@@ -74,7 +114,11 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if not t:
             return JSONResponse({"error": "not found"}, status_code=404)
         b = await req.json()
-        t.deliver(b["body"], sender=b.get("from", "user"), hops=int(b.get("hops", 0)))
+        try:
+            images = images_of(b)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        t.deliver(b.get("body", ""), sender=b.get("from", "user"), hops=int(b.get("hops", 0)), images=images)
         return JSONResponse({"ok": True}, status_code=202)
 
     async def stop(req: Request):

@@ -6,10 +6,46 @@ export function imports({ str, strs, vals, dispatch }) {
   const streams = new Map();
   let nextStream = 1;
   let doc = { op: [], s: [] }; // the markdown md_parse last parsed
+
+  // Images pasted into the request box. They stay data: URLs here until the
+  // request is sent; `stashed` holds them while a send is in flight, so a
+  // refusal can put them back. The server stores them and events carry ids.
+  const MAX_IMAGES = 4, MAX_DIM = 1800, SHRINK_OVER = 1500000;
+  let images = [], stashed = [];
+  const readDataURL = (f) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(f);
+  });
+  // A huge paste is scaled down before it goes anywhere: screenshots of a 4K
+  // screen are far more pixels than a model needs. Small ones keep their bytes.
+  const shrink = async (f) => {
+    if (f.size <= SHRINK_OVER) return readDataURL(f);
+    const url = URL.createObjectURL(f);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = reject;
+        i.src = url;
+      });
+      const scale = Math.min(1, MAX_DIM / Math.max(img.naturalWidth, img.naturalHeight));
+      if (scale === 1) return readDataURL(f);
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.naturalWidth * scale);
+      c.height = Math.round(img.naturalHeight * scale);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL(f.type === "image/png" ? "image/png" : "image/jpeg", 0.9);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
   return {
     o_new: () => put({}),
     o_str: (o, k, h) => { vals[o][str(k)] = strs[h] ?? ""; },
     o_lit: (o, k, v) => { vals[o][str(k)] = str(v); },
+    o_images: (o, k) => { if (images.length) vals[o][str(k)] = images.slice(); },
     http_post: (u, o, msg) => {
       const h = put(null);
       fetch(strs[u], { method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
@@ -121,6 +157,41 @@ export function imports({ str, strs, vals, dispatch }) {
         if (!el) return;
         el.focus();
         el.setSelectionRange(el.value.length, el.value.length);
+      });
+    },
+    // Pasting: an image on the clipboard becomes an attachment of the request
+    // being composed. Text pastes are left to the input.
+    on_paste: (msg) => {
+      document.addEventListener("paste", (e) => {
+        if (!document.getElementById("req")) return; // no composer on this screen
+        const items = [...(e.clipboardData?.items || [])]
+          .filter((it) => it.kind === "file" && it.type.startsWith("image/"));
+        const files = items.map((it) => it.getAsFile()).filter(Boolean);
+        if (!files.length) return;
+        e.preventDefault();
+        (async () => {
+          for (const f of files) {
+            if (images.length >= MAX_IMAGES) break;
+            try { images.push(await shrink(f)); dispatch(msg, images.length); } catch {}
+          }
+        })();
+      }, true);
+    },
+    img_count: () => images.length,
+    img_url: (i, d) => { strs[d] = images[i] ?? ""; },
+    img_drop: (i) => { images.splice(i, 1); },
+    img_stash: () => { stashed = images; images = []; },
+    img_restore: () => { images = stashed.concat(images); stashed = []; },
+    img_clear: () => { images = []; stashed = []; },
+    // An image with the `zoom` class grows to fill the window; click it again
+    // (or another one) to go back.
+    on_zoom: () => {
+      document.addEventListener("click", (e) => {
+        const img = e.target.closest && e.target.closest("img.zoom");
+        if (!img) return;
+        const on = img.classList.contains("zoomed");
+        document.querySelectorAll("img.zoom.zoomed").forEach((n) => n.classList.remove("zoomed"));
+        if (!on) img.classList.add("zoomed");
       });
     },
     scroll_end: (id) => {

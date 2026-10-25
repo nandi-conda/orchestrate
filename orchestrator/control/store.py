@@ -15,6 +15,12 @@ starts and back when it ends, and nothing else reshuffles.
 
 Events carry a project-wide sequence number (`seq`), so a client can resume a
 project or thread stream from `?after=seq`.
+
+Pasted images are stored here too, as rows in `images`, so every control plane
+instance serving the same database can show them. Events and messages carry
+only their ids (`{"id", "media_type", "name", "size"}`); the bytes never go
+through the event log or an SSE stream. The bytes are sent to a runner inside
+the message it delivers, because a worker never reaches back here.
 """
 
 from __future__ import annotations
@@ -69,6 +75,11 @@ class Store(Protocol):
                           reply_to: str | None = None, hops: int = 0) -> dict: ...
     async def list_messages(self, thread_id: str, unread_only: bool = False) -> list[dict]: ...
     async def mark_read(self, message_ids: list[str]) -> None: ...
+
+    async def add_image(self, project_id: str, media_type: str, data: bytes, name: str = "") -> dict:
+        """Store an image's bytes; returns its reference for an event or message."""
+    async def get_image(self, image_id: str) -> dict | None:
+        """An image row, its `data` bytes included."""
 
     async def upsert_worker(self, worker: dict) -> None: ...
     async def lose_worker(self, worker_id: str) -> None:
@@ -130,6 +141,16 @@ PG_EVENTS = """CREATE TABLE IF NOT EXISTS events (
 EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS events_project ON events(project_id, seq)"
 
 PROJECT_FIELDS = {"name", "model", "repo_url"}
+
+# The two databases spell binary differently.
+SQLITE_IMAGES = """CREATE TABLE IF NOT EXISTS images (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, media_type TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL)"""
+PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, media_type TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
                  "archived_at")
 
@@ -290,6 +311,17 @@ class _SqlStore:
         for mid in message_ids:
             await self._exec(self._q("UPDATE messages SET read_at = ? WHERE id = ?"), t, mid)
 
+    # images
+    async def add_image(self, project_id: str, media_type: str, data: bytes, name: str = "") -> dict:
+        i = {"id": new_id("i"), "media_type": media_type, "name": name, "size": len(data)}
+        await self._exec(self._q("INSERT INTO images (id, project_id, media_type, name, size, data, created_at) "
+                                 "VALUES (?, ?, ?, ?, ?, ?, ?)"),
+                         i["id"], project_id, media_type, name, i["size"], data, now())
+        return i
+
+    async def get_image(self, image_id: str) -> dict | None:
+        return await self._fetchone(self._q("SELECT * FROM images WHERE id = ?"), image_id)
+
     # workers
     async def upsert_worker(self, worker: dict) -> None:
         w = {"id": worker["id"], "project_id": worker["project_id"], "provider": worker["provider"],
@@ -321,7 +353,7 @@ class SqliteStore(_SqlStore):
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA journal_mode=WAL")
-        for stmt in SCHEMA + [SQLITE_EVENTS, EVENTS_INDEX]:
+        for stmt in SCHEMA + [SQLITE_EVENTS, EVENTS_INDEX, SQLITE_IMAGES]:
             await self.db.execute(stmt)
         for table, column, definition in ADDED_COLUMNS:
             async with self.db.execute(f"PRAGMA table_info({table})") as cur:
@@ -373,7 +405,7 @@ class PostgresStore(_SqlStore):
 
         self.pool = await asyncpg.create_pool(self.dsn)
         async with self.pool.acquire() as c:
-            for stmt in SCHEMA + [PG_EVENTS, EVENTS_INDEX]:
+            for stmt in SCHEMA + [PG_EVENTS, EVENTS_INDEX, PG_IMAGES]:
                 await c.execute(stmt)
             for table, column, definition in ADDED_COLUMNS:
                 await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
