@@ -94,6 +94,9 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .file:hover { background: var(--muted); }
 .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-size { font-variant-numeric: tabular-nums; }
+/* A markdown file of the worktree, rendered in the Files tab. */
+.fview { max-width: 860px; padding: 14px 18px; border: 1px solid var(--border); border-radius: 8px; font-size: 15px; line-height: 1.6;
+         overflow-wrap: anywhere; }
 .wlog-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
 .wlog { margin: 0; flex: 1; overflow: auto; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
         background: color-mix(in oklch, var(--muted) 60%, transparent); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;

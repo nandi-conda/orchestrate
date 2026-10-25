@@ -192,3 +192,33 @@ def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path)
     click(qtbot, w, "document.querySelector('.ev-assistant .ev-copy')")
     qtbot.waitUntil(lambda: QGuiApplication.clipboard().text() == reply, timeout=WAIT)
     qtbot.waitUntil(lambda: js(qtbot, w, "!!document.querySelector('.ev-assistant .icon-check')"), timeout=WAIT)
+
+
+def test_a_markdown_file_opens_rendered_in_the_files_tab(qtbot, up, tmp_path):
+    w, url = up
+    with httpx.Client(base_url=url, timeout=20) as c:
+        pid = c.post("/api/projects", json={"name": "docs"}).json()["id"]
+        tid = c.post(f"/api/projects/{pid}/requests",
+                     json={"text": "plan\nwrite notes/plan.md: Ship **it** today", "mode": "new"}).json()["spawned"][0]["id"]
+        deadline = time.time() + 20
+        while c.get(f"/api/threads/{tid}").json()["state"] != "idle":
+            assert time.time() < deadline
+            time.sleep(0.1)
+    w.view.load(QUrl(f"{url}/p/{pid}"))
+    qtbot.waitUntil(lambda: js(qtbot, w, "document.querySelectorAll('.thread').length > 1"), timeout=WAIT)
+    click(qtbot, w, "document.querySelectorAll('.thread')[1]")
+    click(qtbot, w, "[...document.querySelectorAll('.tab')].find(t => t.textContent === 'Files')")
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent === 'notes/')")
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent.startsWith('plan.md'))")
+    qtbot.waitUntil(lambda: js(qtbot, w, "(document.querySelector('.fview strong') || {}).textContent") == "it",
+                    timeout=WAIT)
+    assert w.view.url().toString() == f"{url}/p/{pid}", "the file opens in the window's own pane"
+    # Download stays one click away, and saves the file as it is.
+    click(qtbot, w, "document.getElementById('fview-download')")
+    qtbot.waitUntil(lambda: (tmp_path / "dl" / "plan.md").exists()
+                    and w.statusBar().currentMessage().startswith("Saved"), timeout=WAIT)
+    assert (tmp_path / "dl" / "plan.md").read_text() == "Ship **it** today\n"
+    # Back returns to the directory.
+    click(qtbot, w, "[...document.querySelectorAll('.pane-actions .btn')].find(b => b.textContent === 'Back')")
+    qtbot.waitUntil(lambda: js(qtbot, w, "!document.querySelector('.fview') && !!document.querySelector('.files')"),
+                    timeout=WAIT)

@@ -17,7 +17,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, focus_end)
+                  clip_copy, on_select, sel_clear, s_quote, focus_end, is_md)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -63,6 +63,9 @@ COPIED_DONE: Const[i32] = 40
 SELECTED: Const[i32] = 41
 QUOTE: Const[i32] = 42
 UNQUOTE: Const[i32] = 43
+FILE_VIEW: Const[i32] = 44
+GOT_FVIEW: Const[i32] = 45
+FVIEW_CLOSE: Const[i32] = 46
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -116,6 +119,8 @@ wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text}
 wlog_loading: i32 = 0
 files: i32 = 0           # JSON handle: a directory of the selected thread's worktree ({path, entries})
 files_loading: i32 = 0
+fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text})
+fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
@@ -141,6 +146,8 @@ h_stopped: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_fpath: i32 = 0         # the worktree directory the Files tab shows ("" = its root)
 h_files_err: i32 = 0     # why the files could not be read
+h_fview: i32 = 0         # worktree path of the markdown file the Files tab shows ("" = the listing)
+h_fview_err: i32 = 0     # why that file could not be read
 h_md: i32 = 0            # scratch for markdown text
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
@@ -178,6 +185,7 @@ def get_text(url: i32, msg: i32) -> None:
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
+    global h_fview, h_fview_err
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body
     h_pid = s_new()
     h_sel = s_new()
@@ -204,6 +212,8 @@ def init() -> None:
     h_wlog_err = s_new()
     h_fpath = s_new()
     h_files_err = s_new()
+    h_fview = s_new()
+    h_fview_err = s_new()
     h_md = s_new()
     h_run = s_new()
     h_tid = s_new()
@@ -251,6 +261,7 @@ def leave_project() -> None:
     files = take_none(files)
     s_clear(h_fpath)
     s_clear(h_files_err)
+    close_fview()
     s_clear(h_sel)
     s_clear(h_route)
     s_clear(h_err)
@@ -364,6 +375,27 @@ def fetch_files() -> None:
     get(h_url, GOT_FILES)
 
 
+def file_url(dst: i32, name: i32) -> None:
+    """dst = the URL of file name in directory h_fpath of the selected thread's worktree."""
+    s_set(dst, "/api/threads/")
+    s_add_ref(dst, h_sel)
+    s_add(dst, "/files/raw?path=")
+    s_copy(h_t3, h_fpath)
+    if s_len(h_fpath) > 0:
+        s_add(h_t3, "/")
+    s_add_ref(h_t3, name)
+    s_add_enc(dst, h_t3)
+
+
+def close_fview() -> None:
+    """Back to the listing from a markdown file."""
+    global fview, fview_req
+    fview = take_none(fview)
+    fview_req = 0
+    s_clear(h_fview)
+    s_clear(h_fview_err)
+
+
 def take_none(old: i32) -> i32:
     if old != 0:
         j_free(old)
@@ -421,7 +453,7 @@ def land() -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting
+    global copied, selecting, fview_req
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -491,6 +523,7 @@ def update(msg: i32, arg: i32) -> None:
         files = take_none(files)
         s_clear(h_fpath)
         s_clear(h_files_err)
+        close_fview()
         if pane_tab == FILES:
             fetch_files()
     elif msg == ACTIVITY:
@@ -673,6 +706,35 @@ def update(msg: i32, arg: i32) -> None:
             s_add(h_fpath, "/")
         s_add_ref(h_fpath, h_t1)
         fetch_files()
+    elif msg == FILE_VIEW:
+        # arg indexes a markdown file of the listing shown: read it as text
+        # and show it rendered, in the pane.
+        o = j_at(files, "entries")
+        e = j_idx(o, arg)
+        jstr(e, "name", h_t1)
+        j_free(e)
+        j_free(o)
+        close_fview()
+        s_copy(h_fview, h_fpath)
+        if s_len(h_fpath) > 0:
+            s_add(h_fview, "/")
+        s_add_ref(h_fview, h_t1)
+        file_url(h_url, h_t1)
+        fview_req = http_get_text(h_url, GOT_FVIEW)
+    elif msg == GOT_FVIEW:
+        # A reply after Back, or for a file or thread no longer shown, is
+        # dropped: only the read last asked for lands.
+        if arg != fview_req:
+            j_free(arg)
+        else:
+            fview_req = 0
+            if j_ok(arg) == 1:
+                fview = arg
+            else:
+                j_err(arg, h_fview_err)
+                j_free(arg)
+    elif msg == FVIEW_CLOSE:
+        close_fview()
     elif msg == FILES_UP:
         s_add(h_fpath, "/..")
         fetch_files()
@@ -1459,14 +1521,68 @@ def size_text(n: i32) -> None:
         text(" MB")
 
 
+def file_view() -> None:
+    """The markdown file h_fview, rendered in the pane, with Back to its
+    directory and a Download link (the browser saves it; the page stays)."""
+    div("wlog-bar")
+    span("mono")
+    text("/")
+    text_ref(h_fview)
+    end()
+    div("pane-actions")
+    btn_open("ghost", FVIEW_CLOSE, 0)
+    cls("sm")
+    text("Back")
+    end()
+    s_set(h_t2, "/api/threads/")
+    s_add_ref(h_t2, h_sel)
+    s_add(h_t2, "/files/raw?path=")
+    s_add_enc(h_t2, h_fview)
+    el("a")
+    cls("btn")
+    cls("ghost")
+    cls("sm")
+    attr("id", "fview-download")
+    attr_ref("href", h_t2)
+    attr_ref("download", h_fview)
+    text("Download")
+    end()
+    end()
+    end()
+    if s_len(h_fview_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_fview_err)
+        end()
+    elif fview_req != 0:
+        el("p")
+        cls("muted")
+        cls("empty")
+        text("Loading…")
+        end()
+    elif fview != 0:
+        el("div")
+        cls("fview")
+        cls("md")
+        jstr(fview, "text", h_t1)
+        md(h_t1)
+        end()
+
+
 def file_list() -> None:
     """The selected thread's worktree, one directory at a time, read from the
-    worker that holds it. A directory opens in place; a file is a download link
-    (the browser saves it; the page stays)."""
+    worker that holds it. A directory opens in place; a markdown file opens
+    rendered in the pane (file_view); any other file is a download link (the
+    browser saves it; the page stays)."""
     i: i32
     n: i32 = 0
     e: i32
     ents: i32
+    if s_len(h_fview) > 0:
+        file_view()
+        return
     div("wlog-bar")
     span("mono")
     text("/")
@@ -1521,15 +1637,20 @@ def file_list() -> None:
             text("/")
             end()
             end()
+        elif is_md(h_t1) == 1:
+            el("button")
+            cls("file")
+            key(i)
+            on_click(FILE_VIEW, i)
+            span("file-name")
+            text_ref(h_t1)
+            end()
+            span("file-size muted")
+            size_text(j_int(e, "size"))
+            end()
+            end()
         else:
-            s_set(h_t2, "/api/threads/")
-            s_add_ref(h_t2, h_sel)
-            s_add(h_t2, "/files/raw?path=")
-            s_copy(h_t3, h_fpath)
-            if s_len(h_fpath) > 0:
-                s_add(h_t3, "/")
-            s_add_ref(h_t3, h_t1)
-            s_add_enc(h_t2, h_t3)
+            file_url(h_t2, h_t1)
             el("a")
             cls("file")
             key(i)

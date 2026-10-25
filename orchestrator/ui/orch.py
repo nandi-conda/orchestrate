@@ -116,3 +116,8 @@ def s_quote(dst: i32, src: i32) -> None:
 def focus_end(id: str) -> None:
     """Focus the input with this id after the next render, caret at the end."""
     pass
+
+@jscall
+def is_md(h: i32) -> i32:
+    """1 if the file name in handle h is markdown (.md or .markdown, any case)."""
+    pass
