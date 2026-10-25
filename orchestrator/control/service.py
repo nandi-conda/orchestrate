@@ -184,6 +184,8 @@ class Orchestrator:
         self.starting: dict[str, asyncio.Task] = {}
         self.reviving: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        # Every chained task, not only each chain's last: close() ends them all.
+        self.background: set[asyncio.Task] = set()
 
     def _chain(self, chains: dict[str, asyncio.Task], key: str, work) -> asyncio.Task:
         """Run `work()` once the work queued before it under `key` has ended,
@@ -197,6 +199,8 @@ class Orchestrator:
 
         task = asyncio.create_task(run())
         chains[key] = task
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
         task.add_done_callback(lambda t: chains.pop(key) if chains.get(key) is t else None)
         return task
 
@@ -204,14 +208,16 @@ class Orchestrator:
         """Let go of the workers. They are not destroyed: what the threads
         left on them (files never committed, ignored build output) is there
         for the next control plane, which attaches to them again."""
-        for chains in (self.request_chain, self.thread_chain):
-            for task in list(chains.values()):
-                task.cancel()
+        tasks = list(self.background)
         for lws in self.workers.values():
             for lw in lws:
-                for task in (lw.relay, lw.pump, lw.watch):
-                    if task:
-                        task.cancel()
+                tasks += [task for task in (lw.relay, lw.pump, lw.watch) if task]
+        for task in tasks:
+            task.cancel()
+        # Wait for them to end, so none touches the store after it closes.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for lws in self.workers.values():
+            for lw in lws:
                 await lw.client.close()
 
     # ---------------------------------------------------------------- workers
@@ -653,6 +659,8 @@ class Orchestrator:
         if task is None:
             task = asyncio.create_task(self._revive(t, lw))
             self.reviving[thread_id] = task
+            self.background.add(task)
+            task.add_done_callback(self.background.discard)
             task.add_done_callback(lambda _: self.reviving.pop(thread_id, None))
         return await asyncio.shield(task)
 
