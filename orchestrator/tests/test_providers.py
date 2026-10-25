@@ -199,21 +199,30 @@ class FakeStream:
         yield '{"type": "complete"}'
 
 
-async def _sprites_create(env, defined: bool):
+async def _sprites_create(env, defined: bool, serving: str = "c0ffee"):
     env.setattr(secrets, "get_secret", lambda name: "key")
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
     fake = FakeSprites(defined)
     p.http = fake
 
     async def no_exec(name, script, env=None):
+        fake.bootstrap = env
         return ""
 
     async def healthy(url, timeout=120.0):
-        return None
+        return {"ok": True, "commit": serving}
 
     async def accepts(worker):
         return True
 
+    async def resolve(source, ref):
+        return "c0ffee"
+
+    async def logs(worker, lines):
+        return "runner log"
+
+    env.setattr(providers, "remote_commit", resolve)
+    env.setattr(p, "logs", logs)
     env.setattr(p, "exec", no_exec)
     env.setattr(providers, "wait_healthy", healthy)
     env.setattr(p, "accepts_token", accepts)
@@ -235,6 +244,14 @@ async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started
 async def test_sprites_create_starts_a_new_service(env):
     _, fake = await _sprites_create(env, defined=False)
     assert fake.actions == ["start"]
+    assert fake.bootstrap == {"ORCHESTRATE_REPO": "https://example.com/fork.git", "ORCHESTRATE_COMMIT": "c0ffee"}
+
+
+async def test_a_sprite_serving_other_code_is_refused(env):
+    """A worker must run the commit its branch names now; one serving older
+    code (a runner that outlived its definition) is an error, not a worker."""
+    with pytest.raises(RuntimeError, match="runs orchestrate deadbeef, not c0ffee"):
+        await _sprites_create(env, defined=True, serving="deadbeef")
 
 
 async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypatch):

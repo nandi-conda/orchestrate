@@ -2,7 +2,7 @@
 # Prepare a fresh Linux worker (a Sprite, a VM, a container) to run the runner.
 # Idempotent: run it again to update. Then start the service with deploy/start.sh.
 #   ORCHESTRATE_REPO   git URL of this monorepo (default: github.com/nandi-conda/orchestrate)
-#   ORCHESTRATE_REF    branch or tag (default: main)
+#   ORCHESTRATE_REF    branch, tag or commit (default: main)
 #   ORCHESTRATE_HOME   where to check it out (default: /opt/orchestrate)
 set -euo pipefail
 REPO="${ORCHESTRATE_REPO:-https://github.com/nandi-conda/orchestrate}"
@@ -14,12 +14,11 @@ if ! command -v pixi >/dev/null 2>&1 && [ ! -x "$HOME/.pixi/bin/pixi" ]; then
 fi
 export PATH="$HOME/.pixi/bin:$PATH"
 
-if [ -d "$HOME_DIR/.git" ]; then
-  git -C "$HOME_DIR" fetch --depth 1 origin "$REF"
-  git -C "$HOME_DIR" checkout -q FETCH_HEAD
-else
-  git clone --depth 1 --branch "$REF" "$REPO" "$HOME_DIR"
-fi
+[ -d "$HOME_DIR/.git" ] || git init -q "$HOME_DIR"
+git -C "$HOME_DIR" remote remove origin 2>/dev/null || true
+git -C "$HOME_DIR" remote add origin "$REPO"
+git -C "$HOME_DIR" fetch -q --depth 1 origin "$REF"
+git -C "$HOME_DIR" checkout -q --force FETCH_HEAD
 
 cd "$HOME_DIR/runner"
 pixi install -e prod

@@ -80,10 +80,10 @@ def tail(data: bytes, lines: int) -> str:
     return "\n".join(data.decode(errors="replace").splitlines()[-lines:]) + "\n"
 
 
-async def wait_healthy(url: str, timeout: float = 120.0) -> None:
+async def wait_healthy(url: str, timeout: float = 120.0) -> dict:
     """Poll /health until the runner answers. A runner on this machine answers
     in milliseconds, one on a sprite starts by installing; look again at once at
-    first, then back off to a quarter second."""
+    first, then back off to a quarter second. Returns what /health answered."""
     deadline = asyncio.get_running_loop().time() + timeout
     delay = 0.01
     async with httpx.AsyncClient(timeout=5.0) as c:
@@ -91,7 +91,7 @@ async def wait_healthy(url: str, timeout: float = 120.0) -> None:
             try:
                 r = await c.get(url.rstrip("/") + "/health")
                 if r.status_code == 200:
-                    return
+                    return r.json()
             except httpx.HTTPError:
                 pass
             if asyncio.get_running_loop().time() > deadline:
@@ -252,18 +252,29 @@ class LocalProvider:
                     proc.kill()
 
 
-# Get the monorepo onto the sprite, then let runner/deploy/bootstrap.sh install pixi
-# and the runner's prod environment (it is idempotent, so re-running updates).
+# Put the monorepo at exactly $ORCHESTRATE_COMMIT on the sprite, then let
+# runner/deploy/bootstrap.sh install pixi, the runner's environments and
+# prime-agent (it is idempotent, so re-running updates).
 BOOTSTRAP = r"""
 set -euo pipefail
-if [ -d /opt/orchestrate/.git ]; then
-  git -C /opt/orchestrate fetch -q --depth 1 origin "$ORCHESTRATE_REF"
-  git -C /opt/orchestrate checkout -q FETCH_HEAD
-else
-  git clone -q --depth 1 --branch "$ORCHESTRATE_REF" "$ORCHESTRATE_REPO" /opt/orchestrate
-fi
-bash /opt/orchestrate/runner/deploy/bootstrap.sh
+[ -d /opt/orchestrate/.git ] || git init -q /opt/orchestrate
+git -C /opt/orchestrate remote remove origin 2>/dev/null || true
+git -C /opt/orchestrate remote add origin "$ORCHESTRATE_REPO"
+git -C /opt/orchestrate fetch -q --depth 1 origin "$ORCHESTRATE_COMMIT"
+git -C /opt/orchestrate checkout -q --force FETCH_HEAD
+ORCHESTRATE_REF="$ORCHESTRATE_COMMIT" bash /opt/orchestrate/runner/deploy/bootstrap.sh
 """
+
+
+async def remote_commit(source: str, ref: str) -> str:
+    """The commit `ref` names on `source` now: what a new worker runs."""
+    proc = await asyncio.create_subprocess_exec("git", "ls-remote", source, f"refs/heads/{ref}",
+                                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = await proc.communicate()
+    sha = out.decode().split("\t", 1)[0].strip()
+    if proc.returncode != 0 or not sha:
+        raise RuntimeError(f"cannot resolve branch {ref!r} of {source}: {err.decode().strip() or 'no such branch'}")
+    return sha
 
 
 class SpritesProvider:
@@ -323,7 +334,8 @@ class SpritesProvider:
         # checkout's, with this control plane's key and token.
         defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
 
-        await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_REF": self.ref})
+        commit = await remote_commit(self.source, self.ref)
+        await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity)}
@@ -331,7 +343,10 @@ class SpritesProvider:
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
         await self.service_action(name, "restart" if defined else "start")
-        await self.wait_ready(worker)
+        health = await self.wait_ready(worker)
+        if health.get("commit") != commit:
+            raise RuntimeError(f"worker {name}'s runner runs orchestrate {health.get('commit')}, not "
+                               f"{commit} ({self.ref}); its log ends:\n{await self.logs(worker, 20)}")
         if not await self.accepts_token(worker):
             raise RuntimeError(f"worker {name}'s runner does not accept the token it was started "
                                f"with; its log ends:\n{await self.logs(worker, 20)}")
@@ -358,9 +373,9 @@ class SpritesProvider:
             raise RuntimeError(f"the runner service on sprite {name} did not finish {what} "
                                f"within {timeout:.0f}s") from None
 
-    async def wait_ready(self, worker: Worker, timeout: float = 300.0) -> None:
+    async def wait_ready(self, worker: Worker, timeout: float = 300.0) -> dict:
         try:
-            await wait_healthy(worker.url, timeout=timeout)
+            return await wait_healthy(worker.url, timeout=timeout)
         except TimeoutError:
             # A runner that refuses to start (exits, and the service with it)
             # says why in the service log.

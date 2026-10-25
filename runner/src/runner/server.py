@@ -7,6 +7,7 @@ import base64
 import hmac
 import json
 import os
+import subprocess
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -14,7 +15,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from . import files, sandbox
-from .harness import PrimeAgent
+from .harness import RUNNER, PrimeAgent
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repo, refs_header
 from .secrets import get_secret, require
@@ -26,6 +27,13 @@ from .web import deepseek_web
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def checkout_commit() -> str | None:
+    """The commit of the orchestrate checkout this runner runs from: /health
+    reports it, so the control plane can tell a worker running other code."""
+    out = subprocess.run(["git", "-C", str(RUNNER.parent), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else None
 
 
 def images_of(b: dict) -> list[dict]:
@@ -91,8 +99,10 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
     def thread_or_404(req: Request):
         return host.threads.get(req.path_params["id"])
 
+    commit = checkout_commit()
+
     async def health(req: Request):
-        return JSONResponse(host.health())
+        return JSONResponse({**host.health(), "commit": commit})
 
     async def list_threads(req: Request):
         return JSONResponse([t.directory_entry() for t in host.threads.values()])

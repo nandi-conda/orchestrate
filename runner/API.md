@@ -8,7 +8,7 @@ threads. Default port 8080. Every route except `/health` needs
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| GET | `/health` | | `{"ok", "threads", "running", "capacity"}` |
+| GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout) |
 | GET | `/threads` | | list of directory entries |
 | POST | `/threads` | `{"request"?, "images"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
