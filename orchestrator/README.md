@@ -151,8 +151,12 @@ The control plane reads them itself: from `/.sprite/logs/services/runner.log`
 on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
 `.orchestrator/workers/<worker>/runner.log` for a local worker. Stopping the
 control plane destroys its sprites, so read a sprite's log while it is still
-running. With the `sprite` CLI the same file is
-`sprite exec -s orch-<project>-w<n> tail -n 300 /.sprite/logs/services/runner.log`.
+running. To read it without the UI:
+
+```sh
+curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \
+  "https://api.sprites.dev/v1/sprites/orch-<project>-w<n>/fs/read?path=/.sprite/logs/services/runner.log&workingDir=/" | tail -n 300
+```
 
 The spawn path has been exercised against the live API: create, bootstrap,
 `/health`, an agent turn, and destroy.
