@@ -302,8 +302,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         try:
             text = await orch().worker_logs(tid, lines)
         except KeyError:
-            return PlainTextResponse(f"thread {tid} has no live worker in this control plane "
-                                     "(its worker is gone: the control plane restarted or the worker stopped answering)\n", 404)
+            return PlainTextResponse(f"thread {tid} has no worker: it has not started on one yet, "
+                                     "or its worker stopped answering and was dropped\n", 404)
         except Exception as e:
             return PlainTextResponse(f"could not read the worker log: {describe(e)}\n", 502)
         return PlainTextResponse(text)

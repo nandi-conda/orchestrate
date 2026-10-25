@@ -193,8 +193,19 @@ class LocalProvider:
         print(f"LocalProvider: worker {wid} logs to {self.log_path(wid)}", file=sys.stderr)
         worker.handle = str(proc.pid)
         self.procs[wid] = proc
+        # The first run installs the runner env. A runner that exits instead
+        # (it refuses to start without what it needs) says why in its log.
+        healthy = asyncio.create_task(wait_healthy(worker.url, timeout=600))
+        exited = asyncio.create_task(proc.wait())
+        await asyncio.wait({healthy, exited}, return_when=asyncio.FIRST_COMPLETED)
+        if not healthy.done():
+            healthy.cancel()
+            self.procs.pop(wid, None)
+            raise RuntimeError(f"worker {wid}'s runner exited with code {proc.returncode} before it "
+                               f"answered:\n{tail(self.log_path(wid).read_bytes(), 20)}")
+        exited.cancel()
         try:
-            await wait_healthy(worker.url, timeout=600)  # first run installs the runner env
+            healthy.result()
         except TimeoutError:
             proc.kill()
             raise
@@ -367,7 +378,8 @@ class AutoProvider:
         return await provider.create(spec)
 
     def _of(self, worker: Worker):
-        return self._sprites if worker.provider == "sprites" else self._local
+        # A worker an earlier control plane made may be asked about first.
+        return self.sprites() if worker.provider == "sprites" else self.local()
 
     async def destroy(self, worker: Worker) -> None:
         provider = self._of(worker)

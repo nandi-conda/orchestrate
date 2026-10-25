@@ -150,3 +150,13 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
     finally:
         await p.close()
 
+
+
+async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypatch):
+    import sys
+
+    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    monkeypatch.setattr(p, "command", lambda: [sys.executable, "-c",
+                                               "print('bubblewrap cannot make a sandbox here'); raise SystemExit(1)"])
+    with pytest.raises(RuntimeError, match="exited with code 1.*\n.*bubblewrap cannot make a sandbox here"):
+        await p.create(providers.WorkerSpec(project_id="p_1", index=1))

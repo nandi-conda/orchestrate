@@ -743,6 +743,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     # The next control plane attaches to the same worker, files and all.
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
     second = Orchestrator(s, provider, HeuristicRouter())
+    assert "devrunner: echo runner on port" in await second.worker_logs(t["id"], 50)  # before it is attached
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
     revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
@@ -752,6 +753,28 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     await wait_for(lambda: idle_of(s, u["id"]))
     assert (await s.get_thread(u["id"]))["worker_id"] == ran_on
     await second.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_threads_on_a_worker_stored_without_its_index_share_one_new_worker(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    # A row from before workers kept their index (idx 0), and two threads on it.
+    await s.upsert_worker({"id": f"{p['id']}-w1", "project_id": p["id"], "provider": "local",
+                           "handle": "1", "url": "http://127.0.0.1:1", "token": "x"})
+    ts = [await s.create_thread(p["id"], title, "") for title in ("A", "B")]
+    for t in ts:
+        await s.update_thread(t["id"], worker_id=f"{p['id']}-w1", state="idle")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter())
+    lws = [await orch.live_worker(t["id"]) for t in ts]
+    assert lws[0] is lws[1] and len(orch.workers[p["id"]]) == 1 and lws[0].worker.index == 1
+    await orch.close()
     await provider.close()
     await s.close()
 

@@ -44,6 +44,13 @@ def worker_spec(project: dict, index: int) -> WorkerSpec:
                       capacity=CAPACITY)
 
 
+def attachable(w: dict) -> bool:
+    """A stored worker that a control plane can attach to again by its index.
+    Workers start at index 1; 0 marks a row stored before workers kept their
+    index, whose spec cannot be made again."""
+    return w["idx"] >= 1
+
+
 def peer_entry(t: dict) -> dict:
     """A thread as the runner's directory entry shape (runner/API.md)."""
     return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
@@ -221,7 +228,7 @@ class Orchestrator:
 
     async def _made(self, project_id: str) -> set[int]:
         if project_id not in self.made:
-            workers = await self.store.list_workers(project_id)
+            workers = [w for w in await self.store.list_workers(project_id) if attachable(w)]
             self.made[project_id] = {w["idx"] for w in workers}
             self.lost[project_id] = {w["idx"] for w in workers if w["lost_at"] is not None}
         return self.made[project_id]
@@ -229,6 +236,9 @@ class Orchestrator:
     async def _attach(self, project: dict, index: int) -> LiveWorker:
         """The project's worker `index`, started: made new, or the one an
         earlier control plane made, with its disk. Callers hold self._lock."""
+        for lw in self.workers.get(project["id"], []):
+            if lw.worker.index == index:
+                return lw
         worker = await self.provider.create(worker_spec(project, index))
         await self.store.upsert_worker(worker.record())
         (await self._made(project["id"])).add(index)
@@ -251,7 +261,7 @@ class Orchestrator:
                 if lw.worker.id == worker_id:
                     return lw
             for w in await self.store.list_workers(project["id"]):
-                if w["id"] == worker_id and w["lost_at"] is None:
+                if w["id"] == worker_id and w["lost_at"] is None and attachable(w):
                     return await self._attach(project, w["idx"])
         return None
 
@@ -619,12 +629,20 @@ class Orchestrator:
         return out
 
     async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
-        """The runner log of the worker a thread runs on (the control plane
-        reads it from the provider; the worker never sends it)."""
+        """The runner log of the worker a thread runs on, or last ran on when
+        that one is not attached (the control plane reads it from the
+        provider; the worker never sends it). KeyError when it has none."""
         lw = self.by_thread.get(thread_id)
-        if lw is None:
-            raise KeyError(thread_id)
-        return await self.provider.logs(lw.worker, lines)
+        if lw is not None:
+            return await self.provider.logs(lw.worker, lines)
+        t = await self.store.get_thread(thread_id)
+        for w in await self.store.list_workers(t["project_id"]) if t else []:
+            if w["id"] == t["worker_id"]:  # down now, or left by an earlier control plane
+                return await self.provider.logs(Worker(id=w["id"], project_id=w["project_id"],
+                                                       provider=w["provider"], handle=w["handle"],
+                                                       url=w["url"], token=w["token"],
+                                                       capacity=w["capacity"], index=w["idx"]), lines)
+        raise KeyError(thread_id)
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds
