@@ -115,13 +115,27 @@ def bwrap() -> str:
     return path
 
 
+def _no_capabilities() -> None:
+    """Runs in the child before bwrap is exec'd: clear the ambient capability
+    set. A Sprite's services run as a non-root user that holds capabilities in
+    it, which survive exec; bwrap refuses those ("Unexpected capabilities but
+    not setuid"), and a thread's commands have no use for them either. Without
+    ambient capabilities, bwrap starts with none and makes its sandbox from a
+    user namespace."""
+    import ctypes
+
+    PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
+    if ctypes.CDLL(None, use_errno=True).prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0):
+        raise OSError(ctypes.get_errno(), "prctl(PR_CAP_AMBIENT_CLEAR_ALL) failed")
+
+
 def check() -> None:
     """Fail now, not at a thread's first command, when this machine cannot run
     the sandbox (no user namespaces for this user, for one)."""
     import subprocess
 
     r = subprocess.run([bwrap(), "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "true"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, preexec_fn=_no_capabilities)
     if r.returncode:
         raise SandboxError(f"bubblewrap cannot make a sandbox here: {r.stderr.strip()}")
 
@@ -152,7 +166,7 @@ class LocalSandbox:
         proc = await asyncio.create_subprocess_exec(
             self.bwrap, *bwrap_args(self.view), "bash", "-lc", cmd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=True, preexec_fn=_no_capabilities,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)

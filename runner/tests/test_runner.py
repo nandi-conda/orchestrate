@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import types
@@ -434,3 +435,15 @@ async def test_http_resume_needs_request_or_history(tmp_path):
         r = await c.post("/threads", json={"id": "t_x", "title": "t", "history": [], "summary": "was here"})
         assert r.status_code == 201 and r.json()["state"] == "idle" and r.json()["summary"] == "was here"
         assert (await c.post("/threads", json={"id": "t_x", "history": []})).status_code == 409
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="making a user with ambient capabilities needs root")
+def test_sandbox_starts_for_a_user_with_ambient_capabilities():
+    """A Sprite's services run as a non-root user with ambient capabilities,
+    which bwrap refuses unless they are cleared before it starts."""
+    code = "from runner import sandbox; sandbox.check()"
+    r = subprocess.run(["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups",
+                        "--inh-caps=+net_bind_service", "--ambient-caps=+net_bind_service",
+                        sys.executable, "-c", code], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(runner_checkout() / "runner" / "src")})
+    assert r.returncode == 0, r.stderr
