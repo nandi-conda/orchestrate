@@ -34,18 +34,25 @@ def sse_close(id: i32) -> None:
     pass
 
 @jscall
+def http_get_text(url: i32, msg: i32) -> i32:
+    """GET a plain-text reply. Returns a JSON handle now; update(msg, handle)
+    runs when it arrives, with the body under "text" (or the error)."""
+    pass
+
+@jscall
 def page_project(dst: i32) -> i32:
-    """If this window is a project's main window (/p/<id>), write the id to dst
-    and return 1."""
+    """If the address is a project's page (/p/<id>), write the id to dst and
+    return 1."""
     pass
 
 @jscall
-def open_window(url: i32, name: i32) -> None:
-    """window.open(url, name): a named window, so each project has one."""
+def nav_push(url: i32) -> None:
+    """Move the address bar to url (history.pushState) without leaving the page."""
     pass
 
 @jscall
-def go(url: str) -> None:
+def on_nav(msg: i32) -> None:
+    """update(msg, 0) whenever Back or Forward changes the address."""
     pass
 
 @jscall

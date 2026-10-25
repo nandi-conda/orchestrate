@@ -1,7 +1,8 @@
 # orchestrator
 
-The control plane and the ultra UI. Every project gets one main window. A
-request typed there goes to a router, which spawns new threads or messages
+The control plane and the ultra UI. Everything happens in one browser window:
+the project list, each project, and each thread's transcript, tool calls and
+worker log. A request typed in a project goes to a router, which spawns new threads or messages
 existing ones. Threads run on runner workers (see `../runner`), and the control
 plane relays their events back to the window as they happen.
 
@@ -21,8 +22,9 @@ pixi run serve            # builds the UI, then serves http://127.0.0.1:8000
 ```
 
 Open http://127.0.0.1:8000, create a project and give it the path or URL of a
-git repo. Its main window opens at `/p/<project id>`; opening it again
-focuses the same window. Type a request and press Enter:
+git repo. It opens in the same window at `/p/<project id>`, and
+**← All projects**, Back and Forward move between the list and projects
+without reloading or opening anything new. Type a request and press Enter:
 
 - **Router decides** (default): the router spawns threads or messages
   existing ones, leaning toward spawning. A bulleted or numbered list fans out
@@ -40,7 +42,7 @@ thread list shows every event in the project, and each thread shows its own
 transcript, including messages from other threads. A request that spawns
 threads never moves the window into one of them: you stay where you are, the
 new threads show up in the list, and their events stream into Project activity.
-You're only ever talking to the project window, and you open a thread only by
+You're only ever talking to the project, and you open a thread only by
 clicking it.
 
 With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
@@ -150,8 +152,9 @@ repository must be publicly readable.
 
 ### Worker logs
 
-Each thread's pane has a **Worker logs** link: the last 300 lines its runner
-wrote to stdout and stderr, as plain text (`/api/threads/<id>/worker-logs?lines=N`).
+Each thread's pane has a **Worker log** tab next to Dialog and Tools: the last
+300 lines its runner wrote to stdout and stderr, with a Refresh button. The same
+text is served as plain text at `/api/threads/<id>/worker-logs?lines=N`.
 The control plane reads them itself: from `/.sprite/logs/services/runner.log`
 on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
 `.orchestrator/workers/<worker>/runner.log` for a local worker. Stopping the

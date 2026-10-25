@@ -19,6 +19,20 @@ export function imports({ str, strs, vals, dispatch }) {
         .then(() => { vals[o] = undefined; dispatch(msg, h); });
       return h;
     },
+    http_get_text: (u, msg) => {
+      const h = put(null);
+      fetch(strs[u], { headers: { accept: "text/plain" } })
+        .then(async (r) => {
+          const body = await r.text();
+          if (r.ok) { vals[h] = { text: body }; return; }
+          let err = body.trim();
+          try { err = JSON.parse(body).error || err; } catch {}
+          vals[h] = { __error: err || "HTTP " + r.status };
+        })
+        .catch((e) => { vals[h] = { __error: String(e.message || e) }; })
+        .then(() => dispatch(msg, h));
+      return h;
+    },
     sse_open: (u, msg) => {
       const id = nextStream++;
       const es = new EventSource(strs[u]);
@@ -37,8 +51,8 @@ export function imports({ str, strs, vals, dispatch }) {
       strs[d] = decodeURIComponent(m[1]);
       return 1;
     },
-    open_window: (u, n) => { const w = window.open(strs[u], strs[n]); if (w) w.focus(); },
-    go: (u) => { location.href = str(u); },
+    nav_push: (u) => { history.pushState(null, "", strs[u]); },
+    on_nav: (msg) => { addEventListener("popstate", () => dispatch(msg, 0)); },
     set_title: (h) => { document.title = strs[h]; },
     scroll_end: (id) => {
       const sel = str(id);

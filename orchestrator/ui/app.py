@@ -1,7 +1,9 @@
-# Orchestrator UI: a project list at /, and one main window per project at
-# /p/<id>. The main window shows the project's threads on the left, the
-# selected thread's transcript (or the project's activity) in the middle, and
-# a request box at the bottom that goes to the router.
+# Orchestrator UI: one window that shows the project list at / and a project at
+# /p/<id>. Opening a project, going back to the list, Back and Forward all
+# happen in place (history.pushState), never in a new tab or window. A project
+# shows its threads on the left, the selected thread's transcript, tool calls
+# or worker log (or the project's activity) in the middle, and a request box at
+# the bottom that goes to the router.
 #
 # Text lives in ultra's JS string store; this module holds handles. JSON
 # replies stay JS-side too, read with j_* by handle.
@@ -13,8 +15,8 @@ from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, ke
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
-from orch import (o_new, o_str, o_lit, http_post, sse_open, page_project, open_window, go,
-                  set_title, scroll_end)
+from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
+                  nav_push, on_nav, set_title, scroll_end)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -41,10 +43,14 @@ HOME: Const[i32] = 21
 GOT_LOG: Const[i32] = 22
 ACTIVITY: Const[i32] = 23
 TAB: Const[i32] = 24
+NAV: Const[i32] = 25
+GOT_WLOG: Const[i32] = 26
+WLOG_REFRESH: Const[i32] = 27
 
 # pane tabs
 DIALOG: Const[i32] = 0
 TOOLS: Const[i32] = 1
+WLOG: Const[i32] = 2
 
 # routing modes
 AUTO: Const[i32] = 0
@@ -63,9 +69,9 @@ K_ROUTE: Const[i32] = 8
 K_THINKING: Const[i32] = 9
 
 # ---- Model
-screen: i32 = 0          # 0 project list, 1 project window
+screen: i32 = 0          # 0 project list, 1 a project
 projects: i32 = 0        # JSON handle: list of projects
-project: i32 = 0         # JSON handle: this window's project
+project: i32 = 0         # JSON handle: the open project
 threads: i32 = 0         # JSON handle: thread directory
 transcript: i32 = 0      # JSON handle: selected thread's events
 plog: i32 = 0            # JSON handle: project activity
@@ -75,7 +81,10 @@ creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
-pane_tab: i32 = 0        # DIALOG or TOOLS
+pane_tab: i32 = 0        # DIALOG, TOOLS or WLOG
+stream: i32 = 0          # the open project's event stream, 0 when none
+wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
+wlog_loading: i32 = 0
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -94,6 +103,7 @@ h_idle: i32 = 0
 h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
+h_wlog_err: i32 = 0      # why the worker log could not be read
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -114,14 +124,14 @@ def post(url: i32, o: i32, msg: i32) -> None:
     r = http_post(url, o, msg)
 
 
-def listen(url: i32, msg: i32) -> None:
+def get_text(url: i32, msg: i32) -> None:
     r: i32
-    r = sse_open(url, msg)
+    r = http_get_text(url, msg)
 
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, screen, loading
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -144,21 +154,75 @@ def init() -> None:
     s_set(h_queued, "queued")
     h_stopped = s_new()
     s_set(h_stopped, "stopped")
-    loading = 1
+    h_wlog_err = s_new()
+    on_nav(NAV)
+    show_address()
+
+
+# ---- screens
+
+def show_address() -> None:
+    """Show what the address bar names: a project at /p/<id>, else the list."""
     if page_project(h_pid) == 1:
-        screen = 1
-        s_set(h_url, "/api/projects/")
-        s_add_ref(h_url, h_pid)
-        get(h_url, GOT_PROJECT)
-        fetch_threads()
-        fetch_log()
-        s_set(h_url, "/api/projects/")
-        s_add_ref(h_url, h_pid)
-        s_add(h_url, "/events")
-        listen(h_url, EVENT)
+        enter_project()
     else:
-        s_set(h_url, "/api/projects")
-        get(h_url, GOT_PROJECTS)
+        show_projects()
+
+
+def open_project(id: i32) -> None:
+    """Open project id in this window and put /p/<id> in the address bar."""
+    s_copy(h_pid, id)
+    s_set(h_url, "/p/")
+    s_add_ref(h_url, h_pid)
+    nav_push(h_url)
+    enter_project()
+
+
+def leave_project() -> None:
+    """Close the open project's stream and forget its state."""
+    global stream, project, threads, transcript, plog, wlog, mode, pane_tab, sending
+    if stream != 0:
+        sse_close(stream)
+        stream = 0
+    project = take_none(project)
+    threads = take_none(threads)
+    transcript = take_none(transcript)
+    plog = take_none(plog)
+    wlog = take_none(wlog)
+    s_clear(h_sel)
+    s_clear(h_route)
+    s_clear(h_err)
+    s_clear(h_wlog_err)
+    mode = AUTO
+    pane_tab = DIALOG
+    sending = 0
+
+
+def enter_project() -> None:
+    global screen, loading, stream
+    leave_project()
+    screen = 1
+    loading = 1
+    s_set(h_url, "/api/projects/")
+    s_add_ref(h_url, h_pid)
+    get(h_url, GOT_PROJECT)
+    fetch_threads()
+    fetch_log()
+    s_set(h_url, "/api/projects/")
+    s_add_ref(h_url, h_pid)
+    s_add(h_url, "/events")
+    stream = sse_open(h_url, EVENT)
+
+
+def show_projects() -> None:
+    global screen, loading
+    leave_project()
+    screen = 0
+    loading = 1
+    s_set(h_t1, "Orchestrator")
+    set_title(h_t1)
+    s_set(h_url, "/api/projects")
+    get(h_url, GOT_PROJECTS)
 
 
 # ---- requests
@@ -186,6 +250,23 @@ def fetch_transcript() -> None:
     get(h_url, GOT_TRANSCRIPT)
 
 
+def fetch_wlog() -> None:
+    global wlog_loading
+    if s_len(h_sel) == 0:
+        return
+    wlog_loading = 1
+    s_set(h_url, "/api/threads/")
+    s_add_ref(h_url, h_sel)
+    s_add(h_url, "/worker-logs")
+    get_text(h_url, GOT_WLOG)
+
+
+def take_none(old: i32) -> i32:
+    if old != 0:
+        j_free(old)
+    return 0
+
+
 def take(old: i32, new: i32) -> i32:
     """Swap in a fresh JSON reply, freeing the old one. On error keep the old
     one and put the error text in h_err."""
@@ -203,22 +284,19 @@ def take(old: i32, new: i32) -> i32:
 
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending, pane_tab
+    global mode, pending, pane_tab, wlog, wlog_loading
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
     if msg == GOT_PROJECTS:
-        loading = 0
+        if screen == 0:
+            loading = 0
         projects = take(projects, arg)
     elif msg == OPEN:
         e = j_idx(projects, arg)
         jstr(e, "id", h_t1)
         j_free(e)
-        s_set(h_url, "/p/")
-        s_add_ref(h_url, h_t1)
-        s_set(h_t2, "orchestrator-")
-        s_add_ref(h_t2, h_t1)
-        open_window(h_url, h_t2)
+        open_project(h_t1)
     elif msg == NEW_SHOW:
         show_new = 1
     elif msg == NEW_HIDE:
@@ -242,24 +320,21 @@ def update(msg: i32, arg: i32) -> None:
             jstr(arg, "id", h_t1)
             s_clear(h_name)
             s_clear(h_repo)
-            s_set(h_url, "/p/")
-            s_add_ref(h_url, h_t1)
-            s_set(h_t2, "orchestrator-")
-            s_add_ref(h_t2, h_t1)
-            open_window(h_url, h_t2)
-            s_set(h_url, "/api/projects")
-            get(h_url, GOT_PROJECTS)
+            open_project(h_t1)
         else:
             j_err(arg, h_err)
         j_free(arg)
     elif msg == GOT_PROJECT:
         project = take(project, arg)
-        if project != 0:
+        if project != 0 and screen == 1:
             jstr(project, "name", h_t1)
             set_title(h_t1)
     elif msg == GOT_THREADS:
-        loading = 0
-        threads = take(threads, arg)
+        if screen == 1:
+            loading = 0
+            threads = take(threads, arg)
+        else:
+            j_free(arg)
     elif msg == GOT_LOG:
         plog = take(plog, arg)
         if s_len(h_sel) == 0:
@@ -271,10 +346,16 @@ def update(msg: i32, arg: i32) -> None:
         if mode == AUTO:
             mode = TO_THREAD
         fetch_transcript()
+        wlog = take_none(wlog)
+        s_clear(h_wlog_err)
+        if pane_tab == WLOG:
+            fetch_wlog()
     elif msg == ACTIVITY:
         s_clear(h_sel)
         if mode == TO_THREAD:
             mode = AUTO
+        if pane_tab == WLOG:
+            pane_tab = DIALOG
         fetch_log()
     elif msg == GOT_TRANSCRIPT:
         transcript = take(transcript, arg)
@@ -327,11 +408,12 @@ def update(msg: i32, arg: i32) -> None:
             after(150, REFRESH, 0)
     elif msg == REFRESH:
         pending = 0
-        fetch_threads()
-        if s_len(h_sel) > 0:
-            fetch_transcript()
-        else:
-            fetch_log()
+        if screen == 1:
+            fetch_threads()
+            if s_len(h_sel) > 0:
+                fetch_transcript()
+            else:
+                fetch_log()
     elif msg == STOP:
         if s_len(h_sel) > 0:
             o = o_new()
@@ -344,9 +426,29 @@ def update(msg: i32, arg: i32) -> None:
         fetch_threads()
     elif msg == TAB:
         pane_tab = arg
+        if pane_tab == WLOG and wlog == 0:
+            fetch_wlog()
+        scroll_end("pane")
+    elif msg == WLOG_REFRESH:
+        fetch_wlog()
+    elif msg == GOT_WLOG:
+        # A reply for a thread that is no longer selected lands harmlessly:
+        # SELECT cleared the log, and the next fetch replaces it.
+        wlog_loading = 0
+        if j_ok(arg) == 1:
+            s_clear(h_wlog_err)
+            wlog = take_none(wlog)
+            wlog = arg
+        else:
+            j_err(arg, h_wlog_err)
+            j_free(arg)
         scroll_end("pane")
     elif msg == HOME:
-        go("/")
+        s_set(h_url, "/")
+        nav_push(h_url)
+        show_projects()
+    elif msg == NAV:
+        show_address()
 
 
 # ---- View: shared
@@ -440,7 +542,7 @@ def project_list() -> None:
         end()
         btn_open("outline", OPEN, i)
         cls("sm")
-        text("Open window")
+        text("Open")
         end()
         end()
         end()
@@ -452,7 +554,7 @@ def project_list() -> None:
 
 
 def new_project_dialog() -> None:
-    dialog_open("New project", "Each project gets its own main window.", NEW_HIDE)
+    dialog_open("New project", "A repo plus the threads working on it.", NEW_HIDE)
     el("div")
     cls("form")
     label("Name")
@@ -696,17 +798,6 @@ def thread_head(t: i32) -> None:
     end()
     end()
     div("pane-actions")
-    s_set(h_t2, "/api/threads/")
-    s_add_ref(h_t2, h_sel)
-    s_add(h_t2, "/worker-logs")
-    el("a")
-    cls("btn")
-    cls("ghost")
-    cls("sm")
-    attr_ref("href", h_t2)
-    attr("target", "_blank")
-    text("Worker logs")
-    end()
     btn_open("ghost", STOP, 0)
     cls("sm")
     text("Stop thread")
@@ -736,8 +827,9 @@ def tab_open(active: bool, arg: i32) -> None:
     on_click(TAB, arg)
 
 
-def pane_tabs(dialog: i32, tools: i32) -> None:
-    """Dialog (the conversation) and Tools (calls and their output), with counts."""
+def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
+    """Dialog (the conversation) and Tools (calls and their output), with
+    counts, and Worker log (the runner's stdout and stderr) when logs is set."""
     div("pane-tabs")
     tabs_list_open()
     tab_open(pane_tab == DIALOG, DIALOG)
@@ -752,8 +844,44 @@ def pane_tabs(dialog: i32, tools: i32) -> None:
     num(tools)
     end()
     end()
+    if logs:
+        tab_open(pane_tab == WLOG, WLOG)
+        text("Worker log")
+        end()
     end()
     end()
+
+
+def worker_log() -> None:
+    """The selected thread's worker log: the last lines its runner wrote."""
+    div("wlog-bar")
+    span("muted")
+    text("Last 300 lines of this thread's worker")
+    end()
+    btn_open("ghost", WLOG_REFRESH, 0)
+    cls("sm")
+    if wlog_loading == 1:
+        text("Loading…")
+    else:
+        text("Refresh")
+    end()
+    end()
+    if s_len(h_wlog_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_wlog_err)
+        end()
+    elif wlog != 0:
+        el("pre")
+        cls("wlog")
+        jstr(wlog, "text", h_t1)
+        if s_len(h_t1) > 0:
+            text_ref(h_t1)
+        else:
+            text("(empty)")
+        end()
 
 
 def pane() -> None:
@@ -789,11 +917,16 @@ def pane() -> None:
         thread_head(t)
         if t != 0:
             j_free(t)
-    pane_tabs(n - tools, tools)
+    pane_tabs(n - tools, tools, activity == 0)
     el("div")
     cls("events")
     cls_if("events-tools", pane_tab == TOOLS)
     attr("id", "pane")
+    if pane_tab == WLOG:
+        worker_log()
+        end()
+        end()
+        return
     for i in range(n):
         e = j_idx(src, i)
         if is_tool(e) == 1:
