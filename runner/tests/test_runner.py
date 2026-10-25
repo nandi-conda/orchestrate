@@ -242,6 +242,7 @@ async def test_openai_compat_streams_reasoning_text_and_tool_calls():
 
     def handler(req: httpx.Request):
         seen["body"] = json.loads(req.content)
+        seen["accept-encoding"], seen["accept"] = req.headers["accept-encoding"], req.headers["accept"]
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse_body(
             {"choices": [{"delta": {"reasoning_content": "Need a "}}]},
             {"choices": [{"delta": {"reasoning_content": "file."}}]},
@@ -257,6 +258,7 @@ async def test_openai_compat_streams_reasoning_text_and_tool_calls():
     got = []
     r = await m.complete([{"role": "user", "content": "hi"}], [], lambda k, t, n: got.append((k, t, n)))
     assert seen["body"]["stream"] is True
+    assert seen["accept-encoding"] == "identity" and seen["accept"] == "text/event-stream"
     assert r.content == "Writing it." and r.reasoning == "Need a file."
     assert [(c.id, c.name, c.arguments) for c in r.tool_calls] == [("call_1", "write_file", {"path": "a.py"})]
     assert r.message["reasoning_content"] == "Need a file."
@@ -310,5 +312,42 @@ async def test_openai_compat_names_the_url_and_timeout_when_reads_time_out():
     def handler(req):
         raise httpx.ReadTimeout("", request=req)
     m = OpenAICompatModel("m", "k", "https://x", stall=300, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    with pytest.raises(ModelError, match=r"m: ReadTimeout: no data from POST https://x/chat/completions for 300s"):
+    with pytest.raises(ModelError, match=r"m: ReadTimeout: nothing from POST https://x/chat/completions for 300s; no response headers"):
         await m.complete([{"role": "user", "content": "hi"}], [])
+
+
+async def test_stream_is_never_compressed_so_keepalives_arrive_as_sent():
+    """A server (or proxy) that gzips a response buffers small writes until the
+    stream ends. This one does exactly that when asked for gzip, and streams
+    plainly otherwise; the model client must get each line as it is written."""
+    import gzip
+
+    lines = [b": keep-alive\n\n", b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n', b"data: [DONE]\n\n"]
+
+    async def handle(reader, writer):
+        head = (await reader.readuntil(b"\r\n\r\n")).decode().lower()
+        n = int(head.split("content-length:")[1].split("\r\n")[0])
+        await reader.readexactly(n)
+        if "gzip" in head.split("accept-encoding:")[1].split("\r\n")[0]:
+            await asyncio.sleep(1.0)  # a buffering compressor: nothing until the end
+            body = gzip.compress(b"".join(lines))
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\n"
+                         b"content-length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        else:
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+            for line in lines:
+                writer.write(b"%x\r\n%s\r\n" % (len(line), line))
+                await writer.drain()
+                await asyncio.sleep(0.05)
+            writer.write(b"0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        m = OpenAICompatModel("m", "k", f"http://127.0.0.1:{port}", stall=0.5)
+        r = await m.complete([{"role": "user", "content": "hi"}], [])
+        assert r.content == "hi"
+    finally:
+        server.close()

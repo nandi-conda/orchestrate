@@ -149,7 +149,11 @@ def host_from_env() -> ThreadHost:
 def main():
     import sys
 
+    import logging
+
     import uvicorn
+    # Model call timings (runner.model) and thread failures go to the worker log.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     require(["DEEPSEEK_API_KEY"])
     token = get_secret("RUNNER_TOKEN")
     if not token:
