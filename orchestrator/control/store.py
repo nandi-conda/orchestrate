@@ -41,9 +41,12 @@ class Store(Protocol):
     async def open(self) -> None: ...
     async def close(self) -> None: ...
 
-    async def create_project(self, name: str, repo_url: str = "", model: str = "") -> dict: ...
+    async def create_project(self, name: str, model: str = "") -> dict: ...
     async def list_projects(self) -> list[dict]: ...
     async def get_project(self, project_id: str) -> dict | None: ...
+    async def update_project(self, project_id: str, **fields: Any) -> dict | None:
+        """Change a project's name, model or repo_url (its remote; the
+        control plane connects the hub to it first, Orchestrator.update_project)."""
 
     async def create_thread(self, project_id: str, title: str, request: str,
                             parent_id: str | None = None) -> dict: ...
@@ -126,6 +129,7 @@ PG_EVENTS = """CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)"""
 EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS events_project ON events(project_id, seq)"
 
+PROJECT_FIELDS = {"name", "model", "repo_url"}
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
                  "archived_at")
 
@@ -173,8 +177,8 @@ class _SqlStore:
         return rows[0] if rows else None
 
     # projects
-    async def create_project(self, name: str, repo_url: str = "", model: str = "") -> dict:
-        p = {"id": new_id("p"), "name": name, "repo_url": repo_url, "model": model,
+    async def create_project(self, name: str, model: str = "") -> dict:
+        p = {"id": new_id("p"), "name": name, "repo_url": "", "model": model,
              "settings": "{}", "created_at": now()}
         await self._exec(self._q("INSERT INTO projects (id, name, repo_url, model, settings, created_at) "
                                  "VALUES (?, ?, ?, ?, ?, ?)"), *p.values())
@@ -186,6 +190,15 @@ class _SqlStore:
     async def get_project(self, project_id: str) -> dict | None:
         r = await self._fetchone(self._q("SELECT * FROM projects WHERE id = ?"), project_id)
         return _project(r) if r else None
+
+    async def update_project(self, project_id: str, **fields: Any) -> dict | None:
+        bad = set(fields) - PROJECT_FIELDS
+        if bad:
+            raise ValueError(f"unknown project field {', '.join(sorted(bad))}")
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            await self._exec(self._q(f"UPDATE projects SET {sets} WHERE id = ?"), *fields.values(), project_id)
+        return await self.get_project(project_id)
 
     # threads
     async def create_thread(self, project_id: str, title: str, request: str,

@@ -494,14 +494,29 @@ class Orchestrator:
         return self.repos / f"{project_id}.git"
 
     async def hub(self, project: dict) -> Hub:
-        """The project's hub, made on first use."""
+        """The project's hub, made on first use and connected to the
+        project's remote (a project from before hubs had one may not be yet)."""
         async with self._hubs_lock:
             hub = self.hubs.get(project["id"])
             if hub is None:
-                hub = Hub(self.hub_path(project["id"]), project.get("repo_url", ""), get_secret("GITHUB_TOKEN"))
+                hub = Hub(self.hub_path(project["id"]), get_secret("GITHUB_TOKEN"))
                 await hub.open()
+                if hub.url != project["repo_url"]:
+                    await hub.connect(project["repo_url"])
                 self.hubs[project["id"]] = hub
         return hub
+
+    async def update_project(self, project_id: str, **fields) -> dict:
+        """Rename a project, change its model, or attach, change or remove its
+        remote (`repo_url`, "" for none). A new remote is connected to the hub
+        first (Hub.connect); one that cannot be leaves the project as it was."""
+        project = await self.store.get_project(project_id)
+        if project is None:
+            raise KeyError(project_id)
+        if "repo_url" in fields and fields["repo_url"] != project["repo_url"]:
+            hub = await self.hub(project)
+            await hub.connect(fields["repo_url"])
+        return await self.store.update_project(project_id, **fields)
 
     async def _ship(self, lw: LiveWorker, project: dict, tid: str | None = None) -> None:
         """Bring a worker up to the hub: the base (as it is on the project's

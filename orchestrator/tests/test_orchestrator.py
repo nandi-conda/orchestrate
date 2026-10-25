@@ -3,6 +3,7 @@ echo runner (control.devrunner), served over real HTTP so the peer API is used."
 
 import asyncio
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -30,7 +31,12 @@ def anyio_backend():
 async def test_store_roundtrip(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    p = await s.create_project("demo", "https://example.com/r.git")
+    p = await s.create_project("demo", "deepseek-v4-pro")
+    assert p["repo_url"] == "" and p["model"] == "deepseek-v4-pro"
+    p = await s.update_project(p["id"], name="renamed", repo_url="https://example.com/r.git")
+    assert (p["name"], p["repo_url"]) == ("renamed", "https://example.com/r.git")
+    with pytest.raises(ValueError):
+        await s.update_project(p["id"], id="p_x")
     t = await s.create_thread(p["id"], "Fix it", "fix the bug")
     await s.update_thread(t["id"], state="working", files=["a.py"])
     e1 = await s.append_event(p["id"], t["id"], "assistant", {"content": "hi"})
@@ -530,6 +536,34 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
             assert (await c.get(f"/api/threads/{tid}/files/raw", params={"path": "nope"})).status_code == 404
             assert (await c.get(f"/api/threads/{tid}/files", params={"path": "README.md"})).status_code == 400
             assert (await c.get("/api/threads/t_nope/files")).status_code == 404
+
+
+async def test_project_settings_change_name_model_and_remote(tmp_path):
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            # A new project has no remote: what it is given is ignored.
+            p = (await c.post("/api/projects", json={"name": "demo", "repo_url": "https://x/y.git"})).json()
+            pid = p["id"]
+            assert p["repo_url"] == "" and p["repo_path"].endswith(f"{pid}.git")
+
+            r = await c.post(f"/api/projects/{pid}/settings", json={"name": " renamed ", "model": "m"})
+            assert r.status_code == 200 and (r.json()["name"], r.json()["model"]) == ("renamed", "m")
+            assert (await c.post(f"/api/projects/{pid}/settings", json={"name": ""})).status_code == 400
+
+            empty = tmp_path / "remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(empty)], check=True)
+            r = await c.post(f"/api/projects/{pid}/settings", json={"repo_url": str(empty)})
+            assert r.status_code == 200 and r.json()["repo_url"] == str(empty)
+            r = await c.post(f"/api/projects/{pid}/settings", json={"repo_url": str(tmp_path / "nope.git")})
+            assert r.status_code == 400 and "nope.git" in r.json()["error"]
+            assert (await c.get(f"/api/projects/{pid}")).json()["repo_url"] == str(empty)
+            r = await c.post(f"/api/projects/{pid}/settings", json={"repo_url": ""})
+            assert r.status_code == 200 and r.json()["repo_url"] == ""
+            assert (await c.post("/api/projects/p_nope/settings", json={"name": "x"})).status_code == 404
 
 
 async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):

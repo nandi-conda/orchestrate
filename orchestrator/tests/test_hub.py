@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from control.gitio import GitError
 from control.hub import Hub
 from control.providers import LocalProvider
 from control.router import HeuristicRouter
@@ -45,10 +46,19 @@ async def wait_for(fn, timeout=20.0):
 async def setup(tmp_path, repo_url="", workers="w"):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    p = await s.create_project("demo", repo_url)
+    p = await s.create_project("demo")
     orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / workers), use_devrunner=True),
                         HeuristicRouter(), tmp_path / "repos")
+    if repo_url:
+        p = await orch.update_project(p["id"], repo_url=repo_url)
     return s, p, orch
+
+
+def commit(seed, name, text, message):
+    (seed / name).write_text(text)
+    git(seed, "add", "-A")
+    git(seed, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", message)
+    git(seed, "push", "-q", "origin", "HEAD:trunk")
 
 
 async def event(s, p, tid, typ):
@@ -135,10 +145,7 @@ async def test_a_project_repository_gets_the_landing_first_and_nothing_else(tmp_
     assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/trunk"
 
     # Someone pushes to the repository meanwhile; the landing goes on top.
-    (seed / "theirs.txt").write_text("x\n")
-    git(seed, "add", "-A")
-    git(seed, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "theirs")
-    git(seed, "push", "-q", "origin", "HEAD:trunk")
+    commit(seed, "theirs.txt", "x\n", "theirs")
 
     await orch.send(t["id"], "finish")
     landed = await event(s, p, t["id"], "landed")
@@ -187,3 +194,101 @@ async def test_a_hub_at_a_relative_path_is_made_where_it_says(tmp_path, monkeypa
     await hub.open()
     assert (tmp_path / ".orchestrator" / "repos" / "p.git" / "HEAD").exists()
     assert git(tmp_path / ".orchestrator" / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"
+
+
+async def test_a_remote_attached_later_gives_a_new_project_its_history(tmp_path):
+    """A thread begun before the remote was attached lands on the remote's
+    history, without the hub's empty first commit."""
+    bare, seed = remote(tmp_path)
+    s, p, orch = await setup(tmp_path)
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
+    await wait_for(lambda: idle(s, t["id"]))
+    hub = orch.hub_path(p["id"])
+    assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/main"
+
+    p = await orch.update_project(p["id"], repo_url=str(bare))
+    assert p["repo_url"] == str(bare)
+    assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/trunk"
+    assert git(hub, "for-each-ref", "--format=%(refname)", "refs/heads/main") == ""
+    assert git(hub, "rev-parse", "trunk") == git(bare, "rev-parse", "trunk")
+
+    await orch.send(t["id"], "finish")
+    landed = await event(s, p, t["id"], "landed")
+    assert landed["base"] == "trunk" and git(bare, "rev-parse", "trunk") == landed["commit"]
+    assert git(bare, "log", "--format=%s", "trunk").splitlines()[-1] == "init"
+    assert "Start the project" not in git(bare, "log", "--format=%s", "trunk")
+    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "a.txt"}
+    await orch.close()
+    await s.close()
+
+
+async def test_an_empty_remote_gets_the_projects_history(tmp_path):
+    s, p, orch = await setup(tmp_path)
+    t = await orch.spawn(p["id"], "T", "write a.txt: one\nfinish")
+    landed = await event(s, p, t["id"], "landed")
+    empty = tmp_path / "empty.git"
+    git(tmp_path, "init", "-q", "--bare", str(empty))
+
+    await orch.update_project(p["id"], repo_url=str(empty))
+    assert git(empty, "rev-parse", "main") == landed["commit"]
+    await orch.close()
+    await s.close()
+
+
+async def test_a_remote_with_another_history_is_refused(tmp_path):
+    bare, seed = remote(tmp_path)
+    s, p, orch = await setup(tmp_path)
+    t = await orch.spawn(p["id"], "T", "write a.txt: one\nfinish")
+    landed = await event(s, p, t["id"], "landed")
+
+    with pytest.raises(GitError, match="each gone their own way"):
+        await orch.update_project(p["id"], repo_url=str(bare))
+    assert (await s.get_project(p["id"]))["repo_url"] == ""
+    hub = orch.hub_path(p["id"])
+    assert git(hub, "rev-parse", "main") == landed["commit"]
+    assert git(hub, "for-each-ref", "--format=%(refname)", "refs/orchestrate") == ""
+    assert git(bare, "log", "--format=%s", "trunk") == "init"
+    await orch.close()
+    await s.close()
+
+
+async def test_a_remote_ahead_or_behind_follows_and_removing_it_keeps_the_hub(tmp_path):
+    bare, seed = remote(tmp_path)
+    s, p, orch = await setup(tmp_path, str(bare))
+    hub = orch.hub_path(p["id"])
+    a = await orch.spawn(p["id"], "A", "write a.txt: a\nfinish")
+    landed = await event(s, p, a["id"], "landed")
+
+    # Off the remote, the next landing stays here; the remote is left as it was.
+    await orch.update_project(p["id"], repo_url="")
+    b = await orch.spawn(p["id"], "B", "write b.txt: b\nfinish")
+    ours = (await event(s, p, b["id"], "landed"))["commit"]
+    assert git(bare, "rev-parse", "trunk") == landed["commit"]
+    assert git(hub, "rev-parse", "trunk") == ours
+
+    # Back on it: the remote is behind, so it gets the landing it missed.
+    await orch.update_project(p["id"], repo_url=str(bare))
+    assert git(bare, "rev-parse", "trunk") == ours
+
+    # A remote that moved on while the project was off it: the base follows.
+    await orch.update_project(p["id"], repo_url="")
+    git(seed, "pull", "-q", "origin", "trunk")
+    commit(seed, "theirs.txt", "x\n", "theirs")
+    await orch.update_project(p["id"], repo_url=str(bare))
+    assert git(hub, "rev-parse", "trunk") == git(bare, "rev-parse", "trunk")
+    await orch.close()
+    await s.close()
+
+
+async def test_a_hub_remembers_its_remote(tmp_path):
+    bare, seed = remote(tmp_path)
+    hub = Hub(tmp_path / "p.git")
+    await hub.open()
+    await hub.connect(str(bare))
+    again = Hub(tmp_path / "p.git")
+    await again.open()
+    assert (again.url, again.base) == (str(bare), "trunk")
+    await again.connect("")
+    last = Hub(tmp_path / "p.git")
+    await last.open()
+    assert last.url == ""

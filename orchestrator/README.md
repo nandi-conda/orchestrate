@@ -130,7 +130,7 @@ worked out at runtime.
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | router model, and passed to every worker. Sprites need it; the local fallback (used only when `SPRITES_TOKEN` is absent) runs the echo runner without it | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
 | `SPRITES_TOKEN` | stored, workers always run on Sprites; without it they fall back to this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
-| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: it fetches the project's `repo_url` default branch into the project's hub (`.orchestrator/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
+| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: for a project with a remote (`repo_url`, set in its settings) it fetches the remote's default branch into the project's hub (`.orchestrator/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 
 Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
 the exact name, the header they're sent as, and the keyring backend that was
@@ -207,13 +207,34 @@ credentials, so this repository must be publicly readable.
 
 ### Project repos and commits
 
-A project's `repo_url` is cloned once per worker; each thread works in its own
-worktree on `thread/<id>`. Every turn ends with the thread's branch pushed to
-origin, and a turn that ends with `finish` lands it on the default branch
-(rebase, fast-forward push; conflicts go back to the thread). So destroying
-sprites when the control plane stops loses nothing a thread had at the end of
-its last turn; only a turn still running then is cut short.
-Details: [runner/API.md](../runner/API.md#commits).
+Every project has its own git repository on the control plane's machine, a
+bare repository at `.orchestrator/repos/<project id>.git` (the hub; its path is
+under **Settings** in the project window). It starts from an empty commit,
+"Start the project". Each thread works in its own worktree on `thread/<id>` on
+its worker; every turn ends with the thread's branch and a snapshot of its
+whole worktree (ignored files too) taken into the hub, and a turn that ends
+with `finish` lands it on the hub's main branch (rebase, fast-forward;
+conflicts go back to the thread). Workers never reach the hub: the control
+plane moves commits to and from them as git bundles. So destroying sprites
+when the control plane stops loses nothing a thread had at the end of its last
+turn; only a turn still running then is cut short.
+Details: [runner/API.md](../runner/API.md#commits), `control/hub.py`.
+
+A project can get a remote (a GitHub repository) at any time from its
+**Settings**; a new project has none. With a remote, the hub's main branch
+follows the remote's default branch (and takes its name), and every landing is
+pushed there first. Thread branches and snapshots stay on this machine.
+Attaching or changing the remote joins the two histories:
+
+| The remote | What happens |
+| --- | --- |
+| has no commits | it gets the project's main branch |
+| is ahead of the project, or nothing has landed in the project yet | the project's main branch takes the remote's commits; threads begun before land on top of them |
+| is behind the project | it gets the commits it is missing |
+| has a different history | refused; the project keeps the remote it had |
+
+Removing the remote keeps everything in the hub; landings stay local from then
+on, and attaching it again pushes what it missed.
 
 ### Messaging a thread that runs nowhere
 
@@ -297,7 +318,8 @@ SQLite or Postgres database the first time the control plane opens it.
 
 | Method | Path | |
 | --- | --- | --- |
-| GET/POST | `/api/projects` | list, create `{name, repo_url?, model?}` |
+| GET/POST | `/api/projects` | list, create `{name, model?}`; a project has `repo_path` (its hub) and `repo_url` (its remote, `""` for none) |
+| POST | `/api/projects/{id}/settings` | change any of `{name, model, repo_url}`; a remote that cannot be joined is a 400 with git's reason, and nothing changes |
 | POST | `/api/projects/{id}/requests` | `{text, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan |
 | GET/POST | `/api/projects/{id}/threads` | directory of live threads, `?archived=1` for archived ones; force a new thread `{request, title?}` |
 | GET | `/api/projects/{id}/log` | every event in the project (JSON) |

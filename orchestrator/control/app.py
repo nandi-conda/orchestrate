@@ -20,6 +20,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
+from .gitio import GitError
 from .router import Router, default_router
 from .runner_client import FileError
 from .service import ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, tool_arg
@@ -197,8 +198,23 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         name = str(b.get("name", "")).strip()
         if not name:
             return JSONResponse({"error": "name is required"}, 400)
-        p = await store.create_project(name, str(b.get("repo_url", "")).strip(), str(b.get("model", "")).strip())
+        p = await store.create_project(name, str(b.get("model", "")).strip())
         return JSONResponse(project_view(p), 201)
+
+    async def project_settings(req: Request):
+        """Change any of a project's name, model and remote (`repo_url`, "" to
+        remove it). A remote the hub cannot join is refused with git's reason."""
+        b = await body(req)
+        fields = {k: str(b[k]).strip() for k in ("name", "model", "repo_url") if k in b}
+        if fields.get("name") == "":
+            return JSONResponse({"error": "name is required"}, 400)
+        try:
+            p = await orch().update_project(req.path_params["pid"], **fields)
+        except KeyError:
+            return JSONResponse({"error": "no such project"}, 404)
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return JSONResponse(project_view(p))
 
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
@@ -416,6 +432,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/projects", list_projects, methods=["GET"]),
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
+        Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/requests", post_request, methods=["POST"]),
         Route("/api/projects/{pid}/messages/{seq:int}/edit", edit_message, methods=["POST"]),
         Route("/api/projects/{pid}/threads", list_threads, methods=["GET"]),

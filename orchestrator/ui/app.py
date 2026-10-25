@@ -26,7 +26,7 @@ OPEN: Const[i32] = 2
 NEW_SHOW: Const[i32] = 3
 NEW_HIDE: Const[i32] = 4
 NAME_IN: Const[i32] = 5
-REPO_IN: Const[i32] = 6
+REPO_IN: Const[i32] = 6        # the settings' remote field
 CREATE: Const[i32] = 7
 CREATED: Const[i32] = 8
 GOT_PROJECT: Const[i32] = 9
@@ -74,6 +74,12 @@ EDIT_IN: Const[i32] = 50
 EDIT_SAVE: Const[i32] = 51
 EDIT_CANCEL: Const[i32] = 52
 EDITED: Const[i32] = 53
+SETTINGS_SHOW: Const[i32] = 54
+SETTINGS_HIDE: Const[i32] = 55
+SET_NAME_IN: Const[i32] = 56
+SET_MODEL_IN: Const[i32] = 57
+SETTINGS_SAVE: Const[i32] = 58
+SETTINGS_SAVED: Const[i32] = 59
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -135,11 +141,16 @@ copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
+show_settings: i32 = 0   # the open project's settings dialog is up
+saving_settings: i32 = 0
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
 h_name: i32 = 0
-h_repo: i32 = 0
+h_repo: i32 = 0          # the settings' remote ("" = none)
+h_set_name: i32 = 0      # the settings' name
+h_set_model: i32 = 0     # the settings' model ("" = the default)
+h_set_err: i32 = 0       # why the settings could not be saved
 h_req: i32 = 0
 h_last: i32 = 0          # the request being sent, put back if the send fails
 h_err: i32 = 0
@@ -199,10 +210,14 @@ def init() -> None:
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
+    global h_set_name, h_set_model, h_set_err
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
     h_repo = s_new()
+    h_set_name = s_new()
+    h_set_model = s_new()
+    h_set_err = s_new()
     h_req = s_new()
     h_last = s_new()
     h_err = s_new()
@@ -264,6 +279,7 @@ def open_project(id: i32) -> None:
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
     global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived, editing
+    global show_settings, saving_settings
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -286,6 +302,8 @@ def leave_project() -> None:
     sending = 0
     show_archived = 0
     editing = 0
+    show_settings = 0
+    saving_settings = 0
 
 
 def enter_project() -> None:
@@ -477,7 +495,7 @@ def land() -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting, fview_req, editing, edit_sent
+    global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -496,14 +514,11 @@ def update(msg: i32, arg: i32) -> None:
         show_new = 0
     elif msg == NAME_IN:
         s_copy(h_name, arg)
-    elif msg == REPO_IN:
-        s_copy(h_repo, arg)
     elif msg == CREATE:
         if s_len(h_name) > 0 and creating == 0:
             creating = 1
             o = o_new()
             o_str(o, "name", h_name)
-            o_str(o, "repo_url", h_repo)
             s_set(h_url, "/api/projects")
             post(h_url, o, CREATED)
     elif msg == CREATED:
@@ -512,7 +527,6 @@ def update(msg: i32, arg: i32) -> None:
             show_new = 0
             jstr(arg, "id", h_t1)
             s_clear(h_name)
-            s_clear(h_repo)
             open_project(h_t1)
         else:
             j_err(arg, h_err)
@@ -805,6 +819,47 @@ def update(msg: i32, arg: i32) -> None:
         fetch_files()
     elif msg == FILES_REFRESH:
         fetch_files()
+    elif msg == SETTINGS_SHOW:
+        # The fields start as the project is; nothing changes until Save.
+        if project != 0:
+            jstr(project, "name", h_set_name)
+            jstr(project, "model", h_set_model)
+            jstr(project, "repo_url", h_repo)
+            s_clear(h_set_err)
+            show_settings = 1
+    elif msg == SETTINGS_HIDE:
+        if saving_settings == 0:
+            show_settings = 0
+    elif msg == SET_NAME_IN:
+        s_copy(h_set_name, arg)
+    elif msg == SET_MODEL_IN:
+        s_copy(h_set_model, arg)
+    elif msg == REPO_IN:
+        s_copy(h_repo, arg)
+    elif msg == SETTINGS_SAVE:
+        # A changed remote is connected to the project's repository before the
+        # reply comes back, so this can take as long as a fetch.
+        if s_len(h_set_name) > 0 and saving_settings == 0:
+            saving_settings = 1
+            s_clear(h_set_err)
+            o = o_new()
+            o_str(o, "name", h_set_name)
+            o_str(o, "model", h_set_model)
+            o_str(o, "repo_url", h_repo)
+            s_set(h_url, "/api/projects/")
+            s_add_ref(h_url, h_pid)
+            s_add(h_url, "/settings")
+            post(h_url, o, SETTINGS_SAVED)
+    elif msg == SETTINGS_SAVED:
+        saving_settings = 0
+        if j_ok(arg) == 1:
+            show_settings = 0
+            project = take(project, arg)
+            jstr(project, "name", h_t1)
+            set_title(h_t1)
+        else:
+            j_err(arg, h_set_err)
+            j_free(arg)
     elif msg == HOME:
         s_set(h_url, "/")
         nav_push(h_url)
@@ -867,7 +922,7 @@ def project_list() -> None:
         end()
     elif n == 0:
         card_open()
-        card_header("No projects yet", "A project is a repo plus the threads working on it.")
+        card_header("No projects yet", "A project is a git repository plus the threads working on it.")
         card_footer_open()
         btn("Create a project", "", NEW_SHOW, 0)
         end()
@@ -894,7 +949,7 @@ def project_list() -> None:
         if s_len(h_t2) > 0:
             text_ref(h_t2)
         else:
-            text("no repo")
+            text("local only")
         end()
         end()
         el("div")
@@ -916,16 +971,13 @@ def project_list() -> None:
 
 
 def new_project_dialog() -> None:
-    dialog_open("New project", "A repo plus the threads working on it.", NEW_HIDE)
+    dialog_open("New project", "It starts with its own git repository on this machine. "
+                "A GitHub remote can be attached later, in its settings.", NEW_HIDE)
     el("div")
     cls("form")
     label("Name")
     input_open("my-app", h_name, NAME_IN)
     autofocus()
-    on_enter(CREATE, 0)
-    end()
-    label("Git repo URL (optional)")
-    input_open("https://github.com/you/repo", h_repo, REPO_IN)
     on_enter(CREATE, 0)
     end()
     end()
@@ -1962,11 +2014,20 @@ def project_window() -> None:
     else:
         text("Project")
     end()
+    span("muted mono")
     if project != 0:
         jstr(project, "repo_url", h_t1)
-        span("muted mono")
-        text_ref(h_t1)
-        end()
+        if s_len(h_t1) > 0:
+            text_ref(h_t1)
+        else:
+            text("local only")
+    end()
+    span("grow")
+    end()
+    btn_open("ghost", SETTINGS_SHOW, 0)
+    cls("sm")
+    text("Settings")
+    end()
     end()
     div("body")
     thread_list()
@@ -1977,6 +2038,60 @@ def project_window() -> None:
     end()
     end()
     reply_button()
+    if show_settings == 1:
+        settings_dialog()
+    end()
+
+
+def settings_dialog() -> None:
+    """The open project's name, model and remote, and where its repository is."""
+    dialog_open("Project settings", "", SETTINGS_HIDE)
+    el("div")
+    cls("form")
+    label("Name")
+    input_open("my-app", h_set_name, SET_NAME_IN)
+    autofocus()
+    on_enter(SETTINGS_SAVE, 0)
+    end()
+    label("Model (optional)")
+    input_open("the runner's default", h_set_model, SET_MODEL_IN)
+    on_enter(SETTINGS_SAVE, 0)
+    end()
+    label("GitHub remote (optional)")
+    input_open("https://github.com/you/repo", h_repo, REPO_IN)
+    on_enter(SETTINGS_SAVE, 0)
+    end()
+    el("p")
+    cls("help")
+    text("With a remote, the project's main branch follows its default branch and finished threads "
+         "are pushed there. An empty repository gets this project's history; one with history must "
+         "share it, unless nothing has landed here yet. Clearing it keeps everything here.")
+    end()
+    label("Local repository")
+    el("p")
+    cls("mono")
+    cls("repo-path")
+    if project != 0:
+        jstr(project, "repo_path", h_t1)
+        text_ref(h_t1)
+    end()
+    if s_len(h_set_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_set_err)
+        end()
+    end()
+    dialog_footer_open()
+    btn("Cancel", "outline", SETTINGS_HIDE, 0)
+    btn_open("", SETTINGS_SAVE, 0)
+    if saving_settings == 1:
+        text("Saving…")
+    else:
+        text("Save")
+    end()
+    end()
     end()
 
 
