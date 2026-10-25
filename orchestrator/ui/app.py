@@ -122,6 +122,7 @@ h_stopped: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_md: i32 = 0            # scratch for markdown text
 h_run: i32 = 0           # thread id of the thinking run being grouped
+h_tid: i32 = 0           # scratch for a thread id while finding its title
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -149,7 +150,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -175,6 +176,7 @@ def init() -> None:
     h_wlog_err = s_new()
     h_md = s_new()
     h_run = s_new()
+    h_tid = s_new()
     on_nav(NAV)
     show_address()
 
@@ -757,13 +759,75 @@ def is_tool(e: i32) -> i32:
     return 0
 
 
+def thread_index(id: i32) -> i32:
+    """Where thread id is in the directory, or -1."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    if threads != 0:
+        n = j_len(threads, "")
+    for i in range(n):
+        e = j_idx(threads, i)
+        jstr(e, "id", h_tid)
+        j_free(e)
+        if s_eq(h_tid, id) == 1:
+            return i
+    return -1
+
+
+def thread_link(id: i32) -> None:
+    """Thread id by its title; clicking it opens the thread."""
+    i: i32
+    e: i32
+    i = thread_index(id)
+    el("button")
+    cls("ev-thread")
+    if i >= 0:
+        on_click(SELECT, i)
+        e = j_idx(threads, i)
+        jstr(e, "title", h_tid)
+        j_free(e)
+        text_ref(h_tid)
+    else:
+        text_ref(id)
+    end()
+
+
 def thread_tag(e: i32, show_thread: i32) -> None:
     if show_thread == 1:
         if j_str(e, "thread_id", h_t2) == 1:
-            span("mono muted")
-            text(" · ")
+            thread_link(h_t2)
+
+
+def working_now() -> None:
+    """Project activity's live line per working thread: its title and what it
+    is doing, instead of every thread's reasoning."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    if threads != 0:
+        n = j_len(threads, "")
+    div("working")
+    for i in range(n):
+        e = j_idx(threads, i)
+        jstr(e, "activity", h_t1)
+        if s_len(h_t1) > 0:
+            el("button")
+            cls("working-row")
+            key(i + 1)
+            on_click(SELECT, i)
+            span("activity-dot")
+            end()
+            span("working-title")
+            jstr(e, "title", h_t2)
             text_ref(h_t2)
             end()
+            span("working-now mono")
+            text_ref(h_t1)
+            end()
+            end()
+        j_free(e)
+    end()
 
 
 def event_row(e: i32, show_thread: i32) -> None:
@@ -903,10 +967,16 @@ def is_thought(e: i32) -> i32:
     return 0
 
 
-def hidden(e: i32) -> i32:
+def hidden(e: i32, activity: i32) -> i32:
     """Left out of the Dialog: tool rows (under Tools) and state changes
-    (the badges show them)."""
-    if is_tool(e) == 1 or j_int(e, "kind") == K_STATE:
+    (the badges show them). Project activity also leaves out reasoning and
+    replies still streaming: it is about requests, routing and answers, and
+    working_now says what each thread is doing."""
+    k: i32
+    k = j_int(e, "kind")
+    if is_tool(e) == 1 or k == K_STATE:
+        return 1
+    if activity == 1 and (k == K_THINKING or j_int(e, "live") == 1):
         return 1
     return 0
 
@@ -931,7 +1001,7 @@ def thought_run(src: i32, a: i32, n: i32) -> i32:
                 j_free(e)
                 return b
             b = i + 1
-        elif hidden(e) == 0:
+        elif hidden(e, 0) == 0:
             j_free(e)
             return b
         j_free(e)
@@ -1165,13 +1235,13 @@ def pane() -> None:
         activity = 0
     if src != 0:
         n = j_len(src, "")
-    states: i32 = 0
+    said: i32 = 0
     j: i32
     for i in range(n):
         e = j_idx(src, i)
         tools = tools + is_tool(e)
-        if j_int(e, "kind") == K_STATE:
-            states = states + 1
+        if hidden(e, activity) == 0:
+            said = said + 1
         j_free(e)
     el("section")
     cls("pane")
@@ -1186,7 +1256,9 @@ def pane() -> None:
         thread_head(t)
         if t != 0:
             j_free(t)
-    pane_tabs(n - tools - states, tools, activity == 0)
+    pane_tabs(said, tools, activity == 0)
+    if activity == 1 and pane_tab == DIALOG:
+        working_now()
     el("div")
     cls("events")
     cls_if("events-tools", pane_tab == TOOLS)
@@ -1204,7 +1276,7 @@ def pane() -> None:
                 tool_row(e, activity)
                 shown = shown + 1
             j = j + 1
-        elif hidden(e) == 1:
+        elif hidden(e, activity) == 1:
             j = j + 1
         elif is_thought(e) == 1:
             i = thought_run(src, j, n)

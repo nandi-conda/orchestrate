@@ -280,7 +280,7 @@ async def test_end_to_end_with_echo_runner(server):
             log = (await c.get(f"/api/projects/{pid}/log")).json()
             return next((e for e in log if e["type"] == "route"), None)
         route = await wait_for(routed)
-        assert route["payload"]["summary"] == "spawned 2"
+        assert route["payload"]["summary"] == "started “login page”, “export bug”"
         ids = [s["id"] for s in route["payload"]["spawned"]]
 
         async def all_idle():
@@ -393,7 +393,7 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
 
             # No worker is up: the thread exists, says it is starting, and takes messages.
             r = await post({"text": "fix export", "mode": "new"})
-            assert r.status_code == 200 and r.json()["summary"] == "spawned 1"
+            assert r.status_code == 200 and r.json()["summary"] == "started “fix export”"
             tid = r.json()["spawned"][0]["id"]
             t = (await c.get(f"/api/threads/{tid}")).json()
             assert (t["state"], t["activity"]) == ("queued", "starting on a worker")
@@ -420,8 +420,8 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
 
             async def routed():
                 log = (await c.get(f"/api/projects/{pid}/log")).json()
-                return next((e for e in log if e["type"] == "route"), None)
-            assert (await wait_for(routed))["payload"]["summary"] == "spawned 1"
+                return next((e for e in log if e["type"] == "route" and e["payload"]["mode"] == "auto"), None)
+            assert (await wait_for(routed))["payload"]["summary"] == "started “fix login”"
             g = (await c.get(f"/api/threads/{gone}")).json()
             assert (g["state"], g["worker_id"]) == ("stopped", None)
 

@@ -148,3 +148,21 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .md tbody tr:nth-child(even) td { background: color-mix(in oklch, var(--muted) 40%, transparent); }
 .md th.center, .md td.center { text-align: center; }
 .md th.right, .md td.right { text-align: right; }
+
+/* A thread named in Project activity: its title, which opens it. */
+.ev-thread { display: inline; border: 0; padding: 0; margin-left: 6px; background: none; font: inherit; font-weight: 500;
+             text-transform: none; letter-spacing: 0; color: var(--foreground); cursor: pointer; white-space: nowrap;
+             overflow: hidden; text-overflow: ellipsis; max-width: 40ch; vertical-align: bottom; }
+.ev-thread::before { content: "· "; color: var(--muted-foreground); }
+.ev-thread:hover { text-decoration: underline; }
+.tool > summary .ev-thread { flex-shrink: 0; margin-left: 0; }
+
+/* Project activity: one live line per working thread. */
+.working { display: grid; gap: 2px; padding: 6px 16px 0; }
+.working:empty { display: none; }
+.working-row { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 8px; border: 0; border-radius: 6px;
+               background: color-mix(in srgb, var(--primary) 4%, transparent); font: inherit; font-size: 13px;
+               color: inherit; text-align: left; cursor: pointer; }
+.working-row:hover { background: var(--muted); }
+.working-title { font-weight: 500; flex-shrink: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.working-now { color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }

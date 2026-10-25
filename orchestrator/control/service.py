@@ -501,11 +501,13 @@ class Orchestrator:
         for s in plan["send"]:
             await self.send(s["thread"], s["message"], "user")
             sent.append(s["thread"])
+        # The summary names threads by title; the ids stay in spawned and sent.
+        titles = {t["id"]: t["title"] for t in directory}
         parts = []
         if spawned:
-            parts.append(f"spawned {len(spawned)}")
+            parts.append("started " + ", ".join(f"“{t['title']}”" for t in spawned))
         if sent:
-            parts.append("told " + ", ".join(sent))
+            parts.append("told " + ", ".join(f"“{titles.get(tid, tid)}”" for tid in sent))
         result = {"request": text, "mode": mode, "spawned": spawned, "sent": sent, "why": plan.get("why", ""),
                   "summary": ", ".join(parts) or "nothing to do"}
         await self.store.append_event(project_id, None, "route", result)
