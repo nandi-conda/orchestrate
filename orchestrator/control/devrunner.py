@@ -6,7 +6,13 @@ It has no model. Each turn it says what it got, and:
 - a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
 - a line `write <path>: <text>` writes text to that file of the thread's workspace
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
+- a line `finish` lands the thread's branch at the end of the turn,
 - child threads report `Finished: ...` to their parent, like the real runner.
+
+Its git flow is the real runner's (runner/API.md, "Repository"): a worktree
+per thread in a repository the control plane fills (`POST /repo`), and at the
+end of every turn a commit and a snapshot that the control plane takes (peer
+call `save`).
 
 Peer calls wait on /peer/calls for the control plane to collect, as in
 runner/API.md.
@@ -31,14 +37,18 @@ from pathlib import Path
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+from .gitio import Checkout, GitError, refs_header
 
 SPAWN = re.compile(r"^\s*spawn:\s*(.+)$", re.M)
 TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
 LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
+FINISH = re.compile(r"^\s*finish\s*$", re.M)
+THREAD_ID = re.compile(r"^[\w-]+$")
 
 
 class Host:
@@ -46,6 +56,8 @@ class Host:
         self.capacity = capacity
         self.delay = delay
         self.workdir = Path(workdir).resolve()
+        self.repo = Checkout(self.workdir / ".repo")
+        self.opened = False
         self.threads: dict[str, dict] = {}
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
@@ -53,7 +65,17 @@ class Host:
         self.waiting: dict[str, asyncio.Future] = {}
         self.calls_cond = asyncio.Condition()
 
+    async def open(self) -> None:
+        if not self.opened:
+            await self.repo.open()
+            self.opened = True
+
     async def peer_call(self, op: str, **args) -> str:
+        """A peer call whose answer is a tool result."""
+        reply = await self.peer(op, **args)
+        return json.dumps(reply.get("result") if reply.get("ok") else {"error": reply.get("error")})
+
+    async def peer(self, op: str, **args) -> dict:
         cid = f"pc_{secrets.token_hex(5)}"
         fut = asyncio.get_running_loop().create_future()
         self.waiting[cid] = fut
@@ -61,10 +83,9 @@ class Host:
             self.calls[cid] = {"id": cid, "op": op, "args": args}
             self.calls_cond.notify_all()
         try:
-            reply = await asyncio.wait_for(fut, 60)
+            return await asyncio.wait_for(fut, 60)
         finally:
             self.waiting.pop(cid, None)
-        return json.dumps(reply.get("result") if reply.get("ok") else {"error": reply.get("error")})
 
     async def take_calls(self, wait: float) -> list[dict]:
         async with self.calls_cond:
@@ -117,12 +138,37 @@ class Host:
             await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
         summary = f"echoed {len(text)} chars"
         t["summary"] = summary
+        await self.save(t, bool(FINISH.search(text)))
         await self.emit(t["id"], "turn_done", {"summary": summary, "final": f"Echo: {text}"})
         await self.peer_call("set_summary", thread_id=t["id"], summary=summary, files=[])
         if t.get("parent") and not text.startswith("Finished:"):
             await self.peer_call("send_message", sender=t["id"], to=t["parent"], body=f"Finished: {summary}")
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
+
+    async def save(self, t: dict, land: bool) -> None:
+        """Commit and snapshot the worktree; the control plane takes both, and
+        lands the branch when the turn asked to."""
+        tid, branch = t["id"], f"thread/{t['id']}"
+        try:
+            commit = await self.repo.save(self.workdir / tid, tid, f"{t['title']}\n\nThread: {tid}")
+            reply = await self.peer("save", thread_id=tid, land=land)
+            if not reply.get("ok"):
+                raise GitError(reply.get("error") or "save failed")
+            result = reply["result"]
+            if result.get("landed"):
+                await self.repo.follow(self.workdir / tid, tid)
+        except (GitError, asyncio.TimeoutError) as e:
+            await self.emit(tid, "error", {"error": f"saving the work failed: {e or type(e).__name__}"})
+            return
+        if not land:
+            await self.emit(tid, "saved", {"branch": branch, "commit": commit})
+        elif result.get("landed"):
+            await self.emit(tid, "landed", {"branch": branch, "base": result["base"], "commit": result["commit"]})
+        elif result.get("conflict") is not None:
+            await self.emit(tid, "land_conflict", {"branch": branch, "base": result["base"], "files": result["conflict"]})
+        else:
+            await self.emit(tid, "error", {"error": f"landing {branch} failed: {result.get('message')}"})
 
     def inside(self, t: dict, path: str) -> Path:
         """`path` in the thread's workspace; ValueError if it leaves it or names .git."""
@@ -162,8 +208,12 @@ def create_app(host: Host, token: str) -> Starlette:
         t = {"id": tid, "project": b.get("project", ""), "title": b.get("title") or (b.get("request") or tid)[:40],
              "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
              "history": len(b.get("history") or [])}
+        try:
+            await host.open()
+            await host.repo.worktree(host.workdir / tid, tid)
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 500)
         host.threads[tid] = t
-        (host.workdir / tid).mkdir(parents=True, exist_ok=True)
         await host.emit(tid, "created", host.entry(t))
         if b.get("request"):
             await host.emit(tid, "message_in", {"from": "user", "body": b["request"]})
@@ -258,6 +308,39 @@ def create_app(host: Host, token: str) -> Starlette:
             return JSONResponse({"error": "unauthorized"}, 401)
         return stream(req.path_params["tid"], int(req.query_params.get("after", "0") or 0))
 
+    async def get_repo(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        await host.open()
+        return JSONResponse({"base": host.repo.base, "refs": await host.repo.refs()})
+
+    async def post_repo(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        await host.open()
+        try:
+            refs = json.loads(req.headers.get("x-git-refs") or "{}")
+            base = req.headers.get("x-git-base") or ""
+            if not base or not isinstance(refs, dict):
+                raise ValueError("x-git-base and x-git-refs (a JSON object) are required")
+            await host.repo.receive(await req.body(), base, refs)
+        except (ValueError, GitError) as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return JSONResponse({"ok": True})
+
+    async def thread_repo(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        tid = req.path_params["tid"]
+        if not THREAD_ID.match(tid):
+            return JSONResponse({"error": "bad thread id"}, 400)
+        await host.open()
+        try:
+            data, refs = await host.repo.send(tid, [h for h in req.query_params.get("have", "").split(",") if h])
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 404)
+        return Response(data, media_type="application/octet-stream", headers={"x-git-refs": refs_header(refs)})
+
     async def peer_calls(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
@@ -283,6 +366,9 @@ def create_app(host: Host, token: str) -> Starlette:
         Route("/threads/{tid}/events", thread_events),
         Route("/threads/{tid}/files", list_files),
         Route("/threads/{tid}/files/raw", raw_file),
+        Route("/threads/{tid}/repo", thread_repo),
+        Route("/repo", get_repo, methods=["GET"]),
+        Route("/repo", post_repo, methods=["POST"]),
         Route("/events", all_events),
     ])
 

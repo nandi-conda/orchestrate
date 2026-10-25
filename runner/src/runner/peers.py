@@ -21,6 +21,10 @@ class Peers(Protocol):
     async def send_message(self, sender: str, to: str, body: str, reply_to: str | None = None) -> dict: ...
     async def spawn_thread(self, parent: str, project: str, title: str, request: str) -> dict: ...
     async def set_summary(self, thread_id: str, summary: str, files: list[str] | None = None) -> None: ...
+    async def save(self, thread_id: str, land: bool = False) -> dict:
+        """Take the thread's branch and snapshot (runner/API.md, "Repository");
+        with `land`, land the branch: `{"landed", "base", "commit"?,
+        "conflict"?, "message"?}`."""
 
 
 class PeerOutbox:
@@ -114,6 +118,9 @@ class OrchestratorPeers:
     async def set_summary(self, thread_id, summary, files=None):
         await self._call("set_summary", thread_id=thread_id, summary=summary, files=files or [])
 
+    async def save(self, thread_id, land=False):
+        return await self._call("save", thread_id=thread_id, land=land)
+
 
 class LocalPeers:
     """In-process directory and bus over the threads of a single runner."""
@@ -159,3 +166,11 @@ class LocalPeers:
             t.summary = summary
             if files:
                 t.files.update(files)
+
+    async def save(self, thread_id, land=False):
+        """No hub here: the worker's repository is the project's, and landing
+        moves its `origin/<base>`."""
+        ws = self._threads()[thread_id].workspace
+        if land:
+            return await ws.land_here()
+        return {"landed": False, "base": ws.repo.base}

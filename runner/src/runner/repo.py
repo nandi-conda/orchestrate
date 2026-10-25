@@ -1,41 +1,50 @@
-"""The project's git repository on a worker, and how threads' commits reach it.
+"""The project's git repository on a worker, and how threads' work leaves it.
 
-One clone per worker (`<workdir>/repo`); every thread gets a worktree of it on
-its own branch `thread/<id>`. A new thread's branch starts from the remote's
-default branch; a thread brought back on a worker (after its old worker went
-away, or after it stopped) keeps the worktree that worker still has for it
-when that holds all it pushed, and otherwise continues from its pushed
-`thread/<id>`. The
-clone's object store and refs are shared by all threads on the worker, while
-each worktree has its own files, index and HEAD.
+The orchestrator keeps one git repository per project, its hub, and the
+worker's repository (`<workdir>/.repo`) is a copy of the parts its threads
+need. The worker never reaches the hub, or any remote: the orchestrator opens
+every connection and moves commits both ways as git bundles (runner/API.md,
+"Repository"):
 
-Commits leave the worker on one path:
+- `POST /repo` brings the hub's refs to the worker, as remote-tracking refs:
+  the project's default branch as `origin/<base>`, a thread's branch as
+  `origin/thread/<id>` and its snapshot as `origin-snapshots/<id>`.
+- `GET /threads/{id}/repo` hands the orchestrator a thread's branch
+  `thread/<id>` and its snapshot `refs/snapshots/<id>`.
 
-- At the end of every turn the runner commits whatever the thread left
-  uncommitted and pushes `thread/<id>` to origin, so a deleted worker loses
-  nothing.
-- When a turn ends with `finish`, the thread lands: fetch, rebase onto
-  `origin/<default>`, fast-forward push to the default branch. A push rejected
-  because another thread landed first goes round again. A rebase that
-  conflicts is aborted and handed back to the thread to resolve.
+Every thread gets a worktree on its own branch `thread/<id>`. A new thread's
+branch starts from `origin/<base>`. A thread brought back on a worker keeps
+the worktree that worker still has for it when that holds all the hub has of
+its branch; otherwise the worktree is made again from `origin/thread/<id>`,
+with the files of its snapshot.
 
-Authentication: with a token, git sends `Authorization: Basic
-base64("x-access-token:<token>")` to the repo URL through
-`http.<url>.extraHeader`, set only on the runner's own git commands (never in
-the clone's config or the threads' shell environment).
+A snapshot is a commit of the whole worktree, untracked and ignored files
+included (built with an index of its own), whose parent is the branch tip, so
+a thread that moves to another worker finds its build output too.
+
+At the end of every turn the runner commits whatever the thread left and
+makes a snapshot; the orchestrator takes both (peer call `save`). A turn
+that ends with `finish` asks it to land the branch: the orchestrator rebases
+it onto the default branch in the hub and brings both back, and the worktree
+follows the rebased branch. A rebase that conflicts goes back to the thread
+to resolve against `origin/<base>`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import json
 import os
+import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
-LAND_ATTEMPTS = 5  # pushes rejected by a concurrent landing before giving up
+# The refs the orchestrator may set on a worker.
+SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots)/[\w./-]+$")
+THREAD_ID = re.compile(r"^[\w-]+$")
 
 
 class GitError(RuntimeError):
@@ -47,81 +56,150 @@ class Git:
     code: int
     out: str
     err: str
+    raw: bytes = b""
 
 
-@dataclass
-class Landing:
-    """The outcome of `Workspace.land`. `conflict` lists the files a rebase onto
-    the default branch could not merge; `commit` is the default branch's new tip."""
-    ok: bool
-    base: str
-    commit: str = ""
-    conflict: list[str] | None = None
-    message: str = ""
+def snapshot_ref(tid: str) -> str:
+    return f"refs/snapshots/{tid}"
 
 
 class Repo:
-    def __init__(self, url: str, path: str | os.PathLike, token: str | None = None):
-        self.url, self.path = url, Path(path)
+    def __init__(self, path: str | os.PathLike):
+        self.path = Path(path)
         self.env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-        if token:
-            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-            self.env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{url}.extraHeader",
-                             "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}"})
         self.base = ""
-        # Fetches and pushes from threads on this worker share the clone's refs.
+        self.opened = False
+        # Refs are shared by every thread on the worker: changes to them take turns.
         self.lock = asyncio.Lock()
 
-    async def git(self, *args: str, cwd: str | os.PathLike | None = None, check: bool = True) -> Git:
+    async def git(self, *args: str, cwd: str | os.PathLike | None = None, check: bool = True,
+                  env: dict | None = None, input: bytes | None = None) -> Git:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=str(cwd or self.path), env=self.env,
+            "git", *args, cwd=str(cwd or self.path), env={**self.env, **(env or {})},
+            stdin=asyncio.subprocess.PIPE if input is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
-        r = Git(proc.returncode or 0, out.decode().strip(), err.decode().strip())
+        out, err = await proc.communicate(input)
+        r = Git(proc.returncode or 0, out.decode(errors="replace").strip(), err.decode(errors="replace").strip(), out)
         if check and r.code:
             raise GitError(f"git {' '.join(args)} failed: {r.err or r.out}")
         return r
 
     async def open(self) -> None:
-        """Clone on first use, fetch after; learn the remote's default branch."""
-        async with self.lock:
-            if (self.path / ".git").exists():
-                await self.git("fetch", "-q", "--prune", "origin")
-            else:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                await self.git("clone", "-q", self.url, str(self.path), cwd=self.path.parent)
-            # Shared by every worktree, so threads' own commits work too and
-            # `git rebase --continue` never waits on an editor.
-            for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true")):
-                await self.git("config", key, value)
-            head = await self.git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-            self.base = head.out.removeprefix("origin/")
+        """Make the repository on first use; learn the base branch the
+        orchestrator named, if it sent one yet."""
+        if self.opened:
+            return
+        if not (self.path / ".git").exists():
+            self.path.mkdir(parents=True, exist_ok=True)
+            await self.git("init", "-q")
+        # Shared by every worktree, so threads' own commits work too and
+        # `git rebase --continue` never waits on an editor.
+        for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true"),
+                           ("gc.auto", "0")):
+            await self.git("config", key, value)
+        self.base = (await self.git("config", "--get", "orchestrate.base", check=False)).out
+        self.opened = True
 
-    async def worktree(self, path: str | os.PathLike, branch: str) -> "Workspace":
-        """The thread's worktree at `path` on `branch`. One this worker already
-        has is kept as it is, with its uncommitted and ignored files, while it
-        holds everything the thread pushed. One that does not is stale (the
-        thread went on on another worker since) and is made again. A worktree
-        is made from origin's `branch` when the thread pushed one, else from
-        origin's default branch."""
+    async def exists(self, ref: str) -> bool:
+        return (await self.git("rev-parse", "-q", "--verify", f"{ref}^{{commit}}", check=False)).code == 0
+
+    async def refs(self) -> dict[str, str]:
+        """Every ref, by name: what the orchestrator may leave out of the next bundle."""
+        await self.open()
+        out = (await self.git("for-each-ref", "--format=%(refname) %(objectname)")).out
+        return dict(line.split(" ", 1) for line in out.splitlines() if line)
+
+    async def unbundle(self, data: bytes) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as f:
+            f.write(data)
+        try:
+            await self.git("bundle", "unbundle", f.name)
+        finally:
+            os.unlink(f.name)
+
+    async def receive(self, data: bytes, base: str, refs: dict[str, str]) -> None:
+        """Take the hub's commits (a bundle, empty when the worker has them
+        all) and point the remote-tracking refs at them."""
+        bad = [r for r in refs if not SHIPPED.match(r)]
+        if bad:
+            raise GitError(f"refs the orchestrator may not set: {', '.join(bad)}")
+        await self.open()
+        async with self.lock:
+            if data:
+                await self.unbundle(data)
+            for ref, sha in refs.items():
+                await self.git("update-ref", ref, sha)
+            if base != self.base:
+                await self.git("config", "orchestrate.base", base)
+                self.base = base
+
+    async def send(self, tid: str, have: list[str]) -> tuple[bytes, dict[str, str]]:
+        """A thread's branch and snapshot as a bundle without the commits in
+        `have` (the hub's), and the refs' tips. The bundle is empty when the
+        hub has everything; the tips travel apart from it, since a bundle
+        leaves out a ref whose tip is in `have`."""
+        await self.open()
+        names = [f"refs/heads/thread/{tid}", snapshot_ref(tid)]
+        refs = {}
+        for name in names:
+            r = await self.git("rev-parse", "-q", "--verify", name, check=False)
+            if r.code == 0:
+                refs[name] = r.out
+        if not refs:
+            raise GitError(f"thread {tid} has no branch on this worker")
+        known = [h for h in have if await self.exists(h)]
+        return await self.bundle(list(refs), known), refs
+
+    async def bundle(self, refs: list[str], have: list[str]) -> bytes:
+        nots = ["--not", *have] if have else []
+        if (await self.git("rev-list", "--count", *refs, *nots)).out == "0":
+            return b""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.bundle")
+            await self.git("bundle", "create", "-q", path, *refs, *nots)
+            return Path(path).read_bytes()
+
+    async def seed(self, source: str) -> None:
+        """Start from another repository's branches, with no orchestrator (the
+        CLI): its branches become `origin/*` and its HEAD the base."""
+        await self.open()
+        head = (await self.git("ls-remote", "--symref", source, "HEAD")).out.splitlines()
+        base = next((line.split()[1].removeprefix("refs/heads/") for line in head if line.startswith("ref:")), "")
+        if not base:
+            raise GitError(f"{source} has no default branch")
+        await self.git("fetch", "-q", source, "+refs/heads/*:refs/remotes/origin/*")
+        await self.git("config", "orchestrate.base", base)
+        self.base = base
+
+    async def worktree(self, path: str | os.PathLike, tid: str) -> "Workspace":
+        """The thread's worktree at `path` on `thread/<tid>`. One this worker
+        already has is kept as it is, with its uncommitted and ignored files,
+        while it holds everything the hub has of the branch. One that does not
+        is stale (the thread went on on another worker since) and is made
+        again, from the hub's branch and with its snapshot's files when the
+        hub has them, else from the default branch."""
+        await self.open()
         if not self.base:
-            await self.open()
-        path = Path(path)
+            raise GitError("the orchestrator has not sent the project's repository to this worker")
+        path, branch = Path(path), f"thread/{tid}"
+        theirs, snapshot = f"refs/remotes/origin/thread/{tid}", f"refs/remotes/origin-snapshots/{tid}"
         async with self.lock:
             await self.git("worktree", "prune")
-            pushed = bool((await self.git("ls-remote", "--heads", "origin", branch)).out)
-            start = branch if pushed else self.base
-            await self.git("fetch", "-q", "origin", f"+refs/heads/{start}:refs/remotes/origin/{start}")
+            known = await self.exists(theirs)
             listed = (await self.git("worktree", "list", "--porcelain")).out
             if f"worktree {path.resolve()}" in listed.splitlines():
-                if not pushed or (await self.git("merge-base", "--is-ancestor", f"origin/{branch}", "HEAD",
+                if not known or (await self.git("merge-base", "--is-ancestor", theirs, "HEAD",
                                                  cwd=path, check=False)).code == 0:
-                    return Workspace(self, path, branch)
+                    return Workspace(self, path, branch, tid)
                 await self.git("worktree", "remove", "--force", str(path))
             if path.exists():  # a leftover directory git no longer knows as a worktree
                 shutil.rmtree(path)
-            await self.git("worktree", "add", "-q", "-B", branch, str(path), f"origin/{start}")
-        return Workspace(self, path, branch)
+            await self.git("worktree", "add", "-q", "-B", branch, str(path),
+                           theirs if known else f"refs/remotes/origin/{self.base}")
+            ws = Workspace(self, path, branch, tid)
+            if known and await self.exists(snapshot):
+                await ws.restore(snapshot)
+        return ws
 
 
 @dataclass
@@ -129,47 +207,70 @@ class Workspace:
     repo: Repo
     path: Path
     branch: str
+    tid: str
 
-    async def git(self, *args: str, check: bool = True) -> Git:
-        return await self.repo.git(*args, cwd=self.path, check=check)
+    async def git(self, *args: str, check: bool = True, env: dict | None = None) -> Git:
+        return await self.repo.git(*args, cwd=self.path, check=check, env=env)
 
     async def rebasing(self) -> bool:
         r = await self.git("rev-parse", "--git-path", "rebase-merge")
         apply = await self.git("rev-parse", "--git-path", "rebase-apply")
         return any((self.path / p).exists() for p in (r.out, apply.out))
 
-    async def save(self, message: str) -> str:
-        """Commit everything left in the worktree and push the thread's branch.
-        Returns the branch tip."""
+    async def commit(self, message: str) -> str:
+        """Commit everything left in the worktree; the branch tip."""
         if await self.rebasing():
             raise GitError(f"a rebase is in progress in {self.branch}; finish it "
                            "(git rebase --continue) or abort it before the work can be saved")
         await self.git("add", "-A")
         if (await self.git("diff", "--cached", "--quiet", check=False)).code:
             await self.git("commit", "-q", "-m", message)
-        async with self.repo.lock:
-            # The branch is the thread's own; a rebase while landing rewrites it.
-            await self.git("push", "-q", "--force", "origin", f"HEAD:refs/heads/{self.branch}")
         return (await self.git("rev-parse", "HEAD")).out
 
-    async def land(self, message: str) -> Landing:
-        """Put this thread's commits on the default branch: rebase, fast-forward push."""
+    async def index(self, name: str) -> dict:
+        p = Path((await self.git("rev-parse", "--git-path", name)).out)
+        return {"GIT_INDEX_FILE": str(p if p.is_absolute() else self.path / p)}
+
+    async def snapshot(self) -> str:
+        """Commit the whole worktree, ignored files included, as a child of the
+        branch tip at `refs/snapshots/<id>`. Its index lives on with the
+        worktree, so only changed files are hashed again."""
+        env = await self.index("snapshot.index")
+        await self.git("add", "-A", "-f", env=env)
+        tree = (await self.git("write-tree", env=env)).out
+        commit = (await self.git("commit-tree", tree, "-p", "HEAD", "-m", f"Snapshot of {self.branch}")).out
+        await self.git("update-ref", snapshot_ref(self.tid), commit)
+        return commit
+
+    async def restore(self, snapshot: str) -> None:
+        """Write a snapshot's files into the worktree, then put the tracked
+        ones back as the branch has them (the snapshot may predate a rebase)."""
+        env = await self.index("restore.index")
+        await self.git("read-tree", snapshot, env=env)
+        await self.git("checkout-index", "-a", "-f", env=env)
+        os.unlink(env["GIT_INDEX_FILE"])
+        await self.git("reset", "-q", "--hard", "HEAD")
+
+    async def follow(self) -> None:
+        """Move the branch to the hub's (rebased onto the base when it landed)."""
+        await self.git("reset", "-q", "--keep", f"refs/remotes/origin/{self.branch}")
+
+    async def land_here(self) -> dict:
+        """Land on the worker's own `origin/<base>`, for a runner with no
+        orchestrator (the CLI, tests): the same answer the orchestrator's
+        `save` gives."""
         base = self.repo.base
-        await self.save(message)
-        for _ in range(LAND_ATTEMPTS):
-            async with self.repo.lock:
-                await self.git("fetch", "-q", "origin", base)
-            rebase = await self.git("rebase", "-q", f"origin/{base}", check=False)
+        async with self.repo.lock:
+            rebase = await self.git("rebase", "-q", f"refs/remotes/origin/{base}", check=False)
             if rebase.code:
                 files = (await self.git("diff", "--name-only", "--diff-filter=U")).out.split()
                 await self.git("rebase", "--abort")
-                return Landing(False, base, conflict=files, message=rebase.err or rebase.out)
-            async with self.repo.lock:
-                push = await self.git("push", "-q", "origin", f"HEAD:refs/heads/{base}", check=False)
-                if push.code == 0:
-                    await self.git("push", "-q", "--force", "origin", f"HEAD:refs/heads/{self.branch}")
-                    return Landing(True, base, commit=(await self.git("rev-parse", "HEAD")).out)
-            if not any(s in push.err for s in ("fetch first", "non-fast-forward")):
-                raise GitError(f"pushing to {base} failed: {push.err or push.out}")
-            # Another thread landed between our fetch and push. Go again on its tip.
-        return Landing(False, base, message=f"{base} kept moving; {LAND_ATTEMPTS} pushes were rejected")
+                return {"landed": False, "base": base, "conflict": files, "message": rebase.err or rebase.out}
+            head = (await self.git("rev-parse", "HEAD")).out
+            await self.git("update-ref", f"refs/remotes/origin/{base}", head)
+            await self.git("update-ref", f"refs/remotes/origin/{self.branch}", head)
+        return {"landed": True, "base": base, "commit": head}
+
+
+def refs_header(refs: dict[str, str]) -> str:
+    return json.dumps(refs, separators=(",", ":"))

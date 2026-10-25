@@ -17,6 +17,9 @@ threads. Default port 8080. Every route except `/health` needs
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
 | GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream` |
+| GET | `/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>` and its snapshot; header `x-git-refs` (below) |
+| GET | `/repo` | | `{"base", "refs": {"<refname>": "<sha>"}}`: the worker repository's refs |
+| POST | `/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/` and `refs/remotes/origin-snapshots/` |
 | GET | `/events` | | SSE stream for every thread on this worker |
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
@@ -58,16 +61,16 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | provider token counts |
 | `turn_done` | `{"summary", "final"}` |
-| `saved` | `{"branch", "commit"}`: a turn ended without `finish`; leftovers committed and `thread/<id>` pushed |
-| `landed` | `{"branch", "base", "commit"}`: a turn ended with `finish` and the branch is now the tip of `base` |
+| `saved` | `{"branch", "commit"}`: a turn ended without `finish`; leftovers committed, the orchestrator took the branch and snapshot |
+| `landed` | `{"branch", "base", "commit"}`: a turn ended with `finish` and the branch is now the tip of `base` in the orchestrator's repository |
 | `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
 | `dropped` | `{"from", "reason"}` |
 | `error` | `{"error"}` |
 
 ## Resuming a thread
 
-A thread lives on after its worker: its branch is pushed every turn and the
-orchestrator keeps its events. To bring it back on any worker (its old one was
+A thread lives on after its worker: the orchestrator takes its branch and a
+snapshot of its worktree every turn, and keeps its events. To bring it back on any worker (its old one was
 deleted, the orchestrator restarted, or the thread stopped or failed), the
 orchestrator posts `/threads` with the thread's `id`, `title`, `parent`,
 `summary` and `history`, and usually no `request`:
@@ -78,9 +81,10 @@ orchestrator posts `/threads` with the thread's `id`, `title`, `parent`,
   system prompt; other types are skipped. Only messages the thread received
   belong in it. A tool call with no result is answered as stopped. Tool
   results are the events' copies, cut to 4000 characters.
-- The worktree is the worker's own for that thread when it still has one,
-  else `thread/<id>` from origin when the thread pushed it, else a new branch
-  off the default branch.
+- The worktree is the worker's own for that thread when it still has one
+  holding `origin/thread/<id>`; else it is made from `origin/thread/<id>`
+  with the files of `origin-snapshots/<id>` (the orchestrator sends both
+  first, `POST /repo`), else it is a new branch off `origin/<base>`.
 - Without `request` the thread goes `idle` (a `state` event) and waits for
   its next message; nothing runs until one is posted.
 
@@ -111,6 +115,7 @@ wait and then fail; the CLI (`pixi run run`) uses in-process peers instead.
 | `send_message` | `{"sender", "to", "body", "reply_to"}` | `{"ok": true}` |
 | `spawn_thread` | `{"parent", "project", "title", "request"}` | `{"id", "title"}` |
 | `set_summary` | `{"thread_id", "summary", "files"}` | anything |
+| `save` | `{"thread_id", "land"}` | `{"landed", "base", "commit"?, "conflict"?, "message"?}`: see [Repository](#repository) |
 
 A thread also calls `set_summary` after each turn, and when it has a `parent`, sends
 `Finished: <summary>` to the parent through `send_message`. The orchestrator routes
@@ -128,8 +133,6 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, and an `openai-compat` model's `api
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
-| `RUNNER_REPO` | | git URL of the project; cloned once to `$RUNNER_WORKDIR/.repo`, one worktree per thread (branch `thread/<id>`) off the remote's default branch. See [Commits](#commits) |
-| `GITHUB_TOKEN` | | fine-grained token with Contents: Read and write on `RUNNER_REPO`. Git sends it as `Authorization: Basic base64("x-access-token:<token>")` via `http.<RUNNER_REPO>.extraHeader`; threads' commands never see it (see [Sandbox](#sandbox)) |
 | `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repo/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 | `RUNNER_MAX_STEPS` | `60` | model calls per turn |
@@ -144,7 +147,7 @@ command runs in [bubblewrap](https://github.com/containers/bubblewrap)
 | --- | --- |
 | `/` | the machine's system, read-only (its git, compilers, shells) |
 | `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; commands start here |
-| `$RUNNER_WORKDIR/.repo/.git` | the clone's git dir, writable, so the thread can commit |
+| `$RUNNER_WORKDIR/.repo/.git` | the worker repository's git dir, writable, so the thread can commit |
 | `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable, kept between commands |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept between commands |
 | the orchestrate checkout the runner runs from, its pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
@@ -169,18 +172,48 @@ before it starts the service. They also clear the ambient capabilities a
 non-root service may hold before starting bubblewrap, which refuses them
 (Sprites gives its user a set). The runner is Linux-only for this reason.
 
-## Commits
+## Repository
 
-Threads on one worker share the clone's objects and refs; each has its own
-worktree, index and branch. Commits leave the worker on one path:
+The orchestrator keeps one git repository per project (its hub); it is the
+only place commits live beyond a worker. The worker has a repository of its
+own, `$RUNNER_WORKDIR/.repo`, with no remote: the worker reaches nothing, and
+the orchestrator moves commits both ways as git bundles over this API. A
+bundle carries objects only; ref tips travel as JSON in `x-git-refs`
+(`{"<refname>": "<sha>"}`), since a bundle leaves out a ref whose tip the
+other side already has.
 
-1. A thread commits on `thread/<id>` as it likes (it should not push).
+- `POST /repo` brings the hub's commits: the default branch as
+  `refs/remotes/origin/<base>` (`x-git-base` names it), a thread's branch as
+  `refs/remotes/origin/thread/<id>` and its snapshot as
+  `refs/remotes/origin-snapshots/<id>`. The orchestrator sends the base
+  before it starts a thread, and the thread's branch and snapshot before it
+  brings one back. It leaves out of the bundle what `GET /repo` says the
+  worker has.
+- `GET /threads/{id}/repo?have=...` gives the thread's `refs/heads/thread/<id>`
+  and `refs/snapshots/<id>`, without the commits `have` lists (the hub's tips;
+  ones the worker does not know are ignored). The body is empty when the hub
+  has everything.
+
+Threads on one worker share the repository's objects and refs; each has its
+own worktree, index and branch. A turn's work leaves the worker on one path:
+
+1. A thread commits on `thread/<id>` as it likes; there is no remote to push to.
 2. At the end of every turn the runner commits anything left uncommitted and
-   pushes `thread/<id>` to origin (`saved`), so deleting a worker loses nothing.
-3. When the turn ended with `finish`, the runner lands it: fetch, rebase onto
-   `origin/<default>`, fast-forward push to `<default>` (`landed`). A push
-   rejected because another thread landed first is retried on the new tip, up
-   to 5 times. No merge commits, no force pushes to `<default>`.
-4. A conflicting rebase is aborted and handed back as a message from `runner`
-   (`land_conflict`); the thread rebases, resolves, and calls `finish` again.
-   A run of conflicts ends at the hop limit.
+   makes a snapshot: a commit of the whole worktree, untracked and ignored
+   files included, whose parent is the branch tip (`refs/snapshots/<id>`). It
+   then asks the orchestrator to `save` (a peer call), which takes both with
+   `GET /threads/{id}/repo` (`saved`).
+3. When the turn ended with `finish`, `save` has `land: true`: the
+   orchestrator rebases the branch onto the default branch in its hub (and,
+   when the project has a GitHub repository, pushes the new tip there first),
+   sends back the new `origin/<base>` and `origin/thread/<id>`, and answers
+   `{"landed": true, "base", "commit"}`. The worktree's branch follows
+   (`git reset --keep`) and the runner logs `landed`. No merge commits.
+4. A conflicting rebase is answered `{"landed": false, "base", "conflict":
+   [files]}`, with the latest `origin/<base>` sent first. The thread gets a
+   message from `runner` (`land_conflict`), rebases onto `origin/<base>`,
+   resolves, and calls `finish` again. A run of conflicts ends at the hop limit.
+
+The CLI (`pixi run run --repo <path or URL>`) has no orchestrator: `--repo`
+seeds the worker repository (its branches become `origin/*`, its HEAD the
+base) and landing moves `origin/<base>` there.

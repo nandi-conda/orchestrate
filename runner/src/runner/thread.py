@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from . import tools as T
 from .model import Model
-from .peers import LocalPeers, Peers
+from .peers import LocalPeers, PeerError, Peers
 from .repo import GitError, Repo, Workspace
 from .sandbox import LocalSandbox, Sandbox, View, worker_private
 
@@ -31,11 +31,12 @@ How the team works:
 - Keep your directory entry current with set_summary when your focus changes.
 - When the work for this request is done, call finish with a summary. You may get follow-ups later.
 
-Commits: commit your work on {branch} with clear messages; do not push. At the end of every
-turn the runner commits anything left over and pushes your branch. When you call finish it
-lands your branch on the project's main branch (rebase, fast-forward push). If that rebase
-conflicts you get a message from "runner" listing the files: rebase onto the named branch
-yourself, resolve, `git rebase --continue`, and call finish again.
+Commits: commit your work on {branch} with clear messages; there is no remote to push to.
+At the end of every turn the runner commits anything left over and the orchestrator saves your
+branch, and every file in your workspace, to the project's repository. When you call finish it
+lands your branch on the project's main branch (rebase, fast-forward). If that rebase conflicts
+you get a message from "runner" listing the files: rebase onto the named branch yourself,
+resolve, `git rebase --continue`, and call finish again.
 """
 
 
@@ -256,29 +257,34 @@ class AgentThread:
             self.emit("error", {"error": f"peer update failed: {e}"})
 
     async def _commit_work(self):
-        """Save the turn's work to origin; land it on the default branch after finish."""
+        """Commit the turn's work and snapshot the worktree; the orchestrator
+        saves both, and lands the branch on the default branch after finish."""
         message = f"{self.title}\n\n{self.summary}\n\nThread: {self.id}"
         try:
-            if not self.finish_requested:
-                self.emit("saved", {"branch": self.branch, "commit": await self.workspace.save(message)})
-                return
-            landing = await self.workspace.land(message)
-        except GitError as e:
+            commit = await self.workspace.commit(message)
+            await self.workspace.snapshot()
+            result = await self.peers.save(self.id, land=self.finish_requested)
+            if result.get("landed"):
+                await self.workspace.follow()
+        except (GitError, PeerError) as e:
             self.emit("error", {"error": str(e)})
             return
-        if landing.ok:
+        if not self.finish_requested:
+            self.emit("saved", {"branch": self.branch, "commit": commit})
+        elif result.get("landed"):
             self.conflicts = 0
-            self.emit("landed", {"branch": self.branch, "base": landing.base, "commit": landing.commit})
-        elif landing.conflict is not None:
+            self.emit("landed", {"branch": self.branch, "base": result["base"], "commit": result["commit"]})
+        elif result.get("conflict") is not None:
+            base, files = result["base"], result["conflict"]
             self.conflicts += 1
-            self.emit("land_conflict", {"branch": self.branch, "base": landing.base, "files": landing.conflict})
+            self.emit("land_conflict", {"branch": self.branch, "base": base, "files": files})
             # Another turn for the thread; the hop limit ends a run of conflicts it cannot resolve.
-            self.deliver(f"Landing {self.branch} on {landing.base} failed: rebasing onto origin/{landing.base} "
-                         f"conflicts in {', '.join(landing.conflict) or 'some files'}. Run "
-                         f"`git rebase origin/{landing.base}`, resolve the conflicts, `git rebase --continue`, "
+            self.deliver(f"Landing {self.branch} on {base} failed: rebasing onto origin/{base} "
+                         f"conflicts in {', '.join(files) or 'some files'}. Run "
+                         f"`git rebase origin/{base}`, resolve the conflicts, `git rebase --continue`, "
                          "then call finish again.", sender="runner", hops=self.conflicts)
         else:
-            self.emit("error", {"error": f"landing {self.branch} failed: {landing.message}"})
+            self.emit("error", {"error": f"landing {self.branch} failed: {result.get('message') or 'no reason given'}"})
 
 
 class ThreadHost:
@@ -325,8 +331,8 @@ class ThreadHost:
 
     async def _workspace(self, tid: str) -> tuple[View, Workspace | None]:
         """The thread's worktree (a plain directory when the worker has no
-        repo) and the view its commands get: that, the clone's git dir, and the
-        thread's own home and /tmp under `.home/` and `.tmp/`."""
+        repo) and the view its commands get: that, the repository's git dir,
+        and the thread's own home and /tmp under `.home/` and `.tmp/`."""
         path = (self.workdir / tid).resolve()
         view = View(root=str(path), home=str(self.workdir.resolve() / ".home" / tid),
                     tmp=str(self.workdir.resolve() / ".tmp" / tid),
@@ -336,13 +342,13 @@ class ThreadHost:
             path.mkdir(parents=True, exist_ok=True)
             return view, None
         path.parent.mkdir(parents=True, exist_ok=True)
-        return view, await self.repo.worktree(path, f"thread/{tid}")
+        return view, await self.repo.worktree(path, tid)
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
                     model: dict | None = None, id: str | None = None, history: list[dict] | None = None,
                     summary: str = "") -> AgentThread:
         """Start a thread on this worker. With `history` (its earlier events) the
-        thread continues a conversation and its pushed branch; with no
+        thread continues a conversation and its saved branch; with no
         `request` it waits idle for its next message. An id whose thread here
         has ended (stopped or failed) is started afresh."""
         tid = id or _id()

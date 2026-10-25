@@ -10,13 +10,15 @@ nothing of the runner, so the agent sees only the project
 ```sh
 pixi run set-key DEEPSEEK_API_KEY             # once: store the key in the system keyring
 pixi run test                                   # offline tests (scripted model)
-DEEPSEEK_API_KEY=... pixi run run "add a README" --repo /path/to/bare.git   # or a URL, with GITHUB_TOKEN
+DEEPSEEK_API_KEY=... pixi run run "add a README" --repo /path/to/repo   # or a URL
 DEEPSEEK_API_KEY=... RUNNER_TOKEN=... pixi run serve   # HTTP service on :8080
 ```
 
-`--repo` is cloned, and finished work lands on its default branch, so give it
-a URL or a bare repo (git refuses pushes to a checked-out branch).
-How commits get from threads to the repo is in [API.md](API.md#commits).
+`--repo` seeds the run: threads start from its default branch, and finished
+work lands on `origin/<default>` in the workdir's own repository
+(`<workdir>/.repo`); nothing is pushed back to the source. Under an
+orchestrator the worker has no remote at all: the orchestrator moves commits
+to and from its per-project repository ([API.md](API.md#repository)).
 
 `pixi install -e prod` gives the runtime without test tools. The HTTP contract
 and environment variables are in [API.md](API.md).
@@ -30,7 +32,7 @@ and environment variables are in [API.md](API.md).
 | `src/runner/tools.py` | work tools (bash, files), peer tools (threads, messages), web tools (search, fetch) |
 | `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` loop and `ThreadHost` (workspaces, events, capacity) |
-| `src/runner/repo.py` | the project clone, per-thread worktrees, saving and landing commits |
+| `src/runner/repo.py` | the worker's repository, per-thread worktrees, snapshots, bundles to and from the orchestrator |
 | `src/runner/peers.py` | `OrchestratorPeers` (queued for the orchestrator to collect) and `LocalPeers` (same process) |
 | `src/runner/server.py` | Starlette app |
 | `src/runner/cli.py` | one-shot local run |

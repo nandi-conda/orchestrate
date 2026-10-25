@@ -140,7 +140,7 @@ async def test_ingest_tracks_what_a_thread_is_doing(tmp_path):
     await s.open()
     p = await s.create_project("demo")
     t = await s.create_thread(p["id"], "Fix it", "fix the bug")
-    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
 
     async def doing(typ, data):
         await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
@@ -160,7 +160,7 @@ async def test_streamed_reply_shows_live_then_folds_into_its_events(tmp_path):
     await s.open()
     p = await s.create_project("demo")
     t = await s.create_thread(p["id"], "Fix it", "fix the bug")
-    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
 
     async def ingest(typ, data):
         await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
@@ -197,7 +197,7 @@ async def test_worker_logs_come_from_the_provider(tmp_path):
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
-    orch = service.Orchestrator(s, provider, HeuristicRouter())
+    orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
         await asyncio.wait({orch.starting[t["id"]]})  # spawn returns before the worker is up
@@ -266,7 +266,7 @@ def server(tmp_path, monkeypatch):
     url = f"http://127.0.0.1:{port}"
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                      LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
-                     HeuristicRouter())
+                     HeuristicRouter(), repos=str(tmp_path / "repos"))
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()
@@ -395,7 +395,8 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     router = GatedRouter()
     provider = GatedProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, router)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, router,
+                     repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
@@ -451,7 +452,8 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
 async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     provider = GatedProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter())
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
@@ -497,7 +499,8 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
     worker and serves a file as a download."""
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter())
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
@@ -537,7 +540,7 @@ async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):
     p = await s.create_project("demo")
     t = await s.create_thread(p["id"], "Done", "d")
     await s.update_thread(t["id"], state="done")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     got = await orch.archive(t["id"])
     assert got["state"] == "done" and got["archived_at"] is not None
     assert await orch.archive(t["id"]) == got  # archiving twice changes nothing
@@ -561,13 +564,13 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     async def replies(tid):
         return [e["payload"]["content"] for e in await s.list_events(p["id"], tid) if e["type"] == "assistant"]
 
-    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w1"), use_devrunner=True), HeuristicRouter())
+    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w1"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     t = await first.spawn(p["id"], "Hello", "build hello")
     await wait_for(lambda: replies(t["id"]))
     await wait_for(lambda: idle(t["id"]))
     await first.close()
 
-    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True), HeuristicRouter())
+    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     await second.send(t["id"], "can I download it?")
     got = await wait_for(lambda: _second_reply(replies, t["id"]))
     assert got == "Echo: can I download it? (resumed with 3 earlier events)"  # request, reasoning, reply
@@ -600,7 +603,7 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
-    orch = Orchestrator(s, provider, HeuristicRouter())
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     idle_one = await orch.spawn(p["id"], "Idle", "first")
 
     async def state(tid, want):
@@ -645,7 +648,7 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
-    orch = Orchestrator(s, provider, HeuristicRouter())
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def idle():
@@ -671,7 +674,7 @@ async def test_history_is_what_the_thread_received_and_said(tmp_path):
     await s.open()
     p = await s.create_project("demo")
     t = await s.create_thread(p["id"], "T", "do it", parent_id="t_parent")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     await s.append_event(p["id"], t["id"], "created", {"title": "T", "request": "do it", "parent": "t_parent"})
     await s.append_event(p["id"], t["id"], "state", {"state": "working"})
     await s.append_event(p["id"], t["id"], "assistant", {"content": "done"})
@@ -699,7 +702,7 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def idle():
@@ -730,7 +733,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     t = await first.spawn(p["id"], "T", "write build/app: binary")
 
     async def idle():
@@ -743,7 +746,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
 
     # The next control plane attaches to the same worker, files and all.
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
-    second = Orchestrator(s, provider, HeuristicRouter())
+    second = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     assert "devrunner: echo runner on port" in await second.worker_logs(t["id"], 50)  # before it is attached
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
@@ -773,7 +776,7 @@ async def test_threads_on_a_worker_stored_without_its_index_share_one_new_worker
     for t in ts:
         await s.update_thread(t["id"], worker_id=f"{p['id']}-w1", state="idle")
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
-    orch = Orchestrator(s, provider, HeuristicRouter())
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     lws = [await orch.live_worker(t["id"]) for t in ts]
     assert lws[0] is lws[1] and len(orch.workers[p["id"]]) == 1 and lws[0].worker.index == 1
     await orch.close()
@@ -801,7 +804,7 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     await orch.handle_request(p["id"], f"@{t['id']} more", "auto")
     await orch.handle_request(p["id"], "direct", "thread", t["id"])
@@ -941,7 +944,8 @@ async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monke
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     router = GatedRouter()
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), router)
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), router,
+                     repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:

@@ -53,7 +53,6 @@ class Worker:
 class WorkerSpec:
     project_id: str
     index: int
-    repo_url: str = ""
     capacity: int = 16
     env: dict = field(default_factory=dict)
     # The token of the worker this index names, when one was made before: a
@@ -103,7 +102,8 @@ def free_port() -> int:
 
 
 def passthrough_env() -> dict:
-    """Model and git credentials a runner needs; never the Sprites token.
+    """Model credentials a runner needs; never the Sprites token, nor a git
+    token (workers reach no repository: the control plane brings them commits).
 
     Look each one up with `get_secret` rather than reading the environment
     directly: a key stored only in the keyring is copied into `os.environ` when
@@ -112,7 +112,7 @@ def passthrough_env() -> dict:
     """
     from .secrets import get_secret
 
-    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS", "GITHUB_TOKEN")
+    keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS")
     found = {k: get_secret(k) for k in keep}
     return {k: v for k, v in found.items() if v}
 
@@ -189,8 +189,6 @@ class LocalProvider:
                "RUNNER_PORT": str(port), "RUNNER_HOST": "127.0.0.1",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": str(wdir),
                "RUNNER_CAPACITY": str(spec.capacity)}
-        if spec.repo_url:
-            env["RUNNER_REPO"] = spec.repo_url
         cwd = Path(__file__).resolve().parents[1]
         with open(self.log_path(wid), "ab") as log:
             proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd),
@@ -315,8 +313,6 @@ class SpritesProvider:
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity)}
-        if spec.repo_url:
-            env["RUNNER_REPO"] = spec.repo_url
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()

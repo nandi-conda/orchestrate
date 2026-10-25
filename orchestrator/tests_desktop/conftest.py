@@ -39,7 +39,7 @@ def echo_app(tmp_path):
     def make(shutdown):
         return create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                           LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
-                          shutdown_event=shutdown)
+                          shutdown_event=shutdown, repos=str(tmp_path / "repos"))
     return make
 
 

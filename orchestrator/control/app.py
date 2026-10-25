@@ -153,7 +153,7 @@ def thread_view(t: dict) -> dict:
 
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
                router: Router | None = None,
-               shutdown_event: asyncio.Event | None = None) -> Starlette:
+               shutdown_event: asyncio.Event | None = None, repos: str = ".orchestrator/repos") -> Starlette:
     store = store or store_from_url(None)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}
@@ -161,7 +161,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     @asynccontextmanager
     async def lifespan(app):
         await store.open()
-        orch = Orchestrator(store, provider or default_provider(), router or default_router())
+        orch = Orchestrator(store, provider or default_provider(), router or default_router(), repos)
         holder["orch"] = orch
         app.state.orch = orch
         try:
@@ -185,8 +185,12 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
 
     # ------------------------------------------------------------ UI API
 
+    def project_view(p: dict) -> dict:
+        """A project and where its hub is: the git repository its threads' work goes to."""
+        return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve())}
+
     async def list_projects(req: Request):
-        return JSONResponse(await store.list_projects())
+        return JSONResponse([project_view(p) for p in await store.list_projects()])
 
     async def create_project(req: Request):
         b = await body(req)
@@ -194,11 +198,11 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         if not name:
             return JSONResponse({"error": "name is required"}, 400)
         p = await store.create_project(name, str(b.get("repo_url", "")).strip(), str(b.get("model", "")).strip())
-        return JSONResponse(p, 201)
+        return JSONResponse(project_view(p), 201)
 
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
-        return JSONResponse(p) if p else JSONResponse({"error": "no such project"}, 404)
+        return JSONResponse(project_view(p)) if p else JSONResponse({"error": "no such project"}, 404)
 
     async def post_request(req: Request):
         pid = req.path_params["pid"]

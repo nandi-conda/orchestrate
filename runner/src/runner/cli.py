@@ -11,7 +11,7 @@ from . import sandbox
 from . import tools as T
 from .model import from_spec
 from .repo import Repo
-from .secrets import get_secret, require
+from .secrets import require
 from .thread import ThreadHost
 from .web import deepseek_web
 
@@ -31,7 +31,10 @@ def _print(ev: dict):
 
 async def amain(args):
     workdir = args.workdir or tempfile.mkdtemp(prefix="runner-")
-    repo = Repo(args.repo, f"{workdir}/.repo", get_secret("GITHUB_TOKEN")) if args.repo else None
+    repo = None
+    if args.repo:
+        repo = Repo(f"{workdir}/.repo")
+        await repo.seed(args.repo)
     host = ThreadHost(model_factory=from_spec, repo=repo, workdir=workdir,
                       tools=T.ALL_TOOLS + T.web_tools(deepseek_web()))
     q = host.subscribe(None)
@@ -52,12 +55,15 @@ async def amain(args):
         p.cancel()
         for tid in list(host.threads):
             await host.stop(tid)
+        if repo:
+            print(f"work landed on origin/{repo.base} in {repo.path}")
 
 
 def main():
     ap = argparse.ArgumentParser(prog="runner")
     ap.add_argument("request")
-    ap.add_argument("--repo", help="git URL or bare repo path to clone; threads land on its default branch")
+    ap.add_argument("--repo", help="git URL or repo path whose branches the threads start from; "
+                    "they land on its default branch in the workdir's repository, never on the source")
     ap.add_argument("--workdir")
     ap.add_argument("--project", default="local")
     ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-v4-pro)")

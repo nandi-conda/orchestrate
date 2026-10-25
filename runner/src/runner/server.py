@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import os
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import files, sandbox
 from . import tools as T
 from .model import from_spec
 from .peers import OrchestratorPeers
-from .repo import Repo
+from .repo import THREAD_ID, GitError, Repo, refs_header
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 from .web import deepseek_web
@@ -135,6 +136,31 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         backlog = sorted((e for t in host.threads.values() for e in t.events), key=lambda e: e["seq"])
         return sse(None, after_of(req), backlog)
 
+    async def get_repo(req: Request):
+        return JSONResponse({"base": host.repo.base, "refs": await host.repo.refs()})
+
+    async def post_repo(req: Request):
+        try:
+            refs = json.loads(req.headers.get("x-git-refs") or "{}")
+            base = req.headers.get("x-git-base") or ""
+            if not base or not isinstance(refs, dict):
+                raise ValueError("x-git-base and x-git-refs (a JSON object) are required")
+            await host.repo.receive(await req.body(), base, refs)
+        except (ValueError, GitError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True})
+
+    async def thread_repo(req: Request):
+        tid = req.path_params["id"]
+        if not THREAD_ID.match(tid):
+            return JSONResponse({"error": "bad thread id"}, status_code=400)
+        have = [h for h in req.query_params.get("have", "").split(",") if h]
+        try:
+            data, refs = await host.repo.send(tid, have)
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return Response(data, media_type="application/octet-stream", headers={"x-git-refs": refs_header(refs)})
+
     outbox = host.peers.outbox if isinstance(host.peers, OrchestratorPeers) else None
 
     async def peer_calls(req: Request):
@@ -160,19 +186,12 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         Route("/threads/{id}/stop", guard(stop), methods=["POST"]),
         Route("/threads/{id}/files", guard(list_files)),
         Route("/threads/{id}/files/raw", guard(raw_file)),
+        Route("/repo", guard(get_repo), methods=["GET"]),
+        Route("/repo", guard(post_repo), methods=["POST"]),
+        Route("/threads/{id}/repo", guard(thread_repo)),
         Route("/peer/calls", guard(peer_calls), methods=["GET"]),
         Route("/peer/calls/{id}", guard(peer_answer), methods=["POST"]),
     ])
-
-
-def repo_from_env(workdir: str) -> Repo | None:
-    """The project repo to clone into `<workdir>/.repo`, if RUNNER_REPO names one.
-    GITHUB_TOKEN goes to the runner's own git commands only, as a header (see
-    repo.py); threads' commands get an environment of their own (sandbox.py)."""
-    url = os.environ.get("RUNNER_REPO")
-    token = get_secret("GITHUB_TOKEN")
-    os.environ.pop("GITHUB_TOKEN", None)
-    return Repo(url, os.path.join(workdir, ".repo"), token) if url else None
 
 
 def host_from_env() -> ThreadHost:
@@ -180,7 +199,8 @@ def host_from_env() -> ThreadHost:
     return ThreadHost(
         model_factory=from_spec,
         peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
-        repo=repo_from_env(workdir),
+        # The orchestrator brings the project's commits (POST /repo).
+        repo=Repo(os.path.join(workdir, ".repo")),
         workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
         limits=Limits(max_steps=int(os.environ.get("RUNNER_MAX_STEPS", "60"))),

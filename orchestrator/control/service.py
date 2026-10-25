@@ -1,7 +1,9 @@
 """The control plane's core: workers, threads, routing and the message bus.
 
 Every runner event is relayed into the store, so the UI reads one ordered
-event log per project no matter how many workers the project has.
+event log per project no matter how many workers the project has. Every
+project's commits gather in its hub, a git repository on this machine
+(hub.py), which the control plane syncs workers with.
 """
 
 from __future__ import annotations
@@ -10,12 +12,15 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
+from .hub import Hub
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
 from .runner_client import RunnerClient
+from .secrets import get_secret
 from .store import Store, now
 
 log = logging.getLogger("orchestrator")
@@ -40,8 +45,7 @@ ENDS_STREAM = {"reasoning", "assistant", "tool_call", "turn_done", "state", "err
 
 
 def worker_spec(project: dict, index: int) -> WorkerSpec:
-    return WorkerSpec(project_id=project["id"], index=index, repo_url=project.get("repo_url", ""),
-                      capacity=CAPACITY)
+    return WorkerSpec(project_id=project["id"], index=index, capacity=CAPACITY)
 
 
 def attachable(w: dict) -> bool:
@@ -148,9 +152,13 @@ class LiveWorker:
 
 
 class Orchestrator:
-    def __init__(self, store: Store, provider: WorkerProvider, router: Router,
+    def __init__(self, store: Store, provider: WorkerProvider, router: Router, repos: str | Path,
                  max_running: int = 64) -> None:
         self.store = store
+        # One git repository per project, the hub its threads' work goes to (hub.py).
+        self.repos = Path(repos)
+        self.hubs: dict[str, Hub] = {}
+        self._hubs_lock = asyncio.Lock()
         self.provider = provider
         self.router = router
         self.max_running = max_running
@@ -371,7 +379,7 @@ class Orchestrator:
         try:
             if handler is None:
                 raise PeerCallError(f"unknown op {op!r}")
-            reply = {"ok": True, "result": await handler(self, lw.worker.project_id, **args)}
+            reply = {"ok": True, "result": await handler(self, lw, **args)}
         except PeerCallError as e:
             reply = {"ok": False, "error": str(e)}
         except TypeError as e:  # wrong or missing args
@@ -391,22 +399,25 @@ class Orchestrator:
             raise PeerCallError(f"no thread {thread_id}")
         return t
 
-    async def peer_list_threads(self, project_id: str, project: str, query: str | None = None) -> list[dict]:
+    async def peer_list_threads(self, lw: LiveWorker, project: str, query: str | None = None) -> list[dict]:
+        project_id = lw.worker.project_id
         if project != project_id:
             raise PeerCallError("threads of another project are not visible")
         threads = [peer_entry(t) for t in await self.store.list_threads(project_id)]
         q = (query or "").lower()
         return [t for t in threads if q in (t["title"] + " " + t["summary"]).lower()] if q else threads
 
-    async def peer_read_thread(self, project_id: str, thread_id: str, last_n: int = 20) -> dict:
+    async def peer_read_thread(self, lw: LiveWorker, thread_id: str, last_n: int = 20) -> dict:
+        project_id = lw.worker.project_id
         t = await self._own_thread(project_id, thread_id)
         events = await self.store.list_events(project_id, t["id"], 0, limit=5000)
         recent = [{"seq": e["seq"], "thread": e["thread_id"], "type": e["type"], "ts": e["created_at"],
                    "data": e["payload"]} for e in events[-int(last_n):]]
         return {**peer_entry(t), "events": recent}
 
-    async def peer_send_message(self, project_id: str, sender: str, to: str, body: str,
+    async def peer_send_message(self, lw: LiveWorker, sender: str, to: str, body: str,
                                 reply_to: str | None = None, hops: int = 0) -> dict:
+        project_id = lw.worker.project_id
         t = await self._own_thread(project_id, to)
         src = await self.store.get_thread(sender) if sender else None
         try:
@@ -417,8 +428,9 @@ class Orchestrator:
             await self.store.append_event(project_id, sender, "message_out", {"to": to, "body": body})
         return {"ok": True}
 
-    async def peer_spawn_thread(self, project_id: str, parent: str | None, project: str, title: str,
+    async def peer_spawn_thread(self, lw: LiveWorker, parent: str | None, project: str, title: str,
                                 request: str) -> dict:
+        project_id = lw.worker.project_id
         if project != project_id:
             raise PeerCallError("cannot spawn threads in another project")
         request = str(request or "").strip()
@@ -431,18 +443,56 @@ class Orchestrator:
             raise PeerCallError(str(e)) from None
         return {"id": t["id"], "title": t["title"]}
 
-    async def peer_set_summary(self, project_id: str, thread_id: str, summary: str,
+    async def peer_set_summary(self, lw: LiveWorker, thread_id: str, summary: str,
                                files: list | None = None) -> dict:
-        t = await self._own_thread(project_id, thread_id)
+        t = await self._own_thread(lw.worker.project_id, thread_id)
         fields = {"summary": str(summary or "")}
         if isinstance(files, list):
             fields["files"] = [str(f) for f in files]
         await self.store.update_thread(t["id"], **fields)
         return {"ok": True}
 
+    async def peer_save(self, lw: LiveWorker, thread_id: str, land: bool = False) -> dict:
+        """A thread's turn ended: take its branch and snapshot into the hub;
+        with `land`, land the branch there and send the worker the new base
+        and branch (runner/API.md, "Repository")."""
+        t = await self._own_thread(lw.worker.project_id, thread_id)
+        project = await self.store.get_project(t["project_id"])
+        hub = await self.hub(project)
+        data, refs = await lw.client.pull_thread(t["id"], await hub.have(t["id"]))
+        await hub.receive(t["id"], data, refs)
+        if not land:
+            return {"landed": False, "base": hub.base}
+        result = await hub.land(t["id"])
+        await self._ship(lw, project, t["id"])
+        return result
+
     PEER_OPS = {"list_threads": peer_list_threads, "read_thread": peer_read_thread,
                 "send_message": peer_send_message, "spawn_thread": peer_spawn_thread,
-                "set_summary": peer_set_summary}
+                "set_summary": peer_set_summary, "save": peer_save}
+
+    # ---------------------------------------------------------------- hubs
+
+    def hub_path(self, project_id: str) -> Path:
+        return self.repos / f"{project_id}.git"
+
+    async def hub(self, project: dict) -> Hub:
+        """The project's hub, made on first use."""
+        async with self._hubs_lock:
+            hub = self.hubs.get(project["id"])
+            if hub is None:
+                hub = Hub(self.hub_path(project["id"]), project.get("repo_url", ""), get_secret("GITHUB_TOKEN"))
+                await hub.open()
+                self.hubs[project["id"]] = hub
+        return hub
+
+    async def _ship(self, lw: LiveWorker, project: dict, tid: str | None = None) -> None:
+        """Bring a worker up to the hub: the base (as it is on the project's
+        repository, when there is one), and a thread's branch and snapshot."""
+        hub = await self.hub(project)
+        await hub.sync()
+        data, refs = await hub.pack(tid, list((await lw.client.repo_refs()).values()))
+        await lw.client.push_repo(data, hub.base, refs)
 
     async def _ingest(self, project_id: str, ev: dict) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}
@@ -491,6 +541,7 @@ class Orchestrator:
         tid = thread["id"]
         try:
             lw = await self._pick_worker(project)
+            await self._ship(lw, project)
             model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
             await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
                                           project=project["id"], parent=parent, model=model)
@@ -594,12 +645,13 @@ class Orchestrator:
     async def _revive(self, t: dict, lw: LiveWorker | None) -> LiveWorker:
         """Start the thread again on the worker that ran it (`lw` when it is
         live here, else the one an earlier control plane left), so its
-        worktree there, with what it never pushed like ignored build output,
-        is the one it continues in; on a picked worker when that was lost."""
+        worktree there is the one it continues in; on a picked worker when
+        that was lost, from its branch and snapshot in the hub."""
         tid, project = t["id"], await self.store.get_project(t["project_id"])
         history = await self.history(t)
         if lw is None:
             lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
+        await self._ship(lw, project, tid)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
         await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
                                       model=model, summary=t["summary"], history=history)
@@ -650,7 +702,7 @@ class Orchestrator:
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds
         it (the control plane asks; the worker never sends files on its own).
-        A thread with no live worker is revived first, from its pushed branch."""
+        A thread with no live worker is revived first, from the hub."""
         lw = await self.live_worker(thread_id)
         return await lw.client.list_files(thread_id, path)
 

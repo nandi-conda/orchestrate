@@ -7,6 +7,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from .gitio import refs_header
+
 
 class FileError(Exception):
     """The runner refused a files request (bad path, not found); its words and status."""
@@ -73,6 +75,26 @@ class RunnerClient:
                 raise file_error(r, body)
             r.raise_for_status()
         return r
+
+    async def repo_refs(self) -> dict[str, str]:
+        """The worker repository's refs (runner/API.md, "Repository")."""
+        r = await self.http.get("/repo")
+        r.raise_for_status()
+        return r.json()["refs"]
+
+    async def push_repo(self, data: bytes, base: str, refs: dict[str, str]) -> None:
+        """Bring the hub's commits to the worker: a bundle and the refs' tips."""
+        r = await self.http.post("/repo", content=data, timeout=httpx.Timeout(600.0, connect=10.0),
+                                 headers={"content-type": "application/octet-stream", "x-git-base": base,
+                                          "x-git-refs": refs_header(refs)})
+        r.raise_for_status()
+
+    async def pull_thread(self, thread_id: str, have: list[str]) -> tuple[bytes, dict[str, str]]:
+        """A thread's branch and snapshot from the worker, without the commits in `have`."""
+        r = await self.http.get(f"/threads/{thread_id}/repo", params={"have": ",".join(have)},
+                                timeout=httpx.Timeout(600.0, connect=10.0))
+        r.raise_for_status()
+        return r.content, json.loads(r.headers["x-git-refs"])
 
     async def peer_calls(self, wait: float = 25.0) -> list[dict]:
         """Peer calls this worker's threads have queued (long poll; see runner/API.md)."""
