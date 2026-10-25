@@ -16,6 +16,7 @@ stored.
 from __future__ import annotations
 
 import argparse
+import sys
 import asyncio
 import json
 import os
@@ -227,6 +228,7 @@ def main() -> None:
     p.add_argument("--port", type=int, default=int(os.environ.get("RUNNER_PORT", "8080")))
     a = p.parse_args()
     host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")))
+    print(f"devrunner: echo runner on port {a.port}", file=sys.stderr, flush=True)
     uvicorn.run(create_app(host, os.environ.get("RUNNER_TOKEN", "")),
                 host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning")
 

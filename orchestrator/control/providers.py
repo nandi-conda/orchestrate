@@ -66,6 +66,13 @@ class WorkerProvider(Protocol):
 
     async def destroy(self, worker: Worker) -> None: ...
 
+    async def logs(self, worker: Worker, lines: int) -> str:
+        """The last `lines` lines the worker's runner wrote to stdout/stderr."""
+
+
+def tail(data: bytes, lines: int) -> str:
+    return "\n".join(data.decode(errors="replace").splitlines()[-lines:]) + "\n"
+
 
 async def wait_healthy(url: str, timeout: float = 120.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
@@ -177,7 +184,10 @@ class LocalProvider:
         if spec.repo_url:
             env["RUNNER_REPO"] = spec.repo_url
         cwd = Path(__file__).resolve().parents[1]
-        proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd))
+        with open(self.log_path(wid), "ab") as log:
+            proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd),
+                                                        stdout=log, stderr=subprocess.STDOUT)
+        print(f"LocalProvider: worker {wid} logs to {self.log_path(wid)}", file=sys.stderr)
         worker.handle = str(proc.pid)
         self.procs[wid] = proc
         try:
@@ -186,6 +196,12 @@ class LocalProvider:
             proc.kill()
             raise
         return worker
+
+    def log_path(self, wid: str) -> Path:
+        return (self.workdir / wid).resolve() / "runner.log"
+
+    async def logs(self, worker: Worker, lines: int) -> str:
+        return tail(self.log_path(worker.id).read_bytes(), lines)
 
     async def destroy(self, worker: Worker) -> None:
         proc = self.procs.pop(worker.id, None)
@@ -298,6 +314,15 @@ class SpritesProvider:
             raise RuntimeError(f"sprite exec failed ({r.status_code}): {r.text[:500]}")
         return r.text
 
+    # A sprite service's stdout and stderr, timestamped (Sprites docs, "Services").
+    LOG = "/.sprite/logs/services/runner.log"
+
+    async def logs(self, worker: Worker, lines: int) -> str:
+        r = await self.http.get(f"/sprites/{worker.handle}/fs/read", params={"path": self.LOG, "workingDir": "/"})
+        if r.status_code >= 400:
+            raise RuntimeError(f"reading {self.LOG} on sprite {worker.handle} failed ({r.status_code}): {r.text[:300]}")
+        return tail(r.content, lines)
+
     async def destroy(self, worker: Worker) -> None:
         await self.http.delete(f"/sprites/{shlex.quote(worker.handle)}")
 
@@ -343,10 +368,19 @@ class AutoProvider:
             return await self.local().create(spec)
         return await provider.create(spec)
 
+    def _of(self, worker: Worker):
+        return self._sprites if worker.provider == "sprites" else self._local
+
     async def destroy(self, worker: Worker) -> None:
-        provider = self._sprites if worker.provider == "sprites" else self._local
+        provider = self._of(worker)
         if provider is not None:
             await provider.destroy(worker)
+
+    async def logs(self, worker: Worker, lines: int) -> str:
+        provider = self._of(worker)
+        if provider is None:
+            raise RuntimeError(f"no {worker.provider} provider in this control plane")
+        return await provider.logs(worker, lines)
 
     async def close(self) -> None:
         for provider in (self._local, self._sprites):

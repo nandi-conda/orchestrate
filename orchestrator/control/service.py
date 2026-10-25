@@ -336,6 +336,14 @@ class Orchestrator:
         await self.store.mark_read([msg["id"]])
         return msg
 
+    async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
+        """The runner log of the worker a thread runs on (the control plane
+        reads it from the provider; the worker never sends it)."""
+        lw = self.by_thread.get(thread_id)
+        if lw is None:
+            raise KeyError(thread_id)
+        return await self.provider.logs(lw.worker, lines)
+
     async def stop(self, thread_id: str) -> None:
         lw = self.by_thread.get(thread_id)
         if lw:

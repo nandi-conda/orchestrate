@@ -143,6 +143,17 @@ checks out this checkout's `origin` and current branch, so push before
 expecting local commits to be there; a sprite has no git credentials, so the
 repository must be publicly readable.
 
+### Worker logs
+
+Each thread's pane has a **Worker logs** link: the last 300 lines its runner
+wrote to stdout and stderr, as plain text (`/api/threads/<id>/worker-logs?lines=N`).
+The control plane reads them itself: from `/.sprite/logs/services/runner.log`
+on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
+`.orchestrator/workers/<worker>/runner.log` for a local worker. Stopping the
+control plane destroys its sprites, so read a sprite's log while it is still
+running. With the `sprite` CLI the same file is
+`sprite exec -s orch-<project>-w<n> tail -n 300 /.sprite/logs/services/runner.log`.
+
 The spawn path has been exercised against the live API: create, bootstrap,
 `/health`, an agent turn, and destroy.
 
@@ -173,6 +184,7 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | GET | `/api/projects/{id}/events` | SSE, resumable with `?after=seq` or `Last-Event-ID` |
 | GET | `/api/threads/{id}` | one thread |
 | GET | `/api/threads/{id}/transcript` | its events (JSON) |
+| GET | `/api/threads/{id}/worker-logs` | its worker's runner log, `?lines=300` (text) |
 | GET | `/api/threads/{id}/events` | SSE |
 | POST | `/api/threads/{id}/messages` | `{body}` |
 | POST | `/api/threads/{id}/stop` | |

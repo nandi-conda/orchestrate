@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -67,6 +68,9 @@ class DeltaBuffer:
         self.sent = time.monotonic()
 
 
+log = logging.getLogger("runner")
+
+
 def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
@@ -124,6 +128,7 @@ class AgentThread:
             self.set_state("stopped")
             raise
         except Exception as e:
+            log.exception("thread %s failed", self.id)
             self.emit("error", {"error": f"{type(e).__name__}: {e or repr(e)}"})
             self.set_state("failed")
 

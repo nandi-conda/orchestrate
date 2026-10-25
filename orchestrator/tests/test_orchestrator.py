@@ -151,6 +151,23 @@ async def test_streamed_reply_shows_live_then_folds_into_its_events(tmp_path):
     await s.close()
 
 
+async def test_worker_logs_come_from_the_provider(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = service.Orchestrator(s, provider, HeuristicRouter())
+    try:
+        t = await orch.spawn(p["id"], "Echo", "say hi")
+        log = await orch.worker_logs(t["id"], 50)
+        assert "devrunner: echo runner on port" in log
+        with pytest.raises(KeyError):
+            await orch.worker_logs("t_nope")
+    finally:
+        await orch.close()
+        await s.close()
+
+
 def test_describe_names_the_request_a_timeout_was_for():
     req = httpx.Request("POST", "http://w:8080/threads")
     assert service.describe(httpx.ReadTimeout("", request=req)) == "ReadTimeout on POST http://w:8080/threads"
@@ -240,6 +257,8 @@ async def test_end_to_end_with_echo_runner(server):
         assert all(t["activity"] == "" for t in (await c.get(f"/api/projects/{pid}/threads")).json())
 
         tr = (await c.get(f"/api/threads/{ids[0]}/transcript")).json()
+        logs = await c.get(f"/api/threads/{ids[0]}/worker-logs?lines=20")
+        assert logs.status_code == 200 and logs.headers["content-type"].startswith("text/plain")
         assert any(e["type"] == "assistant" and "login page" in e["text"] for e in tr)
         # The request shows once, as "created"; the runner's echo of it is dropped.
         assert [e["type"] for e in tr if "login page" in e["text"]].count("created") == 1

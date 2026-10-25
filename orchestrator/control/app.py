@@ -12,13 +12,13 @@ from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
-from .service import ENDS_STREAM, Orchestrator, tool_arg
+from .service import ENDS_STREAM, Orchestrator, describe, tool_arg
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -220,6 +220,21 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         await orch().stop(req.path_params["tid"])
         return JSONResponse({"ok": True})
 
+    async def worker_logs(req: Request):
+        tid = req.path_params["tid"]
+        if await store.get_thread(tid) is None:
+            return JSONResponse({"error": "no such thread"}, 404)
+        q = req.query_params.get("lines", "300")
+        lines = min(int(q), 5000) if q.isdigit() else 300
+        try:
+            text = await orch().worker_logs(tid, lines)
+        except KeyError:
+            return PlainTextResponse(f"thread {tid} has no live worker in this control plane "
+                                     "(its worker is gone once the control plane restarts)\n", 404)
+        except Exception as e:
+            return PlainTextResponse(f"could not read the worker log: {describe(e)}\n", 502)
+        return PlainTextResponse(text)
+
     async def transcript(req: Request):
         t = await store.get_thread(req.path_params["tid"])
         if t is None:
@@ -303,6 +318,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/threads/{tid}/messages", thread_message, methods=["POST"]),
         Route("/api/threads/{tid}/stop", thread_stop, methods=["POST"]),
         Route("/api/threads/{tid}/transcript", transcript, methods=["GET"]),
+        Route("/api/threads/{tid}/worker-logs", worker_logs, methods=["GET"]),
         Route("/api/threads/{tid}/events", thread_events, methods=["GET"]),
         Route("/", index),
         Route("/p/{pid}", index),
