@@ -3,7 +3,11 @@ projects, routing, the thread list, the pane's tabs, archiving and SSE."""
 
 from PySide6.QtCore import Qt
 
+import sys
+from pathlib import Path
+
 from orchestrate_desktop.api import Api
+from orchestrate_desktop.server import DOWN, UP, ControlPlane
 from orchestrate_desktop.widgets import EventRow, Fold
 from orchestrate_desktop.window import AUTO, DIALOG, FILES, NEW_THREAD, TO_THREAD, TOOLS, WLOG, MainWindow
 
@@ -32,8 +36,9 @@ def dialog_texts(page) -> list[str]:
     return [w.text.text() for w in page.dialog.widgets() if isinstance(w, EventRow)]
 
 
-def make_window(qtbot, url, tmp_path) -> MainWindow:
-    w = MainWindow(Api(url))
+def make_window(qtbot, url, tmp_path, command=None) -> MainWindow:
+    api = Api(url)
+    w = MainWindow(api, ControlPlane(api, command))
     qtbot.addWidget(w)
     w.project.download_dir = tmp_path
     w.show()
@@ -42,7 +47,7 @@ def make_window(qtbot, url, tmp_path) -> MainWindow:
 
 def open_new_project(qtbot, w, name="demo"):
     pp = w.projects
-    qtbot.waitUntil(lambda: not pp.status.text().startswith("Loading"), timeout=WAIT)
+    qtbot.waitUntil(lambda: w.control.state == UP and not pp.status.text().startswith("Loading"), timeout=WAIT)
     pp.new_button.click()
     pp.name.setText(name)
     pp.create_button.click()
@@ -155,3 +160,42 @@ def test_archive_and_unarchive(qtbot, control_plane, tmp_path):
     page.unarchive_button.click()
     qtbot.waitUntil(lambda: not page.show_archived and thread_ids(page) == [tid], timeout=WAIT)
     assert page.sel == tid and page.list_title.text() == "Threads"
+
+
+SERVE = Path(__file__).with_name("serve_echo.py")
+
+
+def test_the_window_starts_and_stops_its_own_control_plane(qtbot, tmp_path):
+    from conftest import free_port
+    port = free_port()
+    w = make_window(qtbot, f"http://127.0.0.1:{port}", tmp_path,
+                    [sys.executable, str(SERVE), str(port), str(tmp_path)])
+    assert w.control.proc is not None
+    page = open_new_project(qtbot, w)
+    assert "stops when this window closes" in w.projects.conn.text()
+    send(page, "hello")
+    qtbot.waitUntil(lambda: len(thread_ids(page)) == 1, timeout=WAIT)
+    proc = w.control.proc
+    w.close()
+    assert proc.poll() is not None and w.control.proc is None
+
+
+def test_a_control_plane_that_exits_shows_down_not_an_empty_list(qtbot, tmp_path):
+    from conftest import free_port
+    port = free_port()
+    w = make_window(qtbot, f"http://127.0.0.1:{port}", tmp_path,
+                    [sys.executable, str(SERVE), str(port), str(tmp_path), "3"])
+    qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
+    pp = w.projects
+    assert "exited with code 3" in pp.conn.text() and f"127.0.0.1:{port}" in pp.conn.text()
+    assert pp.retry.isVisibleTo(w) and not pp.list.isVisibleTo(w) and not pp.status.isVisibleTo(w)
+    assert not pp.new_button.isEnabled()
+
+
+def test_connecting_to_nothing_names_the_url(qtbot, tmp_path):
+    from conftest import free_port
+    url = f"http://127.0.0.1:{free_port()}"
+    w = make_window(qtbot, url, tmp_path)
+    qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
+    assert w.projects.conn.text().startswith(f"No control plane at {url}: ")
+    assert not w.projects.status.isVisibleTo(w)

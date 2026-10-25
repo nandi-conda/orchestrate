@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLineEdit, QLi
 
 from .api import Api, q
 from .model import K_ERROR, K_ROUTE, K_TOOL_CALL, counts, dialog_items, is_tool, join_path, size_text
+from .server import DOWN, UP, ControlPlane
 from .widgets import STYLE, Column, EventRow, badge, label, one_line, restyle, thread_tag
 
 AUTO, TO_THREAD, NEW_THREAD = range(3)
@@ -60,10 +61,12 @@ class ProjectsPage(QWidget):
     """The project list, with a form for a new project."""
 
     open_project = Signal(str)
+    retry_requested = Signal()
 
     def __init__(self, api: Api) -> None:
         super().__init__()
         self.api = api
+        self.up = False
         self.projects: list[dict] = []
         self.creating = False
         lay = vbox(self, (32, 24, 32, 24), 12)
@@ -73,6 +76,13 @@ class ProjectsPage(QWidget):
         self.new_button = button("New project", self.show_form)
         top.addWidget(self.new_button)
         lay.addLayout(top)
+        # Where the control plane is: starting, up or down, with its URL.
+        conn = hbox()
+        self.conn = label("", "muted", wrap=True)
+        conn.addWidget(self.conn, 1)
+        self.retry = button("Retry", self.retry_requested.emit)
+        conn.addWidget(self.retry)
+        lay.addLayout(conn)
         self.error = label(name="error", wrap=True)
         self.error.hide()
         lay.addWidget(self.error)
@@ -108,15 +118,33 @@ class ProjectsPage(QWidget):
         self.list.itemClicked.connect(lambda it: self.open_project.emit(it.data(Qt.ItemDataRole.UserRole)))
         lay.addWidget(self.list, 1)
 
+    def set_connection(self, state: str, text: str) -> None:
+        """Show the control plane's state; the projects show only while it is up."""
+        self.up = state == UP
+        self.conn.setObjectName("muted" if state != DOWN else "error")
+        restyle(self.conn)
+        self.conn.setText(text)
+        self.retry.setVisible(state == DOWN)
+        self.new_button.setEnabled(self.up)
+        self.list.setVisible(self.up)
+        if not self.up:
+            self.form.hide()
+            self.set_error("")
+            self.status.hide()
+
     def refresh(self) -> None:
+        if not self.up:
+            return
         self.status.setText("Loading…")
         self.status.show()
         self.api.get_json("/api/projects", self._got)
 
     def _got(self, data, err: str) -> None:
         self.set_error(err)
-        if not err:
-            self.projects = data
+        if err:
+            self.status.hide()
+            return
+        self.projects = data
         self.list.clear()
         for p in self.projects:
             it = QListWidgetItem()
@@ -875,9 +903,10 @@ class ProjectPage(QWidget):
 # ---------------------------------------------------------------- window
 
 class MainWindow(QMainWindow):
-    def __init__(self, api: Api) -> None:
+    def __init__(self, api: Api, control: ControlPlane) -> None:
         super().__init__()
         self.api = api
+        self.control = control
         self.setStyleSheet(STYLE)
         self.resize(1280, 820)
         self.stack = QStackedWidget()
@@ -889,7 +918,22 @@ class MainWindow(QMainWindow):
         self.projects.open_project.connect(self.open_project)
         self.project.home.connect(self.show_projects)
         self.project.title_changed.connect(lambda name: self.setWindowTitle(f"{name} · Orchestrator"))
+        self.projects.retry_requested.connect(control.start)
+        control.changed.connect(self._control_changed)
         self.show_projects()
+        control.start()
+
+    def _control_changed(self, state: str, text: str) -> None:
+        self.projects.set_connection(state, text)
+        if state == UP:
+            self.projects.refresh()
+        elif self.stack.currentWidget() is self.project:
+            self.show_projects()
+
+    def closeEvent(self, event) -> None:
+        self.project.leave()
+        self.control.stop()
+        super().closeEvent(event)
 
     def show_projects(self) -> None:
         self.project.leave()

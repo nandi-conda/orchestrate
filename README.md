@@ -17,8 +17,8 @@ drive everything from the repo root:
 pixi run setup                        # install what every project needs
 pixi run set-key DEEPSEEK_API_KEY     # once: store the key in the system keyring
 pixi run set-key SPRITES_TOKEN        # once: run workers on Fly Sprites, even for a local UI
-pixi run serve                        # build the UI, then serve http://127.0.0.1:8000
-pixi run desktop                      # the desktop client, on that control plane
+pixi run serve                        # just the control plane + web UI on http://127.0.0.1:8000
+pixi run desktop                      # the desktop client; starts and owns its control plane on :8000
 pixi run test                         # every test suite: runner, orchestrator, desktop
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```

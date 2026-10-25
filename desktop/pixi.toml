@@ -24,7 +24,7 @@ keyring = ">=25"
 test = ["test"]
 
 [tasks]
-start = { cmd = "python -m orchestrate_desktop", description = "Open the desktop client; --url picks the control plane (default http://127.0.0.1:8000)" }
+start = { cmd = "python -m orchestrate_desktop", description = "Open the desktop client; it starts and owns the control plane on :8000 (--port N), or --url connects to one" }
 
 [feature.test.tasks]
 test = { cmd = "pytest -q tests", env = { QT_QPA_PLATFORM = "offscreen" } }
