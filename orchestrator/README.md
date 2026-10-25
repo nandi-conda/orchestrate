@@ -169,6 +169,15 @@ curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \
 The spawn path has been exercised against the live API: create, bootstrap,
 `/health`, an agent turn, and destroy.
 
+### Archiving threads
+
+**Archive** in a thread's pane stops the thread if it is still on its runner,
+then hides it from the thread list, the router and other threads' peer calls.
+**Archived** at the top of the thread list shows the archived threads; pick one
+and press **Unarchive** to bring it back (it stays stopped). An archived thread
+takes no messages. The state is `threads.archived_at`, added to an existing
+SQLite or Postgres database the first time the control plane opens it.
+
 ## Layout
 
 | Path | What |
@@ -191,7 +200,7 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | --- | --- | --- |
 | GET/POST | `/api/projects` | list, create `{name, repo_url?, model?}` |
 | POST | `/api/projects/{id}/requests` | `{text, mode: auto\|thread\|new, target?}`; returns at once. `auto` → 202 `{queued}`, the plan follows as a `route` event; `thread`/`new` → the plan |
-| GET/POST | `/api/projects/{id}/threads` | directory; force a new thread `{request, title?}` |
+| GET/POST | `/api/projects/{id}/threads` | directory of live threads, `?archived=1` for archived ones; force a new thread `{request, title?}` |
 | GET | `/api/projects/{id}/log` | every event in the project (JSON) |
 | GET | `/api/projects/{id}/events` | SSE, resumable with `?after=seq` or `Last-Event-ID` |
 | GET | `/api/threads/{id}` | one thread |
@@ -200,3 +209,5 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | GET | `/api/threads/{id}/events` | SSE |
 | POST | `/api/threads/{id}/messages` | `{body}` |
 | POST | `/api/threads/{id}/stop` | |
+| POST | `/api/threads/{id}/archive` | stops it if running, then archives it; the thread |
+| POST | `/api/threads/{id}/unarchive` | the thread |

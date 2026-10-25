@@ -46,6 +46,11 @@ TAB: Const[i32] = 24
 NAV: Const[i32] = 25
 GOT_WLOG: Const[i32] = 26
 WLOG_REFRESH: Const[i32] = 27
+ARCHIVE: Const[i32] = 28
+UNARCHIVE: Const[i32] = 29
+ARCHIVED: Const[i32] = 30
+UNARCHIVED: Const[i32] = 31
+SHOW_ARCHIVED: Const[i32] = 32
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -85,6 +90,7 @@ pane_tab: i32 = 0        # DIALOG, TOOLS or WLOG
 stream: i32 = 0          # the open project's event stream, 0 when none
 wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
 wlog_loading: i32 = 0
+show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -180,7 +186,7 @@ def open_project(id: i32) -> None:
 
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
-    global stream, project, threads, transcript, plog, wlog, mode, pane_tab, sending
+    global stream, project, threads, transcript, plog, wlog, mode, pane_tab, sending, show_archived
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -196,6 +202,7 @@ def leave_project() -> None:
     mode = AUTO
     pane_tab = DIALOG
     sending = 0
+    show_archived = 0
 
 
 def enter_project() -> None:
@@ -231,7 +238,31 @@ def fetch_threads() -> None:
     s_set(h_url, "/api/projects/")
     s_add_ref(h_url, h_pid)
     s_add(h_url, "/threads")
+    if show_archived == 1:
+        s_add(h_url, "?archived=1")
     get(h_url, GOT_THREADS)
+
+
+def show_activity() -> None:
+    """Select nothing: the pane shows the project's activity."""
+    global mode, pane_tab
+    s_clear(h_sel)
+    if mode == TO_THREAD:
+        mode = AUTO
+    if pane_tab == WLOG:
+        pane_tab = DIALOG
+    fetch_log()
+
+
+def post_thread(action: str, msg: i32) -> None:
+    """POST /api/threads/<selected>/<action>."""
+    o: i32
+    o = o_new()
+    s_set(h_url, "/api/threads/")
+    s_add_ref(h_url, h_sel)
+    s_add(h_url, "/")
+    s_add(h_url, action)
+    post(h_url, o, msg)
 
 
 def fetch_log() -> None:
@@ -284,7 +315,7 @@ def take(old: i32, new: i32) -> i32:
 
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending, pane_tab, wlog, wlog_loading
+    global mode, pending, pane_tab, wlog, wlog_loading, show_archived
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -343,7 +374,7 @@ def update(msg: i32, arg: i32) -> None:
         e = j_idx(threads, arg)
         jstr(e, "id", h_sel)
         j_free(e)
-        if mode == AUTO:
+        if mode == AUTO and show_archived == 0:
             mode = TO_THREAD
         fetch_transcript()
         wlog = take_none(wlog)
@@ -351,12 +382,7 @@ def update(msg: i32, arg: i32) -> None:
         if pane_tab == WLOG:
             fetch_wlog()
     elif msg == ACTIVITY:
-        s_clear(h_sel)
-        if mode == TO_THREAD:
-            mode = AUTO
-        if pane_tab == WLOG:
-            pane_tab = DIALOG
-        fetch_log()
+        show_activity()
     elif msg == GOT_TRANSCRIPT:
         transcript = take(transcript, arg)
         scroll_end("pane")
@@ -421,6 +447,35 @@ def update(msg: i32, arg: i32) -> None:
             s_add_ref(h_url, h_sel)
             s_add(h_url, "/stop")
             post(h_url, o, STOPPED)
+    elif msg == ARCHIVE:
+        if s_len(h_sel) > 0:
+            post_thread("archive", ARCHIVED)
+    elif msg == ARCHIVED:
+        # The control plane stopped the thread if it was running; it leaves
+        # the list, so the pane goes back to the project's activity.
+        if j_ok(arg) == 1:
+            show_activity()
+            fetch_threads()
+        else:
+            j_err(arg, h_err)
+        j_free(arg)
+    elif msg == UNARCHIVE:
+        if s_len(h_sel) > 0:
+            post_thread("unarchive", UNARCHIVED)
+    elif msg == UNARCHIVED:
+        # Back to the live list, with the thread still selected.
+        if j_ok(arg) == 1:
+            show_archived = 0
+            fetch_threads()
+            fetch_transcript()
+        else:
+            j_err(arg, h_err)
+        j_free(arg)
+    elif msg == SHOW_ARCHIVED:
+        show_archived = arg
+        threads = take_none(threads)
+        show_activity()
+        fetch_threads()
     elif msg == STOPPED:
         j_free(arg)
         fetch_threads()
@@ -589,7 +644,10 @@ def thread_list() -> None:
     cls("threads")
     div("threads-head")
     span("title")
-    text("Threads")
+    if show_archived == 1:
+        text("Archived")
+    else:
+        text("Threads")
     end()
     if threads != 0:
         n = j_len(threads, "")
@@ -598,6 +656,18 @@ def thread_list() -> None:
     cls("secondary")
     num(n)
     end()
+    span("grow")
+    end()
+    if show_archived == 1:
+        btn_open("ghost", SHOW_ARCHIVED, 0)
+        cls("sm")
+        text("← Threads")
+        end()
+    else:
+        btn_open("ghost", SHOW_ARCHIVED, 1)
+        cls("sm")
+        text("Archived")
+        end()
     end()
     el("button")
     cls("thread")
@@ -656,6 +726,12 @@ def thread_list() -> None:
         end()
         end()
         j_free(e)
+    if show_archived == 1 and n == 0:
+        el("p")
+        cls("muted")
+        cls("empty")
+        text("No archived threads.")
+        end()
     end()
 
 
@@ -779,7 +855,7 @@ def selected_thread() -> i32:
 
 
 def thread_head(t: i32) -> None:
-    """Title, state and Stop for the selected thread, and a line saying what it
+    """Title, state, Stop and Archive (Unarchive once archived) for the selected thread, and a line saying what it
     is doing right now (the running tool, or "thinking") while it works."""
     div("pane-head")
     div("pane-title")
@@ -798,10 +874,21 @@ def thread_head(t: i32) -> None:
     end()
     end()
     div("pane-actions")
-    btn_open("ghost", STOP, 0)
-    cls("sm")
-    text("Stop thread")
-    end()
+    if t != 0 and j_has(t, "archived_at") == 1:
+        btn_open("ghost", UNARCHIVE, 0)
+        cls("sm")
+        text("Unarchive")
+        end()
+    else:
+        btn_open("ghost", STOP, 0)
+        cls("sm")
+        text("Stop thread")
+        end()
+        btn_open("ghost", ARCHIVE, 0)
+        cls("sm")
+        attr("title", "Stops the thread if it is running and hides it from the list")
+        text("Archive")
+        end()
     end()
     end()
     if t != 0:
@@ -968,7 +1055,7 @@ def request_box() -> None:
     div("composer-row")
     toggle_group_open()
     toggle("Router decides", mode == AUTO, MODE, AUTO)
-    if s_len(h_sel) > 0:
+    if s_len(h_sel) > 0 and show_archived == 0:
         toggle("This thread", mode == TO_THREAD, MODE, TO_THREAD)
     toggle("New thread", mode == NEW_THREAD, MODE, NEW_THREAD)
     end()

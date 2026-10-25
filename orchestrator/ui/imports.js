@@ -39,7 +39,8 @@ export function imports({ str, strs, vals, dispatch }) {
       es.onmessage = (e) => { try { dispatch(msg, put(JSON.parse(e.data))); } catch {} };
       // Typed events (event: <type>) don't reach onmessage; listen to the ones we emit.
       for (const t of ["request", "created", "state", "message_in", "message_out", "delta", "reasoning", "assistant", "tool_call",
-                       "tool_result", "usage", "turn_done", "dropped", "error", "route", "worker"])
+                       "tool_result", "usage", "turn_done", "dropped", "error", "route", "worker",
+                       "archived", "unarchived"])
         es.addEventListener(t, es.onmessage);
       streams.set(id, es);
       return id;
