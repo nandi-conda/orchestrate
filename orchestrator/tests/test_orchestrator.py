@@ -2,7 +2,6 @@
 echo runner (control.devrunner), served over real HTTP so the peer API is used."""
 
 import asyncio
-from dataclasses import replace
 import socket
 import sys
 import threading
@@ -13,6 +12,7 @@ import httpx
 import pytest
 import uvicorn
 
+from control import service
 from control.app import create_app
 from control.providers import LocalProvider
 from control.router import HeuristicRouter, clean_plan
@@ -72,23 +72,16 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-class PullLocalProvider(LocalProvider):
-    """Local workers that cannot dial the control plane, like a sprite behind a
-    laptop's localhost: the control plane has to collect their peer calls."""
-
-    async def create(self, spec):
-        return await super().create(replace(spec, orchestrator_url="", peer_mode="pull"))
-
-
-@pytest.fixture(params=["http", "pull"])
-def server(tmp_path, monkeypatch, request):
+@pytest.fixture
+def server(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
+    # One running thread per worker, so peer calls have to cross workers.
+    monkeypatch.setattr(service, "CAPACITY", 1)
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    provider = (PullLocalProvider if request.param == "pull" else LocalProvider)(
-        workdir=str(tmp_path / "workers"), use_devrunner=True)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider,
-                     HeuristicRouter())  # no public_url: it comes from the request's Host
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
+                     HeuristicRouter())
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()
@@ -146,8 +139,26 @@ async def test_end_to_end_with_echo_runner(server):
             return any(e["type"] == "message_in" and e["text"].startswith("Finished:") for e in tr)
         await wait_for(child_reported)
 
-        # Peer API rejects callers without a worker token.
-        assert (await c.get(f"/api/peer/projects/{pid}/threads")).status_code == 401
+        # Workers never call the control plane, so it serves no peer API.
+        assert (await c.get(f"/api/peer/projects/{pid}/threads")).status_code == 404
+
+        # Across workers: list, read and message threads on another worker.
+        on = {t["id"]: t["worker_id"] for t in (await c.get(f"/api/projects/{pid}/threads")).json()}
+        assert on[ids[0]] and on[ids[1]] and on[ids[0]] != on[ids[1]]
+        await c.post(f"/api/projects/{pid}/requests", json={
+            "text": f"list: export\nread {ids[0]}\ntell {ids[0]}: hello from the export thread",
+            "mode": "thread", "target": ids[1]})
+
+        async def peers_answered():
+            tr = (await c.get(f"/api/threads/{ids[1]}/transcript")).json()
+            results = {e["label"]: e["text"] for e in tr if e["type"] == "tool_result"}
+            got = (await c.get(f"/api/threads/{ids[0]}/transcript")).json()
+            told = any(e["type"] == "message_in" and "hello from the export thread" in e["text"] for e in got)
+            if "list_threads result" in results and "read_thread result" in results and told:
+                return results
+        results = await wait_for(peers_answered)
+        assert "export bug" in results["list_threads result"] and "login page" not in results["list_threads result"]
+        assert ids[0] in results["read_thread result"]
 
         # The project SSE stream replays from ?after.
         async with c.stream("GET", f"/api/projects/{pid}/events", params={"after": 0}) as s:

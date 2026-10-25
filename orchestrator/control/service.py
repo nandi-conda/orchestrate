@@ -10,9 +10,6 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
-import httpx
-
-from .context import request_base_url
 from .providers import Worker, WorkerProvider, WorkerSpec
 from .router import Router
 from .runner_client import RunnerClient
@@ -25,12 +22,19 @@ CAPACITY = 16  # running threads per worker before another one starts
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
 
 
-def worker_spec(project: dict, index: int, public_url: str = "") -> WorkerSpec:
-    """Where the next worker should call back. `public_url` is an explicit
-    override; otherwise the address the current request came in on, which is
-    what decides local versus sprite too."""
+def worker_spec(project: dict, index: int) -> WorkerSpec:
     return WorkerSpec(project_id=project["id"], index=index, repo_url=project.get("repo_url", ""),
-                      orchestrator_url=public_url or request_base_url.get(), capacity=CAPACITY)
+                      capacity=CAPACITY)
+
+
+def peer_entry(t: dict) -> dict:
+    """A thread as the runner's directory entry shape (runner/API.md)."""
+    return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
+            "summary": t["summary"], "files": t["files"], "parent": t["parent_id"]}
+
+
+class PeerCallError(Exception):
+    """A peer call the orchestrator refuses; its text goes back to the tool."""
 
 
 @dataclass
@@ -45,22 +49,17 @@ class LiveWorker:
 
 class Orchestrator:
     def __init__(self, store: Store, provider: WorkerProvider, router: Router,
-                 public_url: str = "", max_running: int = 64) -> None:
+                 max_running: int = 64) -> None:
         self.store = store
         self.provider = provider
         self.router = router
-        self.public_url = public_url
         self.max_running = max_running
         self.workers: dict[str, list[LiveWorker]] = {}
         self.by_thread: dict[str, LiveWorker] = {}
-        self.by_token: dict[str, LiveWorker] = {}
         # Spawned threads whose request the runner has yet to echo back as their
         # first message_in; the "created" event already shows it.
         self.unechoed: dict[str, str] = {}
         self._lock = asyncio.Lock()
-        # The control plane's own ASGI app: pull-mode peer calls are run against
-        # its peer API, so they are checked exactly like calls a worker dials in.
-        self.peer_app = None
 
     async def close(self) -> None:
         for lws in self.workers.values():
@@ -87,21 +86,16 @@ class Orchestrator:
                     best, best_load = lw, running
             if best is not None:
                 return best
-            spec = worker_spec(project, len(lws) + 1, self.public_url)
+            spec = worker_spec(project, len(lws) + 1)
             worker = await self.provider.create(spec)
             await self.store.upsert_worker(worker.record())
             lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
             lw.relay = asyncio.create_task(self._relay(project["id"], lw))
-            if worker.peers == "pull":
-                lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
+            lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
             lws.append(lw)
-            self.by_token[worker.token] = lw
             await self.store.append_event(project["id"], None, "worker",
                                           {"id": worker.id, "provider": worker.provider, "url": worker.url})
             return lw
-
-    def worker_for_token(self, token: str) -> LiveWorker | None:
-        return self.by_token.get(token)
 
     async def _relay(self, project_id: str, lw: LiveWorker) -> None:
         """Copy a worker's event stream into the store; reconnect on drops."""
@@ -116,15 +110,14 @@ class Orchestrator:
                 log.warning("relay from %s dropped: %s", lw.worker.id, e)
             await asyncio.sleep(1.0)
 
+    # ---------------------------------------------------------------- peer calls
+    #
+    # The control plane is never reachable from a worker: it opens every
+    # connection. Each worker queues its threads' peer calls (list, read,
+    # message, spawn, summary) and this pump long-polls them off it, runs each
+    # one concurrently and posts the answer back (runner/API.md, "Peer calls").
+
     async def _pump_peer_calls(self, lw: LiveWorker) -> None:
-        """Collect a pull-mode worker's peer calls and answer them. Every
-        connection is opened from here, so the worker never has to reach us."""
-        if self.peer_app is None:
-            log.warning("worker %s is in pull mode but there is no peer API to run its calls", lw.worker.id)
-            return
-        # A loopback base: a thread spawned by one of these calls goes to a pull-mode worker too.
-        local = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.peer_app), base_url="http://127.0.0.1",
-                                  headers={"authorization": f"Bearer {lw.worker.token}"}, timeout=None)
         running: set[asyncio.Task] = set()
         try:
             while True:
@@ -137,32 +130,88 @@ class Orchestrator:
                     await asyncio.sleep(1.0)
                     continue
                 for call in calls:
-                    task = asyncio.create_task(self._answer_peer_call(lw, local, call))
+                    task = asyncio.create_task(self._answer_peer_call(lw, call))
                     running.add(task)
                     task.add_done_callback(running.discard)
         finally:
             for task in running:
                 task.cancel()
-            await local.aclose()
 
-    async def _answer_peer_call(self, lw: LiveWorker, local: httpx.AsyncClient, call: dict) -> None:
-        method, path = str(call.get("method", "GET")).upper(), str(call.get("path", ""))
-        if not path.startswith("/api/peer/") or ".." in path:
-            status, body = 403, {"error": "only /api/peer/ routes"}
-        else:
-            try:
-                r = await local.request(method, path, params=call.get("params") or None, json=call.get("json"))
-                status = r.status_code
-                try:
-                    body = r.json() if r.content else None
-                except ValueError:
-                    body = r.text
-            except Exception as e:
-                status, body = 500, {"error": f"{type(e).__name__}: {e}"}
+    async def _answer_peer_call(self, lw: LiveWorker, call: dict) -> None:
+        op, args = call.get("op"), call.get("args") or {}
+        handler = self.PEER_OPS.get(op) if isinstance(op, str) else None
         try:
-            await lw.client.answer_peer_call(call["id"], status, body)
+            if handler is None:
+                raise PeerCallError(f"unknown op {op!r}")
+            reply = {"ok": True, "result": await handler(self, lw.worker.project_id, **args)}
+        except PeerCallError as e:
+            reply = {"ok": False, "error": str(e)}
+        except TypeError as e:  # wrong or missing args
+            reply = {"ok": False, "error": f"bad arguments for {op}: {e}"}
+        except Exception as e:
+            log.exception("peer call %s from %s", op, lw.worker.id)
+            reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        try:
+            await lw.client.answer_peer_call(call["id"], reply)
         except Exception as e:  # the worker hands the call out again after its lease
             log.warning("answering peer call %s on %s: %s", call.get("id"), lw.worker.id, e)
+
+    async def _own_thread(self, project_id: str, thread_id: str | None) -> dict:
+        """A thread of the calling worker's project; nothing else is visible to it."""
+        t = await self.store.get_thread(thread_id) if thread_id else None
+        if t is None or t["project_id"] != project_id:
+            raise PeerCallError(f"no thread {thread_id}")
+        return t
+
+    async def peer_list_threads(self, project_id: str, project: str, query: str | None = None) -> list[dict]:
+        if project != project_id:
+            raise PeerCallError("threads of another project are not visible")
+        threads = [peer_entry(t) for t in await self.store.list_threads(project_id)]
+        q = (query or "").lower()
+        return [t for t in threads if q in (t["title"] + " " + t["summary"]).lower()] if q else threads
+
+    async def peer_read_thread(self, project_id: str, thread_id: str, last_n: int = 20) -> dict:
+        t = await self._own_thread(project_id, thread_id)
+        events = await self.store.list_events(project_id, t["id"], 0, limit=5000)
+        recent = [{"seq": e["seq"], "thread": e["thread_id"], "type": e["type"], "ts": e["created_at"],
+                   "data": e["payload"]} for e in events[-int(last_n):]]
+        return {**peer_entry(t), "events": recent}
+
+    async def peer_send_message(self, project_id: str, sender: str, to: str, body: str,
+                                reply_to: str | None = None, hops: int = 0) -> dict:
+        t = await self._own_thread(project_id, to)
+        src = await self.store.get_thread(sender) if sender else None
+        await self.send(t["id"], str(body), sender or "unknown", int(hops or 0) + 1, reply_to)
+        if src and src["project_id"] == project_id:
+            await self.store.append_event(project_id, sender, "message_out", {"to": to, "body": body})
+        return {"ok": True}
+
+    async def peer_spawn_thread(self, project_id: str, parent: str | None, project: str, title: str,
+                                request: str) -> dict:
+        if project != project_id:
+            raise PeerCallError("cannot spawn threads in another project")
+        request = str(request or "").strip()
+        if not request:
+            raise PeerCallError("request is required")
+        from .router import title_for
+        try:
+            t = await self.spawn(project_id, title or title_for(request), request, parent)
+        except RuntimeError as e:
+            raise PeerCallError(str(e)) from None
+        return {"id": t["id"], "title": t["title"]}
+
+    async def peer_set_summary(self, project_id: str, thread_id: str, summary: str,
+                               files: list | None = None) -> dict:
+        t = await self._own_thread(project_id, thread_id)
+        fields = {"summary": str(summary or "")}
+        if isinstance(files, list):
+            fields["files"] = [str(f) for f in files]
+        await self.store.update_thread(t["id"], **fields)
+        return {"ok": True}
+
+    PEER_OPS = {"list_threads": peer_list_threads, "read_thread": peer_read_thread,
+                "send_message": peer_send_message, "spawn_thread": peer_spawn_thread,
+                "set_summary": peer_set_summary}
 
     async def _ingest(self, project_id: str, ev: dict) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}

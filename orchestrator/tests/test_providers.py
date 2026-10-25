@@ -1,4 +1,4 @@
-"""Where workers run and what address they call back on.
+"""Where workers run.
 
 No network and no keyring: `control.secrets.get_secret` is patched, so these
 run anywhere.
@@ -9,7 +9,6 @@ import subprocess
 import pytest
 
 from control import providers, secrets
-from control.context import base_url_from_scope, request_base_url
 from control.service import worker_spec
 
 pytestmark = pytest.mark.anyio
@@ -48,59 +47,18 @@ class Recording:
         pass
 
 
-async def test_a_loopback_address_still_uses_sprites(env, capsys):
+async def test_a_token_means_sprites(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     local, sprites = Recording("local"), Recording("sprites")
     p = providers.AutoProvider(local=local, sprites=sprites)
-    worker = await p.create(worker_spec({"id": "p_1"}, 1, "http://127.0.0.1:8000"))
-    assert worker.provider == "sprites" and not local.created
-    assert "peer API" in capsys.readouterr().err
+    worker = await p.create(worker_spec({"id": "p_1"}, 1))
+    assert worker.provider == "sprites" and sprites.created and not local.created
 
 
-async def test_a_loopback_callback_switches_to_pull_mode(env):
-    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
-    sprites = Recording("sprites")
-    p = providers.AutoProvider(sprites=sprites)
-    await p.create(worker_spec({"id": "p_1"}, 1, "http://127.0.0.1:8000"))
-    assert sprites.created[0].orchestrator_url == ""
-    assert sprites.created[0].peer_mode == "pull"
-
-
-def test_peer_env():
-    w = providers.Worker(id="w", project_id="p", provider="sprites", handle="", url="u")
-    pull = providers.WorkerSpec(project_id="p", index=1, peer_mode="pull")
-    assert providers.peer_env(pull, w) == {"RUNNER_PEERS": "pull"} and w.peers == "pull"
-    direct = providers.WorkerSpec(project_id="p", index=1, orchestrator_url="https://o.example.com")
-    assert providers.peer_env(direct, w) == {"ORCHESTRATOR_URL": "https://o.example.com",
-                                             "ORCHESTRATOR_TOKEN": w.token} and w.peers == "http"
-
-
-async def test_a_public_address_moves_workers_to_sprites(env):
-    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
-    local, sprites = Recording("local"), Recording("sprites")
-    p = providers.AutoProvider(local=local, sprites=sprites)
-    await p.create(worker_spec({"id": "p_1"}, 1, "https://orch.example.com"))
-    assert sprites.created and not local.created
-
-
-async def test_a_public_url_override_keeps_the_callback(env):
-    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
-    sprites = Recording("sprites")
-    p = providers.AutoProvider(sprites=sprites)
-    token = request_base_url.set("http://127.0.0.1:8000")
-    try:
-        spec = worker_spec({"id": "p_1"}, 1, "https://orch.example.com")
-    finally:
-        request_base_url.reset(token)
-    await p.create(spec)
-    assert sprites.created[0].orchestrator_url == "https://orch.example.com"
-    assert sprites.created[0].peer_mode == ""
-
-
-async def test_a_public_address_without_a_token_stays_local(env, capsys):
+async def test_no_token_means_local_workers(env, capsys):
     local = Recording("local")
     p = providers.AutoProvider(local=local)
-    await p.create(worker_spec({"id": "p_1"}, 1, "https://orch.example.com"))
+    await p.create(worker_spec({"id": "p_1"}, 1))
     assert local.created
     assert "SPRITES_TOKEN is not stored" in capsys.readouterr().err
 
@@ -111,19 +69,6 @@ async def test_destroy_goes_to_the_provider_that_made_the_worker(env):
     worker = providers.Worker(id="x", project_id="p_1", provider="sprites", handle="x", url="u")
     await p.destroy(worker)
     assert sprites.destroyed == [worker] and not local.destroyed
-
-
-@pytest.mark.parametrize("url,ok", [
-    ("https://orch.example.com", True),
-    ("http://93.184.216.34:8000", True),
-    ("http://127.0.0.1:8000", False),
-    ("http://localhost:8000", False),
-    ("http://192.168.1.5:8000", False),
-    ("http://0.0.0.0:8000", False),
-    ("", False),
-])
-def test_public_url_ok(url, ok):
-    assert providers.public_url_ok(url) is ok
 
 
 def test_passthrough_env_reads_a_keyring_only_secret(env):
@@ -137,68 +82,10 @@ def test_passthrough_env_never_includes_the_sprites_token(env):
     assert "SPRITES_TOKEN" not in kept
 
 
-@pytest.mark.parametrize("url,rule", [
-    ("https://orch.example.com", {"action": "allow", "domain": "orch.example.com"}),
-    ("http://93.184.216.34:8000", {"action": "allow", "address": "93.184.216.34",
-                                    "protocol": "tcp", "port": 8000}),
-    ("https://93.184.216.34", {"action": "allow", "address": "93.184.216.34",
-                               "protocol": "tcp", "port": 443}),
-    ("", None),
-])
-def test_allow_host_rule(url, rule):
-    assert providers.allow_host_rule(url) == rule
-
-
-def _scope(headers, scheme="http"):
-    return {"type": "http", "scheme": scheme,
-            "headers": [(k.encode(), v.encode()) for k, v in headers]}
-
-
-def test_base_url_comes_from_the_request_headers():
-    assert base_url_from_scope(_scope([("host", "127.0.0.1:8000")])) == "http://127.0.0.1:8000"
-    assert base_url_from_scope(
-        _scope([("host", "orch.example.com"), ("x-forwarded-proto", "https")])) == "https://orch.example.com"
-    assert base_url_from_scope(
-        _scope([("host", "0.0.0.0:8000"), ("x-forwarded-host", "orch.example.com")])) == "http://orch.example.com"
-
-
-def test_base_url_rejects_a_host_that_is_not_an_address():
-    assert base_url_from_scope(_scope([("host", "evil.example/../x")])) == ""
-    assert base_url_from_scope(_scope([])) == ""
-    assert base_url_from_scope({"type": "lifespan", "headers": []}) == ""
-
-
-async def test_the_app_records_the_address_for_the_duration_of_a_request():
-    from control.app import BaseUrlMiddleware
-
-    seen = {}
-
-    async def app(scope, receive, send):
-        seen["url"] = request_base_url.get()
-
-    middleware = BaseUrlMiddleware(app)
-    await middleware(_scope([("host", "orch.example.com"), ("x-forwarded-proto", "https")]), None, None)
-    assert seen["url"] == "https://orch.example.com"
-    assert request_base_url.get() == ""  # reset, so the next request starts clean
-
-
-def test_worker_spec_uses_the_address_of_the_current_request():
-    token = request_base_url.set("https://orch.example.com")
-    try:
-        spec = worker_spec({"id": "p_1", "repo_url": "https://example.com/r.git"}, 2)
-    finally:
-        request_base_url.reset(token)
-    assert (spec.orchestrator_url, spec.index, spec.repo_url) == (
-        "https://orch.example.com", 2, "https://example.com/r.git")
-
-
-def test_worker_spec_override_wins_over_the_request():
-    token = request_base_url.set("http://127.0.0.1:8000")
-    try:
-        spec = worker_spec({"id": "p_1"}, 1, "https://orch.example.com")
-    finally:
-        request_base_url.reset(token)
-    assert spec.orchestrator_url == "https://orch.example.com"
+def test_worker_spec_carries_no_control_plane_address():
+    spec = worker_spec({"id": "p_1", "repo_url": "https://example.com/r.git"}, 2)
+    assert (spec.index, spec.repo_url) == (2, "https://example.com/r.git")
+    assert not hasattr(spec, "orchestrator_url")
 
 
 def _checkout(tmp_path):

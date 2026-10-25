@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from .model import from_spec
-from .peers import HttpPeers, PulledPeers
+from .peers import OrchestratorPeers
 from .secrets import get_secret, require
 from .thread import Limits, ThreadHost, dumps
 
@@ -107,7 +107,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         backlog = sorted((e for t in host.threads.values() for e in t.events), key=lambda e: e["seq"])
         return sse(None, after_of(req), backlog)
 
-    outbox = host.peers.outbox if isinstance(host.peers, PulledPeers) else None
+    outbox = host.peers.outbox if isinstance(host.peers, OrchestratorPeers) else None
 
     async def peer_calls(req: Request):
         if outbox is None:
@@ -117,7 +117,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
     async def peer_answer(req: Request):
         b = await req.json()
-        if outbox is None or not outbox.answer(req.path_params["id"], int(b.get("status", 200)), b.get("body")):
+        if outbox is None or not isinstance(b, dict) or not outbox.answer(req.path_params["id"], b):
             return JSONResponse({"error": "no such call"}, status_code=404)
         return JSONResponse({"ok": True})
 
@@ -136,16 +136,9 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
 
 def host_from_env() -> ThreadHost:
-    orch = os.environ.get("ORCHESTRATOR_URL")
-    if os.environ.get("RUNNER_PEERS") == "pull":
-        peers = PulledPeers()  # the orchestrator collects calls from /peer/calls
-    elif orch:
-        peers = HttpPeers(orch, get_secret("ORCHESTRATOR_TOKEN") or "")
-    else:
-        peers = None
     return ThreadHost(
         model_factory=from_spec,
-        peers=peers,
+        peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
         repo=os.environ.get("RUNNER_REPO") or None,
         workdir=os.environ.get("RUNNER_WORKDIR", "/work/threads"),
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
@@ -157,8 +150,7 @@ def main():
     import sys
 
     import uvicorn
-    dials = os.environ.get("ORCHESTRATOR_URL") and os.environ.get("RUNNER_PEERS") != "pull"
-    require(["DEEPSEEK_API_KEY"] + (["ORCHESTRATOR_TOKEN"] if dials else []))
+    require(["DEEPSEEK_API_KEY"])
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)

@@ -11,12 +11,15 @@ when every worker it has is at capacity.
   it and runs it as a sprite service on port 8080.
 - `AutoProvider` is the default: sprites whenever `SPRITES_TOKEN` is stored,
   local workers otherwise.
+
+A worker is never told where the control plane is and never connects to it:
+the control plane opens every connection, including the one that collects its
+peer calls. So a provider only has to hand back a URL the control plane can reach.
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import os
 import secrets
 import shlex
@@ -24,7 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -40,7 +43,6 @@ class Worker:
     url: str
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     capacity: int = 16
-    peers: str = ""  # "http": dials the peer API; "pull": the control plane collects calls; "": none
 
     def record(self) -> dict:
         return asdict(self)
@@ -51,21 +53,9 @@ class WorkerSpec:
     project_id: str
     index: int
     repo_url: str = ""
-    orchestrator_url: str = ""
     capacity: int = 16
     env: dict = field(default_factory=dict)
-    peer_mode: str = ""  # "pull": the worker queues peer calls and the control plane collects them
 
-
-def peer_env(spec: WorkerSpec, worker: Worker) -> dict:
-    """How the runner reaches the peer API, and what `worker.peers` records."""
-    if spec.peer_mode == "pull":
-        worker.peers = "pull"
-        return {"RUNNER_PEERS": "pull"}
-    if spec.orchestrator_url:
-        worker.peers = "http"
-        return {"ORCHESTRATOR_URL": spec.orchestrator_url, "ORCHESTRATOR_TOKEN": worker.token}
-    return {}
 
 
 class WorkerProvider(Protocol):
@@ -111,36 +101,6 @@ def passthrough_env() -> dict:
     keep = ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "RUNNER_MAX_STEPS")
     found = {k: get_secret(k) for k in keep}
     return {k: v for k, v in found.items() if v}
-
-
-def public_url_ok(url: str) -> bool:
-    """Can a sprite reach this URL? Loopback, LAN and link-local addresses
-    cannot be dialled from outside, so those count as unusable. A name is taken
-    at face value: only DNS knows where it points."""
-    host = httpx.URL(url).host if url else ""
-    if not host or host == "localhost":
-        return False
-    try:
-        return ipaddress.ip_address(host).is_global
-    except ValueError:
-        return True
-
-
-def allow_host_rule(url: str) -> dict | None:
-    """A network-policy rule that lets a sprite reach `url`.
-
-    A name is allowed as a domain; an address needs an explicit port, because
-    address rules match `protocol`/`port` rather than everything on a host."""
-    u = httpx.URL(url or "")
-    host = u.host
-    if not host:
-        return None
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return {"action": "allow", "domain": host}
-    return {"action": "allow", "address": host, "protocol": "tcp",
-            "port": u.port or (443 if u.scheme == "https" else 80)}
 
 
 DEFAULT_SOURCE = "https://github.com/nandi-conda/orchestrate"
@@ -216,7 +176,6 @@ class LocalProvider:
                "RUNNER_CAPACITY": str(spec.capacity)}
         if spec.repo_url:
             env["RUNNER_REPO"] = spec.repo_url
-        env.update(peer_env(spec, worker))
         cwd = Path(__file__).resolve().parents[1]
         proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd))
         worker.handle = str(proc.pid)
@@ -318,7 +277,6 @@ class SpritesProvider:
                "RUNNER_CAPACITY": str(spec.capacity)}
         if spec.repo_url:
             env["RUNNER_REPO"] = spec.repo_url
-        env.update(peer_env(spec, worker))
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
@@ -328,9 +286,6 @@ class SpritesProvider:
                 pass
         if self.allow_domains:
             rules = [{"action": "allow", "domain": d} for d in self.allow_domains]
-            rule = allow_host_rule(spec.orchestrator_url) if worker.peers == "http" else None
-            if rule:
-                rules.append(rule)
             await self.http.post(f"/sprites/{name}/policy/network", json={"rules": rules})
         await wait_healthy(worker.url, timeout=300)
         return worker
@@ -351,18 +306,10 @@ class SpritesProvider:
 
 
 class AutoProvider:
-    """Remote first: workers are sprites whenever a token is stored, no matter
-    where the browser reached the control plane from. Without a token the
-    control plane falls back to local workers, so the offline echo demo still
-    works.
-
-    The request address still decides how a sprite reaches the peer API. A
-    public address is dialled directly. A loopback or private one cannot be
-    dialled from a sprite, so that worker runs in pull mode instead: it queues
-    its peer calls and the control plane, which can reach the sprite, collects
-    them over plain HTTP (runner/API.md, "Pull mode"). `--public-url` turns
-    direct calls back on.
-    """
+    """Remote first: workers are sprites whenever a token is stored. Without a
+    token the control plane falls back to local workers, so the offline echo
+    demo still works. Either way the control plane opens every connection, so
+    where it runs never matters to the worker."""
 
     name = "auto"
 
@@ -371,7 +318,6 @@ class AutoProvider:
         self._sprites = sprites
         self._looked_for_token = sprites is not None
         self._warned_local = False
-        self._warned_callback = False
 
     def local(self) -> LocalProvider:
         if self._local is None:
@@ -395,14 +341,6 @@ class AutoProvider:
                       "Store it with `pixi run set-key SPRITES_TOKEN` to run workers on Sprites.",
                       file=sys.stderr)
             return await self.local().create(spec)
-        if not public_url_ok(spec.orchestrator_url):
-            if not self._warned_callback:
-                self._warned_callback = True
-                where = spec.orchestrator_url or "the control plane"
-                print(f"AutoProvider: a sprite cannot reach {where}, so the control plane collects "
-                      "its peer API calls instead (pull mode). Pass --public-url to have sprites "
-                      "call back directly.", file=sys.stderr)
-            spec = replace(spec, orchestrator_url="", peer_mode="pull")
         return await provider.create(spec)
 
     async def destroy(self, worker: Worker) -> None:

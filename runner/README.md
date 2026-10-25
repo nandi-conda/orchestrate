@@ -22,7 +22,7 @@ and environment variables are in [API.md](API.md).
 | `src/runner/sandbox.py` | `Sandbox` protocol, `LocalSandbox` |
 | `src/runner/tools.py` | work tools (bash, files) and peer tools (threads, messages) |
 | `src/runner/thread.py` | `AgentThread` loop and `ThreadHost` (worktrees, events, capacity) |
-| `src/runner/peers.py` | `HttpPeers` (orchestrator) and `LocalPeers` (same process) |
+| `src/runner/peers.py` | `OrchestratorPeers` (queued for the orchestrator to collect) and `LocalPeers` (same process) |
 | `src/runner/server.py` | Starlette app |
 | `src/runner/cli.py` | one-shot local run |
 

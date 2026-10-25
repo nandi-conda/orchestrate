@@ -21,10 +21,11 @@ pixi run test                         # both test suites: runner, then orchestra
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```
 
-With `SPRITES_TOKEN` stored, workers are sprites even when the UI is reached on
-localhost. A sprite cannot call back to `127.0.0.1`, so pass
-`--public-url https://…` (the tunnel or public address) when the control plane
-is local; without it, workers run but their peer API is disabled.
+With `SPRITES_TOKEN` stored, workers are sprites, including when the control
+plane runs on your laptop. The control plane is never reachable from a worker,
+by design: it opens every connection, and it also collects the workers' peer
+calls (list, read, message and spawn threads across workers), so nothing has to
+be exposed or tunnelled.
 
 The same tasks with their full lists are still there: `cd orchestrator && pixi run <task>`
 and `cd runner && pixi run <task>`.

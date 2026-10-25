@@ -81,19 +81,33 @@ What the control plane works out for itself:
 | | How |
 | --- | --- |
 | Where workers run | Sprites whenever `SPRITES_TOKEN` is stored, even when the browser is on this machine. Local only when no token is stored |
-| What the runner calls back on | The address the browser used, taken from `Host` and `X-Forwarded-Host`/`X-Forwarded-Proto`, or `--public-url`. A loopback/private address cannot be reached from a sprite, so that worker runs in pull mode: the control plane long-polls the sprite for its peer calls and posts the answers back, over connections it opens itself |
 | What a sprite checks out | This checkout's `origin` remote and current branch, with a warning when the sprite would not get this exact commit |
 | Which router | The model when `DEEPSEEK_API_KEY` is stored, the rule-based one otherwise |
 | Storage | SQLite in `orchestrator.db`, or `--db postgresql://…` for several control planes |
 
-Flags: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db`,
-`--public-url` (an address a sprite can dial directly; optional, see below).
+Flags: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db`.
 
-Because the callback address comes from the request, publish the control plane
-behind a proxy you trust and have it forward the original host, and remember
-that only `/api/peer/*` is authenticated — the UI API is not. Reaching the UI
-through a public URL means anyone with that URL can use it. A control plane on
-localhost needs no tunnel: sprites reach its peer API in pull mode.
+The UI API is not authenticated, so keep `--host` on loopback unless the
+network in front of it is trusted. Workers never need to reach it.
+
+### Workers never connect to the control plane
+
+The control plane is not reachable from workers, by design: it can sit on a
+laptop behind NAT, and it opens every connection. It drives each worker over
+the worker's own URL (create threads, post messages, stream events), and it
+also carries the workers' peer calls:
+
+1. A thread's peer tool (`list_threads`, `read_thread`, `send_message`,
+   `spawn_thread`, `set_summary`) queues the call on its worker.
+2. The control plane holds a long poll on each worker's `GET /peer/calls`,
+   which returns the moment a call is queued.
+3. It runs every call concurrently, scoped to the worker's project
+   (`Orchestrator.PEER_OPS` in `control/service.py`), and posts the answer to
+   `POST /peer/calls/{id}`.
+
+So threads on different workers, local or on Sprites, list, read, message and
+spawn each other in one round trip from the control plane. The protocol is in
+`runner/API.md`, "Peer calls".
 
 ### Storage
 
@@ -104,7 +118,7 @@ localhost needs no tunnel: sprites reach its peer API in pull mode.
   share state. Appends are announced with `LISTEN/NOTIFY`, so an event written
   by one instance wakes SSE streams on all of them.
 
-Runners never touch the database; they talk to the control plane over HTTP.
+Runners never touch the database, and never connect to the control plane.
 
 ### Sprites
 
@@ -113,25 +127,13 @@ When `SPRITES_TOKEN` is stored, each worker is a sprite named
 localhost. The provider clones this repo to `/opt/orchestrate`, runs
 `runner/deploy/bootstrap.sh`, and registers `runner/deploy/start.sh` as the
 sprite service on port 8080. It also sets a network policy that allows only
-DeepSeek, GitHub, the package mirrors and, for direct peer calls, the orchestrator.
-
-The peer API (other threads, messages, spawning) works whether or not a
-sprite can reach the control plane:
-
-- **Pull mode** (the default for a loopback or private address, such as
-  `127.0.0.1:8000`): the runner starts with `RUNNER_PEERS=pull` and queues its
-  peer calls. The control plane long-polls `GET /peer/calls` on the sprite's
-  URL, runs each call against its own peer API, and posts the answer to
-  `/peer/calls/{id}` (runner/API.md, "Pull mode"). Only the control plane
-  opens connections, so nothing has to be exposed.
-- **Direct**: with a public address, or `--public-url`, the runner dials
-  `/api/peer/*` itself.
+DeepSeek, GitHub and the package mirrors; the control plane is not on it,
+since a sprite never connects to it.
 
 ```sh
 cd orchestrator
 pixi run set-key SPRITES_TOKEN
-pixi run serve                                          # pull mode
-pixi run serve --public-url https://orch.example.com   # direct, via a tunnel or public host
+pixi run serve
 ```
 
 A laptop session now starts billable sprites as soon as it spawns a thread;
@@ -148,8 +150,8 @@ The spawn path has been exercised against the live API: create, bootstrap,
 
 | Path | What |
 | --- | --- |
-| `control/app.py` | Starlette app: UI API, SSE streams, runner peer API, static UI |
-| `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, pull-mode peer calls, request handling |
+| `control/app.py` | Starlette app: UI API, SSE streams, static UI |
+| `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, peer calls collected from workers, request handling |
 | `control/router.py` | `ModelRouter` (DeepSeek), `HeuristicRouter` |
 | `control/store.py` | `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` (Sprites whenever a token is stored, local otherwise) |
@@ -174,4 +176,3 @@ The spawn path has been exercised against the live API: create, bootstrap,
 | GET | `/api/threads/{id}/events` | SSE |
 | POST | `/api/threads/{id}/messages` | `{body}` |
 | POST | `/api/threads/{id}/stop` | |
-| | `/api/peer/...` | the runner peer API from `runner/API.md`, authenticated with the worker's token |

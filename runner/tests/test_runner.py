@@ -127,11 +127,11 @@ async def test_http_api(tmp_path):
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202
 
 
-async def test_pulled_peers_over_http(tmp_path):
-    from runner.peers import PulledPeers
+async def test_peer_calls_over_http(tmp_path):
+    from runner.peers import OrchestratorPeers, PeerError
 
     host = ThreadHost(model_factory=lambda spec: ScriptedModel([]), workdir=str(tmp_path / "t"),
-                      peers=PulledPeers())
+                      peers=OrchestratorPeers())
     app = create_app(host, token="secret")
     h = {"Authorization": "Bearer secret"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
@@ -139,20 +139,19 @@ async def test_pulled_peers_over_http(tmp_path):
         assert (await c.get("/peer/calls", params={"wait": 0}, headers=h)).json() == []
         pending = asyncio.ensure_future(host.peers.list_threads("p", "export"))
         calls = (await c.get("/peer/calls", params={"wait": 2}, headers=h)).json()
-        assert [(x["method"], x["path"], x["params"]) for x in calls] == [
-            ("GET", "/api/peer/projects/p/threads", {"q": "export"})]
+        assert [(x["op"], x["args"]) for x in calls] == [("list_threads", {"project": "p", "query": "export"})]
         # leased: not handed out again while the orchestrator works on it
         assert (await c.get("/peer/calls", params={"wait": 0}, headers=h)).json() == []
-        r = await c.post(f"/peer/calls/{calls[0]['id']}", json={"status": 200, "body": [{"id": "t_1"}]}, headers=h)
+        r = await c.post(f"/peer/calls/{calls[0]['id']}", json={"ok": True, "result": [{"id": "t_1"}]}, headers=h)
         assert r.status_code == 200
         assert await pending == [{"id": "t_1"}]
-        assert (await c.post(f"/peer/calls/{calls[0]['id']}", json={"status": 200}, headers=h)).status_code == 404
+        assert (await c.post(f"/peer/calls/{calls[0]['id']}", json={"ok": True}, headers=h)).status_code == 404
 
         failing = asyncio.ensure_future(host.peers.send_message("t_a", "t_b", "hi"))
         call = (await c.get("/peer/calls", params={"wait": 2}, headers=h)).json()[0]
-        assert call["json"]["to"] == "t_b"
-        await c.post(f"/peer/calls/{call['id']}", json={"status": 404, "body": {"error": "no such thread"}}, headers=h)
-        with pytest.raises(RuntimeError, match="404"):
+        assert call["op"] == "send_message" and call["args"]["to"] == "t_b"
+        await c.post(f"/peer/calls/{call['id']}", json={"ok": False, "error": "no such thread"}, headers=h)
+        with pytest.raises(PeerError, match="no such thread"):
             await failing
 
 
@@ -160,12 +159,12 @@ async def test_unanswered_peer_call_is_handed_out_again():
     from runner.peers import PeerOutbox
 
     box = PeerOutbox(lease=0.05)
-    pending = asyncio.ensure_future(box.call("GET", "/api/peer/threads/t_1", None, None, timeout=5))
+    pending = asyncio.ensure_future(box.call("read_thread", {"thread_id": "t_1"}, timeout=5))
     first = await box.take(wait=1)
     again = await box.take(wait=1)
     assert first[0]["id"] == again[0]["id"]
-    box.answer(first[0]["id"], 200, {"ok": True})
-    assert await pending == (200, {"ok": True})
+    box.answer(first[0]["id"], {"ok": True, "result": {}})
+    assert await pending == {"ok": True, "result": {}}
 
 
 def test_secrets_env_then_keyring_then_exit(monkeypatch, capsys):

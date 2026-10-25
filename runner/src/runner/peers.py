@@ -1,9 +1,10 @@
 """How a thread reaches the rest of the system: other threads and the orchestrator.
 
-The orchestrator owns the thread directory and the message bus. A runner talks
-to it through `HttpPeers` when it can dial the orchestrator, or through
-`PulledPeers` when it cannot (a control plane on a laptop): then the calls wait
-in a `PeerOutbox` until the orchestrator collects them. `LocalPeers` keeps
+The orchestrator owns the thread directory and the message bus, and it is never
+reachable from a worker: it opens every connection. So a runner served under an
+orchestrator uses `OrchestratorPeers`, which queues each peer call in a
+`PeerOutbox`; the orchestrator long-polls `GET /peer/calls`, runs the calls and
+posts the answers back (runner/API.md, "Peer calls"). `LocalPeers` keeps
 everything in-process, for a runner used on its own (CLI, tests).
 """
 
@@ -12,8 +13,6 @@ from __future__ import annotations
 import asyncio
 import secrets
 from typing import Any, Callable, Awaitable, Protocol
-
-import httpx
 
 
 class Peers(Protocol):
@@ -24,43 +23,12 @@ class Peers(Protocol):
     async def set_summary(self, thread_id: str, summary: str, files: list[str] | None = None) -> None: ...
 
 
-class HttpPeers:
-    """Calls the orchestrator's peer API (see README: "Orchestrator peer API")."""
-
-    def __init__(self, base_url: str, token: str, client: httpx.AsyncClient | None = None):
-        self.base = base_url.rstrip("/")
-        self.client = client or httpx.AsyncClient(timeout=30.0)
-        self.headers = {"Authorization": f"Bearer {token}"}
-
-    async def _req(self, method: str, path: str, **kw) -> Any:
-        r = await self.client.request(method, f"{self.base}{path}", headers=self.headers, **kw)
-        r.raise_for_status()
-        return r.json() if r.content else None
-
-    async def list_threads(self, project, query=None):
-        return await self._req("GET", f"/api/peer/projects/{project}/threads", params={"q": query} if query else None)
-
-    async def read_thread(self, thread_id, last_n=20):
-        return await self._req("GET", f"/api/peer/threads/{thread_id}", params={"last_n": last_n})
-
-    async def send_message(self, sender, to, body, reply_to=None):
-        return await self._req("POST", "/api/peer/messages", json={"from": sender, "to": to, "body": body, "reply_to": reply_to})
-
-    async def spawn_thread(self, parent, project, title, request):
-        return await self._req("POST", f"/api/peer/projects/{project}/threads", json={"parent": parent, "title": title, "request": request})
-
-    async def set_summary(self, thread_id, summary, files=None):
-        await self._req("PUT", f"/api/peer/threads/{thread_id}/summary", json={"summary": summary, "files": files or []})
-
-
 class PeerOutbox:
-    """Peer API calls waiting for the orchestrator to collect them.
+    """Peer calls waiting for the orchestrator to collect them.
 
-    The orchestrator long-polls `GET /peer/calls` (runner/API.md), runs each
-    call against its own peer API and posts the answer to `/peer/calls/{id}`.
-    Every connection is opened by the orchestrator, so the worker never needs
-    to reach it. A call handed out but not answered within `lease` seconds
-    (a dropped poll response) is handed out again.
+    A long poll returns as soon as a call is queued, so a call costs one round
+    trip from the orchestrator's side. A call handed out but not answered within
+    `lease` seconds (a poll response lost on the way) is handed out again.
     """
 
     def __init__(self, lease: float = 60.0) -> None:
@@ -70,12 +38,12 @@ class PeerOutbox:
         self.futures: dict[str, asyncio.Future] = {}
         self.cond = asyncio.Condition()
 
-    async def call(self, method: str, path: str, params: dict | None, json: Any, timeout: float) -> tuple[int, Any]:
+    async def call(self, op: str, args: dict, timeout: float) -> dict:
         cid = f"pc_{secrets.token_hex(6)}"
         fut = asyncio.get_running_loop().create_future()
         self.futures[cid] = fut
         async with self.cond:
-            self.calls[cid] = {"id": cid, "method": method, "path": path, "params": params, "json": json}
+            self.calls[cid] = {"id": cid, "op": op, "args": args}
             self.cond.notify_all()
         try:
             return await asyncio.wait_for(fut, timeout)
@@ -102,15 +70,19 @@ class PeerOutbox:
                 self.leased[c["id"]] = now + self.lease
             return due
 
-    def answer(self, cid: str, status: int, body: Any) -> bool:
+    def answer(self, cid: str, reply: dict) -> bool:
         fut = self.futures.get(cid)
         if fut is None or fut.done():
             return False
-        fut.set_result((status, body))
+        fut.set_result(reply)
         return True
 
 
-class PulledPeers(HttpPeers):
+class PeerError(RuntimeError):
+    pass
+
+
+class OrchestratorPeers:
     """The peer API, carried over connections the orchestrator opens."""
 
     def __init__(self, outbox: PeerOutbox | None = None, timeout: float = 900.0):
@@ -118,15 +90,29 @@ class PulledPeers(HttpPeers):
         self.outbox = outbox or PeerOutbox()
         self.timeout = timeout
 
-    async def _req(self, method: str, path: str, params: dict | None = None, json: Any = None, **kw) -> Any:
+    async def _call(self, op: str, **args: Any) -> Any:
         try:
-            status, body = await self.outbox.call(method, path, params, json, self.timeout)
+            reply = await self.outbox.call(op, args, self.timeout)
         except asyncio.TimeoutError:
-            raise RuntimeError(f"orchestrator did not collect peer call {method} {path} "
-                               f"within {self.timeout:.0f}s") from None
-        if status >= 400:
-            raise RuntimeError(f"peer API {method} {path} failed ({status}): {str(body)[:300]}")
-        return body
+            raise PeerError(f"the orchestrator did not answer {op} within {self.timeout:.0f}s") from None
+        if not reply.get("ok"):
+            raise PeerError(f"{op}: {reply.get('error') or 'failed'}")
+        return reply.get("result")
+
+    async def list_threads(self, project, query=None):
+        return await self._call("list_threads", project=project, query=query)
+
+    async def read_thread(self, thread_id, last_n=20):
+        return await self._call("read_thread", thread_id=thread_id, last_n=last_n)
+
+    async def send_message(self, sender, to, body, reply_to=None):
+        return await self._call("send_message", sender=sender, to=to, body=body, reply_to=reply_to)
+
+    async def spawn_thread(self, parent, project, title, request):
+        return await self._call("spawn_thread", parent=parent, project=project, title=title, request=request)
+
+    async def set_summary(self, thread_id, summary, files=None):
+        await self._call("set_summary", thread_id=thread_id, summary=summary, files=files or [])
 
 
 class LocalPeers:

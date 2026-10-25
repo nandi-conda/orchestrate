@@ -20,7 +20,6 @@ SERVICE = "orchestrate"
 KNOWN = {
     "DEEPSEEK_API_KEY": ("DeepSeek API key", "Authorization: Bearer <key> to https://api.deepseek.com"),
     "RUNNER_TOKEN": ("token the orchestrator uses to call this runner", "Authorization: Bearer <token> on every route but /health"),
-    "ORCHESTRATOR_TOKEN": ("token this runner uses to call the orchestrator peer API", "Authorization: Bearer <token>"),
 }
 
 

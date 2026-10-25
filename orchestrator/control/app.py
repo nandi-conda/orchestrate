@@ -1,4 +1,7 @@
-"""HTTP API for the UI, the peer API for runners, and the static ultra UI."""
+"""HTTP API for the UI and the static ultra UI.
+
+Workers never call in here: the control plane opens every connection to them
+(control/service.py, "peer calls")."""
 
 from __future__ import annotations
 
@@ -8,13 +11,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from .context import base_url_from_scope, request_base_url
 from .providers import WorkerProvider, default_provider
 from .router import Router, default_router
 from .service import Orchestrator
@@ -74,31 +75,8 @@ def thread_view(t: dict) -> dict:
                               "worker_id", "files", "created_at", "updated_at")}
 
 
-def peer_entry(t: dict) -> dict:
-    """A thread as the runner's directory entry shape (runner/API.md)."""
-    return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
-            "summary": t["summary"], "files": t["files"], "parent": t["parent_id"]}
-
-
-class BaseUrlMiddleware:
-    """Record the address this request came in on, so workers can call back to
-    it and the provider can tell local from reachable-remotely."""
-
-    def __init__(self, app) -> None:
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        token = request_base_url.set(base_url_from_scope(scope))
-        try:
-            return await self.app(scope, receive, send)
-        finally:
-            request_base_url.reset(token)
-
-
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
-               router: Router | None = None, public_url: str | None = None,
+               router: Router | None = None,
                shutdown_event: asyncio.Event | None = None) -> Starlette:
     store = store or store_from_url(None)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
@@ -107,10 +85,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     @asynccontextmanager
     async def lifespan(app):
         await store.open()
-        orch = Orchestrator(store, provider or default_provider(), router or default_router(),
-                            public_url or "")
+        orch = Orchestrator(store, provider or default_provider(), router or default_router())
         holder["orch"] = orch
-        orch.peer_app = app
         app.state.orch = orch
         try:
             yield
@@ -261,81 +237,6 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return JSONResponse({"error": "no such thread"}, 404)
         return sse(t["project_id"], t["id"], after_of(req))
 
-    # ------------------------------------------------------------ peer API (runners)
-
-    def peer_guard(fn):
-        async def inner(req: Request):
-            auth = req.headers.get("authorization", "")
-            token = auth.removeprefix("Bearer ").strip()
-            lw = orch().worker_for_token(token) if token else None
-            if lw is None:
-                return JSONResponse({"error": "unauthorized"}, 401)
-            req.state.worker = lw
-            return await fn(req)
-        return inner
-
-    async def peer_project_ok(req: Request, pid: str) -> bool:
-        return req.state.worker.worker.project_id == pid
-
-    async def peer_threads(req: Request):
-        pid = req.path_params["pid"]
-        if not await peer_project_ok(req, pid):
-            return JSONResponse({"error": "forbidden"}, 403)
-        q = (req.query_params.get("q") or "").lower()
-        threads = [peer_entry(t) for t in await store.list_threads(pid)]
-        if q:
-            threads = [t for t in threads if q in (t["title"] + " " + t["summary"]).lower()]
-        return JSONResponse(threads)
-
-    async def peer_thread(req: Request):
-        t = await store.get_thread(req.path_params["tid"])
-        if t is None or not await peer_project_ok(req, t["project_id"]):
-            return JSONResponse({"error": "no such thread"}, 404)
-        n = int(req.query_params.get("last_n", "20") or 20)
-        events = await store.list_events(t["project_id"], t["id"], 0, limit=5000)
-        recent = [{"seq": e["seq"], "thread": e["thread_id"], "type": e["type"], "ts": e["created_at"],
-                   "data": e["payload"]} for e in events[-n:]]
-        return JSONResponse({**peer_entry(t), "events": recent})
-
-    async def peer_message(req: Request):
-        b = await body(req)
-        to, frm = b.get("to"), b.get("from")
-        t = await store.get_thread(to) if to else None
-        if t is None or not await peer_project_ok(req, t["project_id"]):
-            return JSONResponse({"error": "no such thread"}, 404)
-        src = await store.get_thread(frm) if frm else None
-        hops = int(b.get("hops", 0) or 0)
-        await orch().send(to, str(b.get("body", "")), frm or "unknown", hops + 1, b.get("reply_to"))
-        if src:
-            await store.append_event(t["project_id"], frm, "message_out", {"to": to, "body": b.get("body", "")})
-        return JSONResponse({"ok": True})
-
-    async def peer_spawn(req: Request):
-        pid = req.path_params["pid"]
-        if not await peer_project_ok(req, pid):
-            return JSONResponse({"error": "forbidden"}, 403)
-        b = await body(req)
-        request = str(b.get("request", "")).strip()
-        if not request:
-            return JSONResponse({"error": "request is required"}, 400)
-        from .router import title_for
-        try:
-            t = await orch().spawn(pid, b.get("title") or title_for(request), request, b.get("parent"))
-        except RuntimeError as e:
-            return JSONResponse({"error": str(e)}, 409)
-        return JSONResponse({"id": t["id"], "title": t["title"]})
-
-    async def peer_summary(req: Request):
-        t = await store.get_thread(req.path_params["tid"])
-        if t is None or not await peer_project_ok(req, t["project_id"]):
-            return JSONResponse({"error": "no such thread"}, 404)
-        b = await body(req)
-        fields = {"summary": str(b.get("summary", ""))}
-        if isinstance(b.get("files"), list):
-            fields["files"] = [str(f) for f in b["files"]]
-        await store.update_thread(t["id"], **fields)
-        return JSONResponse({"ok": True})
-
     # ------------------------------------------------------------ UI files
 
     async def index(req: Request):
@@ -362,13 +263,8 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/threads/{tid}/stop", thread_stop, methods=["POST"]),
         Route("/api/threads/{tid}/transcript", transcript, methods=["GET"]),
         Route("/api/threads/{tid}/events", thread_events, methods=["GET"]),
-        Route("/api/peer/projects/{pid}/threads", peer_guard(peer_threads), methods=["GET"]),
-        Route("/api/peer/projects/{pid}/threads", peer_guard(peer_spawn), methods=["POST"]),
-        Route("/api/peer/threads/{tid}", peer_guard(peer_thread), methods=["GET"]),
-        Route("/api/peer/threads/{tid}/summary", peer_guard(peer_summary), methods=["PUT"]),
-        Route("/api/peer/messages", peer_guard(peer_message), methods=["POST"]),
         Route("/", index),
         Route("/p/{pid}", index),
     ]
     routes.append(Mount("/ui", StaticFiles(directory=UI_DIR, check_dir=False)))
-    return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(BaseUrlMiddleware)])
+    return Starlette(routes=routes, lifespan=lifespan)

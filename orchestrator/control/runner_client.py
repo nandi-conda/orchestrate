@@ -37,14 +37,14 @@ class RunnerClient:
         r.raise_for_status()
 
     async def peer_calls(self, wait: float = 25.0) -> list[dict]:
-        """Peer API calls a pull-mode worker has queued (long poll)."""
+        """Peer calls this worker's threads have queued (long poll; see runner/API.md)."""
         r = await self.http.get("/peer/calls", params={"wait": wait},
                                 timeout=httpx.Timeout(wait + 30.0, connect=10.0))
         r.raise_for_status()
         return r.json()
 
-    async def answer_peer_call(self, call_id: str, status: int, body: Any) -> None:
-        r = await self.http.post(f"/peer/calls/{call_id}", json={"status": status, "body": body})
+    async def answer_peer_call(self, call_id: str, reply: dict) -> None:
+        r = await self.http.post(f"/peer/calls/{call_id}", json=reply)
         if r.status_code != 404:  # 404: the call already timed out or was answered
             r.raise_for_status()
 

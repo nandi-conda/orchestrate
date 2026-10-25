@@ -3,10 +3,11 @@
 It has no model. Each turn it says what it got, and:
 - a line `spawn: <task>` in a request spawns a child thread through the peer API,
 - a line `tell t_xxx: <text>` sends that thread a message,
+- a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
-Peer calls go to ORCHESTRATOR_URL, or with RUNNER_PEERS=pull wait on
-/peer/calls for the control plane to collect, as in runner/API.md.
+Peer calls wait on /peer/calls for the control plane to collect, as in
+runner/API.md.
 
 The control plane uses it when ../runner is missing or DEEPSEEK_API_KEY is not
 stored.
@@ -22,7 +23,6 @@ import re
 import secrets
 import time
 
-import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -31,40 +31,33 @@ from starlette.routing import Route
 
 SPAWN = re.compile(r"^\s*spawn:\s*(.+)$", re.M)
 TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
+LIST = re.compile(r"^\s*list:(.*)$", re.M)
+READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 
 
 class Host:
-    def __init__(self, capacity: int, orch_url: str, orch_token: str, delay: float, pull: bool = False) -> None:
+    def __init__(self, capacity: int, delay: float) -> None:
         self.capacity = capacity
         self.delay = delay
         self.threads: dict[str, dict] = {}
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
-        self.client = httpx.AsyncClient(base_url=orch_url, headers={"authorization": f"Bearer {orch_token}"},
-                                        timeout=10.0) if orch_url and not pull else None
-        self.pull = pull
-        self.calls: dict[str, dict] = {}  # pull mode: queued, not yet handed out
+        self.calls: dict[str, dict] = {}  # peer calls queued, not yet handed out
         self.waiting: dict[str, asyncio.Future] = {}
         self.calls_cond = asyncio.Condition()
 
-    @property
-    def peer(self) -> bool:
-        return self.pull or self.client is not None
-
-    async def peer_call(self, method: str, path: str, json_body: dict) -> str:
-        if self.client is not None:
-            return (await self.client.request(method, path, json=json_body)).text
+    async def peer_call(self, op: str, **args) -> str:
         cid = f"pc_{secrets.token_hex(5)}"
         fut = asyncio.get_running_loop().create_future()
         self.waiting[cid] = fut
         async with self.calls_cond:
-            self.calls[cid] = {"id": cid, "method": method, "path": path, "params": None, "json": json_body}
+            self.calls[cid] = {"id": cid, "op": op, "args": args}
             self.calls_cond.notify_all()
         try:
-            _, body = await asyncio.wait_for(fut, 60)
+            reply = await asyncio.wait_for(fut, 60)
         finally:
             self.waiting.pop(cid, None)
-        return json.dumps(body)
+        return json.dumps(reply.get("result") if reply.get("ok") else {"error": reply.get("error")})
 
     async def take_calls(self, wait: float) -> list[dict]:
         async with self.calls_cond:
@@ -90,23 +83,26 @@ class Host:
         await self.set_state(t, "working")
         await asyncio.sleep(self.delay)
         await self.emit(t["id"], "assistant", {"content": f"Echo: {text}"})
-        if self.peer:
-            for task in SPAWN.findall(text):
-                await self.emit(t["id"], "tool_call", {"id": "c1", "name": "spawn_thread",
-                                                       "arguments": {"request": task}})
-                r = await self.peer_call("POST", f"/api/peer/projects/{t['project']}/threads",
-                                         {"parent": t["id"], "title": task[:40], "request": task})
-                await self.emit(t["id"], "tool_result", {"id": "c1", "name": "spawn_thread", "result": r})
-            for to, body in TELL.findall(text):
-                await self.peer_call("POST", "/api/peer/messages", {"from": t["id"], "to": to, "body": body})
+        for task in SPAWN.findall(text):
+            await self.emit(t["id"], "tool_call", {"id": "c1", "name": "spawn_thread",
+                                                   "arguments": {"request": task}})
+            r = await self.peer_call("spawn_thread", parent=t["id"], project=t["project"], title=task[:40],
+                                     request=task)
+            await self.emit(t["id"], "tool_result", {"id": "c1", "name": "spawn_thread", "result": r})
+        for to, body in TELL.findall(text):
+            await self.peer_call("send_message", sender=t["id"], to=to, body=body)
+        for query in LIST.findall(text):
+            r = await self.peer_call("list_threads", project=t["project"], query=query.strip() or None)
+            await self.emit(t["id"], "tool_result", {"id": "c2", "name": "list_threads", "result": r})
+        for tid in READ.findall(text):
+            r = await self.peer_call("read_thread", thread_id=tid, last_n=5)
+            await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
         summary = f"echoed {len(text)} chars"
         t["summary"] = summary
         await self.emit(t["id"], "turn_done", {"summary": summary, "final": f"Echo: {text}"})
-        if self.peer:
-            await self.peer_call("PUT", f"/api/peer/threads/{t['id']}/summary", {"summary": summary, "files": []})
-            if t.get("parent") and not text.startswith("Finished:"):
-                await self.peer_call("POST", "/api/peer/messages",
-                                     {"from": t["id"], "to": t["parent"], "body": f"Finished: {summary}"})
+        await self.peer_call("set_summary", thread_id=t["id"], summary=summary, files=[])
+        if t.get("parent") and not text.startswith("Finished:"):
+            await self.peer_call("send_message", sender=t["id"], to=t["parent"], body=f"Finished: {summary}")
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
 
@@ -195,8 +191,6 @@ def create_app(host: Host, token: str) -> Starlette:
     async def peer_calls(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
-        if not host.pull:
-            return JSONResponse([])
         return JSONResponse(await host.take_calls(min(float(req.query_params.get("wait") or 25), 55.0)))
 
     async def peer_answer(req: Request):
@@ -205,8 +199,7 @@ def create_app(host: Host, token: str) -> Starlette:
         fut = host.waiting.get(req.path_params["cid"])
         if fut is None or fut.done():
             return JSONResponse({"error": "no such call"}, 404)
-        b = await req.json()
-        fut.set_result((b.get("status", 200), b.get("body")))
+        fut.set_result(await req.json())
         return JSONResponse({"ok": True})
 
     return Starlette(routes=[
@@ -226,9 +219,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=int(os.environ.get("RUNNER_PORT", "8080")))
     a = p.parse_args()
-    host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), os.environ.get("ORCHESTRATOR_URL", ""),
-                os.environ.get("ORCHESTRATOR_TOKEN", ""), float(os.environ.get("DEVRUNNER_DELAY", "0.3")),
-                pull=os.environ.get("RUNNER_PEERS") == "pull")
+    host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")))
     uvicorn.run(create_app(host, os.environ.get("RUNNER_TOKEN", "")),
                 host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning")
 
