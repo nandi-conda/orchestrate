@@ -6,19 +6,8 @@ import uvicorn
 
 from .app import create_app
 from .secrets import warn_optional
+from .server import Server
 from .store import store_from_url
-
-
-class Server(uvicorn.Server):
-    """End the SSE streams before uvicorn waits for their connections."""
-
-    def __init__(self, config: uvicorn.Config, shutdown_event: asyncio.Event) -> None:
-        super().__init__(config)
-        self._shutdown_event = shutdown_event
-
-    async def shutdown(self, sockets=None) -> None:
-        self._shutdown_event.set()
-        await super().shutdown(sockets)
 
 
 def main() -> None:

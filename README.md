@@ -5,12 +5,11 @@ request becomes one or more agent threads running on remote workers.
 
 | Directory | What | Docs |
 | --- | --- | --- |
-| [`orchestrator/`](orchestrator) | control plane + ultra UI | [README](orchestrator/README.md) |
+| [`orchestrator/`](orchestrator) | control plane + ultra UI, in a browser or a desktop window | [README](orchestrator/README.md) |
 | [`runner/`](runner) | agent runner that hosts many threads per worker | [README](runner/README.md), [API](runner/API.md) |
-| [`desktop/`](desktop) | desktop window (PySide) showing the control plane's ultra UI | [README](desktop/README.md) |
 
 They're separate pixi projects and deploy separately. The root
-[`pixi.toml`](pixi.toml) is a front door that delegates to them, so you can
+[`pixi.toml`](pixi.toml) is a front door that delegates to both, so you can
 drive everything from the repo root:
 
 ```sh
@@ -18,8 +17,8 @@ pixi run setup                        # install what every project needs
 pixi run set-key DEEPSEEK_API_KEY     # once: store the key in the system keyring
 pixi run set-key SPRITES_TOKEN        # once: run workers on Fly Sprites, even for a local UI
 pixi run serve                        # just the control plane + web UI on http://127.0.0.1:8000
-pixi run desktop                      # the UI in a desktop window; starts and owns the control plane
-pixi run test                         # every test suite: runner, orchestrator, desktop
+pixi run desktop                      # or: the UI in a desktop window, control plane in the same process
+pixi run test                         # every test suite: runner, orchestrator, desktop window
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```
 

@@ -56,10 +56,44 @@ traffic without a model: `spawn: <task>` starts a child thread, which reports
 `Finished: …` back to its parent, and `tell t_xxx: <text>` messages another
 thread.
 
+## The desktop window
+
+```sh
+pixi run desktop          # from the repo root or here
+```
+
+The same UI in a desktop window instead of a browser tab. Qt (PySide6) draws
+the window and the ultra UI fills it. The control plane runs in the same
+process, on a thread next to the window, so it ends when the window does,
+however the window ends; closing the window (or Ctrl+C in the terminal) stops
+it gracefully, which also destroys its sprites. While it runs, the UI is at
+http://127.0.0.1:8000 in a browser too. `--port N` and `--db …` are as for
+`python -m control`.
+
+- The UI's own links, `window.open` and `target=_blank` stay in the window.
+- Links anywhere else (a URL in an agent's reply) open in your default browser.
+- Downloads (the Files tab) are saved to your downloads folder, never over an
+  existing file (`name (1)`, …), with a line at the bottom saying where.
+- If the port is taken, the window says so, and how to free it
+  (`fuser -k 8000/tcp`, or `kill $(lsof -t -i :8000)`), with a Retry.
+  What the control plane is doing is also printed to the terminal as
+  `desktop: …` lines.
+
+The window is drawn on the CPU (Qt Quick's software renderer, Chromium with
+`--disable-gpu`), and on Linux as an X11 window, through XWayland under
+Wayland. The environment's Qt otherwise needs a working OpenGL/EGL that
+matches its own: without one, the window aborted ("QQuickWidget: Failed to get
+a QRhi") or, on Wayland ("qt.qpa.wayland: EGL not available"), never
+appeared. `QT_QPA_PLATFORM` still decides when set.
+
+It runs on linux-64, osx-arm64 and win-64 (the `desktop` environment):
+conda-forge has no Qt WebEngine for osx-64.
+
 ## Tests
 
 ```sh
 pixi run test             # store, router, the whole loop against the echo runner, the markdown renderer, Postgres if installed
+pixi run test-desktop     # the desktop window, offscreen, against the real UI on the echo runner
 ```
 
 The Postgres test starts a throwaway server with `initdb`, which refuses to run
@@ -234,6 +268,9 @@ SQLite or Postgres database the first time the control plane opens it.
 | `control/secrets.py` | env-then-keyring lookup (shared convention with the runner) |
 | `ui/app.py` | the ultra app (LPython → wasm) |
 | `ui/orch.py`, `ui/imports.js` | extra `@jscall` imports: POST, SSE, named windows |
+| `control/server.py` | uvicorn server that ends the SSE streams on shutdown (`python -m control` and the desktop window) |
+| `desktop/window.py` | the desktop window: a web view on the UI, links, downloads, the status page |
+| `desktop/server.py` | the control plane on a thread in the window's process |
 
 ## HTTP API
 
