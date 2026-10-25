@@ -6,6 +6,20 @@ export function imports({ str, strs, vals, dispatch }) {
   const streams = new Map();
   let nextStream = 1;
   let doc = { op: [], s: [] }; // the markdown md_parse last parsed
+  const follow = new Map(); // element id -> keeps the bottom in view (scroll_follow)
+  const placed = new WeakMap(); // element -> the scrollTop toEnd last set
+  const toEnd = (sel) => {
+    const el = document.getElementById(sel);
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    placed.set(el, el.scrollTop);
+  };
+  document.addEventListener("scroll", (e) => {
+    const el = e.target;
+    if (!el.id || !follow.has(el.id) || placed.get(el) === el.scrollTop) return;
+    // At the bottom within a few pixels (zoom and fractional heights).
+    follow.set(el.id, el.scrollHeight - el.scrollTop - el.clientHeight <= 8);
+  }, true);
 
   // Images pasted into the request box. They stay data: URLs here until the
   // request is sent; `stashed` holds them while a send is in flight, so a
@@ -194,23 +208,20 @@ export function imports({ str, strs, vals, dispatch }) {
         if (!on) img.classList.add("zoomed");
       });
     },
+    // Scroll following. An element follows its new content until the reader
+    // scrolls it away from the bottom, and again once they scroll back. Only
+    // a change of scrollTop fires "scroll": the reader, our own scrolls
+    // (skipped), or the browser clamping a shrunk element, which leaves it
+    // at the bottom. Content growing or the element resizing fires none, so
+    // they never turn following off.
     scroll_end: (id) => {
       const sel = str(id);
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        const el = document.getElementById(sel);
-        if (el) el.scrollTop = el.scrollHeight;
-      }));
+      follow.set(sel, true);
+      requestAnimationFrame(() => requestAnimationFrame(() => toEnd(sel)));
     },
     scroll_follow: (id) => {
       const sel = str(id);
-      const el = document.getElementById(sel);
-      // At the bottom within a few pixels (zoom and fractional heights).
-      if (!el || el.scrollHeight - el.scrollTop - el.clientHeight > 8) return;
-      const top = el.scrollTop;
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        const now = document.getElementById(sel);
-        if (now && now.scrollTop >= top) now.scrollTop = now.scrollHeight;
-      }));
+      requestAnimationFrame(() => requestAnimationFrame(() => { if (follow.get(sel) !== false) toEnd(sel); }));
     },
   };
 }

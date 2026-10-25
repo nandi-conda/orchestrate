@@ -76,13 +76,14 @@ def set_title(h: i32) -> None:
 
 @jscall
 def scroll_end(id: str) -> None:
-    """Scroll the element with this id to the bottom after the next render."""
+    """Scroll the element with this id to the bottom after the next render,
+    and follow it there (scroll_follow)."""
     pass
 
 @jscall
 def scroll_follow(id: str) -> None:
-    """Like scroll_end, but only if the element is scrolled to the bottom now,
-    before the next render, and the reader hasn't scrolled up by then."""
+    """Like scroll_end, unless the reader scrolled the element away from the
+    bottom since (until they scroll back to it)."""
     pass
 
 @jscall
