@@ -133,9 +133,8 @@ When `SPRITES_TOKEN` is stored, each worker is a sprite named
 `orch-<project>-w<n>`, even when the browser reached the control plane on
 localhost. The provider clones this repo to `/opt/orchestrate`, runs
 `runner/deploy/bootstrap.sh`, and registers `runner/deploy/start.sh` as the
-sprite service on port 8080. It also sets a network policy that allows only
-DeepSeek, GitHub and the package mirrors; the control plane is not on it,
-since a sprite never connects to it.
+sprite service on port 8080. Sprites keep their default open outbound
+network; the orchestrator sets no network policy.
 
 ```sh
 cd orchestrator

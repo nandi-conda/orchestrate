@@ -246,7 +246,7 @@ class SpritesProvider:
     API = "https://api.sprites.dev/v1"
 
     def __init__(self, token: str | None = None, source: str | None = None, ref: str | None = None,
-                 prefix: str | None = None, allow_domains: list[str] | None = None) -> None:
+                 prefix: str | None = None) -> None:
         from .secrets import get_secret
 
         self.token = token or get_secret("SPRITES_TOKEN") or ""
@@ -263,10 +263,6 @@ class SpritesProvider:
             if note:
                 print(f"SpritesProvider: {note}", file=sys.stderr)
         self.prefix = prefix if prefix is not None else "orch-"
-        self.allow_domains = allow_domains if allow_domains is not None else [
-            "api.deepseek.com", "github.com", "*.github.com", "*.githubusercontent.com",
-            "conda.anaconda.org", "prefix.dev", "*.prefix.dev", "pixi.sh", "pypi.org",
-            "files.pythonhosted.org"]
         self.http = httpx.AsyncClient(base_url=self.API, timeout=httpx.Timeout(60.0, read=600.0),
                                       headers={"authorization": f"Bearer {self.token}"})
 
@@ -300,9 +296,6 @@ class SpritesProvider:
             s.raise_for_status()
             async for _ in s.aiter_lines():
                 pass
-        if self.allow_domains:
-            rules = [{"action": "allow", "domain": d} for d in self.allow_domains]
-            await self.http.post(f"/sprites/{name}/policy/network", json={"rules": rules})
         await wait_healthy(worker.url, timeout=300)
         return worker
 
