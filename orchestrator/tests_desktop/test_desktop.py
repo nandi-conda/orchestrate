@@ -125,6 +125,23 @@ def test_a_taken_port_is_refused_with_how_to_free_it(qtbot, tmp_path):
     w.close()
 
 
+def test_connections_the_last_run_left_dont_hold_the_port(qtbot, tmp_path):
+    """After a run ends, its closed connections sit in TIME_WAIT on the port
+    with no process holding them (lsof shows nothing); the next run starts."""
+    with socket.socket() as last:
+        last.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        last.bind(("127.0.0.1", 0))
+        last.listen()
+        port = last.getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port))
+        accepted, _ = last.accept()
+        accepted.close()  # the server side closes first, so it is the side left in TIME_WAIT
+    client.close()
+    w = window(qtbot, tmp_path, port)
+    qtbot.waitUntil(lambda: w.control.state == UP, timeout=WAIT)
+    w.close()
+
+
 def test_a_control_plane_that_stops_shows_down(qtbot, up):
     w, url = up
     w.control.server.should_exit = True

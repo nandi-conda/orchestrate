@@ -7,6 +7,7 @@ does, however the window ends."""
 from __future__ import annotations
 
 import asyncio
+import errno
 import socket
 import sys
 import threading
@@ -28,13 +29,25 @@ STARTING, UP, DOWN = "starting", "up", "down"
 AppFactory = Callable[[asyncio.Event], Starlette]
 
 
-def port_in_use(port: int) -> bool:
-    with socket.socket() as s:
-        try:
-            s.bind(("127.0.0.1", port))
-        except OSError:
-            return True
-    return False
+def listen(port: int) -> socket.socket | None:
+    """The control plane's socket, or None if another process holds the port.
+    Connections the last run left in TIME_WAIT don't hold it: they show in
+    no process (lsof), so refusing them would be refusing nothing. That is
+    SO_REUSEADDR on POSIX; Windows allows such binds already, and its
+    SO_REUSEADDR would let a second process share a live port."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as e:
+        sock.close()
+        if e.errno == errno.EADDRINUSE:
+            return None
+        raise
+    return sock
 
 
 class ControlPlane(QObject):
@@ -57,7 +70,8 @@ class ControlPlane(QObject):
         self.watch.timeout.connect(self._watch)
 
     def start(self) -> None:
-        if port_in_use(self.port):
+        sock = listen(self.port)
+        if sock is None:
             self._set(DOWN, f"Port {self.port} is already in use, so the control plane can't run there. "
                             f"If it is a control plane from another run, stop it with `fuser -k {self.port}/tcp` "
                             f"(Linux) or `kill $(lsof -t -i :{self.port})`, then Retry. Or use another port: "
@@ -69,17 +83,17 @@ class ControlPlane(QObject):
         config = uvicorn.Config(self.make_app(shutdown), host="127.0.0.1", port=self.port, log_level="info",
                                 timeout_graceful_shutdown=5)
         self.server = Server(config, shutdown)
-        self.thread = threading.Thread(target=self._serve, name="control-plane", daemon=True)
+        self.thread = threading.Thread(target=self._serve, args=(sock,), name="control-plane", daemon=True)
         self.thread.start()
         self._set(STARTING, f"Starting the control plane at {self.base_url}…")
         self.watch.start(POLL_MS)
 
-    def _serve(self) -> None:
+    def _serve(self, sock: socket.socket) -> None:
         """The control plane's thread. uvicorn ends a failed startup with
         SystemExit; that, like any error, is why it is down."""
         asyncio.set_event_loop(self.loop)
         try:
-            self.loop.run_until_complete(self.server.serve())
+            self.loop.run_until_complete(self.server.serve(sockets=[sock]))
         except BaseException as e:  # noqa: BLE001 - reported on the window, then the thread ends
             self.error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
         finally:
