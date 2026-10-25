@@ -27,11 +27,12 @@ from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
-# Event kinds for the UI, which can't compare strings cheaply. K_RESULT is a
-# turn's summary, shown as its answer; K_STATE is a state change, which the
-# Dialog leaves to the state badges.
+# Event kinds for the UI, which can't compare strings cheaply. K_USER is only
+# what the person typed; K_REQUEST is the brief a thread was spawned with,
+# which the router writes. K_RESULT is a turn's summary, shown as its answer;
+# K_STATE is a state change, which the Dialog leaves to the state badges.
 (K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE, K_THINKING,
- K_RESULT, K_STATE) = range(1, 12)
+ K_RESULT, K_STATE, K_REQUEST) = range(1, 13)
 
 
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
@@ -58,7 +59,7 @@ def display(ev: dict) -> dict:
     elif t == "message_out":
         kind, label, text = K_PEER, f"to {d.get('to', '?')}", d.get("body", "")
     elif t == "created":
-        kind, label, text = K_USER, "Request", d.get("request", "")
+        kind, label, text = K_REQUEST, "Request", d.get("request", "")
     elif t == "assistant":
         kind, label, text = K_ASSISTANT, "Agent", d.get("content", "")
     elif t == "reasoning":

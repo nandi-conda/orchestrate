@@ -55,7 +55,13 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .ev { border-radius: 8px; padding: 8px 12px; border: 1px solid var(--border); max-width: 860px; }
 .ev-label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted-foreground); margin-bottom: 2px; }
 .ev-text { white-space: pre-wrap; word-break: break-word; }
-.ev-user { background: var(--muted); }
+/* The person's own messages read as chat bubbles on the right, in the accent
+   colour; everything machine-written (requests, router, agents) stays neutral
+   on the left. */
+.ev-user { align-self: flex-end; max-width: min(640px, 85%); border-radius: 14px 14px 4px 14px;
+           border: 1px solid hsl(221 83% 53%); background: hsl(221 83% 53% / .12); }
+.ev-user .ev-label { color: hsl(221 83% 48%); }
+.ev-request { border-style: dashed; }
 .ev-assistant { border-color: color-mix(in oklch, var(--primary) 30%, transparent); padding: 10px 14px; }
 .ev-assistant .ev-text { font-size: 15px; line-height: 1.6; }
 .ev-thinking { border-style: dashed; color: var(--muted-foreground); font-size: 13px; }

@@ -695,6 +695,15 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     await s.close()
 
 
+def test_only_what_the_person_typed_is_a_user_row():
+    def kind(t, d):
+        return app_mod.display({"type": t, "payload": d})["kind"]
+    assert kind("request", {"text": "zip it"}) == app_mod.K_USER
+    assert kind("message_in", {"from": "user", "body": "more"}) == app_mod.K_USER
+    assert kind("created", {"request": "Create a zip archive"}) == app_mod.K_REQUEST
+    assert kind("message_in", {"from": "router", "body": "x"}) == app_mod.K_PEER
+
+
 async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     from control.service import Orchestrator
 

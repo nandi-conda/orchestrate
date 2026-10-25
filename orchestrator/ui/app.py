@@ -79,6 +79,7 @@ K_ROUTE: Const[i32] = 8
 K_THINKING: Const[i32] = 9
 K_RESULT: Const[i32] = 10
 K_STATE: Const[i32] = 11
+K_REQUEST: Const[i32] = 12
 
 # markdown render ops (ui/markdown.js); codes from 10 open an element
 MD_END: Const[i32] = 0
@@ -904,6 +905,7 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls("ev")
     key(j_int(e, "seq"))
     cls_if("ev-user", k == K_USER)
+    cls_if("ev-request", k == K_REQUEST)
     cls_if("ev-assistant", k == K_ASSISTANT)
     cls_if("ev-status", k == K_STATUS)
     cls_if("ev-peer", k == K_PEER)
