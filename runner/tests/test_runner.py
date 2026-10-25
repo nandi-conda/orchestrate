@@ -70,6 +70,24 @@ async def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, mo
         await sb.read_file(str(runner_checkout() / "runner" / "pixi.toml"))
 
 
+def test_sandbox_falls_back_to_an_empty_proc(monkeypatch, tmp_path):
+    """A kernel that refuses procfs in a user namespace (Sprites') still gets a
+    sandbox: /proc is an empty tmpfs, and the check says so."""
+    import runner.sandbox as sandbox
+
+    monkeypatch.setattr(sandbox, "_proc_mount", "proc")  # restored after the test
+
+    def probe(kind):
+        return subprocess.CompletedProcess([], 0 if kind == "tmpfs" else 1, "",
+                                           "bwrap: Can't mount proc on /proc: Operation not permitted")
+    monkeypatch.setattr(sandbox, "_probe", probe)
+
+    sandbox.check()
+    assert sandbox._proc_mount == "tmpfs"
+    args = sandbox.bwrap_args(view(tmp_path))
+    assert any(a == "--tmpfs" and b == "/proc" for a, b in zip(args, args[1:]))
+
+
 async def test_thread_uses_tools_and_finishes(tmp_path):
     host = host_with({"t": [
         ModelResponse("", [call("write_file", path="hello.py", content="print('hi')\n")]),
