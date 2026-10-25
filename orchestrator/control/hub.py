@@ -47,7 +47,7 @@ def worker_ref(ref: str, base: str) -> str:
 
 class Hub:
     def __init__(self, path: str | os.PathLike, repo_url: str = "", token: str | None = None) -> None:
-        self.path = Path(path)
+        self.path = Path(path).resolve()  # git runs in other directories
         self.url = repo_url
         self.env: dict = {}
         if token and repo_url.startswith(("http://", "https://")):

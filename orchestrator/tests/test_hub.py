@@ -178,3 +178,12 @@ async def test_a_worker_may_only_set_its_threads_refs(tmp_path):
     await hub.open()
     with pytest.raises(Exception, match="may not set"):
         await hub.receive("t_1", b"", {"refs/heads/main": git(hub.path, "rev-parse", "main")})
+
+
+async def test_a_hub_at_a_relative_path_is_made_where_it_says(tmp_path, monkeypatch):
+    """The control plane's default is `.orchestrator/repos`, relative to where it runs."""
+    monkeypatch.chdir(tmp_path)
+    hub = Hub(".orchestrator/repos/p.git")
+    await hub.open()
+    assert (tmp_path / ".orchestrator" / "repos" / "p.git" / "HEAD").exists()
+    assert git(tmp_path / ".orchestrator" / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"

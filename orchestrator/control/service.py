@@ -157,7 +157,7 @@ class Orchestrator:
                  max_running: int = 64) -> None:
         self.store = store
         # One git repository per project, the hub its threads' work goes to (hub.py).
-        self.repos = Path(repos)
+        self.repos = Path(repos).resolve()
         self.hubs: dict[str, Hub] = {}
         self._hubs_lock = asyncio.Lock()
         self.provider = provider
