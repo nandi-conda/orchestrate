@@ -24,7 +24,8 @@ Your workspace is a git worktree of the project at {root}; your branch is {branc
 How the team works:
 - Many threads run at once. Spawn a new thread for independent work instead of doing it yourself.
 - Use list_threads before touching shared areas; if another thread owns it, send_message instead of editing.
-- Messages from other threads and the user arrive as user messages that start with [from ...].
+- Messages from other threads, and user requests the project's router passes on, arrive as user
+  messages that start with [from <thread id>] or [from router]; the user's own come as they are.
 - Keep your directory entry current with set_summary when your focus changes.
 - When the work for this request is done, call finish with a summary. You may get follow-ups later.
 
@@ -82,10 +83,73 @@ def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
 
+def user_content(sender: str, body: str) -> str:
+    return body if sender == "user" else f"[from {sender}] {body}"
+
+
+STOPPED_TOOL = "error: the thread stopped before this tool returned"
+
+
+def replay(events: list[dict]) -> list[dict]:
+    """The conversation a thread's events record, as model messages after the
+    system prompt. Brings a thread back on a worker with what it had said and
+    done (runner/API.md, "Resuming a thread").
+
+    One model step is its `reasoning`, its `assistant` reply and its
+    `tool_call`s (which carry the step's number), in that order, each part
+    optional; `tool_result`s answer the calls. A call with no result (the
+    thread stopped while it ran) is answered as stopped. Tool results are the
+    events' copies, cut to 4000 characters."""
+    messages: list[dict] = []
+    step: dict | None = None  # the assistant message being rebuilt, and its step number
+    step_no = None
+    unanswered: list[str] = []
+
+    def close():
+        nonlocal step
+        for cid in unanswered:
+            messages.append({"role": "tool", "tool_call_id": cid, "content": STOPPED_TOOL})
+        unanswered.clear()
+        step = None
+
+    def open_step():
+        nonlocal step
+        close()
+        step = {"role": "assistant", "content": ""}
+        messages.append(step)
+
+    for ev in events:
+        typ, d = ev.get("type"), ev.get("data") or {}
+        if typ == "message_in":
+            close()
+            messages.append({"role": "user", "content": user_content(d.get("from", "user"), d.get("body", ""))})
+        elif typ == "reasoning":
+            open_step()
+            step["reasoning_content"] = d.get("content", "")
+        elif typ == "assistant":
+            if step is None or step["content"] or step.get("tool_calls"):
+                open_step()
+            step["content"] = d.get("content", "")
+        elif typ == "tool_call":
+            if step is None or (step.get("tool_calls") and d.get("step") != step_no):
+                open_step()
+            step_no = d.get("step")
+            step.setdefault("tool_calls", []).append(
+                {"id": d["id"], "type": "function",
+                 "function": {"name": d.get("name", ""), "arguments": json.dumps(d.get("arguments") or {})}})
+            unanswered.append(d["id"])
+        elif typ == "tool_result" and d.get("id") in unanswered:
+            unanswered.remove(d["id"])
+            messages.append({"role": "tool", "tool_call_id": d["id"], "content": str(d.get("result", ""))})
+    close()
+    return messages
+
+
 class AgentThread:
     def __init__(self, *, id: str, project: str, title: str, model: Model, sandbox: Sandbox, peers: Peers,
                  tools: list[T.Tool], limits: Limits, parent: str | None, workspace: Workspace | None,
-                 emit: Callable[["AgentThread", str, Any], None]):
+                 emit: Callable[["AgentThread", str, Any], None], history: list[dict] | None = None,
+                 summary: str = ""):
         self.id, self.project, self.title, self.parent = id, project, title, parent
         self.workspace = workspace
         self.branch = workspace.branch if workspace else None
@@ -95,7 +159,7 @@ class AgentThread:
         self.tool_schemas = T.schemas(tools)
         self._emit = emit
         self.state = "queued"
-        self.summary = ""
+        self.summary = summary
         self.files: set[str] = set()
         self.spawned = 0
         self.finish_requested = False
@@ -103,6 +167,7 @@ class AgentThread:
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
         self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT.format(
             project=project, id=id, title=title, root=sandbox.root, branch=self.branch or "(none)")}]
+        self.messages += replay(history or [])
         self.task: asyncio.Task | None = None
 
     def emit(self, type: str, data: Any = None):
@@ -123,8 +188,7 @@ class AgentThread:
         if item["hops"] > self.limits.max_hops:
             self.emit("dropped", {"from": item["from"], "reason": "hop limit"})
             return False
-        content = item["body"] if item["from"] == "user" else f"[from {item['from']}] {item['body']}"
-        self.messages.append({"role": "user", "content": content})
+        self.messages.append({"role": "user", "content": user_content(item["from"], item["body"])})
         self.emit("message_in", {"from": item["from"], "body": item["body"]})
         return True
 
@@ -165,7 +229,7 @@ class AgentThread:
             if not resp.tool_calls:
                 break
             for tc in resp.tool_calls:
-                self.emit("tool_call", {"id": tc.id, "name": tc.name, "arguments": tc.arguments})
+                self.emit("tool_call", {"id": tc.id, "name": tc.name, "arguments": tc.arguments, "step": step})
                 try:
                     result = await asyncio.wait_for(T.call(self.tools, self, tc.name, tc.arguments), self.limits.tool_timeout)
                 except asyncio.TimeoutError:
@@ -265,18 +329,30 @@ class ThreadHost:
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path), await self.repo.worktree(path, f"thread/{tid}")
 
-    async def start(self, *, project: str, title: str, request: str, parent: str | None = None,
-                    model: dict | None = None, id: str | None = None) -> AgentThread:
+    async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
+                    model: dict | None = None, id: str | None = None, history: list[dict] | None = None,
+                    summary: str = "") -> AgentThread:
+        """Start a thread on this worker. With `history` (its earlier events) the
+        thread continues a conversation and its pushed branch; with no
+        `request` it waits idle for its next message. An id whose thread here
+        has ended (stopped or failed) is started afresh."""
         tid = id or _id()
-        if tid in self.threads:
+        old = self.threads.get(tid)
+        if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
         root, workspace = await self._workspace(tid)
         t = AgentThread(id=tid, project=project, title=title, model=self.model_factory(model),
                         sandbox=self.sandbox_factory(root), peers=self.peers, tools=self.tools,
-                        limits=self.limits, parent=parent, workspace=workspace, emit=self._emit)
+                        limits=self.limits, parent=parent, workspace=workspace, emit=self._emit,
+                        history=history, summary=summary)
+        if old is not None:
+            t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
-        t.deliver(request, sender="user" if parent is None else parent)
+        if request:
+            t.deliver(request, sender="user" if parent is None else parent)
+        else:
+            t.set_state("idle")
         t.task = asyncio.create_task(t.run(), name=tid)
         return t
 

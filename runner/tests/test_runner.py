@@ -338,3 +338,39 @@ async def test_stream_is_never_compressed_so_keepalives_arrive_as_sent():
         assert r.content == "hi"
     finally:
         server.close()
+
+
+def test_replay_rebuilds_steps_tool_results_and_senders():
+    from runner.thread import replay
+    ev = lambda type, **data: {"type": type, "data": data}
+    msgs = replay([
+        ev("message_in", **{"from": "user", "body": "hi"}),
+        ev("reasoning", content="think"),
+        ev("assistant", content="looking"),
+        ev("tool_call", id="a", name="bash", arguments={"command": "ls"}, step=0),
+        ev("tool_result", id="a", name="bash", result="x"),
+        ev("tool_call", id="b", name="bash", arguments={"command": "pwd"}, step=0),
+        ev("tool_result", id="b", name="bash", result="/w"),
+        ev("tool_call", id="c", name="read_file", arguments={"path": "x"}, step=1),
+        ev("tool_result", id="c", name="read_file", result="data"),
+        ev("assistant", content="done"),
+        ev("turn_done", summary="s"),
+        ev("message_in", **{"from": "router", "body": "more"}),
+    ])
+    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "tool", "assistant", "tool", "assistant", "user"]
+    assert msgs[1]["reasoning_content"] == "think" and msgs[1]["content"] == "looking"
+    assert [c["id"] for c in msgs[1]["tool_calls"]] == ["a", "b"]
+    assert json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]) == {"command": "ls"}
+    assert msgs[4]["content"] == "" and [c["id"] for c in msgs[4]["tool_calls"]] == ["c"]
+    assert msgs[6] == {"role": "assistant", "content": "done"}
+    assert msgs[7]["content"] == "[from router] more"
+
+
+async def test_http_resume_needs_request_or_history(tmp_path):
+    host = host_with({"t": [ModelResponse("ok")]}, tmp_path)
+    app = create_app(host, None)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w") as c:
+        assert (await c.post("/threads", json={"id": "t_x"})).status_code == 400
+        r = await c.post("/threads", json={"id": "t_x", "title": "t", "history": [], "summary": "was here"})
+        assert r.status_code == 201 and r.json()["state"] == "idle" and r.json()["summary"] == "was here"
+        assert (await c.post("/threads", json={"id": "t_x", "history": []})).status_code == 409

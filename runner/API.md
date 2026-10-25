@@ -10,7 +10,7 @@ threads. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity"}` |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"request", "title"?, "project"?, "parent"?, "model"?, "id"?}` | 201 + directory entry; 409 if `id` exists |
+| POST | `/threads` | `{"request"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "history"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
 | POST | `/threads/{id}/messages` | `{"body", "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
@@ -19,7 +19,8 @@ threads. Default port 8080. Every route except `/health` needs
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
 
-- `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`.
+- `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
+- `request` or `history` is required. `history` resumes a thread: see [Resuming a thread](#resuming-a-thread).
 - `model` is `{"provider": "deepseek", "model": "deepseek-v4-pro"}` or `{"provider": "openai-compat", "model", "base_url", "api_key_env"}`. Omitted: DeepSeek with `$DEEPSEEK_MODEL`.
 - `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`.
 - A message whose `hops` exceeds the limit (6) is dropped with a `dropped` event. The orchestrator should increment `hops` when it forwards a thread-to-thread message.
@@ -50,7 +51,7 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
 | `reasoning` | `{"content"}`: the model's whole reasoning for one step, once it is done |
 | `assistant` | `{"content"}` |
-| `tool_call` | `{"id", "name", "arguments"}` |
+| `tool_call` | `{"id", "name", "arguments", "step"}`: `step` numbers the model call within its turn |
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | provider token counts |
 | `turn_done` | `{"summary", "final"}` |
@@ -59,6 +60,26 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
 | `dropped` | `{"from", "reason"}` |
 | `error` | `{"error"}` |
+
+## Resuming a thread
+
+A thread lives on after its worker: its branch is pushed every turn and the
+orchestrator keeps its events. To bring it back on any worker (its old one was
+deleted, the orchestrator restarted, or the thread stopped or failed), the
+orchestrator posts `/threads` with the thread's `id`, `title`, `parent`,
+`summary` and `history`, and usually no `request`:
+
+- `history` is the thread's earlier events, oldest first, in the SSE shape
+  (`{"type", "data"}`; other keys are ignored). `message_in`, `reasoning`,
+  `assistant`, `tool_call` and `tool_result` rebuild the conversation after the
+  system prompt; other types are skipped. Only messages the thread received
+  belong in it. A tool call with no result is answered as stopped. Tool
+  results are the events' copies, cut to 4000 characters.
+- The worktree is the worker's own for that thread when it still has one,
+  else `thread/<id>` from origin when the thread pushed it, else a new branch
+  off the default branch.
+- Without `request` the thread goes `idle` (a `state` event) and waits for
+  its next message; nothing runs until one is posted.
 
 ## Peer calls (collected by the orchestrator)
 

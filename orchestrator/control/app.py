@@ -74,6 +74,8 @@ def display(ev: dict) -> dict:
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")
     elif t in ("archived", "unarchived"):
         kind, label, text = K_STATUS, t, f"thread {t}"
+    elif t == "revived":
+        kind, label, text = K_STATUS, "revived", f"back on worker {d.get('worker')}, idle until its next message"
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     elif t == "saved":

@@ -84,7 +84,7 @@ class Host:
         await self.set_state(t, "working")
         await asyncio.sleep(self.delay)
         # Stream the reply the way the real runner does (runner/API.md, `delta`).
-        reply = f"Echo: {text}"
+        reply = f"Echo: {text}" + (f" (resumed with {t['history']} earlier events)" if t["history"] else "")
         await self.emit(t["id"], "delta", {"kind": "reasoning", "text": "Echoing the request."})
         for i in range(0, len(reply), 16):
             await self.emit(t["id"], "delta", {"kind": "content", "text": reply[i:i + 16]})
@@ -136,15 +136,21 @@ def create_app(host: Host, token: str) -> Starlette:
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
         b = await req.json()
+        if not b.get("request") and b.get("history") is None:
+            return JSONResponse({"error": "request or history is required"}, 400)
         tid = b.get("id") or f"t_{secrets.token_hex(5)}"
-        if tid in host.threads:
+        if tid in host.threads and host.threads[tid]["state"] not in ("stopped", "failed"):
             return JSONResponse({"error": "exists"}, 409)
-        t = {"id": tid, "project": b.get("project", ""), "title": b.get("title") or b["request"][:40],
-             "state": "queued", "summary": "", "files": [], "parent": b.get("parent")}
+        t = {"id": tid, "project": b.get("project", ""), "title": b.get("title") or (b.get("request") or tid)[:40],
+             "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
+             "history": len(b.get("history") or [])}
         host.threads[tid] = t
         await host.emit(tid, "created", host.entry(t))
-        await host.emit(tid, "message_in", {"from": "user", "body": b["request"]})
-        asyncio.create_task(host.turn(t, b["request"]))
+        if b.get("request"):
+            await host.emit(tid, "message_in", {"from": "user", "body": b["request"]})
+            asyncio.create_task(host.turn(t, b["request"]))
+        else:  # resumed: idle until its next message (runner/API.md, "Resuming a thread")
+            await host.set_state(t, "idle")
         return JSONResponse(host.entry(t), 201)
 
     async def message(req: Request):

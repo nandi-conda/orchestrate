@@ -1308,7 +1308,9 @@ def pane() -> None:
 def request_box() -> None:
     el("footer")
     cls("composer")
-    if s_len(h_route) > 0:
+    # Project activity shows the router's decisions in its log; with a thread
+    # open, the last one shows here instead.
+    if s_len(h_route) > 0 and s_len(h_sel) > 0:
         div("route")
         attr_ref("title", h_route)
         span("route-label")

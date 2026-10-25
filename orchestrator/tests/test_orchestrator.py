@@ -486,6 +486,119 @@ async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):
     await s.close()
 
 
+async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, monkeypatch):
+    """After a control plane restart no worker runs the thread; a message brings it
+    back on a new worker with its conversation, then is delivered."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+
+    async def idle(tid):
+        return (await s.get_thread(tid))["state"] == "idle" or None
+
+    async def replies(tid):
+        return [e["payload"]["content"] for e in await s.list_events(p["id"], tid) if e["type"] == "assistant"]
+
+    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w1"), use_devrunner=True), HeuristicRouter())
+    t = await first.spawn(p["id"], "Hello", "build hello")
+    await wait_for(lambda: replies(t["id"]))
+    await wait_for(lambda: idle(t["id"]))
+    await first.close()
+
+    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True), HeuristicRouter())
+    await second.send(t["id"], "can I download it?")
+    got = await wait_for(lambda: _second_reply(replies, t["id"]))
+    assert got == "Echo: can I download it? (resumed with 3 earlier events)"  # request, reasoning, reply
+    types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    assert "revived" in types and "error" not in types
+    assert types.index("revived") > types.index("message_in")
+    assert [x for x in types if x == "message_in"] == ["message_in"]  # the runner's echo is dropped
+    row = await s.get_thread(t["id"])
+    assert row["worker_id"] == second.by_thread[t["id"]].worker.id and row["state"] == "idle"
+    assert await s.list_messages(t["id"], unread_only=True) == []
+    await second.close()
+    await s.close()
+
+
+async def _second_reply(replies, tid):
+    r = await replies(tid)
+    return r[1] if len(r) > 1 else None
+
+
+async def test_history_is_what_the_thread_received_and_said(tmp_path):
+    from control.service import Orchestrator
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "T", "do it", parent_id="t_parent")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    await s.append_event(p["id"], t["id"], "created", {"title": "T", "request": "do it", "parent": "t_parent"})
+    await s.append_event(p["id"], t["id"], "state", {"state": "working"})
+    await s.append_event(p["id"], t["id"], "assistant", {"content": "done"})
+    await s.append_event(p["id"], t["id"], "message_in", {"from": "runner", "body": "conflict"})
+    delivered = await s.add_message(p["id"], "user", t["id"], "next")
+    await s.mark_read([delivered["id"]])
+    await s.append_event(p["id"], t["id"], "message_in", {"from": "user", "body": "next", "message": delivered["id"]})
+    lost = await s.add_message(p["id"], "router", t["id"], "never arrived")
+    await s.append_event(p["id"], t["id"], "message_in", {"from": "router", "body": "never arrived",
+                                                         "message": lost["id"]})
+    await s.append_event(p["id"], t["id"], "error", {"error": "message not delivered: boom"})
+    assert await orch.history(await s.get_thread(t["id"])) == [
+        {"type": "message_in", "data": {"from": "t_parent", "body": "do it"}},
+        {"type": "assistant", "data": {"content": "done"}},
+        {"type": "message_in", "data": {"from": "runner", "body": "conflict"}},
+        {"type": "message_in", "data": {"from": "user", "body": "next", "message": delivered["id"]}},
+    ]
+    await s.close()
+
+
+async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def idle():
+        return (await s.get_thread(t["id"]))["state"] == "idle" or None
+    await wait_for(idle)
+    await orch.stop(t["id"])
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    assert "revived" in [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    await orch.close()
+    await s.close()
+
+
+async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter())
+    t = await orch.spawn(p["id"], "T", "first")
+    await orch.handle_request(p["id"], f"@{t['id']} more", "auto")
+    await orch.handle_request(p["id"], "direct", "thread", t["id"])
+    got = [(e["payload"]["from"], app_mod.display(e)["label"]) for e in await s.list_events(p["id"], t["id"])
+           if e["type"] == "message_in"]
+    assert got == [("router", "from router"), ("user", "You")]
+    await orch.close()
+    await s.close()
+
+
 @pytest.fixture
 def postgres(tmp_path):
     import shutil

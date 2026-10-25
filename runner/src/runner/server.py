@@ -43,11 +43,16 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
     async def create_thread(req: Request):
         b = await req.json()
-        if not b.get("request"):
-            return JSONResponse({"error": "request is required"}, status_code=400)
+        history = b.get("history")
+        if not b.get("request") and history is None:
+            return JSONResponse({"error": "request or history is required"}, status_code=400)
+        if history is not None and not isinstance(history, list):
+            return JSONResponse({"error": "history must be a list of events"}, status_code=400)
         try:
-            t = await host.start(project=b.get("project", "default"), title=b.get("title") or b["request"][:60],
-                                 request=b["request"], parent=b.get("parent"), model=b.get("model"), id=b.get("id"))
+            t = await host.start(project=b.get("project", "default"),
+                                 title=b.get("title") or (b.get("request") or b.get("id") or "thread")[:60],
+                                 request=b.get("request"), parent=b.get("parent"), model=b.get("model"),
+                                 id=b.get("id"), history=history, summary=b.get("summary") or "")
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         except Exception as e:

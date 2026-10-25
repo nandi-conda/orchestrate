@@ -160,6 +160,19 @@ sprites when the control plane stops loses nothing a thread had at the end of
 its last turn; only a turn still running then is cut short.
 Details: [runner/API.md](../runner/API.md#commits).
 
+### Messaging a thread that runs nowhere
+
+A thread outlives its worker. When a message (yours, the router's or another
+thread's) is for a thread no live worker runs (the control plane restarted and
+its sprites are gone, or the thread stopped or failed), the control plane
+brings it back first: it picks a worker as for a new thread and posts the
+thread to it with its conversation rebuilt from the event log (the request,
+the messages it received, its replies, tool calls and tool results), and the
+runner continues the worktree from the pushed `thread/<id>`. The thread's log
+shows a `revived` line, then the message is delivered. `Orchestrator.live_worker`
+is that one path; anything that needs the thread's worker calls it.
+Details: [runner/API.md](../runner/API.md#resuming-a-thread).
+
 ### Worker logs
 
 Each thread's pane has a **Worker log** tab next to Dialog and Tools: the last

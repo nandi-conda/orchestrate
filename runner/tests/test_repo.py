@@ -118,3 +118,43 @@ async def test_token_reaches_git_only(tmp_path, monkeypatch):
     assert repo.env["GIT_CONFIG_KEY_0"] == "http.https://github.com/acme/app.git.extraHeader"
     assert repo.env["GIT_CONFIG_VALUE_0"] == "Authorization: Basic " + base64.b64encode(b"x-access-token:ghp_x").decode()
     assert "GITHUB_TOKEN" not in repo.env
+
+
+async def test_resumed_thread_continues_its_pushed_branch_on_a_new_worker(tmp_path):
+    bare = origin(tmp_path)
+    first = ThreadHost(model_factory=lambda spec: ScriptedModel([
+        ModelResponse("", [call("write_file", path="draft.txt", content="v1\n")]),
+        ModelResponse("saved a draft")]),
+        workdir=str(tmp_path / "w1"), repo=Repo(str(bare), tmp_path / "w1" / ".repo"))
+    t = await first.start(project="p", title="t", request="draft", id="t_resume")
+    await first.wait_idle(t.id)
+    # The first worker is gone; another one picks the thread up with its events.
+    model = ScriptedModel([ModelResponse("still here")])
+    second = ThreadHost(model_factory=lambda spec: model, workdir=str(tmp_path / "w2"),
+                        repo=Repo(str(bare), tmp_path / "w2" / ".repo"))
+    r = await second.start(project="p", title="t", id="t_resume", history=list(t.events))
+    assert r.state == "idle" and (await r.sandbox.exec("cat draft.txt")).stdout == "v1\n"
+    assert (await r.sandbox.exec("git branch --show-current")).stdout.strip() == "thread/t_resume"
+    second.deliver(r.id, "and now?")
+    await second.wait_idle(r.id)
+    roles = [m["role"] for m in model.seen[0]]
+    assert roles == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert model.seen[0][-1]["content"] == "and now?"
+
+
+async def test_stopped_thread_restarts_in_the_worktree_it_had(tmp_path):
+    bare = origin(tmp_path)
+    h = host(tmp_path, bare, {"a": [ModelResponse("", [call("bash", command="echo wip > wip.txt; sleep 30")])],
+                              "b": [ModelResponse("back")]})
+    t = await h.start(project="p", title="t", request="x", id="t_stop")
+    for _ in range(300):
+        if (tmp_path / "threads" / "t_stop" / "wip.txt").exists():
+            break
+        await asyncio.sleep(0.02)
+    await h.stop(t.id)
+    r = await h.start(project="p", title="t", id="t_stop", history=list(t.events))
+    assert r is not t and (await r.sandbox.exec("cat wip.txt")).stdout == "wip\n"  # never pushed, still here
+    h.deliver(r.id, "go on")
+    await h.wait_idle(r.id)
+    assert r.model.seen[0][3] == {"role": "tool", "tool_call_id": "c_bash",
+                                  "content": "error: the thread stopped before this tool returned"}
