@@ -152,16 +152,24 @@ def test_a_control_plane_that_stops_shows_down(qtbot, up):
 
 def click(qtbot, w, element: str) -> None:
     """A real mouse click (a user gesture) on the centre of the element that
-    the JS expression element finds."""
+    the JS expression element finds. It waits until the element is what is
+    under that point, at the same place on two looks in a row: Chromium hit
+    tests its last committed layout, and a click sent while a render is still
+    landing goes to whatever was there before."""
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
-    where = (f"(() => {{ const e = {element}; if (!e) return ''; const b = e.getBoundingClientRect();"
-             " return JSON.stringify([b.left + b.width / 2, b.top + b.height / 2]); })()")
-    found = []
-    qtbot.waitUntil(lambda: found.append(js(qtbot, w, where)) or bool(found[-1]), timeout=WAIT)
-    r = json.loads(found[-1])
-    QTest.mouseClick(w.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
-                     QPoint(round(r[0]), round(r[1])))
+    where = (f"(() => {{ const e = {element}; if (!e) return '';"
+             " const b = e.getBoundingClientRect(), x = b.left + b.width / 2, y = b.top + b.height / 2;"
+             " const hit = document.elementFromPoint(x, y);"
+             " return hit && e.contains(hit) ? JSON.stringify([Math.round(x), Math.round(y)]) : ''; })()")
+    seen = [""]
+
+    def settled() -> bool:
+        seen.append(js(qtbot, w, where) or "")
+        return seen[-1] != "" and seen[-1] == seen[-2]
+    qtbot.waitUntil(settled, timeout=WAIT)
+    x, y = json.loads(seen[-1])
+    QTest.mouseClick(w.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(x, y))
 
 
 def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path):
@@ -188,7 +196,6 @@ def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path)
     w.view.load(QUrl(f"{url}/p/{pid}"))
     qtbot.waitUntil(lambda: "a thread" in page_text(qtbot, w), timeout=WAIT)
     click(qtbot, w, "document.querySelectorAll('.thread')[1]")
-    qtbot.waitUntil(lambda: js(qtbot, w, "!!document.querySelector('.ev-assistant .ev-copy')"), timeout=WAIT)
     click(qtbot, w, "document.querySelector('.ev-assistant .ev-copy')")
     qtbot.waitUntil(lambda: QGuiApplication.clipboard().text() == reply, timeout=WAIT)
     qtbot.waitUntil(lambda: js(qtbot, w, "!!document.querySelector('.ev-assistant .icon-check')"), timeout=WAIT)
