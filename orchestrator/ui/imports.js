@@ -70,5 +70,16 @@ export function imports({ str, strs, vals, dispatch }) {
         if (el) el.scrollTop = el.scrollHeight;
       }));
     },
+    scroll_follow: (id) => {
+      const sel = str(id);
+      const el = document.getElementById(sel);
+      // At the bottom within a few pixels (zoom and fractional heights).
+      if (!el || el.scrollHeight - el.scrollTop - el.clientHeight > 8) return;
+      const top = el.scrollTop;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const now = document.getElementById(sel);
+        if (now && now.scrollTop >= top) now.scrollTop = now.scrollHeight;
+      }));
+    },
   };
 }

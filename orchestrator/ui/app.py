@@ -16,7 +16,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, set_title, scroll_end, md_parse, md_op, md_str, s_add_enc)
+                  nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -109,6 +109,7 @@ wlog_loading: i32 = 0
 files: i32 = 0           # JSON handle: a directory of the selected thread's worktree ({path, entries})
 files_loading: i32 = 0
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
+jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -237,7 +238,7 @@ def leave_project() -> None:
 
 
 def enter_project() -> None:
-    global screen, loading, stream
+    global screen, loading, stream, jump
     leave_project()
     screen = 1
     loading = 1
@@ -245,6 +246,7 @@ def enter_project() -> None:
     s_add_ref(h_url, h_pid)
     get(h_url, GOT_PROJECT)
     fetch_threads()
+    jump = 1
     fetch_log()
     s_set(h_url, "/api/projects/")
     s_add_ref(h_url, h_pid)
@@ -276,12 +278,13 @@ def fetch_threads() -> None:
 
 def show_activity() -> None:
     """Select nothing: the pane shows the project's activity."""
-    global mode, pane_tab
+    global mode, pane_tab, jump
     s_clear(h_sel)
     if mode == TO_THREAD:
         mode = AUTO
     if pane_tab == WLOG or pane_tab == FILES:
         pane_tab = DIALOG
+    jump = 1
     fetch_log()
 
 
@@ -357,9 +360,21 @@ def take(old: i32, new: i32) -> i32:
 
 # ---- Update
 
+def land() -> None:
+    """New pane content has arrived. Content navigation asked for opens at the
+    bottom; content that streamed in keeps the bottom in view only if the
+    reader was already there, so scrolling up to read is left alone."""
+    global jump
+    if jump == 1:
+        jump = 0
+        scroll_end("pane")
+    else:
+        scroll_follow("pane")
+
+
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading
+    global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -412,14 +427,15 @@ def update(msg: i32, arg: i32) -> None:
             j_free(arg)
     elif msg == GOT_LOG:
         plog = take(plog, arg)
-        if s_len(h_sel) == 0:
-            scroll_end("pane")
+        if s_len(h_sel) == 0 and pane_tab != WLOG and pane_tab != FILES:
+            land()
     elif msg == SELECT:
         e = j_idx(threads, arg)
         jstr(e, "id", h_sel)
         j_free(e)
         if mode == AUTO and show_archived == 0:
             mode = TO_THREAD
+        jump = 1
         fetch_transcript()
         wlog = take_none(wlog)
         s_clear(h_wlog_err)
@@ -434,7 +450,8 @@ def update(msg: i32, arg: i32) -> None:
         show_activity()
     elif msg == GOT_TRANSCRIPT:
         transcript = take(transcript, arg)
-        scroll_end("pane")
+        if pane_tab != WLOG and pane_tab != FILES:
+            land()
     elif msg == REQ_IN:
         s_copy(h_req, arg)
     elif msg == MODE:
@@ -531,6 +548,7 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == TAB:
         pane_tab = arg
         if pane_tab == WLOG and wlog == 0:
+            jump = 1
             fetch_wlog()
         if pane_tab == FILES and files == 0:
             fetch_files()
@@ -548,7 +566,8 @@ def update(msg: i32, arg: i32) -> None:
         else:
             j_err(arg, h_wlog_err)
             j_free(arg)
-        scroll_end("pane")
+        if pane_tab == WLOG:
+            land()
     elif msg == GOT_FILES:
         # Like the worker log: a late reply for another thread is replaced by
         # the next fetch. The listing names its own (normalized) path.

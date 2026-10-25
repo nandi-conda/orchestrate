@@ -70,6 +70,12 @@ def scroll_end(id: str) -> None:
     pass
 
 @jscall
+def scroll_follow(id: str) -> None:
+    """Like scroll_end, but only if the element is scrolled to the bottom now,
+    before the next render, and the reader hasn't scrolled up by then."""
+    pass
+
+@jscall
 def md_parse(h: i32) -> i32:
     """Parse the markdown in handle h (ui/markdown.js) and return how many
     render ops it made; md_op and md_str read them until the next md_parse."""
