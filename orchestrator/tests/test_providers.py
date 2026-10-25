@@ -186,12 +186,94 @@ async def test_sprites_create_keeps_the_token_a_running_service_uses(env, monkey
     try:
         await p.http.aclose()
         p.http = httpx.AsyncClient(base_url=p.API, transport=httpx.MockTransport(handler))
+
+        async def accepts(worker):
+            return True
+        monkeypatch.setattr(p, "accepts_token", accepts)
+
         worker = await p.create(providers.WorkerSpec(project_id="p_1", index=1, token="stored-token"))
         assert worker.token == "running-token"  # the running service's, not the stored one
         assert service["env"]["RUNNER_TOKEN"] == "running-token"
     finally:
         await p.close()
 
+
+class FakeSprites:
+    """The Sprites API surface `SpritesProvider.create` uses, for a sprite that
+    already exists and whose runner this control plane cannot talk to."""
+
+    def __init__(self) -> None:
+        self.actions: list[str] = []
+
+    async def post(self, url, **kw):
+        assert url == "/sprites"
+        return httpx.Response(409, request=httpx.Request("POST", url))
+
+    async def get(self, url, **kw):
+        assert url.startswith("/sprites/")
+        return httpx.Response(200, json={"url": "https://worker.invalid"},
+                              request=httpx.Request("GET", url))
+
+    async def put(self, url, **kw):
+        return httpx.Response(200, request=httpx.Request("PUT", url))
+
+    def stream(self, method, url, **kw):
+        self.actions.append(url.rsplit("/", 1)[-1])
+        return FakeStream()
+
+    async def aclose(self):
+        pass
+
+
+class FakeStream:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def aiter_lines(self):
+        yield '{"type": "complete"}'
+
+
+async def _sprites_create(env, accepted_before_restart: bool):
+    env.setattr(secrets, "get_secret", lambda name: "key")
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    fake = FakeSprites()
+    p.http = fake
+    checks = []
+
+    async def no_exec(name, script, env=None):
+        return ""
+
+    async def healthy(url, timeout=120.0):
+        return None
+
+    async def accepts(worker):
+        checks.append(worker.token)
+        return accepted_before_restart or len(checks) > 1
+
+    env.setattr(p, "exec", no_exec)
+    env.setattr(providers, "wait_healthy", healthy)
+    env.setattr(p, "accepts_token", accepts)
+    try:
+        return await p.create(providers.WorkerSpec(project_id="p_1", index=1, token="stored")), fake
+    finally:
+        await fake.aclose()
+
+
+async def test_sprites_create_restarts_a_runner_holding_another_token(env):
+    worker, fake = await _sprites_create(env, accepted_before_restart=False)
+    assert fake.actions == ["start", "restart"]
+    assert worker.token == "stored"
+
+
+async def test_sprites_create_leaves_a_runner_that_accepts_its_token_alone(env):
+    _, fake = await _sprites_create(env, accepted_before_restart=True)
+    assert fake.actions == ["start"]
 
 
 async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypatch):

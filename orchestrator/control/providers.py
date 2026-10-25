@@ -316,18 +316,62 @@ class SpritesProvider:
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        async with self.http.stream("POST", f"/sprites/{name}/services/runner/start") as s:
-            s.raise_for_status()
-            async for _ in s.aiter_lines():
-                pass
+        await self.service_action(name, "start")
+        await self.wait_ready(worker)
+        if not await self.accepts_token(worker):
+            # The sprite was already there, running a runner an earlier control
+            # plane started. It holds a token this one does not know, so
+            # /health answers but every real call is a 401. Restart it from the
+            # definition, and token, stored just above.
+            await self.service_action(name, "restart")
+            await self.wait_ready(worker)
+            if not await self.accepts_token(worker):
+                raise RuntimeError(f"worker {name}'s runner does not accept the token the control "
+                                   f"plane stored for it; its log ends:\n{await self.logs(worker, 20)}")
+        return worker
+
+    async def service_action(self, name: str, action: str, timeout: float = 300.0) -> None:
+        """Run `start`/`restart`/`stop` on the runner service to completion.
+
+        The response is a stream of the action's log, which ends with a
+        `complete` event. Bound it: a runtime that is confused about the
+        service must not hang worker creation forever.
+        """
+
+        async def run() -> None:
+            async with self.http.stream("POST", f"/sprites/{name}/services/runner/{action}") as s:
+                s.raise_for_status()
+                async for _ in s.aiter_lines():
+                    pass
+
+        what = {"start": "starting", "restart": "restarting", "stop": "stopping"}.get(action, action)
         try:
-            await wait_healthy(worker.url, timeout=300)
+            await asyncio.wait_for(run(), timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"the runner service on sprite {name} did not finish {what} "
+                               f"within {timeout:.0f}s") from None
+
+    async def wait_ready(self, worker: Worker, timeout: float = 300.0) -> None:
+        try:
+            await wait_healthy(worker.url, timeout=timeout)
         except TimeoutError:
             # A runner that refuses to start (exits, and the service with it)
             # says why in the service log.
-            raise RuntimeError(f"worker {name}'s runner did not answer in 300s; its log ends:\n"
-                               f"{await self.logs(worker, 20)}") from None
-        return worker
+            raise RuntimeError(f"worker {worker.handle}'s runner did not answer in {timeout:.0f}s; "
+                               f"its log ends:\n{await self.logs(worker, 20)}") from None
+
+    async def accepts_token(self, worker: Worker) -> bool:
+        """Whether the runner now serving the sprite answers an authenticated
+        call. /health is deliberately open, so a runner started by an earlier
+        control plane with an unknown token looks healthy while everything
+        else is a 401."""
+        async with httpx.AsyncClient(timeout=15.0,
+                                     headers={"authorization": f"Bearer {worker.token}"}) as c:
+            r = await c.get(f"{worker.url.rstrip('/')}/threads")
+        if r.status_code == 401:
+            return False
+        r.raise_for_status()
+        return True
 
     async def exec(self, name: str, script: str, env: dict | None = None) -> str:
         params = [("cmd", "bash"), ("cmd", "-c"), ("cmd", script)]
