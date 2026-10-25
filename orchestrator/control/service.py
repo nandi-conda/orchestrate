@@ -149,6 +149,7 @@ class LiveWorker:
     pump: asyncio.Task | None = None
     watch: asyncio.Task | None = None
     threads: set[str] = field(default_factory=set)
+    starting: int = 0  # threads picked for it and not yet posted: they count as running
 
 
 class Orchestrator:
@@ -215,24 +216,34 @@ class Orchestrator:
 
     # ---------------------------------------------------------------- workers
 
-    async def _pick_worker(self, project: dict) -> LiveWorker:
+    async def _pick_worker(self, project: dict, start: bool = False) -> LiveWorker:
+        """The least loaded worker with room, made when none has. With `start`
+        the caller is about to start a thread there and holds a place for it
+        (`starting`) until it has, so concurrent starts spread out."""
         async with self._lock:
-            lws = self.workers.setdefault(project["id"], [])
-            best, best_load = None, None
-            for lw in list(lws):
-                h = await self._health(lw)
-                if h is None:
-                    await self._lose(lw)
-                    continue
-                running = h.get("running", 0)
-                if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
-                    best, best_load = lw, running
-            if best is not None:
-                return best
-            made = await self._made(project["id"])
-            live = {lw.worker.index for lw in lws}
-            idle = sorted(made - live - self.lost[project["id"]])  # left by an earlier control plane
-            return await self._attach(project, idle[0] if idle else max(made, default=0) + 1)
+            lw = await self._least_loaded(project)
+            if start:
+                lw.starting += 1
+            return lw
+
+    async def _least_loaded(self, project: dict) -> LiveWorker:
+        """Callers hold self._lock."""
+        lws = self.workers.setdefault(project["id"], [])
+        best, best_load = None, None
+        for lw in list(lws):
+            h = await self._health(lw)
+            if h is None:
+                await self._lose(lw)
+                continue
+            running = h.get("running", 0) + lw.starting
+            if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
+                best, best_load = lw, running
+        if best is not None:
+            return best
+        made = await self._made(project["id"])
+        live = {lw.worker.index for lw in lws}
+        idle = sorted(made - live - self.lost[project["id"]])  # left by an earlier control plane
+        return await self._attach(project, idle[0] if idle else max(made, default=0) + 1)
 
     async def _made(self, project_id: str) -> set[int]:
         if project_id not in self.made:
@@ -540,11 +551,14 @@ class Orchestrator:
         """Put a spawned thread on a worker, creating one when every worker is full."""
         tid = thread["id"]
         try:
-            lw = await self._pick_worker(project)
-            await self._ship(lw, project)
-            model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
-            await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
-                                          project=project["id"], parent=parent, model=model)
+            lw = await self._pick_worker(project, start=True)
+            try:
+                await self._ship(lw, project)
+                model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
+                await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
+                                              project=project["id"], parent=parent, model=model)
+            finally:
+                lw.starting -= 1
         except asyncio.CancelledError:  # stopped before it started
             self.unechoed.pop(tid, None)
             raise

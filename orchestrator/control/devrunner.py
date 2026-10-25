@@ -58,6 +58,7 @@ class Host:
         self.workdir = Path(workdir).resolve()
         self.repo = Checkout(self.workdir / ".repo")
         self.opened = False
+        self.opening = asyncio.Lock()  # requests come in at once; one makes the repository
         self.threads: dict[str, dict] = {}
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
@@ -66,9 +67,10 @@ class Host:
         self.calls_cond = asyncio.Condition()
 
     async def open(self) -> None:
-        if not self.opened:
-            await self.repo.open()
-            self.opened = True
+        async with self.opening:
+            if not self.opened:
+                await self.repo.open()
+                self.opened = True
 
     async def peer_call(self, op: str, **args) -> str:
         """A peer call whose answer is a tool result."""

@@ -573,6 +573,7 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     await second.send(t["id"], "can I download it?")
     got = await wait_for(lambda: _second_reply(replies, t["id"]))
+    await wait_for(lambda: idle(t["id"]))  # its work is saved before it goes idle
     assert got == "Echo: can I download it? (resumed with 3 earlier events)"  # request, reasoning, reply
     types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
     assert "revived" in types and "error" not in types

@@ -130,7 +130,7 @@ worked out at runtime.
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | router model, and passed to every worker. Sprites need it; the local fallback (used only when `SPRITES_TOKEN` is absent) runs the echo runner without it | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
 | `SPRITES_TOKEN` | stored, workers always run on Sprites; without it they fall back to this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
-| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Passed to every worker, which clones the project's `repo_url`, pushes `thread/<id>` branches and lands finished work on the default branch | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
+| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: it fetches the project's `repo_url` default branch into the project's hub (`.orchestrator/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 
 Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
 the exact name, the header they're sent as, and the keyring backend that was

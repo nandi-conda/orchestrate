@@ -69,6 +69,7 @@ class Repo:
         self.env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         self.base = ""
         self.opened = False
+        self.opening = asyncio.Lock()  # requests come in at once; one makes the repository
         # Refs are shared by every thread on the worker: changes to them take turns.
         self.lock = asyncio.Lock()
 
@@ -87,18 +88,19 @@ class Repo:
     async def open(self) -> None:
         """Make the repository on first use; learn the base branch the
         orchestrator named, if it sent one yet."""
-        if self.opened:
-            return
-        if not (self.path / ".git").exists():
-            self.path.mkdir(parents=True, exist_ok=True)
-            await self.git("init", "-q")
-        # Shared by every worktree, so threads' own commits work too and
-        # `git rebase --continue` never waits on an editor.
-        for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true"),
-                           ("gc.auto", "0")):
-            await self.git("config", key, value)
-        self.base = (await self.git("config", "--get", "orchestrate.base", check=False)).out
-        self.opened = True
+        async with self.opening:
+            if self.opened:
+                return
+            if not (self.path / ".git").exists():
+                self.path.mkdir(parents=True, exist_ok=True)
+                await self.git("init", "-q")
+            # Shared by every worktree, so threads' own commits work too and
+            # `git rebase --continue` never waits on an editor.
+            for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true"),
+                               ("gc.auto", "0")):
+                await self.git("config", key, value)
+            self.base = (await self.git("config", "--get", "orchestrate.base", check=False)).out
+            self.opened = True
 
     async def exists(self, ref: str) -> bool:
         return (await self.git("rev-parse", "-q", "--verify", f"{ref}^{{commit}}", check=False)).code == 0
