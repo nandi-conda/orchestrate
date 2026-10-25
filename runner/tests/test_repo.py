@@ -51,6 +51,23 @@ async def test_worktree_per_thread_off_default_branch(tmp_path):
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
 
 
+async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
+    """Other threads' worktrees and the clone's checkout are hidden; the thread
+    can still commit, since its worktree's git dir is in the view."""
+    bare = origin(tmp_path)
+    h = host(tmp_path, bare, {"a": [ModelResponse("ok")], "b": [ModelResponse("ok")]})
+    a = await h.start(project="p", title="a", request="x")
+    b = await h.start(project="p", title="b", request="y")
+    await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
+    threads = tmp_path / "threads"
+    r = await a.sandbox.exec(f"ls -A {threads}; echo ---; ls -A {threads / '.repo'}; echo ---; "
+                             "echo hi > mine.txt && git add mine.txt && git commit -qm mine && git log --format=%s -1")
+    listed, clone, log = r.stdout.split("---\n")
+    assert b.id not in listed.split() and a.id in listed.split()
+    assert clone.split() == [".git"]
+    assert log.strip() == "mine", r.stderr
+
+
 async def test_turn_end_commits_leftovers_and_pushes_branch(tmp_path):
     bare = origin(tmp_path)
     h = host(tmp_path, bare, {"t": [

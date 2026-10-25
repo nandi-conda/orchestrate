@@ -7,8 +7,9 @@ import types
 import httpx
 import pytest
 
-from runner import LocalSandbox, ModelResponse, OpenAICompatModel, ScriptedModel, ThreadHost, ToolCall
+from runner import LocalSandbox, ModelResponse, OpenAICompatModel, ScriptedModel, ThreadHost, ToolCall, View
 from runner.model import ModelError
+from runner.sandbox import runner_checkout
 from runner.server import create_app
 
 
@@ -27,8 +28,12 @@ def host_with(scripts: dict, tmp_path, repo=None):
     return ThreadHost(model_factory=factory, workdir=str(tmp_path / "threads"), repo=repo)
 
 
+def view(tmp_path, **kw):
+    return View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"), **kw)
+
+
 async def test_sandbox_confines_paths(tmp_path):
-    sb = LocalSandbox(tmp_path / "ws")
+    sb = LocalSandbox(view(tmp_path))
     await sb.write_file("a/b.txt", b"hi")
     assert await sb.read_file("a/b.txt") == b"hi"
     with pytest.raises(Exception):
@@ -37,6 +42,31 @@ async def test_sandbox_confines_paths(tmp_path):
     assert r.exit_code == 0 and "5" in r.stdout and "b.txt" in r.stdout
     r = await sb.exec("sleep 5", timeout=0.2)
     assert r.timed_out
+
+
+async def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, monkeypatch):
+    """The runner's checkout, environment and processes are not in a thread's view."""
+    monkeypatch.setenv("RUNNER_TOKEN", "runner-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "model-secret")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "other-thread.txt").write_text("not yours")
+    checkout = str(runner_checkout())
+    sb = LocalSandbox(view(tmp_path, hidden=(checkout, sys.prefix, str(tmp_path / "state"))))
+    await sb.write_file("mine.txt", b"yours")
+    r = await sb.exec("env; echo ---; pwd; cat mine.txt; echo ---; "
+                      f"ls -A {checkout}; ls -A {tmp_path / 'state'}; echo ---; "
+                      "echo kept > /tmp/scratch; ls /proc | grep -c '^[0-9]'")
+    env, here, hidden, procs = r.stdout.split("---\n")
+    assert "runner-secret" not in env and "model-secret" not in env and "RUNNER_" not in env
+    assert "PIXI" not in env and "CONDA_PREFIX" not in env and sys.prefix not in env
+    assert f"HOME={tmp_path / 'home'}" in env
+    assert here.split() == [str(tmp_path / "ws"), "yours"]
+    assert hidden == ""  # the runner's checkout and the worker's state are empty
+    assert int(procs) < 5  # its own pid namespace: the runner is not in /proc
+    assert (tmp_path / "tmp" / "scratch").read_text() == "kept\n"
+    assert (await sb.exec("cat /tmp/scratch")).stdout == "kept\n"  # /tmp lasts across commands
+    with pytest.raises(Exception):
+        await sb.read_file(str(runner_checkout() / "runner" / "pixi.toml"))
 
 
 async def test_thread_uses_tools_and_finishes(tmp_path):

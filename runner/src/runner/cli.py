@@ -7,6 +7,7 @@ import asyncio
 import json
 import tempfile
 
+from . import sandbox
 from . import tools as T
 from .model import from_spec
 from .repo import Repo
@@ -63,6 +64,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=1800)
     args = ap.parse_args()
     require(["DEEPSEEK_API_KEY"])
+    sandbox.check()
     asyncio.run(amain(args))
 
 

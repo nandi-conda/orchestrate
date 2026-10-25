@@ -11,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from . import files
+from . import files, sandbox
 from . import tools as T
 from .model import from_spec
 from .peers import OrchestratorPeers
@@ -167,8 +167,8 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 
 def repo_from_env(workdir: str) -> Repo | None:
     """The project repo to clone into `<workdir>/.repo`, if RUNNER_REPO names one.
-    GITHUB_TOKEN goes to the runner's own git commands only: it is taken out of
-    the environment the threads' shells inherit."""
+    GITHUB_TOKEN goes to the runner's own git commands only, as a header (see
+    repo.py); threads' commands get an environment of their own (sandbox.py)."""
     url = os.environ.get("RUNNER_REPO")
     token = get_secret("GITHUB_TOKEN")
     os.environ.pop("GITHUB_TOKEN", None)
@@ -197,6 +197,7 @@ def main():
     # Model call timings (runner.model) and thread failures go to the worker log.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     require(["DEEPSEEK_API_KEY"])
+    sandbox.check()
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)

@@ -129,10 +129,39 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`, and an `openai-compat` model's `api
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
 | `RUNNER_REPO` | | git URL of the project; cloned once to `$RUNNER_WORKDIR/.repo`, one worktree per thread (branch `thread/<id>`) off the remote's default branch. See [Commits](#commits) |
-| `GITHUB_TOKEN` | | fine-grained token with Contents: Read and write on `RUNNER_REPO`. Git sends it as `Authorization: Basic base64("x-access-token:<token>")` via `http.<RUNNER_REPO>.extraHeader`; it is removed from the environment threads' shells inherit |
-| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go |
+| `GITHUB_TOKEN` | | fine-grained token with Contents: Read and write on `RUNNER_REPO`. Git sends it as `Authorization: Basic base64("x-access-token:<token>")` via `http.<RUNNER_REPO>.extraHeader`; threads' commands never see it (see [Sandbox](#sandbox)) |
+| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repo/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 | `RUNNER_MAX_STEPS` | `60` | model calls per turn |
+
+## Sandbox
+
+A thread works on its project and sees nothing else of the worker. Every `bash`
+command runs in [bubblewrap](https://github.com/containers/bubblewrap)
+(`bwrap`, from the runner's pixi environment) with this view:
+
+| Path | In the view |
+| --- | --- |
+| `/` | the machine's system, read-only (its git, compilers, shells) |
+| `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; commands start here |
+| `$RUNNER_WORKDIR/.repo/.git` | the clone's git dir, writable, so the thread can commit |
+| `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable, kept between commands |
+| `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept between commands |
+| the orchestrate checkout the runner runs from, its pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
+| `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |
+
+The environment is made afresh for each command: `PATH` (without the hidden
+directories), `HOME`, `TMPDIR=/tmp`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
+`LC_*`, `TERM`, `TZ`. No token, key, `RUNNER_*` or pixi variable reaches it.
+Processes end with the command that started them.
+
+`read_file`, `write_file`, `edit_file` and `list_dir` resolve paths inside the
+worktree (symlinks included) and refuse anything outside it, as does the
+Files API.
+
+`serve` and `run` check at startup that bubblewrap can make a sandbox (it needs
+unprivileged user namespaces) and exit with bubblewrap's error if not. The
+runner is Linux-only for this reason.
 
 ## Commits
 

@@ -10,6 +10,9 @@ plane relays their events back to the window as they happen.
 
 You need [pixi](https://pixi.sh). The orchestrator works on linux-64, osx-64,
 osx-arm64 and win-64; ultra's compiler (lpython 0.22) has no linux-aarch64 build.
+The runner (`../runner`) is Linux-only, since it sandboxes threads with
+bubblewrap, so local workers with the real runner need a Linux machine; Sprites
+are Linux.
 
 ```sh
 git clone https://github.com/nandi-conda/orchestrate && cd orchestrate

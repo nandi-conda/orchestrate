@@ -15,11 +15,13 @@ from . import tools as T
 from .model import Model
 from .peers import LocalPeers, Peers
 from .repo import GitError, Repo, Workspace
-from .sandbox import LocalSandbox, Sandbox
+from .sandbox import LocalSandbox, Sandbox, View, worker_private
 
 SYSTEM_PROMPT = """You are one thread in a team of agent threads working on the project "{project}".
 Your thread id is {id}. Your title: {title}.
 Your workspace is a git worktree of the project at {root}; your branch is {branch}.
+The project is all there is to work on: your commands run in a sandbox that holds this workspace,
+your own home and /tmp, and the system's tools read-only.
 
 How the team works:
 - Many threads run at once. Spawn a new thread for independent work instead of doing it yourself.
@@ -284,7 +286,7 @@ class ThreadHost:
 
     def __init__(self, *, model_factory: Callable[[dict | None], Model], peers: Peers | None = None,
                  repo: Repo | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
-                 sandbox_factory: Callable[[str], Sandbox] = LocalSandbox, capacity: int = 16,
+                 sandbox_factory: Callable[[View], Sandbox] = LocalSandbox, capacity: int = 16,
                  tools: list[T.Tool] | None = None):
         self.model_factory = model_factory
         self.peers = peers or LocalPeers()
@@ -321,13 +323,20 @@ class ThreadHost:
     def running(self) -> int:
         return sum(1 for t in self.threads.values() if t.state in ("queued", "working"))
 
-    async def _workspace(self, tid: str) -> tuple[str, Workspace | None]:
-        path = self.workdir / tid
+    async def _workspace(self, tid: str) -> tuple[View, Workspace | None]:
+        """The thread's worktree (a plain directory when the worker has no
+        repo) and the view its commands get: that, the clone's git dir, and the
+        thread's own home and /tmp under `.home/` and `.tmp/`."""
+        path = (self.workdir / tid).resolve()
+        view = View(root=str(path), home=str(self.workdir.resolve() / ".home" / tid),
+                    tmp=str(self.workdir.resolve() / ".tmp" / tid),
+                    writable=(str(self.repo.path.resolve() / ".git"),) if self.repo else (),
+                    hidden=worker_private(self.workdir))
         if not self.repo:
             path.mkdir(parents=True, exist_ok=True)
-            return str(path), None
+            return view, None
         path.parent.mkdir(parents=True, exist_ok=True)
-        return str(path), await self.repo.worktree(path, f"thread/{tid}")
+        return view, await self.repo.worktree(path, f"thread/{tid}")
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
                     model: dict | None = None, id: str | None = None, history: list[dict] | None = None,
@@ -340,9 +349,9 @@ class ThreadHost:
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
-        root, workspace = await self._workspace(tid)
+        view, workspace = await self._workspace(tid)
         t = AgentThread(id=tid, project=project, title=title, model=self.model_factory(model),
-                        sandbox=self.sandbox_factory(root), peers=self.peers, tools=self.tools,
+                        sandbox=self.sandbox_factory(view), peers=self.peers, tools=self.tools,
                         limits=self.limits, parent=parent, workspace=workspace, emit=self._emit,
                         history=history, summary=summary)
         if old is not None:

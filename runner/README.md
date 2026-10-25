@@ -3,6 +3,9 @@
 Hosts many agent threads in one process. Each thread has its own git worktree,
 calls a pluggable model (DeepSeek first) and runs tools in a pluggable sandbox
 (a local shell first). Threads can list, read, message and spawn each other.
+A thread's commands run in a bubblewrap sandbox that holds its worktree and
+nothing of the runner, so the agent sees only the project
+([API.md](API.md#sandbox)). Linux only (linux-64, linux-aarch64).
 
 ```sh
 pixi run set-key DEEPSEEK_API_KEY             # once: store the key in the system keyring
@@ -23,7 +26,7 @@ and environment variables are in [API.md](API.md).
 | File | What |
 | --- | --- |
 | `src/runner/model.py` | `Model` protocol, `OpenAICompatModel` (DeepSeek), `ScriptedModel` for tests |
-| `src/runner/sandbox.py` | `Sandbox` protocol, `LocalSandbox` |
+| `src/runner/sandbox.py` | `Sandbox` protocol, `View` (what a thread's commands see), `LocalSandbox` (bubblewrap) |
 | `src/runner/tools.py` | work tools (bash, files), peer tools (threads, messages), web tools (search, fetch) |
 | `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` loop and `ThreadHost` (workspaces, events, capacity) |
@@ -34,7 +37,7 @@ and environment variables are in [API.md](API.md).
 
 ## Deploying a worker
 
-On any Linux box with git and curl: `deploy/bootstrap.sh` installs pixi, checks out
+On any Linux box with git, curl and unprivileged user namespaces (bubblewrap needs them): `deploy/bootstrap.sh` installs pixi, checks out
 this repo and installs the `prod` environment; `deploy/start.sh` runs the service in
 the foreground. On Sprites, run bootstrap once through exec, checkpoint, then register
 `deploy/start.sh` as a sprite service with `http_port` 8080 and the env vars from API.md.

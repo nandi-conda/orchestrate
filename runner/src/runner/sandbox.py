@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -40,17 +42,104 @@ def _clip(b: bytes) -> str:
     return s
 
 
-class LocalSandbox:
-    """Runs in the current machine, confined to one directory.
+@dataclass(frozen=True)
+class View:
+    """What a thread's commands see of the worker: the project, and nothing of ours.
 
-    The directory confinement only stops accidents; the worker itself (a Sprite,
-    a container) is the real isolation boundary.
+    The worker runs the runner from a checkout of the orchestrate monorepo and
+    keeps every thread's workspace, the project clone and its secrets on the
+    same machine. A thread's command sees the machine's system read-only, with
+    `hidden` paths empty (the runner's checkout and environment, the worker's
+    home and state), its workspace and the clone's git dir writable at their
+    own paths, its own `home`, and its own `tmp` as /tmp. It has its own pid
+    namespace, so the runner's processes (and their environments) are not in
+    its /proc.
+    """
+    root: str                         # the workspace: the project's worktree, where commands start
+    home: str                         # the thread's HOME
+    tmp: str                          # the thread's /tmp
+    writable: tuple[str, ...] = ()    # more of the worker the workspace needs (the clone's .git)
+    hidden: tuple[str, ...] = ()
+
+
+def runner_checkout() -> Path:
+    """The orchestrate checkout this runner runs from (deploy/bootstrap.sh and
+    the orchestrator's LocalProvider both run it from one): src/runner/ is two
+    levels into runner/, which is one into the checkout."""
+    return Path(__file__).resolve().parents[3]
+
+
+def worker_private(workdir: str | os.PathLike) -> tuple[str, ...]:
+    """Everything on a worker that is not the project: the runner's checkout
+    and environment, the worker user's home (keyring, caches) and the runner's
+    working directory (other threads' workspaces)."""
+    return tuple(str(Path(p).resolve()) for p in (runner_checkout(), sys.prefix, Path.home(), workdir))
+
+
+def _under(path: str, roots: tuple[str, ...]) -> bool:
+    p = Path(path)
+    return any(p == Path(r) or Path(r) in p.parents for r in roots)
+
+
+def thread_env(view: View) -> dict[str, str]:
+    """A command's environment, made afresh: none of the runner's variables
+    (tokens, keys, RUNNER_*, the pixi environment's activation), and a PATH
+    without the directories the view hides."""
+    keep = {k: v for k, v in os.environ.items()
+            if k in ("LANG", "TERM", "TZ", "USER", "LOGNAME", "SHELL") or k.startswith("LC_")}
+    path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                           if p and not _under(str(Path(p).resolve()), view.hidden))
+    return {**keep, "PATH": path, "HOME": view.home, "TMPDIR": "/tmp"}
+
+
+def bwrap_args(view: View) -> list[str]:
+    """bubblewrap's mounts for `view`, parents before children so a writable
+    path inside a hidden one is put back after the hiding."""
+    hidden = [p for p in view.hidden if Path(p).is_dir()]
+    # A hidden path inside another is hidden already; its own mount point would show.
+    mounts = [(p, 0, ["--tmpfs", p]) for p in hidden if not _under(str(Path(p).parent), tuple(hidden))]
+    mounts += [("/tmp", 1, ["--bind", view.tmp, "/tmp"])]
+    mounts += [(p, 1, ["--bind", p, p]) for p in (view.root, view.home, *view.writable)]
+    mounts.sort(key=lambda m: (len(Path(m[0]).parts), m[1]))
+    args = ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--die-with-parent"]
+    for _, _, a in mounts:
+        args += a
+    return args + ["--chdir", view.root]
+
+
+def bwrap() -> str:
+    """The bubblewrap binary (a dependency of the runner's pixi environment)."""
+    path = shutil.which("bwrap")
+    if not path:
+        raise SandboxError("bwrap (bubblewrap) is not on PATH; it ships with the runner's pixi environment")
+    return path
+
+
+def check() -> None:
+    """Fail now, not at a thread's first command, when this machine cannot run
+    the sandbox (no user namespaces for this user, for one)."""
+    import subprocess
+
+    r = subprocess.run([bwrap(), "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "true"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise SandboxError(f"bubblewrap cannot make a sandbox here: {r.stderr.strip()}")
+
+
+class LocalSandbox:
+    """Runs on this machine, in a bubblewrap view of it (see `View`).
+
+    File tools resolve paths inside the workspace, symlinks included; commands
+    run in the view, where nothing outside it exists to reach.
     """
 
-    def __init__(self, root: str | os.PathLike, env: dict[str, str] | None = None):
-        self.root = str(Path(root).resolve())
-        Path(self.root).mkdir(parents=True, exist_ok=True)
+    def __init__(self, view: View, env: dict[str, str] | None = None):
+        self.view = view
+        self.root = str(Path(view.root).resolve())
+        for d in (self.root, view.home, view.tmp):
+            Path(d).mkdir(parents=True, exist_ok=True)
         self.env = env
+        self.bwrap = bwrap()
 
     def _path(self, path: str) -> Path:
         p = (Path(self.root) / path).resolve()
@@ -59,9 +148,9 @@ class LocalSandbox:
         return p
 
     async def exec(self, cmd: str, timeout: float = 120.0) -> ExecResult:
-        env = {**os.environ, **(self.env or {})}
+        env = {**thread_env(self.view), **(self.env or {})}
         proc = await asyncio.create_subprocess_exec(
-            "bash", "-lc", cmd, cwd=self.root, env=env,
+            self.bwrap, *bwrap_args(self.view), "bash", "-lc", cmd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
