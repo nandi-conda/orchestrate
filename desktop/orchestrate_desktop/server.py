@@ -1,8 +1,8 @@
-"""The control plane the window talks to.
+"""The control plane whose ultra UI the window shows.
 
-By default the client starts the control plane itself (`pixi run serve` in
-../orchestrator, which also serves the web UI) and owns it: the window waits
-for its /health, and closing the window stops it. Given --url, the client
+By default the window starts the control plane itself (`pixi run serve` in
+../orchestrator, which builds and serves the ultra UI) and owns it: it waits
+for its /health, and closing the window stops it. Given --url, the window
 connects to a control plane someone else runs and never starts one."""
 
 from __future__ import annotations
@@ -14,10 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
-
-from .api import Api
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 ORCHESTRATOR = Path(__file__).resolve().parents[2] / "orchestrator"
 POLL_MS = 500
@@ -40,9 +38,10 @@ class ControlPlane(QObject):
 
     changed = Signal(str, str)
 
-    def __init__(self, api: Api, command: list[str] | None) -> None:
-        super().__init__(api)
-        self.api = api
+    def __init__(self, base_url: str, command: list[str] | None, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.base_url = base_url.rstrip("/")
+        self.net = QNetworkAccessManager(self)
         self.command = command
         self.proc: subprocess.Popen | None = None
         self.state, self.text = STARTING, ""
@@ -52,7 +51,7 @@ class ControlPlane(QObject):
 
     def start(self) -> None:
         if self.command is None:
-            self._set(STARTING, f"Connecting to {self.api.base_url}…")
+            self._set(STARTING, f"Connecting to {self.base_url}…")
             self._probe()
             return
         kw: dict = {"cwd": str(ORCHESTRATOR)}
@@ -65,7 +64,7 @@ class ControlPlane(QObject):
         except OSError as e:
             self._set(DOWN, f"Could not start the control plane ({' '.join(self.command)}): {e}")
             return
-        self._set(STARTING, f"Starting the control plane at {self.api.base_url}. The first run installs "
+        self._set(STARTING, f"Starting the control plane at {self.base_url}. The first run installs "
                             "its environment and builds the web UI, which takes a while; its output is in "
                             "the terminal.")
         self._probe()
@@ -75,7 +74,7 @@ class ControlPlane(QObject):
         self.changed.emit(state, text)
 
     def _probe(self) -> None:
-        reply = self.api.net.get(self.api.request("/health"))
+        reply = self.net.get(QNetworkRequest(QUrl(self.base_url + "/health")))
         reply.finished.connect(lambda: self._probed(reply))
 
     def _probed(self, reply: QNetworkReply) -> None:
@@ -83,7 +82,7 @@ class ControlPlane(QObject):
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         if status == 200:
             owned = "; it stops when this window closes" if self.proc else ""
-            self._set(UP, f"Control plane at {self.api.base_url}{owned}")
+            self._set(UP, f"Control plane at {self.base_url}{owned}")
             return
         if self.proc is not None:
             code = self.proc.poll()
@@ -92,11 +91,11 @@ class ControlPlane(QObject):
                 return
             self.proc = None
             self._set(DOWN, f"The control plane exited with code {code} before answering at "
-                            f"{self.api.base_url}. Its output is in the terminal (a port already in use "
+                            f"{self.base_url}. Its output is in the terminal (a port already in use "
                             "shows there as \"address already in use\").")
             return
         why = reply.errorString() if status is None else f"/health answered HTTP {status}"
-        self._set(DOWN, f"No control plane at {self.api.base_url}: {why}.")
+        self._set(DOWN, f"No control plane at {self.base_url}: {why}.")
 
     def stop(self) -> None:
         """Stop the control plane this client started, gracefully (so it

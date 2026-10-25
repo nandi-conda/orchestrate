@@ -1,16 +1,20 @@
 [workspace]
 name = "orchestrate-desktop"
 version = "0.1.0"
-description = "PySide6 desktop client for the orchestrator's control plane"
+description = "Desktop window for the orchestrator: PySide draws it, the control plane's ultra UI fills it"
 channels = ["conda-forge"]
-platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+# osx-64 is left out: conda-forge has no qt6-webengine for it. linux-aarch64 too: the control plane
+# the window starts needs ultra, which has no build there.
+platforms = ["linux-64", "osx-arm64", "win-64"]
 
 [dependencies]
 python = "3.12.*"
 pyside6 = ">=6.8"
+qt6-webengine = ">=6.8"
 
-# The tests run the real control plane (../orchestrator) in-process against its
-# echo runner, so they need its dependencies, but not ultra: no web UI is built.
+# The tests run the real control plane (../orchestrator) on its echo runner
+# (tests/serve_echo.py), so they need its dependencies; its UI is built by
+# ../orchestrator's own build-ui task.
 [feature.test.dependencies]
 pytest = ">=8"
 pytest-qt = ">=4.4"
@@ -24,7 +28,7 @@ keyring = ">=25"
 test = ["test"]
 
 [tasks]
-start = { cmd = "python -m orchestrate_desktop", description = "Open the desktop client; it starts and owns the control plane on :8000 (--port N), or --url connects to one" }
+start = { cmd = "python -m orchestrate_desktop", description = "Open the UI in a desktop window; it starts and owns the control plane on :8000 (--port N), or --url shows one" }
 
 [feature.test.tasks]
-test = { cmd = "pytest -q tests", env = { QT_QPA_PLATFORM = "offscreen" } }
+test = { cmd = "pixi run --manifest-path ../orchestrator/pixi.toml build-ui && pytest -q tests", env = { QT_QPA_PLATFORM = "offscreen" } }

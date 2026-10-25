@@ -1,201 +1,113 @@
-"""The window against the control plane and its echo runner, end to end:
-projects, routing, the thread list, the pane's tabs, archiving and SSE."""
+"""The window: it starts and stops its control plane, shows the ultra UI,
+keeps new windows in its one view, and saves downloads to the downloads folder."""
 
-from PySide6.QtCore import Qt
-
+import json
 import sys
+import time
 from pathlib import Path
 
-from orchestrate_desktop.api import Api
-from orchestrate_desktop.server import DOWN, UP, ControlPlane
-from orchestrate_desktop.widgets import EventRow, Fold
-from orchestrate_desktop.window import AUTO, DIALOG, FILES, NEW_THREAD, TO_THREAD, TOOLS, WLOG, MainWindow
+import httpx
+import pytest
+from PySide6.QtCore import QUrl
 
-WAIT = 20000
-
-
-def thread_ids(page) -> list[str]:
-    lst = page.thread_list
-    return [lst.item(i).data(Qt.ItemDataRole.UserRole) for i in range(1, lst.count())
-            if lst.item(i).data(Qt.ItemDataRole.UserRole)]
-
-
-def click_thread(qtbot, page, tid: str) -> None:
-    lst = page.thread_list
-    item = next(lst.item(i) for i in range(lst.count()) if lst.item(i).data(Qt.ItemDataRole.UserRole) == tid)
-    lst.itemClicked.emit(item)
-    qtbot.waitUntil(lambda: page.sel == tid, timeout=WAIT)
-
-
-def send(page, text: str) -> None:
-    page.input.setText(text)
-    page.send_button.click()
-
-
-def dialog_texts(page) -> list[str]:
-    return [w.text.text() for w in page.dialog.widgets() if isinstance(w, EventRow)]
-
-
-def make_window(qtbot, url, tmp_path, command=None) -> MainWindow:
-    api = Api(url)
-    w = MainWindow(api, ControlPlane(api, command))
-    qtbot.addWidget(w)
-    w.project.download_dir = tmp_path
-    w.show()
-    return w
-
-
-def open_new_project(qtbot, w, name="demo"):
-    pp = w.projects
-    qtbot.waitUntil(lambda: w.control.state == UP and not pp.status.text().startswith("Loading"), timeout=WAIT)
-    pp.new_button.click()
-    pp.name.setText(name)
-    pp.create_button.click()
-    page = w.project
-    qtbot.waitUntil(lambda: w.stack.currentWidget() is page and page.project is not None, timeout=WAIT)
-    return page
-
-
-def test_route_threads_dialog_tools_and_back_to_projects(qtbot, control_plane, tmp_path):
-    w = make_window(qtbot, control_plane, tmp_path)
-    page = open_new_project(qtbot, w)
-    assert page.name.text() == "demo" and w.windowTitle() == "demo · Orchestrator"
-    assert page.mode == AUTO and not page.mode_buttons[TO_THREAD].isVisibleTo(page)
-
-    # A list fans out into one thread per item; the stream brings them in.
-    send(page, "- login page\n- export bug")
-    assert page.input.text() == ""
-    qtbot.waitUntil(lambda: len(thread_ids(page)) == 2
-                    and all(t["state"] == "idle" for t in page.threads), timeout=WAIT)
-    qtbot.waitUntil(lambda: page.route_line.startswith("started"), timeout=WAIT)
-    assert not page.sel, "a spawned thread never takes the pane with it"
-    assert any("login page" in t for t in dialog_texts(page))
-
-    # Opening a thread: its transcript, This thread mode, Files and Worker log tabs.
-    login = next(t["id"] for t in page.threads if t["title"] == "login page")
-    click_thread(qtbot, page, login)
-    assert page.mode == TO_THREAD and page.mode_buttons[TO_THREAD].isVisibleTo(page)
-    assert page.tabs.isTabVisible(FILES) and page.tabs.isTabVisible(WLOG)
-    qtbot.waitUntil(lambda: any("login page" in t for t in dialog_texts(page)), timeout=WAIT)
-    assert page.route.isVisibleTo(page) and page.route_text.text().startswith("started")
-
-    # Message the thread: its spawn line goes through the peer calls and the
-    # child reports back; tool calls are under Tools, folded.
-    send(page, "spawn: write tests")
-    qtbot.waitUntil(lambda: any(t.get("parent_id") == login for t in page.threads), timeout=WAIT)
-    qtbot.waitUntil(lambda: any(t.startswith("Finished:") for t in dialog_texts(page)), timeout=WAIT)
-    page.tabs.setCurrentIndex(TOOLS)
-    folds = [f for f in page.tools.widgets() if isinstance(f, Fold)]
-    assert folds and page.tabs.tabText(TOOLS) == f"Tools  {len(folds)}"
-    assert not folds[0].body.isVisibleTo(page)
-    folds[0].button.click()
-    assert folds[0].body.isVisibleTo(page)
-
-    page.tabs.setCurrentIndex(WLOG)
-    qtbot.waitUntil(lambda: page.wlog is not None, timeout=WAIT)
-    assert not page.wlog_err
-
-    # Project activity again: Files and Worker log go, the mode goes back.
-    page.thread_list.itemClicked.emit(page.thread_list.item(0))
-    qtbot.waitUntil(lambda: page.sel == "", timeout=WAIT)
-    assert page.mode == AUTO and page.tabs.currentIndex() == DIALOG
-    assert not page.tabs.isTabVisible(FILES)
-
-    pid = page.pid
-    page.home.emit()
-    assert w.stack.currentWidget() is w.projects and page.stream is None and w.windowTitle() == "Orchestrator"
-    qtbot.waitUntil(lambda: w.projects.list.count() == 1, timeout=WAIT)
-    item = w.projects.list.item(0)
-    assert item.data(Qt.ItemDataRole.UserRole) == pid
-    w.projects.list.itemClicked.emit(item)
-    qtbot.waitUntil(lambda: page.pid == pid and len(thread_ids(page)) == 3, timeout=WAIT)
-
-
-def test_files_browse_and_download(qtbot, control_plane, tmp_path):
-    w = make_window(qtbot, control_plane, tmp_path / "dl")
-    (tmp_path / "dl").mkdir()
-    page = open_new_project(qtbot, w)
-    page.mode_buttons[NEW_THREAD].click()
-    assert page.mode == NEW_THREAD
-    send(page, "build hello\nwrite out/hello world: compiled\nwrite README.md: hi")
-    qtbot.waitUntil(lambda: bool(page.threads) and page.threads[0]["state"] == "idle", timeout=WAIT)
-    click_thread(qtbot, page, page.threads[0]["id"])
-    page.tabs.setCurrentIndex(FILES)
-    qtbot.waitUntil(lambda: page.files is not None and page.files_list.count() == 2, timeout=WAIT)
-    assert [page.files_list.item(i).text() for i in range(2)] == ["out/", "README.md    3 B"]
-
-    page.files_list.itemClicked.emit(page.files_list.item(0))
-    qtbot.waitUntil(lambda: page.fpath == "out" and page.files_list.count() == 1, timeout=WAIT)
-    assert page.files_path.text() == "/out" and page.files_up.isVisibleTo(page)
-    page.files_list.itemClicked.emit(page.files_list.item(0))
-    qtbot.waitUntil(lambda: page.files_status.text().startswith("Saved"), timeout=WAIT)
-    assert (tmp_path / "dl" / "hello world").read_bytes() == b"compiled\n"
-    page.files_list.itemClicked.emit(page.files_list.item(0))  # never overwrites
-    qtbot.waitUntil(lambda: (tmp_path / "dl" / "hello world (1)").exists(), timeout=WAIT)
-
-    page.files_up.click()
-    qtbot.waitUntil(lambda: page.fpath == "" and page.files_list.count() == 2, timeout=WAIT)
-
-
-def test_archive_and_unarchive(qtbot, control_plane, tmp_path):
-    w = make_window(qtbot, control_plane, tmp_path)
-    page = open_new_project(qtbot, w)
-    page.mode = NEW_THREAD
-    send(page, "tidy up")
-    qtbot.waitUntil(lambda: bool(page.threads) and page.threads[0]["state"] == "idle", timeout=WAIT)
-    tid = page.threads[0]["id"]
-    click_thread(qtbot, page, tid)
-    assert page.archive_button.isVisibleTo(page) and not page.unarchive_button.isVisibleTo(page)
-
-    page.archive_button.click()
-    qtbot.waitUntil(lambda: page.sel == "" and thread_ids(page) == [], timeout=WAIT)
-
-    page.archived_button.click()
-    assert page.list_title.text() == "Archived"
-    qtbot.waitUntil(lambda: thread_ids(page) == [tid], timeout=WAIT)
-    click_thread(qtbot, page, tid)
-    assert page.unarchive_button.isVisibleTo(page) and not page.stop_button.isVisibleTo(page)
-    assert not page.mode_buttons[TO_THREAD].isVisibleTo(page), "an archived thread takes no messages"
-
-    page.unarchive_button.click()
-    qtbot.waitUntil(lambda: not page.show_archived and thread_ids(page) == [tid], timeout=WAIT)
-    assert page.sel == tid and page.list_title.text() == "Threads"
-
+from conftest import free_port
+from orchestrate_desktop.server import DOWN, STARTING, UP, ControlPlane
+from orchestrate_desktop.window import MainWindow
 
 SERVE = Path(__file__).with_name("serve_echo.py")
+WAIT = 30000
 
 
-def test_the_window_starts_and_stops_its_own_control_plane(qtbot, tmp_path):
-    from conftest import free_port
+def js(qtbot, w, code: str):
+    """Run code in the page and return its value, or None when the page went
+    away first (a navigation drops the call)."""
+    with qtbot.waitCallback(timeout=3000, raising=False) as cb:
+        w.view.page().runJavaScript(code, 0, cb)
+    return cb.args[0] if cb.called else None
+
+
+def page_text(qtbot, w) -> str:
+    return js(qtbot, w, "document.body ? document.body.innerText : ''") or ""
+
+
+@pytest.fixture
+def owned(qtbot, tmp_path):
+    """A window that started its own control plane, with the UI loaded."""
     port = free_port()
-    w = make_window(qtbot, f"http://127.0.0.1:{port}", tmp_path,
-                    [sys.executable, str(SERVE), str(port), str(tmp_path)])
-    assert w.control.proc is not None
-    page = open_new_project(qtbot, w)
-    assert "stops when this window closes" in w.projects.conn.text()
-    send(page, "hello")
-    qtbot.waitUntil(lambda: len(thread_ids(page)) == 1, timeout=WAIT)
+    url = f"http://127.0.0.1:{port}"
+    (tmp_path / "dl").mkdir()
+    w = MainWindow(ControlPlane(url, [sys.executable, str(SERVE), str(port), str(tmp_path)]))
+    w.download_dir = tmp_path / "dl"
+    qtbot.addWidget(w)
+    w.show()
+    assert w.control.proc is not None and w.control.state in (STARTING, UP)
+    qtbot.waitUntil(lambda: w.control.state == UP, timeout=WAIT)
+    qtbot.waitUntil(lambda: "Projects" in page_text(qtbot, w), timeout=WAIT)
+    yield w, url
+    w.close()
+
+
+def test_the_window_shows_the_ultra_ui_of_the_control_plane_it_started(qtbot, owned):
+    w, url = owned
+    assert w.view.url().toString() == url + "/"
+    with httpx.Client(base_url=url) as c:
+        pid = c.post("/api/projects", json={"name": "from-the-test"}).json()["id"]
+    w.view.reload()
+    qtbot.waitUntil(lambda: "from-the-test" in page_text(qtbot, w), timeout=WAIT)
+    assert "stops when this window closes" in w.control.text
+
+    # A new window (window.open, target=_blank) is this view.
+    js(qtbot, w, f"window.open({json.dumps(url + '/p/' + pid)}, '_blank'); true")
+    qtbot.waitUntil(lambda: w.view.url().toString() == f"{url}/p/{pid}", timeout=WAIT)
+
     proc = w.control.proc
     w.close()
     assert proc.poll() is not None and w.control.proc is None
 
 
-def test_a_control_plane_that_exits_shows_down_not_an_empty_list(qtbot, tmp_path):
-    from conftest import free_port
+def test_a_files_download_lands_in_the_downloads_folder(qtbot, owned, tmp_path):
+    w, url = owned
+    with httpx.Client(base_url=url, timeout=20) as c:
+        pid = c.post("/api/projects", json={"name": "demo"}).json()["id"]
+        tid = c.post(f"/api/projects/{pid}/requests",
+                     json={"text": "build\nwrite out/hello: compiled", "mode": "new"}).json()["spawned"][0]["id"]
+        deadline = time.time() + 20
+        while c.get(f"/api/threads/{tid}").json()["state"] != "idle":
+            assert time.time() < deadline
+            time.sleep(0.1)
+    # What the Files tab's link does: <a href=… download=…>, clicked.
+    link = f"/api/threads/{tid}/files/raw?path=out%2Fhello"
+    click = f"""const a = document.createElement('a'); a.href = {json.dumps(link)}; a.download = 'hello';
+                document.body.appendChild(a); a.click(); true"""
+    js(qtbot, w, click)
+    qtbot.waitUntil(lambda: (tmp_path / "dl" / "hello").exists()
+                    and w.statusBar().currentMessage().startswith("Saved"), timeout=WAIT)
+    assert (tmp_path / "dl" / "hello").read_bytes() == b"compiled\n"
+    # Never overwrites. (A second scripted click would be held back by
+    # Chromium's guard against downloads without a user gesture.)
+    w.view.page().download(QUrl(url + link), "hello")
+    qtbot.waitUntil(lambda: (tmp_path / "dl" / "hello (1)").exists(), timeout=WAIT)
+    assert w.view.url().toString() == url + "/", "a download leaves the page where it was"
+
+
+def test_a_control_plane_that_exits_says_so_with_retry(qtbot, tmp_path):
     port = free_port()
-    w = make_window(qtbot, f"http://127.0.0.1:{port}", tmp_path,
-                    [sys.executable, str(SERVE), str(port), str(tmp_path), "3"])
+    w = MainWindow(ControlPlane(f"http://127.0.0.1:{port}", [sys.executable, str(SERVE), str(port), str(tmp_path), "3"]))
+    qtbot.addWidget(w)
+    w.show()
     qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
-    pp = w.projects
-    assert "exited with code 3" in pp.conn.text() and f"127.0.0.1:{port}" in pp.conn.text()
-    assert pp.retry.isVisibleTo(w) and not pp.list.isVisibleTo(w) and not pp.status.isVisibleTo(w)
-    assert not pp.new_button.isEnabled()
+    qtbot.waitUntil(lambda: "exited with code 3" in page_text(qtbot, w), timeout=WAIT)
+    assert f"127.0.0.1:{port}" in page_text(qtbot, w)
+    js(qtbot, w, "document.querySelector('a').click(); true")  # Retry starts it again
+    qtbot.waitUntil(lambda: w.control.proc is not None or w.control.state == STARTING, timeout=WAIT)
+    qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
 
 
-def test_connecting_to_nothing_names_the_url(qtbot, tmp_path):
-    from conftest import free_port
+def test_connecting_to_nothing_names_the_url(qtbot):
     url = f"http://127.0.0.1:{free_port()}"
-    w = make_window(qtbot, url, tmp_path)
+    w = MainWindow(ControlPlane(url, None))
+    qtbot.addWidget(w)
+    w.show()
     qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
-    assert w.projects.conn.text().startswith(f"No control plane at {url}: ")
-    assert not w.projects.status.isVisibleTo(w)
+    assert w.control.text.startswith(f"No control plane at {url}: ")
+    qtbot.waitUntil(lambda: f"No control plane at {url}" in page_text(qtbot, w), timeout=WAIT)

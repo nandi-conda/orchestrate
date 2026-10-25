@@ -1,19 +1,23 @@
-"""The tests drive the window against the real control plane (../orchestrator),
-served in-process on a free port with its echo runner and rule-based router,
-so they need no credentials and never start a sprite or call a model."""
+"""The tests start the real control plane (../orchestrator) the way the window
+does, as a process it owns, but on its echo runner and rule-based router
+(serve_echo.py), so they need no credentials and never start a sprite or call
+a model. The window then shows the real ultra UI from ../orchestrator/ui/dist,
+which `pixi run test` builds first."""
 
-import asyncio
+import os
 import socket
 import sys
-import threading
-import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication, QEvent
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "orchestrator"))
+# Chromium's sandbox refuses to run as root, which test containers often are.
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+# Offscreen there is no OpenGL, and Chromium's GPU process hangs looking for it.
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
 
 
 def free_port() -> int:
@@ -22,30 +26,11 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def control_plane(tmp_path, monkeypatch):
-    import uvicorn
-
-    from control.app import create_app
-    from control.providers import LocalProvider
-    from control.router import HeuristicRouter
-    from control.store import SqliteStore
-
-    monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
-    port = free_port()
-    # Set before the server stops, it ends the SSE streams the window holds open.
-    stop = asyncio.Event()
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
-                     shutdown_event=stop)
-    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    loop = asyncio.new_event_loop()
-    th = threading.Thread(target=loop.run_until_complete, args=(srv.serve(),), daemon=True)
-    th.start()
-    deadline = time.time() + 10
-    while not srv.started and time.time() < deadline:
-        time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}"
-    loop.call_soon_threadsafe(stop.set)
-    srv.should_exit = True
-    th.join(10)
+@pytest.fixture(autouse=True)
+def delete_windows(qapp):
+    """Delete each test's windows before the next test (pytest-qt only
+    schedules it). A web page left for interpreter exit crashes Chromium's
+    teardown."""
+    yield
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()

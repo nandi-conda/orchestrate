@@ -1,1 +1,1 @@
-"""PySide6 desktop client for the orchestrator's control plane."""
+"""A desktop window for the orchestrator: PySide draws it, the ultra UI is what is in it."""

@@ -1,7 +1,7 @@
 [workspace]
 name = "orchestrate"
 version = "0.1.0"
-description = "Project-based agent orchestrator: control plane + ultra UI, the agent runner, and a PySide6 desktop client"
+description = "Project-based agent orchestrator: control plane + ultra UI, the agent runner, and a desktop window for the UI"
 channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
 
@@ -12,7 +12,7 @@ platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
 [tasks]
 setup = { cmd = "pixi install --manifest-path runner && pixi install --all --manifest-path orchestrator && pixi install --all --manifest-path desktop", description = "Install every subproject's environments, including the test envs" }
 serve = { cmd = "pixi run --manifest-path orchestrator serve", description = "Build the UI, then serve the control plane on http://127.0.0.1:8000" }
-desktop = { cmd = "pixi run --manifest-path desktop start", description = "Open the PySide6 desktop client; it starts and owns the control plane on :8000 (--port, or --url to connect to one)" }
+desktop = { cmd = "pixi run --manifest-path desktop start", description = "Open the UI in a desktop window; it starts and owns the control plane on :8000 (--port, or --url to show one)" }
 worker = { cmd = "pixi run --manifest-path runner serve", description = "Run a runner service on :8080 (a worker; the control plane starts one per project itself)" }
 test = { cmd = "pixi run --manifest-path runner test && pixi run --manifest-path orchestrator test && pixi run --manifest-path desktop test", description = "Run every test suite: runner, orchestrator, desktop" }
 set-key = { cmd = "pixi run --manifest-path runner set-key", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }
