@@ -18,6 +18,7 @@ ultra = ">=0.1.20,<0.2"
 
 [feature.test.dependencies]
 pytest = ">=8"
+pytest-xdist = ">=3"
 anyio = ">=4"
 nodejs = ">=22"
 postgresql = ">=18.4,<19"
@@ -57,4 +58,5 @@ devrunner = "python -m control.devrunner --port 8080"
 set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }
 
 [feature.test.tasks]
-test = { cmd = "pytest -q tests", depends-on = ["build-ui"] }
+# Each test has its own directory, ports and workers, so they run side by side.
+test = { cmd = "pytest -q tests -n auto", depends-on = ["build-ui"] }

@@ -21,6 +21,7 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT/src"
 [feature.test.dependencies]
 pytest = "*"
 pytest-asyncio = "*"
+pytest-xdist = "*"
 
 [environments]
 default = { features = ["test"], solve-group = "default" }
@@ -29,5 +30,5 @@ prod = { features = [], solve-group = "default" }
 [tasks]
 serve = "python -m runner.server"
 run = "python -m runner.cli"
-test = "pytest -q"
+test = "pytest -q -n auto"
 set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }

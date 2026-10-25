@@ -81,7 +81,11 @@ def tail(data: bytes, lines: int) -> str:
 
 
 async def wait_healthy(url: str, timeout: float = 120.0) -> None:
+    """Poll /health until the runner answers. A runner on this machine answers
+    in milliseconds, one on a sprite starts by installing; look again at once at
+    first, then back off to a quarter second."""
     deadline = asyncio.get_running_loop().time() + timeout
+    delay = 0.01
     async with httpx.AsyncClient(timeout=5.0) as c:
         while True:
             try:
@@ -92,13 +96,20 @@ async def wait_healthy(url: str, timeout: float = 120.0) -> None:
                 pass
             if asyncio.get_running_loop().time() > deadline:
                 raise TimeoutError(f"runner at {url} did not become healthy")
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.25)
 
 
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+# How long a runner gets to exit after SIGTERM before it is killed: its /events
+# streams and peer long polls end with the connections the control plane closes
+# first, so this is only for one that is stuck.
+STOP_GRACE = 5.0
 
 
 def passthrough_env() -> dict:
@@ -225,16 +236,20 @@ class LocalProvider:
         if proc and proc.returncode is None:
             proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), 5)
+                await asyncio.wait_for(proc.wait(), STOP_GRACE)
             except asyncio.TimeoutError:
                 proc.kill()
 
     async def close(self) -> None:
+        """Stop every runner this provider started, as destroy() does."""
         for wid in list(self.procs):
             proc = self.procs.pop(wid)
             if proc.returncode is None:
                 proc.terminate()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), STOP_GRACE)
+                except asyncio.TimeoutError:
+                    proc.kill()
 
 
 # Get the monorepo onto the sprite, then let runner/deploy/bootstrap.sh install pixi

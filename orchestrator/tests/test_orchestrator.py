@@ -20,6 +20,7 @@ from control import service
 from control.app import create_app
 from control.providers import LocalProvider
 from control.router import HeuristicRouter, clean_plan
+from control.server import Server
 from control.store import SqliteStore
 
 pytestmark = pytest.mark.anyio
@@ -265,6 +266,7 @@ async def test_worker_logs_come_from_the_provider(tmp_path):
             await orch.worker_logs("t_nope")
     finally:
         await orch.close()
+        await provider.close()
         await s.close()
 
 
@@ -322,10 +324,15 @@ def server(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "CAPACITY", 1)
     port = free_port()
     url = f"http://127.0.0.1:{port}"
+    # Served as production does (control/server.py): the shutdown event ends the
+    # SSE streams, so the server stops at once instead of waiting on a client
+    # that still holds one open.
+    stop = asyncio.Event()
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                      LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True),
-                     HeuristicRouter(), repos=str(tmp_path / "repos"))
-    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+                     HeuristicRouter(), shutdown_event=stop, repos=str(tmp_path / "repos"))
+    srv = Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                timeout_graceful_shutdown=5), stop)
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()
     deadline = time.time() + 10
@@ -423,7 +430,12 @@ async def test_end_to_end_with_echo_runner(server):
         assert seen >= 5
 
         await c.post(f"/api/threads/{ids[1]}/stop")
-        assert (await c.get(f"/api/threads/{ids[1]}")).json()["state"] == "stopped"
+
+        # The state can lag the stop: a state event from the turn that was just
+        # running may still be on its way when the control plane takes it.
+        async def stopped():
+            return (await c.get(f"/api/threads/{ids[1]}")).json()["state"] == "stopped" or None
+        await wait_for(stopped)
 
 
 class GatedRouter(HeuristicRouter):
@@ -838,6 +850,7 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     await wait_for(lambda: replies(t["id"]))
     await wait_for(lambda: idle(t["id"]))
     await first.close()
+    await first.provider.close()
 
     second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
     await second.send(t["id"], "can I download it?")
@@ -852,6 +865,7 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     assert row["worker_id"] == second.by_thread[t["id"]].worker.id and row["state"] == "idle"
     assert await s.list_messages(t["id"], unread_only=True) == []
     await second.close()
+    await second.provider.close()
     await s.close()
 
 
@@ -905,6 +919,7 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     new = orch.by_thread[busy["id"]]
     assert new is orch.by_thread[idle_one["id"]] and new.worker.id != old.worker.id
     await orch.close()
+    await provider.close()
     await s.close()
 
 
@@ -934,6 +949,7 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
     types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
     assert "error" not in types and types.index("worker_lost") < types.index("revived")
     await orch.close()
+    await provider.close()
     await s.close()
 
 
@@ -993,6 +1009,7 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
     assert [e["payload"]["worker"] for e in revived] == [ran_on]
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -1082,6 +1099,7 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
            if e["type"] == "message_in"]
     assert got == [("router", "from router"), ("user", "You")]
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 

@@ -54,6 +54,27 @@ def images_of(b: dict) -> list[dict]:
     return out
 
 
+async def gone(req: Request) -> None:
+    """Returns once the caller's connection is closed."""
+    while not await req.is_disconnected():
+        await asyncio.sleep(0.1)
+
+
+async def long_poll(taking, req: Request) -> list[dict]:
+    """What `taking` answers, or [] as soon as the caller goes away first: a
+    long poll must not outlive the connection that asked for it, or a worker
+    being stopped waits for a poll nobody will read (uvicorn's shutdown waits
+    for it too)."""
+    task = asyncio.ensure_future(taking)
+    left = asyncio.ensure_future(gone(req))
+    try:
+        await asyncio.wait({task, left}, return_when=asyncio.FIRST_COMPLETED)
+        return task.result() if task.done() and not task.cancelled() else []
+    finally:
+        for ending in (task, left):
+            ending.cancel()
+
+
 def create_app(host: ThreadHost, token: str | None) -> Starlette:
     def authed(req: Request) -> bool:
         if not token:
@@ -211,7 +232,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if outbox is None:
             return JSONResponse([])
         wait = min(max(float(req.query_params.get("wait") or 25), 0.0), 55.0)
-        return JSONResponse(await outbox.take(wait))
+        return JSONResponse(await long_poll(outbox.take(wait), req))
 
     async def peer_answer(req: Request):
         b = await req.json()

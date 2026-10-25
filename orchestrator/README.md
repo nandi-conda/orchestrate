@@ -125,6 +125,9 @@ pixi run test             # store, router, the whole loop against the echo runne
 pixi run test-desktop     # the desktop window, offscreen, against the real UI on the echo runner
 ```
 
+Each test has its own directory, ports and workers, so `test` runs them side by
+side (`-n auto`, one per core).
+
 The Postgres test starts a throwaway server with `initdb`, which refuses to run
 as root, so it is skipped there.
 

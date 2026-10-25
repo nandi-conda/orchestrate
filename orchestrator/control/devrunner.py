@@ -51,6 +51,27 @@ FINISH = re.compile(r"^\s*finish\s*$", re.M)
 THREAD_ID = re.compile(r"^[\w-]+$")
 
 
+async def gone(req: Request) -> None:
+    """Returns once the caller's connection is closed."""
+    while not await req.is_disconnected():
+        await asyncio.sleep(0.1)
+
+
+async def long_poll(taking, req: Request) -> list[dict]:
+    """What `taking` answers, or [] as soon as the caller goes away first: a
+    long poll must not outlive the connection that asked for it, or a worker
+    being stopped waits for a poll nobody will read (uvicorn's shutdown waits
+    for it too). The real runner's server.py does the same."""
+    task = asyncio.ensure_future(taking)
+    left = asyncio.ensure_future(gone(req))
+    try:
+        await asyncio.wait({task, left}, return_when=asyncio.FIRST_COMPLETED)
+        return task.result() if task.done() and not task.cancelled() else []
+    finally:
+        for ending in (task, left):
+            ending.cancel()
+
+
 class Host:
     def __init__(self, capacity: int, delay: float, workdir: str) -> None:
         self.capacity = capacity
@@ -90,6 +111,8 @@ class Host:
             self.waiting.pop(cid, None)
 
     async def take_calls(self, wait: float) -> list[dict]:
+        """The calls queued for the control plane, waiting up to `wait` seconds
+        for one."""
         async with self.calls_cond:
             if not self.calls:
                 try:
@@ -348,7 +371,8 @@ def create_app(host: Host, token: str) -> Starlette:
     async def peer_calls(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
-        return JSONResponse(await host.take_calls(min(float(req.query_params.get("wait") or 25), 55.0)))
+        wait = min(float(req.query_params.get("wait") or 25), 55.0)
+        return JSONResponse(await long_poll(host.take_calls(wait), req))
 
     async def peer_answer(req: Request):
         if not authed(req):
@@ -384,8 +408,12 @@ def main() -> None:
     host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")),
                 os.environ.get("RUNNER_WORKDIR") or tempfile.mkdtemp(prefix="devrunner-"))
     print(f"devrunner: echo runner on port {a.port}", file=sys.stderr, flush=True)
+    # /events streams stay open for subscribers (the control plane's relay), and
+    # so does the peer long poll, so bound the wait for them; otherwise Ctrl+C
+    # never completes (the real runner, runner/server.py).
     uvicorn.run(create_app(host, os.environ.get("RUNNER_TOKEN", "")),
-                host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning")
+                host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning",
+                timeout_graceful_shutdown=int(os.environ.get("RUNNER_GRACEFUL_SHUTDOWN", "5")))
 
 
 if __name__ == "__main__":

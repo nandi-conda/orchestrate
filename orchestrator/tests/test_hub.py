@@ -109,6 +109,7 @@ async def test_every_turn_reaches_the_hub_and_finish_lands(tmp_path):
     assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "b.txt"}
     assert git(hub, "rev-list", "--merges", "--count", "main") == "0"
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -133,6 +134,7 @@ async def test_landing_rebases_onto_what_landed_before_and_conflicts_go_back(tmp
     wt = tmp_path / "w" / f"{p['id']}-w1" / c["id"]
     assert git(wt, "rev-parse", "origin/main") == git(hub, "rev-parse", "main")
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -153,6 +155,7 @@ async def test_a_project_repository_gets_the_landing_first_and_nothing_else(tmp_
     assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "theirs.txt", "a.txt"}
     assert git(bare, "for-each-ref", "--format=%(refname)") == "refs/heads/trunk"  # no thread branches
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -219,6 +222,7 @@ async def test_a_remote_attached_later_gives_a_new_project_its_history(tmp_path)
     assert "Start the project" not in git(bare, "log", "--format=%s", "trunk")
     assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "a.txt"}
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -232,6 +236,7 @@ async def test_an_empty_remote_gets_the_projects_history(tmp_path):
     await orch.update_project(p["id"], repo_url=str(empty))
     assert git(empty, "rev-parse", "main") == landed["commit"]
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -249,6 +254,7 @@ async def test_a_remote_with_another_history_is_refused(tmp_path):
     assert git(hub, "for-each-ref", "--format=%(refname)", "refs/orchestrate") == ""
     assert git(bare, "log", "--format=%s", "trunk") == "init"
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 
@@ -277,6 +283,7 @@ async def test_a_remote_ahead_or_behind_follows_and_removing_it_keeps_the_hub(tm
     await orch.update_project(p["id"], repo_url=str(bare))
     assert git(hub, "rev-parse", "trunk") == git(bare, "rev-parse", "trunk")
     await orch.close()
+    await orch.provider.close()
     await s.close()
 
 

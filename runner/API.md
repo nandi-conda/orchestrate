@@ -97,7 +97,9 @@ reach it, by queuing their calls on this runner for the orchestrator to collect:
 
 1. `GET /peer/calls?wait=25` (max 55) long-polls. It returns as soon as a call
    is queued, with every call due: `[{"id", "op", "args"}]`, or `[]` after
-   `wait` seconds with none.
+   `wait` seconds with none, or when the connection asking is closed (an
+   orchestrator that went away; a poll outliving it would hold the worker open
+   while it stops).
 2. The orchestrator runs each call (concurrently) as this worker, limited to
    the worker's project.
 3. `POST /peer/calls/{id}` with `{"ok": true, "result": ...}` or
