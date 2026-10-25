@@ -484,8 +484,9 @@ class Orchestrator:
     async def live_worker(self, thread_id: str) -> LiveWorker:
         """The worker running the thread. A thread that runs nowhere (its worker
         went away with an earlier control plane, it stopped or it failed) is
-        brought back on a worker first: its pushed branch and its conversation,
-        idle until its next message. Concurrent callers share one revival.
+        brought back first, on the worker it ran on while that one is alive:
+        its worktree and its conversation, idle until its next message.
+        Concurrent callers share one revival.
 
         Raises KeyError for an unknown thread, ArchivedError for an archived one."""
         t = await self.store.get_thread(thread_id)
@@ -498,21 +499,27 @@ class Orchestrator:
             await asyncio.wait({starting})
             t = await self.store.get_thread(thread_id)
         lw = self.by_thread.get(thread_id)
-        if lw is not None and t["state"] not in ENDED:
-            if await self._health(lw) is not None:
+        if lw is not None:
+            if await self._health(lw) is None:
+                await self._lose(lw)
+                lw = None
+            elif t["state"] not in ENDED:
                 return lw
-            await self._lose(lw)
         task = self.reviving.get(thread_id)
         if task is None:
-            task = asyncio.create_task(self._revive(t))
+            task = asyncio.create_task(self._revive(t, lw))
             self.reviving[thread_id] = task
             task.add_done_callback(lambda _: self.reviving.pop(thread_id, None))
         return await asyncio.shield(task)
 
-    async def _revive(self, t: dict) -> LiveWorker:
+    async def _revive(self, t: dict, lw: LiveWorker | None) -> LiveWorker:
+        """Start the thread again on `lw`, the live worker that ran it, so its
+        worktree there (with what it never pushed, like ignored build output)
+        is the one it continues in; on a picked worker when it has none."""
         tid, project = t["id"], await self.store.get_project(t["project_id"])
         history = await self.history(t)
-        lw = await self._pick_worker(project)
+        if lw is None:
+            lw = await self._pick_worker(project)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
         await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
                                       model=model, summary=t["summary"], history=history)

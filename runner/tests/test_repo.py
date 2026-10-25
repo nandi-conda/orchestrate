@@ -158,3 +158,30 @@ async def test_stopped_thread_restarts_in_the_worktree_it_had(tmp_path):
     await h.wait_idle(r.id)
     assert r.model.seen[0][3] == {"role": "tool", "tool_call_id": "c_bash",
                                   "content": "error: the thread stopped before this tool returned"}
+
+
+async def test_worktree_left_behind_by_a_thread_that_moved_on_is_made_again(tmp_path):
+    bare = origin(tmp_path)
+    old = Repo(str(bare), tmp_path / "w1" / ".repo")
+    ws = await old.worktree(tmp_path / "w1" / "T", "thread/T")
+    (ws.path / "a.txt").write_text("a\n")
+    await ws.save("a")
+    # The thread went on on another worker and pushed more there.
+    other = Repo(str(bare), tmp_path / "w2" / ".repo")
+    ws2 = await other.worktree(tmp_path / "w2" / "T", "thread/T")
+    (ws2.path / "b.txt").write_text("b\n")
+    await ws2.save("b")
+    back = await old.worktree(tmp_path / "w1" / "T", "thread/T")
+    assert sorted(p.name for p in back.path.iterdir() if p.name != ".git") == ["a.txt", "b.txt", "notes.txt"]
+
+
+async def test_worktree_that_holds_what_was_pushed_keeps_its_ignored_files(tmp_path):
+    bare = origin(tmp_path)
+    repo = Repo(str(bare), tmp_path / "w1" / ".repo")
+    ws = await repo.worktree(tmp_path / "w1" / "T", "thread/T")
+    (ws.path / ".gitignore").write_text("build/\n")
+    await ws.save("ignore build")
+    (ws.path / "build").mkdir()
+    (ws.path / "build" / "app").write_text("binary\n")
+    again = await repo.worktree(tmp_path / "w1" / "T", "thread/T")
+    assert (again.path / "build" / "app").read_text() == "binary\n"

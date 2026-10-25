@@ -706,13 +706,19 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
         return (await s.get_thread(t["id"]))["state"] == "idle" or None
     await wait_for(idle)
     await orch.stop(t["id"])
+    ran_on = (await s.get_thread(t["id"]))["worker_id"]
+
+    async def no_other_worker(project):
+        raise AssertionError("revived away from the live worker that holds its worktree")
+    monkeypatch.setattr(orch, "_pick_worker", no_other_worker)
     await orch.send(t["id"], "again")
 
     async def answered():
         return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
-    assert "revived" in [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
+    assert [e["payload"]["worker"] for e in revived] == [ran_on]
     await orch.close()
     await s.close()
 

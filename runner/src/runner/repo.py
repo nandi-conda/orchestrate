@@ -3,7 +3,9 @@
 One clone per worker (`<workdir>/repo`); every thread gets a worktree of it on
 its own branch `thread/<id>`. A new thread's branch starts from the remote's
 default branch; a thread brought back on a worker (after its old worker went
-away, or after it stopped) continues from its pushed `thread/<id>`. The
+away, or after it stopped) keeps the worktree that worker still has for it
+when that holds all it pushed, and otherwise continues from its pushed
+`thread/<id>`. The
 clone's object store and refs are shared by all threads on the worker, while
 each worktree has its own files, index and HEAD.
 
@@ -97,7 +99,9 @@ class Repo:
 
     async def worktree(self, path: str | os.PathLike, branch: str) -> "Workspace":
         """The thread's worktree at `path` on `branch`. One this worker already
-        has is kept as it is (it holds at least what was pushed). Otherwise it
+        has is kept as it is, with its uncommitted and ignored files, while it
+        holds everything the thread pushed. One that does not is stale (the
+        thread went on on another worker since) and is made again. A worktree
         is made from origin's `branch` when the thread pushed one, else from
         origin's default branch."""
         if not self.base:
@@ -105,14 +109,17 @@ class Repo:
         path = Path(path)
         async with self.lock:
             await self.git("worktree", "prune")
+            pushed = bool((await self.git("ls-remote", "--heads", "origin", branch)).out)
+            start = branch if pushed else self.base
+            await self.git("fetch", "-q", "origin", f"+refs/heads/{start}:refs/remotes/origin/{start}")
             listed = (await self.git("worktree", "list", "--porcelain")).out
             if f"worktree {path.resolve()}" in listed.splitlines():
-                return Workspace(self, path, branch)
+                if not pushed or (await self.git("merge-base", "--is-ancestor", f"origin/{branch}", "HEAD",
+                                                 cwd=path, check=False)).code == 0:
+                    return Workspace(self, path, branch)
+                await self.git("worktree", "remove", "--force", str(path))
             if path.exists():  # a leftover directory git no longer knows as a worktree
                 shutil.rmtree(path)
-            pushed = (await self.git("ls-remote", "--heads", "origin", branch)).out
-            start = self.base if not pushed else branch
-            await self.git("fetch", "-q", "origin", f"+refs/heads/{start}:refs/remotes/origin/{start}")
             await self.git("worktree", "add", "-q", "-B", branch, str(path), f"origin/{start}")
         return Workspace(self, path, branch)
 
