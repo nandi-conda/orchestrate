@@ -343,18 +343,23 @@ def host_from_env() -> ThreadHost:
     )
 
 
-def serve(app: Starlette, host: ThreadHost, **config) -> None:
-    """Serve `app` with uvicorn. A signal that stops the runner (SIGTERM from
-    a service manager, Ctrl+C) reaches the threads first (ThreadHost.shut_down):
-    their agents get it too, and the turns that cuts short are interrupted,
-    not failed."""
+def serve(app: Starlette, thread_host: ThreadHost, **config) -> None:
+    """Serve `app` with uvicorn, `config` being uvicorn.Config's own (host,
+    port, timeout_graceful_shutdown). A signal that stops the runner (SIGTERM
+    from a service manager, Ctrl+C) reaches the threads first
+    (ThreadHost.shut_down): their agents get it too, and the turns that cuts
+    short are interrupted, not failed.
+
+    The thread host is not named `host`: that is uvicorn's bind address, and
+    the two in one signature made every start of the runner service crash
+    (`TypeError: serve() got multiple values for argument 'host'`)."""
     import signal
 
     import uvicorn
 
     class Server(uvicorn.Server):
         def handle_exit(self, sig, frame):
-            host.shut_down(f"the runner got {signal.Signals(sig).name}")
+            thread_host.shut_down(f"the runner got {signal.Signals(sig).name}")
             super().handle_exit(sig, frame)
 
     Server(uvicorn.Config(app, **config)).run()

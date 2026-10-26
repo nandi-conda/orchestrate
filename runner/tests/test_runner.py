@@ -1,16 +1,18 @@
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import types
 
 import httpx
 import pytest
+import uvicorn
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
 from runner import ThreadHost, View
 from runner.sandbox import SandboxError, pixi, runner_checkout, worker_private
-from runner.server import create_app
+from runner.server import create_app, serve
 
 
 def host_with(*scripts, tmp_path, **kw):
@@ -218,6 +220,34 @@ async def test_thread_searches_and_fetches_the_web(tmp_path):
     assert results(t)[0].split("\n")[:2] == ["https://github.com/containers/bubblewrap", "Unprivileged sandboxing tool"]
     assert web.calls == [("search", "bubblewrap", 3, "what is it"), ("fetch", "https://github.com/containers/bubblewrap")]
     await host.stop(t.id)
+
+
+def test_serve_gives_uvicorn_its_config_and_the_thread_host_the_signal(tmp_path, monkeypatch):
+    """The service starts the runner with `serve(app, thread_host, host=…,
+    port=…)`: uvicorn's config keys are not serve's own parameters. A thread
+    host named `host` there crashed every start of the service (`TypeError:
+    serve() got multiple values for argument 'host'`), so no worker came up;
+    and the host is the one a stopping signal reaches, so its threads mark
+    their turns interrupted."""
+    seen = {}
+
+    class Stub(uvicorn.Server):
+        def __init__(self, config):
+            super().__init__(config)
+            seen["config"], seen["class"] = config, type(self)
+
+        def run(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr(uvicorn, "Server", Stub)
+    host = host_with(tmp_path=tmp_path)
+    serve(create_app(host, "tok"), host, host="127.0.0.1", port=8123, timeout_graceful_shutdown=3)
+    assert seen["ran"]
+    assert (seen["config"].host, seen["config"].port) == ("127.0.0.1", 8123)
+    server = seen["class"](seen["config"])
+    server.handle_exit(signal.SIGTERM, None)
+    assert server.should_exit
+    assert host.stopping == "the runner got SIGTERM"
 
 
 async def test_http_api(tmp_path):
