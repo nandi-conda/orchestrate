@@ -30,14 +30,14 @@ worker with their next message.
 
 ## The project window
 
-The left side is the thread list: **Project activity** first, then the
+The left side is the thread list: **Project orchestrator** first, then the
 project's threads, each with its state, and an "N waiting" badge when
 messages to it are piling up (red once it is backed up: the router then gives
 new work to a new thread instead; see
 [thread load](../architecture/routing.md#thread-load)). The right side is the pane for what
 you selected, with the request box under it.
 
-**Project activity** shows the router's decisions and every thread's events,
+**Project orchestrator** shows the router's decisions and every thread's events,
 newest last (up to the newest 2,000), with a live line per working thread
 saying what it is doing.
 
@@ -54,7 +54,7 @@ goes:
 
 Enter never waits on the router, a worker or a runner: the box clears at once
 and the request shows in the log. The router's decision appears above the box
-("routing…" until the model answers) and in Project activity. A new thread
+("routing…" until the model answers) and in Project orchestrator. A new thread
 shows up in the list right away, saying "starting on a worker" until its worker
 is up (a new sprite can take a while); messages sent to it meanwhile are
 delivered in order once it starts.
@@ -89,7 +89,7 @@ router re-assesses it in the background:
   finished one comes back and acts on it.
 - The router plans the new text knowing those threads, so it starts threads
   only for parts none of them covers. Its decision shows as an "edit:" line in
-  Project activity.
+  Project orchestrator.
 
 ## A thread's pane
 

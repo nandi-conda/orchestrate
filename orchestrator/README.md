@@ -40,12 +40,12 @@ clears at once and the request shows in the log. The router's decision then
 shows above the request box ("routing…" until the model answers). A new thread
 appears in the list right away and says "starting on a worker" until its worker
 is up (a sprite can take a while); messages sent to it meanwhile are delivered,
-in order, once it starts. **Project activity** in the
+in order, once it starts. **Project orchestrator** in the
 thread list shows the project's events, newest last (the newest 2,000: a project
 worked on for a while has more than a pane holds), and each thread shows its own
 transcript, including messages from other threads. A request that spawns
 threads never moves the window into one of them: you stay where you are, the
-new threads show up in the list, and their events stream into Project activity.
+new threads show up in the list, and their events stream into Project orchestrator.
 You're only ever talking to the project, and you open a thread only by
 clicking it.
 
@@ -62,7 +62,7 @@ the background, after any routing still queued for the original:
 - the router plans the new text knowing those threads, so it starts threads
   only for parts none of them covers (without a model: one per list item that
   is new in the edit), and can tell a thread what changed for it. Its decision
-  shows as an "edit:" line in Project activity.
+  shows as an "edit:" line in Project orchestrator.
 
 **Pasted images.** Paste a screenshot or a copied picture into the request box
 and it becomes an attachment above it: up to 4, each up to 8 MB, and a huge

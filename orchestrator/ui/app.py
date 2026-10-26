@@ -130,7 +130,7 @@ projects: i32 = 0        # JSON handle: list of projects
 project: i32 = 0         # JSON handle: the open project
 threads: i32 = 0         # JSON handle: thread directory
 transcript: i32 = 0      # JSON handle: selected thread's events
-plog: i32 = 0            # JSON handle: project activity
+plog: i32 = 0            # JSON handle: project orchestrator
 loading: i32 = 0
 show_new: i32 = 0
 creating: i32 = 0
@@ -513,7 +513,7 @@ def take_none(old: i32) -> i32:
 
 def find_text(seq: i32, dst: i32) -> i32:
     """Write the text of the shown event with this seq (in the transcript, or
-    in project activity) to dst; 1 if it is there."""
+    in project orchestrator) to dst; 1 if it is there."""
     src: i32 = plog
     n: i32 = 0
     i: i32
@@ -1230,7 +1230,7 @@ def thread_list() -> None:
     on_click(ACTIVITY, 0)
     div("thread-top")
     span("thread-title")
-    text("Project activity")
+    text("Project orchestrator")
     end()
     end()
     el("div")
@@ -1381,7 +1381,7 @@ def event_time(e: i32) -> None:
 
 
 def working_now() -> None:
-    """Project activity's live line per working thread: its title and what it
+    """Project orchestrator's live line per working thread: its title and what it
     is doing, instead of every thread's reasoning."""
     n: i32 = 0
     i: i32
@@ -1694,7 +1694,7 @@ def is_thought(e: i32) -> i32:
 
 def hidden(e: i32, activity: i32) -> i32:
     """Left out of the Dialog: tool rows (under Tools) and state changes
-    (the badges show them). Project activity also leaves out reasoning and
+    (the badges show them). Project orchestrator also leaves out reasoning and
     replies still streaming: it is about requests, routing and answers, and
     working_now says what each thread is doing."""
     k: i32
@@ -2188,7 +2188,7 @@ def pane() -> None:
     if activity == 1:
         div("pane-head")
         span("title")
-        text("Project activity")
+        text("Project orchestrator")
         end()
         end()
     else:
@@ -2286,7 +2286,7 @@ def attachments() -> None:
 def request_box() -> None:
     el("footer")
     cls("composer")
-    # Project activity shows the router's decisions in its log; with a thread
+    # Project orchestrator shows the router's decisions in its log; with a thread
     # open, the last one shows here instead.
     if s_len(h_route) > 0 and s_len(h_sel) > 0:
         div("route")

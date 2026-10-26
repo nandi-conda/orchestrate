@@ -172,8 +172,8 @@ def click(qtbot, w, element: str) -> None:
     QTest.mouseClick(w.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(x, y))
 
 
-def test_a_request_sent_in_project_activity_shows_there(qtbot, up, tmp_path, monkeypatch):
-    """Project activity is where requests are typed, so a request has to show
+def test_a_request_sent_in_project_orchestrator_shows_there(qtbot, up, tmp_path, monkeypatch):
+    """Project orchestrator is where requests are typed, so a request has to show
     there. A project worked on for a while has more events than the pane holds:
     it shows the newest ones, and a request sent now is among them."""
     import asyncio
