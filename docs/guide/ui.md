@@ -94,13 +94,14 @@ router re-assesses it in the background:
 ## A thread's pane
 
 Open a thread from the list. The pane has a title bar, a **Now** line saying
-what the thread is doing ("thinking", "running python_repl: …"), and four
+what the thread is doing ("thinking", "running python_repl: …"), and five
 tabs:
 
 | Tab | Shows |
 | --- | --- |
 | **Dialog** | The conversation: your messages, messages from other threads and the router, and the agent's replies, rendered as Markdown. Replies grow live as the model streams them. Each message shows when it was sent in your local time (hover it for the full date and zone). |
 | **Tools** | Every tool call the agent made (`python_repl` code) with its result. |
+| **Thinking** | The agent's reasoning steps in order, numbered, each rendered as Markdown under its time in your local time. A step still streaming shows last and grows live. |
 | **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane, with **Back** and **Download**; any other file downloads. `.git` is hidden. |
 | **Worker log** | Where the thread stands (its binding and its worker's state, each with the reason), then the last 300 lines its runner wrote, with **Refresh**. The runner logs in UTC; its times show here, and on the control plane's stdout, in the control plane's local time. |
 

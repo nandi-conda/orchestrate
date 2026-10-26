@@ -96,6 +96,7 @@ DIALOG: Const[i32] = 0
 TOOLS: Const[i32] = 1
 WLOG: Const[i32] = 2
 FILES: Const[i32] = 3
+THINKING: Const[i32] = 4
 
 # routing modes
 AUTO: Const[i32] = 0
@@ -138,7 +139,7 @@ sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
 threads_pending: i32 = 0 # a thread-list refresh is scheduled
-pane_tab: i32 = 0        # DIALOG, TOOLS, FILES or WLOG
+pane_tab: i32 = 0        # DIALOG, TOOLS, THINKING, FILES or WLOG
 stream: i32 = 0          # the open project's event stream, 0 when none
 wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
 wlog_loading: i32 = 0
@@ -415,7 +416,7 @@ def show_activity() -> None:
     editing = 0
     if mode == TO_THREAD:
         mode = AUTO
-    if pane_tab == WLOG or pane_tab == FILES:
+    if pane_tab == WLOG or pane_tab == FILES or pane_tab == THINKING:
         pane_tab = DIALOG
     jump = 1
     fetch_log()
@@ -1938,10 +1939,10 @@ def tab_open(active: bool, arg: i32) -> None:
     on_click(TAB, arg)
 
 
-def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
+def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool) -> None:
     """Dialog (the conversation) and Tools (calls and their output), with
-    counts, and for a thread (logs set) Files (its worktree) and Worker log
-    (the runner's stdout and stderr)."""
+    counts, and for a thread (logs set) Thinking (its reasoning steps), Files
+    (its worktree) and Worker log (the runner's stdout and stderr)."""
     div("pane-tabs")
     tabs_list_open()
     tab_open(pane_tab == DIALOG, DIALOG)
@@ -1957,6 +1958,12 @@ def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
     end()
     end()
     if logs:
+        tab_open(pane_tab == THINKING, THINKING)
+        text("Thinking")
+        span("tab-count")
+        num(thoughts)
+        end()
+        end()
         tab_open(pane_tab == FILES, FILES)
         text("Files")
         end()
@@ -1965,6 +1972,46 @@ def pane_tabs(dialog: i32, tools: i32, logs: bool) -> None:
         end()
     end()
     end()
+
+
+def thinking_steps(src: i32, n: i32) -> i32:
+    """The Thinking tab: each of the thread's reasoning steps in order, as
+    markdown under its local time. A step still streaming is the last one and
+    grows as it comes in. Returns how many steps it showed."""
+    i: i32
+    e: i32
+    steps: i32 = 0
+    el("ol")
+    cls("thinking-steps")
+    for i in range(n):
+        e = j_idx(src, i)
+        if j_int(e, "kind") == K_THINKING:
+            steps = steps + 1
+            el("li")
+            cls("thinking-step")
+            cls_if("ev-live", j_int(e, "live") == 1)
+            key(j_int(e, "seq"))
+            div("step-head")
+            span("step-num")
+            text("Step ")
+            num(steps)
+            end()
+            event_time(e)
+            if j_int(e, "live") == 1:
+                span("muted")
+                text(" · thinking…")
+                end()
+            end()
+            el("div")
+            cls("step-text")
+            cls("md")
+            jstr(e, "text", h_t1)
+            md(h_t1)
+            end()
+            end()
+        j_free(e)
+    end()
+    return steps
 
 
 def worker_log() -> None:
@@ -2165,6 +2212,7 @@ def pane() -> None:
     e: i32 = 0
     t: i32 = 0
     tools: i32 = 0
+    thoughts: i32 = 0
     shown: i32 = 0
     src: i32
     activity: i32
@@ -2180,6 +2228,8 @@ def pane() -> None:
     for i in range(n):
         e = j_idx(src, i)
         tools = tools + is_tool(e)
+        if j_int(e, "kind") == K_THINKING:
+            thoughts = thoughts + 1
         if hidden(e, activity) == 0:
             said = said + 1
         j_free(e)
@@ -2196,7 +2246,7 @@ def pane() -> None:
         thread_head(t)
         if t != 0:
             j_free(t)
-    pane_tabs(said, tools, activity == 0)
+    pane_tabs(said, tools, thoughts, activity == 0)
     if activity == 1 and pane_tab == DIALOG:
         working_now()
     el("div")
@@ -2210,6 +2260,16 @@ def pane() -> None:
         return
     if pane_tab == FILES:
         file_list()
+        end()
+        end()
+        return
+    if pane_tab == THINKING:
+        if thinking_steps(src, n) == 0:
+            el("p")
+            cls("muted")
+            cls("empty")
+            text("No thinking steps yet.")
+            end()
         end()
         end()
         return

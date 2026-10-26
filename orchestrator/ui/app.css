@@ -261,3 +261,10 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .quote-text { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
               white-space: pre-wrap; word-break: break-word; }
 .ev-user .md blockquote { color: inherit; opacity: .75; border-left-color: hsl(221 83% 53% / .5); }
+
+/* Thinking tab: the thread's reasoning steps, each under its step number and local time */
+.thinking-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.thinking-step { border: 1px dashed var(--border); border-radius: 8px; padding: 8px 12px; }
+.thinking-step .step-head { display: flex; align-items: baseline; font-size: 12px; color: var(--muted-foreground); margin-bottom: 4px; }
+.thinking-step .step-num { font-weight: 600; }
+.thinking-step .step-text { font-size: 14px; }
