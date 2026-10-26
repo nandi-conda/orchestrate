@@ -21,3 +21,8 @@ jobs:
     with:
       # ultra, which compiles the UI, is on nandi-testing
       build-channels: conda-forge https://prefix.dev/nandi-testing
+      # Installs take conda-forge first and nandi-testing second, as
+      # orchestrator/pixi.toml does. The channel mirrors only some of
+      # conda-forge (python 3.14+, an older Qt), so a solve that puts it first
+      # cannot reach python 3.12 or this Qt WebEngine under strict priority.
+      copy-deps: false

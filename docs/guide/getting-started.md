@@ -21,7 +21,7 @@ Every push to main publishes the `orchestrate` conda package to
 [prefix.dev/nandi-testing](https://prefix.dev/channels/nandi-testing):
 
 ```sh
-pixi global install -c https://prefix.dev/nandi-testing -c conda-forge orchestrate
+pixi global install -c conda-forge -c https://prefix.dev/nandi-testing orchestrate
 orchestrate           # the desktop window
 orchestrate-serve     # the control plane alone, for a browser on http://127.0.0.1:8000
 ```
@@ -31,7 +31,9 @@ same options. The package carries the runner too, so a local worker runs from
 the install with `pixi run`, which keeps the runner's environments inside it.
 The package is noarch but needs Qt WebEngine, so it installs where the desktop
 window runs: linux-64, osx-arm64 and win-64. Store keys with
-`keyring set orchestrate NAME` (keyring comes with it).
+`keyring set orchestrate NAME` (keyring comes with it). Keep conda-forge first:
+nandi-testing mirrors only part of conda-forge (no python 3.12, an older Qt),
+so with it first the strict channel priority finds no solution.
 
 `pixi run package` in a checkout builds the same package into `output/`
 (`recipe/recipe.yaml`; `.github/workflows/package.yml` publishes it).
