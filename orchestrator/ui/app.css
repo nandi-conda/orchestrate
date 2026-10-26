@@ -63,7 +63,11 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .where:empty { display: none; }
 .where .muted { margin-left: auto; flex-shrink: 0; }
 .now-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.activity-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: hsl(142 71% 45%); animation: pulse 1.4s ease-in-out infinite; }
+/* A dot that pulses a few times when it appears and then holds still. It is on
+   every working thread, and desktop/window.py draws this window in software
+   (--disable-gpu), so an animation with no end keeps the compositor at frame
+   rate and a core busy for as long as the window is open. */
+.activity-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: hsl(142 71% 45%); animation: pulse 1.4s ease-in-out 3; }
 @keyframes pulse { 50% { opacity: .3; } }
 @media (prefers-reduced-motion: reduce) { .activity-dot, .ev-live .ev-label::after { animation: none; } }
 
@@ -85,7 +89,7 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .ev-assistant { border-color: color-mix(in oklch, var(--primary) 30%, transparent); padding: 10px 14px; }
 .ev-assistant .ev-text { font-size: 15px; line-height: 1.6; }
 .ev-thinking { border-style: dashed; color: var(--muted-foreground); font-size: 13px; }
-.ev-live .ev-label::after { content: " ●"; color: hsl(142 71% 45%); animation: pulse 1.2s ease-in-out infinite; }
+.ev-live .ev-label::after { content: " ●"; color: hsl(142 71% 45%); animation: pulse 1.2s ease-in-out 2; }
 .thinking { font-style: italic; }
 .thinking .tool-body { font-style: normal; }
 .ev-status { border: 0; padding: 0 12px; font-size: 12px; color: var(--muted-foreground); opacity: .75; }
