@@ -42,6 +42,8 @@ from typing import AsyncIterator, Protocol
 import httpx
 
 from . import paths
+from .gitio import git
+from .steps import Steps
 
 log = logging.getLogger("orchestrator.providers")
 
@@ -68,6 +70,9 @@ class WorkerSpec:
     # The token of the worker this slot names, when one was made before: a
     # runner still going from an earlier control plane keeps answering to it.
     token: str = ""
+    # Where `create` says what it is doing, step by step, with timings: the
+    # control plane's stdout and the Worker log tab of threads waiting on it.
+    steps: Steps = field(default_factory=lambda: Steps("worker"))
 
 
 
@@ -246,14 +251,15 @@ class LocalProvider:
         with open(self.log_path(wid), "ab") as log:
             proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd),
                                                         stdout=log, stderr=subprocess.STDOUT)
-        print(f"LocalProvider: worker {wid} logs to {self.log_path(wid)}", file=sys.stderr)
+        spec.steps.note(f"started its runner, pid {proc.pid}, logging to {self.log_path(wid)}")
         worker.handle = str(proc.pid)
         self.procs[wid] = proc
         # The first run installs the runner env. A runner that exits instead
         # (it refuses to start without what it needs) says why in its log.
         healthy = asyncio.create_task(wait_healthy(worker.url, timeout=600))
         exited = asyncio.create_task(proc.wait())
-        await asyncio.wait({healthy, exited}, return_when=asyncio.FIRST_COMPLETED)
+        async with spec.steps.step(f"waiting up to 600s for its runner to answer at {worker.url}"):
+            await asyncio.wait({healthy, exited}, return_when=asyncio.FIRST_COMPLETED)
         if not healthy.done():
             healthy.cancel()
             self.procs.pop(wid, None)
@@ -346,12 +352,10 @@ ORCHESTRATE_REF="$ORCHESTRATE_COMMIT" bash /opt/orchestrate/runner/deploy/bootst
 
 async def remote_commit(source: str, ref: str) -> str:
     """The commit `ref` names on `source` now: what a new worker runs."""
-    proc = await asyncio.create_subprocess_exec("git", "ls-remote", source, f"refs/heads/{ref}",
-                                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = await proc.communicate()
-    sha = out.decode().split("\t", 1)[0].strip()
-    if proc.returncode != 0 or not sha:
-        raise RuntimeError(f"cannot resolve branch {ref!r} of {source}: {err.decode().strip() or 'no such branch'}")
+    r = await git(Path.cwd(), "ls-remote", source, f"refs/heads/{ref}", check=False)
+    sha = r.out.split("\t", 1)[0].strip()
+    if r.code != 0 or not sha:
+        raise RuntimeError(f"cannot resolve branch {ref!r} of {source}: {r.err or 'no such branch'}")
     return sha
 
 
@@ -426,18 +430,23 @@ class SpritesProvider:
         if not get_secret("DEEPSEEK_API_KEY"):
             raise RuntimeError("SpritesProvider needs DEEPSEEK_API_KEY (env or keyring): "
                                "the runner cannot start without it")
-        name = self.sprite_name(spec.index)
-        r = await self.http.post("/sprites", json={"name": name, "url_settings": {"auth": "public"},
-                                                   "labels": [self.LABEL]})
-        if r.status_code == 409:  # the slot's sprite is there: it carries the label too
-            (await self.http.put(f"/sprites/{name}", json={"labels": [self.LABEL]})).raise_for_status()
-        elif r.status_code not in (200, 201):
-            r.raise_for_status()
-        info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
+        name, steps = self.sprite_name(spec.index), spec.steps
+        steps.name = f"worker {name}"
+        async with steps.step(f"making sprite {name}, or finding it made"):
+            r = await self.http.post("/sprites", json={"name": name, "url_settings": {"auth": "public"},
+                                                       "labels": [self.LABEL]})
+            if r.status_code == 409:  # the slot's sprite is there: it carries the label too
+                (await self.http.put(f"/sprites/{name}", json={"labels": [self.LABEL]})).raise_for_status()
+            elif r.status_code not in (200, 201):
+                r.raise_for_status()
+            info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
+        steps.note(f"sprite {name} " + ("was there" if r.status_code == 409 else "made")
+                   + f", status {info.get('status', '?')}, at {info['url']}")
         worker = Worker(id=name, provider=self.name, handle=name,
                         url=info["url"].rstrip("/"), capacity=spec.capacity, index=spec.index)
         worker.token = spec.token or worker.token
-        commit = await remote_commit(self.source, self.ref)
+        async with steps.step(f"resolving branch {self.ref} of {self.source}"):
+            commit = await remote_commit(self.source, self.ref)
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity), "PYTHONUNBUFFERED": "1"}
@@ -456,20 +465,34 @@ class SpritesProvider:
         # always this checkout's, with this control plane's key and token;
         # the turns that cuts short resume when their threads are posted
         # again (runner/API.md, "Interrupted turns").
-        defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
-        if defined and await self.serves(worker, want):
-            log.info("worker %s already runs orchestrate %s as this control plane would start it; "
-                     "left running", name, commit[:12])
-            return worker
+        async with steps.step("looking for its runner service"):
+            defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
+        if defined:
+            async with steps.step(f"asking its runner whether it is orchestrate {commit[:12]} as this control "
+                                  f"plane would start it (up to {SERVES_WAIT:.0f}s: a paused sprite wakes)"):
+                serving = await self.serves(worker, want)
+            if serving:
+                steps.note("it is: left running")
+                return worker
+            steps.note("it is not (another commit, key, token or settings, or no answer): it is restarted")
 
-        await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
-        (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        await self.service_action(name, "restart" if defined else "start")
-        health = await self.wait_ready(worker)
+        async with steps.step(f"installing orchestrate {commit[:12]} on it (git fetch, pixi install, prime-agent)"):
+            out = await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
+        for line in out.strip().splitlines()[-10:]:
+            steps.note(f"  install | {line}")
+        async with steps.step("defining its runner service"):
+            (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
+        action = "restart" if defined else "start"
+        async with steps.step(f"{action}ing its runner service"):
+            await self.service_action(name, action)
+        async with steps.step("waiting up to 300s for its runner to answer"):
+            health = await self.wait_ready(worker)
         if health.get("commit") != commit:
             raise RuntimeError(f"worker {name}'s runner runs orchestrate {health.get('commit')}, not "
                                f"{commit} ({self.ref}); its log ends:\n{await self.logs(worker, 20)}")
-        if not await self.accepts_token(worker):
+        async with steps.step("checking its runner accepts the token it was started with"):
+            accepted = await self.accepts_token(worker)
+        if not accepted:
             raise RuntimeError(f"worker {name}'s runner does not accept the token it was started "
                                f"with; its log ends:\n{await self.logs(worker, 20)}")
         return worker

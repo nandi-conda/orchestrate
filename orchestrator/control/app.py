@@ -28,8 +28,8 @@ from .gitio import GitError
 from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
 from .runner_client import FileError
-from .service import (ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, image_title,
-                      tool_arg)
+from .service import (ENDS_STREAM, ArchivedError, EditError, NotOnWorker, Orchestrator, describe, editable,
+                      image_title, tool_arg)
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -501,7 +501,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     def files_error(e: Exception) -> Response:
         if isinstance(e, KeyError):
             return JSONResponse({"error": "no such thread"}, 404)
-        if isinstance(e, ArchivedError):
+        if isinstance(e, (ArchivedError, NotOnWorker)):
             return JSONResponse({"error": str(e)}, 409)
         if isinstance(e, FileError):
             return JSONResponse({"error": str(e)}, e.status)

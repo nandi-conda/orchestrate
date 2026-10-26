@@ -212,6 +212,11 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
     # Its worker's disk is gone: the next control plane makes the worker again in a new directory.
     second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True),
                           HeuristicRouter(), tmp_path / "repos")
+    await second.respawn(t["id"])
+
+    async def bound():
+        return (await s.get_thread(t["id"]))["binding"] == "bound" or None
+    await wait_for(bound)
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
     r = await second.open_file(t["id"], "src.txt")
