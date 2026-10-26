@@ -198,3 +198,17 @@ def j_put_row(rows: i32, row: i32) -> i32:
     """Put JSON object row into the JSON array rows, by its `seq`: 1 when it
     replaced the row already there, 0 when it started a new one."""
     pass
+
+@jscall
+def host_folders() -> i32:
+    """1 when the page is in the desktop window, whose Browse… is the OS's
+    folder dialog (host_pick_folder); 0 in a browser, which has the UI's own
+    folder picker."""
+    pass
+
+@jscall
+def host_pick_folder(h: i32, msg: i32, arg: i32) -> None:
+    """Show the desktop window's folder dialog, open at the folder in h. When
+    a folder is chosen it goes to h and update(msg, arg) runs; a cancel does
+    nothing."""
+    pass

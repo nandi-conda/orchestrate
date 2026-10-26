@@ -295,3 +295,27 @@ def test_images_show_in_the_files_tab_and_in_markdown(qtbot, up):
     qtbot.waitUntil(lambda: js(qtbot, w, "(document.querySelector('.fview img') || {}).naturalWidth") == 40,
                     timeout=WAIT)
     assert js(qtbot, w, "document.querySelector('.fview img').alt") == "the box"
+
+
+def test_browse_shows_the_os_folder_dialog_and_fills_the_field(qtbot, up, tmp_path):
+    """In the window, Browse… is the OS's folder dialog (desktop/host.js), not
+    the UI's own picker, which a browser shows instead."""
+    from PySide6.QtWidgets import QApplication, QFileDialog
+
+    w, url = up
+    target = tmp_path / "my-app"
+    target.mkdir()
+    btn = "[...document.querySelectorAll('.btn')].find(b => b.textContent === '{}')"
+    click(qtbot, w, btn.format("Open folder"))
+    click(qtbot, w, btn.format("Browse…"))
+
+    def dialog():
+        ds = [d for d in QApplication.topLevelWidgets() if isinstance(d, QFileDialog) and d.isVisible()]
+        return ds[0] if ds else None
+    qtbot.waitUntil(lambda: dialog() is not None, timeout=WAIT)
+    assert js(qtbot, w, "!!document.querySelector('.picker')") is False, "the UI's own picker stays closed"
+    d = dialog()
+    d.setDirectory(str(target))
+    d.accept()
+    field = "document.querySelector('input[placeholder=\"/home/you/my-app\"]').value"
+    qtbot.waitUntil(lambda: js(qtbot, w, field) == str(target), timeout=WAIT)

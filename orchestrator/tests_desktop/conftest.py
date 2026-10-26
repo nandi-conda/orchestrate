@@ -15,6 +15,10 @@ from PySide6.QtCore import QCoreApplication, QEvent
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Chromium's sandbox refuses to run as root, which test containers often are.
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+# Qt's own folder dialog, which a test can drive: a theme name no plugin has
+# gives Qt's plain theme. The desktop's portal dialog (prepare_qt) would pop
+# up on the screen of whoever runs the tests.
+os.environ["QT_QPA_PLATFORMTHEME"] = "plain"
 
 
 def pytest_configure(config):

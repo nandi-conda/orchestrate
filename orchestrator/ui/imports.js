@@ -264,6 +264,16 @@ export function imports({ str, strs, vals, dispatch }) {
     // (skipped), or the browser clamping a shrunk element, which leaves it
     // at the bottom. Content growing or the element resizing fires none, so
     // they never turn following off.
+    // The desktop window's folder dialog (desktop/host.js). A browser has no
+    // host, and the UI shows its own folder picker there instead.
+    host_folders: () => (window.orchestrateHost ? 1 : 0),
+    host_pick_folder: (h, msg, arg) => {
+      window.orchestrateHost.pickFolder(strs[h] ?? "").then((path) => {
+        if (!path) return;
+        strs[h] = path;
+        dispatch(msg, arg);
+      });
+    },
     scroll_end: (id) => {
       const sel = str(id);
       follow.set(sel, true);

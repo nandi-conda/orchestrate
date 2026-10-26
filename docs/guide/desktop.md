@@ -24,6 +24,11 @@ environment). conda-forge has no Qt WebEngine for osx-64.
 - Markdown files and images in the Files tab open in the pane; other files
   download to your Downloads folder, never over an existing file
   (`name (1)`, …), with a line at the bottom saying where.
+- **Browse…** (Open folder, and a project's Settings → Remote) shows your
+  OS's folder dialog, open at the folder the field names. The window gives
+  the page this through a Qt web channel (`desktop/host.js`); on Linux the
+  dialog comes from the XDG desktop portal (`QT_QPA_PLATFORMTHEME=xdgdesktopportal`),
+  so it is GNOME's, KDE's or your desktop's own, on Wayland and X11 alike.
 - If the port is taken, the window says so, and how to free it
   (`fuser -k 8000/tcp`, or `kill $(lsof -t -i :8000)`), with a **Retry**.
 - What the control plane is doing is printed to the terminal as `desktop: …`

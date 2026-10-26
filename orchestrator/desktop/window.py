@@ -2,8 +2,8 @@
 UI. PySide draws the window and does what a browser tab would: it keeps the
 UI's own navigation in this view (window.open and target=_blank included),
 opens links anywhere else in the default browser, saves downloads to the
-downloads folder, and lets the UI write to the clipboard (a reply's copy
-button)."""
+downloads folder, lets the UI write to the clipboard (a reply's copy button),
+and shows the OS's folder dialog for the UI's Browse… buttons (Host)."""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, QTimer, QUrl
+from PySide6.QtCore import QDir, QFile, QIODevice, QObject, QStandardPaths, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
-from PySide6.QtWebEngineCore import QWebEngineDownloadRequest, QWebEnginePage, QWebEnginePermission
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage, QWebEnginePermission,
+                                     QWebEngineScript)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QMainWindow
+from PySide6.QtWidgets import QFileDialog, QMainWindow, QWidget
 
 from .server import DOWN, UP, ControlPlane
 
@@ -35,10 +37,14 @@ def prepare_qt() -> None:
     environment's Qt would find is what broke: conda-forge's Mesa has no
     Wayland EGL ("qt.qpa.wayland: EGL not available"), and the system's GLX
     can fail to match its Qt ("Could not initialize GLX", then an abort).
+
+    Dialogs on Linux go through the XDG desktop portal, so the folder dialog
+    is the desktop's own (GNOME's, KDE's, …) on Wayland and X11 alike.
     Variables already set still decide."""
     if sys.platform == "linux":
         os.environ.setdefault("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "none")
         os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
     QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Software)
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} --disable-gpu".strip()
@@ -63,6 +69,47 @@ def status_page(state: str, text: str) -> str:
 <style>body {{ font: 15px system-ui, sans-serif; margin: 48px; color-scheme: light dark; }}
 p {{ max-width: 720px; line-height: 1.5; }}</style>
 <h1>Orchestrator</h1><p style="color: {color}">{html.escape(text)}</p>{retry}"""
+
+
+def host_script() -> QWebEngineScript:
+    """host.js, with the qwebchannel.js it needs from Qt's resources, run in
+    the page before the UI's own scripts."""
+    f = QFile(":/qtwebchannel/qwebchannel.js")
+    if not f.open(QIODevice.OpenModeFlag.ReadOnly):
+        raise RuntimeError("Qt's qwebchannel.js is missing from QtWebChannel's resources")
+    channel = bytes(f.readAll()).decode()
+    f.close()
+    s = QWebEngineScript()
+    s.setName("orchestrate-host")
+    s.setSourceCode(channel + "\n" + (Path(__file__).with_name("host.js")).read_text())
+    s.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    s.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    s.setRunsOnSubFrames(False)
+    return s
+
+
+class Host(QObject):
+    """What the window does for the UI's page (desktop/host.js): show the OS's
+    folder dialog. The answer comes back as folderPicked(id, path), "" when
+    cancelled, so the page never waits on a dialog inside a call."""
+
+    folderPicked = Signal(int, str)
+
+    def __init__(self, window: QWidget) -> None:
+        super().__init__(window)
+        self.window_ = window
+
+    @Slot(int, str)
+    def pickFolder(self, id: int, start: str) -> None:
+        start = os.path.expanduser(start.strip())
+        d = QFileDialog(self.window_, "Choose a folder", start if os.path.isdir(start) else QDir.homePath())
+        d.setFileMode(QFileDialog.FileMode.Directory)
+        d.setOption(QFileDialog.Option.ShowDirsOnly)
+        d.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        picked = [""]
+        d.fileSelected.connect(lambda path: picked.__setitem__(0, path))
+        d.finished.connect(lambda _: self.folderPicked.emit(id, picked[0]))
+        d.open()
 
 
 class NewWindow(QWebEnginePage):
@@ -139,6 +186,11 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self.view = QWebEngineView(self)
         self.view.setPage(Page(self.view, control))
+        self.host = Host(self)
+        self.channel = QWebChannel(self)
+        self.channel.registerObject("host", self.host)
+        self.view.page().setWebChannel(self.channel)
+        self.view.page().scripts().insert(host_script())
         self.view.titleChanged.connect(self.setWindowTitle)
         self.view.page().profile().downloadRequested.connect(self._download)
         self.setCentralWidget(self.view)

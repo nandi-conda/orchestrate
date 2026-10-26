@@ -20,7 +20,8 @@ from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_o
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
-                  img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row)
+                  img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row,
+                  host_folders, host_pick_folder)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -97,6 +98,7 @@ PICK_HIDE: Const[i32] = 71
 GOT_FOLDERS: Const[i32] = 72
 PICK_OPEN: Const[i32] = 73     # arg: a folder of the listing; -1 its parent; -2 the home folder
 PICK_USE: Const[i32] = 74
+PICKED: Const[i32] = 75       # arg: the field the desktop window's folder dialog picked for
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -148,6 +150,7 @@ plog: i32 = 0            # JSON handle: project orchestrator
 loading: i32 = 0
 show_new: i32 = 0        # 1 the New project dialog is up, 2 the Open folder one
 picking: i32 = 0         # the field the folder picker is open for (PICK_NEW, PICK_REMOTE), 0 when closed
+host_picks: i32 = 0      # 1 in the desktop window: Browse… is the OS's folder dialog, not the picker
 folders: i32 = 0         # JSON handle: the folder the picker shows ({path, parent, entries})
 folders_loading: i32 = 0
 creating: i32 = 0
@@ -255,7 +258,7 @@ def init() -> None:
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
-    global h_img, h_when, h_when_full
+    global h_img, h_when, h_when_full, host_picks
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -315,6 +318,7 @@ def init() -> None:
     h_act = s_new()
     h_edit = s_new()
     h_img = s_new()
+    host_picks = host_folders()
     on_nav(NAV)
     on_select(h_seltext, h_selpos, SELECTED)
     on_paste(PASTED)
@@ -651,14 +655,22 @@ def update(msg: i32, arg: i32) -> None:
         s_copy(h_folder, arg)
     elif msg == PICK_SHOW:
         # The picker starts at the folder the field names, the home folder
-        # when it names none.
-        picking = arg
-        s_clear(h_pick_err)
+        # when it names none. The desktop window shows the OS's dialog instead.
         if arg == PICK_NEW:
             s_copy(h_pick, h_folder)
         else:
             s_copy(h_pick, h_repo)
-        fetch_folders()
+        if host_picks == 1:
+            host_pick_folder(h_pick, PICKED, arg)
+        else:
+            picking = arg
+            s_clear(h_pick_err)
+            fetch_folders()
+    elif msg == PICKED:
+        if arg == PICK_NEW:
+            s_copy(h_folder, h_pick)
+        else:
+            s_copy(h_repo, h_pick)
     elif msg == PICK_HIDE:
         picking = 0
     elif msg == PICK_OPEN:

@@ -10,15 +10,21 @@ The start page lists your projects. **New project** asks only for a name; a
 project starts with its own local git repository and no remote (cards say
 "local only"). **Open folder** makes a project from a folder on the machine
 the control plane runs on: type its full path (`~/` works), or **Browse…** to
-pick it (folders from your home folder, one at a time: click one to go in,
-**Up** and **Home** to go back, git repositories marked, hidden folders left
-out; **Use this folder** fills the field), and optionally a name (the
+pick it, and optionally a name (the
 folder's name otherwise). The folder becomes the project's remote,
 so finished threads land in its checked-out branch and their work shows up in
 its files; see [Opening a folder](../architecture/git.md#opening-a-folder).
 A folder that cannot be opened is refused with the reason, and no project is
 made. Click a card to open the project at `/p/<project id>`;
 **← All projects** goes back.
+
+**Browse…** (here and in Settings) is your OS's folder dialog in the
+[desktop window](desktop.md). In a browser, and in the Android app, it is the
+UI's own folder picker instead: folders from your home folder, one at a time
+(click one to go in, **Up** and **Home** to go back, git repositories marked,
+hidden folders left out), and **Use this folder** fills the field. A browser
+cannot hand a page a folder's path, so the picker lists the control plane's
+folders through `GET /api/folders`.
 
 **Settings** in a project's top bar opens a dialog with:
 
