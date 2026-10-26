@@ -4,7 +4,7 @@ import asyncio
 import subprocess
 
 import pytest
-from conftest import Scripted, Web, in_view, py, sh, types, until
+from conftest import Scripted, Web, in_view, py, sh, started, types, until
 
 from runner import ThreadHost
 from runner.peers import OrchestratorPeers, PeerOutbox
@@ -38,7 +38,7 @@ async def host(tmp_path, *scripts, name="threads", **kw):
 
 async def run(t, command):
     """A command in the thread's sandbox, once it is up (its team socket is in it)."""
-    await until(lambda: t.harness is not None)
+    await started(t)
     return in_view(t.place.view, command)
 
 

@@ -9,7 +9,7 @@ import pytest
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
 from runner import ThreadHost, View
-from runner.sandbox import runner_checkout
+from runner.sandbox import SandboxError, runner_checkout
 from runner.server import create_app
 
 
@@ -55,6 +55,15 @@ def test_readonly_paths_come_back_inside_hidden_ones(tmp_path):
     r = in_view(v, f"ls -A {tmp_path / 'state'}; cat {tmp_path / 'state/env/bin/tool'}; "
                    f"touch {tmp_path / 'state/env/x'} 2>/dev/null || echo read-only")
     assert r.stdout.split() == ["env", "tool", "read-only"], r.stderr
+
+
+async def test_a_workdir_too_deep_for_a_thread_socket_is_refused(tmp_path):
+    """A thread's team socket is a file under the worker's workdir, and a unix
+    socket address is at most 107 bytes: a workdir that deep is refused up
+    front, not left to fail as an OSError in the thread's start."""
+    host = ThreadHost(agent=Scripted(), web=Web(), workdir=str(tmp_path / ("d" * 100)))
+    with pytest.raises(SandboxError, match="longer than a unix socket address"):
+        await host.start(project="p", title="t", request="x")
 
 
 async def test_the_kernel_runs_in_the_sandbox_with_no_secrets(tmp_path, monkeypatch):

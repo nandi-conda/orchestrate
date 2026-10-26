@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from typing import Any, Callable
 from .harness import HARNESS, KERNEL, SESSION, Harness, HarnessError, Place, PrimeAgent
 from .peers import LocalPeers, PeerError, Peers
 from .repo import GitError, Repo, Workspace
-from .sandbox import View, worker_private
+from .sandbox import SandboxError, View, worker_private
 from .team import TeamServer
 from .web import DeepSeekWeb
 
@@ -50,6 +51,10 @@ something, leave what you have working. If landing conflicts you get a message f
 listing the files: rebase onto the named branch yourself, resolve, `git rebase --continue`, and
 end the turn; it lands again.
 """
+
+# A thread's team socket is a file under the worker's workdir, so the workdir's
+# depth is bounded by the socket's address: sun_path is 108 bytes, NUL included.
+SOCKET_ADDRESS_MAX = 108
 
 
 @dataclass
@@ -363,6 +368,10 @@ class ThreadHost:
         and the kernel's Python environment and prime-agent's skills read-only."""
         work = self.workdir.resolve()
         socket = str(work / ".team" / f"{tid}.sock")
+        if len(os.fsencode(socket)) >= SOCKET_ADDRESS_MAX:
+            raise SandboxError(f"a thread's team socket would be {socket!r}, longer than a unix socket "
+                               f"address ({SOCKET_ADDRESS_MAX - 1} bytes): use a shorter workdir than "
+                               f"{str(work)!r}")
         view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
                     writable=((str(self.repo.path.resolve() / ".git"),) if self.repo else ()) + (socket,),
                     hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")))
