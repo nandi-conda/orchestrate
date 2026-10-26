@@ -891,6 +891,10 @@ def update(msg: i32, arg: i32) -> None:
             fetch_threads()
             if s_len(h_sel) > 0:
                 fetch_transcript()
+                # Files the thread could not show yet (it was not on a worker)
+                # are asked for again as its binding moves.
+                if pane_tab == FILES and files == 0 and files_loading == 0:
+                    fetch_files()
             else:
                 fetch_log()
     elif msg == STOP:

@@ -124,7 +124,7 @@ gone loses it.
 ```mermaid
 stateDiagram-v2
     [*] --> binding: thread created
-    unbound --> binding: next message, file read, or Respawn
+    unbound --> binding: next message, or Respawn
     binding --> bound: worker picked, hub shipped, thread posted
     binding --> unbound: failed, or called off (Respawn, Stop)
     bound --> unbound: worker lost; runner or control plane restarted (idle threads)
@@ -135,7 +135,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `bound` | a live worker's runner has the thread | |
 | `binding` | being put on a worker: one picked (a slot filled, or waiting for room), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
-| `unbound` | on no worker | its next message, opening its files, or Respawn |
+| `unbound` | on no worker | its next message, or Respawn |
 
 Each move is stored with its reason (`threads.binding_reason`) and logged as a
 `binding` event in the thread's log. Reasons you will see for `unbound`:
@@ -195,7 +195,13 @@ as a thread's state.
 - **The red bar** under the title appears when a thread is unbound or its
   worker is not ready. It shows the binding, its reason, the worker's state
   and reason, and that Respawn brings it back.
-- **Now:** while binding, the activity line says `starting on a worker`.
+- **Now:** while binding, the activity line names the step under way
+  (`picking a worker of the pool`, `waiting for worker slot 2 to come up`,
+  `sending worker orch-w1 the bundle (12 KiB)`, ...), with how long it has
+  taken once it passes 15 seconds.
+- **The Files tab** of a thread on no ready worker answers at once with
+  where the thread stands, and lists the files once its binding event says
+  it is bound. Opening it puts no thread on a worker.
 - **The project log** shows `worker_state` events (`worker unreachable`,
   `worker ready`, ...) with their reasons, in every project with a thread on
   that worker or last on it; a thread's log shows its `unbound` moves.
@@ -206,8 +212,37 @@ as a thread's state.
   worker orch-w1 is ready: its runner answers again
   ```
 
+  Then, once a thread has been put on a worker by this control plane, the
+  steps of its latest binding, timed, and the steps of the worker being made
+  or reattached for it, if it waited on one (see "Binding steps" below).
   For a thread whose worker was lost, it shows the end of that worker's log
   as it was followed before the worker was destroyed.
+
+## Binding steps
+
+Putting a thread on a worker, and making or reattaching a worker, are logged
+step by step, to the control plane's stdout and to the thread's Worker log
+tab. Each step is logged when it starts, every 15 seconds while it runs
+(`still ... (45s so far)`) and when it ends (`done in 3.2s`, or
+`failed after 300.0s: ...`), so a binding that stalls always says what it is
+waiting on:
+
+```text
+INFO:orchestrator:thread t_ab12: picking a worker of the pool ...
+INFO:orchestrator:thread t_ab12: waiting for worker slot 1 to come up ...
+INFO:orchestrator:worker orch-w1: making sprite orch-w1, or finding it made ...
+INFO:orchestrator:worker orch-w1: asking its runner whether it is orchestrate 1a2b3c4d5e6f as this control plane would start it (up to 60s: a paused sprite wakes) ...
+INFO:orchestrator:worker orch-w1: installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) ...
+INFO:orchestrator:worker orch-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
+```
+
+A worker being made holds up only the threads waiting for it: other threads
+bind on a worker with room meanwhile. A sprite is reinstalled and its runner
+restarted whenever the commit, model key, token or settings it would run
+with changed since it was started (a new commit on the branch the control
+plane's checkout follows is the usual one); otherwise its runner is left
+running and the attach takes seconds. Respawn of a thread waiting on a
+worker being made calls that attach off too, and it starts again.
 
 ## Respawn, from each state
 

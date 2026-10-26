@@ -96,6 +96,7 @@ class Host:
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
         self.calls: dict[str, dict] = {}  # peer calls queued, not yet handed out
+        self.turn_locks: dict[str, asyncio.Lock] = {}
         self.waiting: dict[str, asyncio.Future] = {}
         self.calls_cond = asyncio.Condition()
 
@@ -170,6 +171,12 @@ class Host:
         return self.workdir / ".team" / f"{tid}.turn"
 
     async def turn(self, t: dict, text: str, images: list | None = None) -> None:
+        """One turn at a time per thread, as the real runner takes them: a
+        message that comes in during a turn is the next one."""
+        async with self.turn_locks.setdefault(t["id"], asyncio.Lock()):
+            await self._turn(t, text, images)
+
+    async def _turn(self, t: dict, text: str, images: list | None = None) -> None:
         await self.set_state(t, "working")
         self.turn_file(t["id"]).parent.mkdir(parents=True, exist_ok=True)
         self.turn_file(t["id"]).write_text("{}")

@@ -17,6 +17,7 @@ import uvicorn
 
 from control import app as app_mod
 from control import service
+from control.service import NotOnWorker
 from control.app import create_app
 from control.providers import LocalProvider
 from control.router import HeuristicRouter, clean_plan
@@ -1392,7 +1393,8 @@ async def test_respawn_starts_over_a_thread_stuck_being_put_on_a_worker(tmp_path
              if e["type"] == "binding"]
     assert moves == [("unbound", "binding"), ("binding", "unbound"), ("unbound", "binding"), ("binding", "bound")]
     assert "Respawn called off" in (await unbinds(s, p["id"], t["id"]))[0]
-    assert "error" not in [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    errors = [e["payload"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "error"]
+    assert errors == []
     await orch.close()
     await provider.close()
     await s.close()
@@ -1612,6 +1614,12 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
     second = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     assert "devrunner: echo runner on port" in await second.worker_logs(t["id"], 50)  # before it is attached
+    # Reading its files waits for nothing and binds nothing: it says where
+    # the thread stands; Respawn puts it back on its worker.
+    with pytest.raises(NotOnWorker, match="on no worker"):
+        await second.list_files(t["id"], "build")
+    await second.respawn(t["id"])
+    await wait_for(lambda: bound_of(s, t["id"]))
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])][1:] == [ran_on]
@@ -1654,6 +1662,10 @@ async def test_threads_on_a_projects_own_worker_from_before_the_pool_come_back_o
     await orch.close()
     await provider.close()
     await s.close()
+
+
+async def bound_of(s, tid):
+    return (await s.get_thread(tid))["binding"] == "bound" or None
 
 
 async def idle_of(s, tid):
@@ -2163,3 +2175,80 @@ async def test_projects_share_a_worker_and_see_only_their_own_threads(tmp_path, 
     await orch.close()
     await provider.close()
     await s.close()
+
+
+async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it(tmp_path, monkeypatch):
+    """Making a worker (a sprite installing) takes no lock: while the second
+    slot's worker is being made for one thread, another thread binds on the
+    first worker, which has room. The waiting thread's Worker log says what
+    it waits on, step by step, the worker's own steps with it."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.3")
+    monkeypatch.setattr(service, "CAPACITY", 1)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+
+    class SlowSecondSlot(LocalProvider):
+        gate = asyncio.Event()
+
+        async def create(self, spec):
+            if spec.index == 2:
+                await self.gate.wait()
+            return await super().create(spec)
+
+    provider = SlowSecondSlot(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos", pool=2)
+    a = await orch.spawn(p["id"], "A", "one")
+
+    async def working():
+        return (await s.get_thread(a["id"]))["state"] == "working" or None
+    await wait_for(working)
+    b = await orch.spawn(p["id"], "B", "two")
+
+    async def b_waits():
+        return "waiting for worker slot 2" in (await s.get_thread(b["id"]))["activity"] or None
+    await wait_for(b_waits)
+    await wait_for(lambda: idle_of(s, a["id"]))
+    c = await orch.spawn(p["id"], "C", "three")
+    await wait_for(lambda: idle_of(s, c["id"]))
+    assert (await s.get_thread(c["id"]))["worker_id"] == "w1"
+    assert (await s.get_thread(b["id"]))["binding"] == "binding"
+    text = await orch.worker_logs(b["id"])
+    assert "picking a worker of the pool ..." in text and "waiting for worker slot 2 to come up ..." in text
+    assert "worker slot 2, which it waits on:" in text and "making or finding its worker" in text
+
+    provider.gate.set()
+    await wait_for(lambda: idle_of(s, b["id"]))
+    assert [lw.worker.id for lw in orch.workers] == ["w1", "w2"]
+    text = await orch.worker_logs(b["id"])
+    assert "waiting for worker slot 2 to come up: done in" in text and "bound: on worker w" in text
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_reading_files_never_waits_for_a_binding(tmp_path, monkeypatch):
+    """The Files tab of a thread still being put on a worker answers at once
+    (409, with where it stands) instead of holding the request open."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    provider = GatedProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "hello", "mode": "new"})
+            tid = r.json()["spawned"][0]["id"]
+            t0 = time.perf_counter()
+            r = await c.get(f"/api/threads/{tid}/files?path=")
+            assert time.perf_counter() - t0 < 1.0
+            assert r.status_code == 409 and "being put on a worker" in r.json()["error"]
+            provider.gate.set()
+
+            async def listed():
+                r = await c.get(f"/api/threads/{tid}/files?path=")
+                return r.status_code == 200 or None
+            await wait_for(listed)
