@@ -1001,6 +1001,26 @@ def state_badge(h: i32) -> None:
         end()
 
 
+def thread_badges(t: i32) -> None:
+    """Where a thread stands (states.py in the control plane). On a worker:
+    its runner's state (queued, working, idle...), and its worker's state when
+    that is not ready. On none, or on its way to one: its binding, since a
+    runner state is only true while a runner has it; a turn that ended badly
+    (failed, stopped) still says so."""
+    jstr(t, "binding", h_t2)
+    if s_eq(h_t2, h_bound) == 1:
+        jstr(t, "state", h_t2)
+        state_badge(h_t2)
+        jstr(t, "worker_state", h_t2)
+        if s_len(h_t2) > 0 and s_eq(h_t2, h_ready) == 0:
+            outline_badge("worker ", h_t2)
+        return
+    outline_badge("", h_t2)
+    jstr(t, "state", h_t2)
+    if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1:
+        state_badge(h_t2)
+
+
 def error_banner() -> None:
     if s_len(h_err) > 0:
         el("div")
@@ -1205,8 +1225,7 @@ def thread_list() -> None:
         jstr(e, "title", h_t1)
         text_ref(h_t1)
         end()
-        jstr(e, "state", h_t2)
-        state_badge(h_t2)
+        thread_badges(e)
         end()
         jstr(e, "activity", h_t1)
         if s_len(h_t1) > 0:
@@ -1780,14 +1799,7 @@ def thread_head(t: i32) -> None:
         text_ref(h_sel)
     end()
     if t != 0:
-        jstr(t, "state", h_t2)
-        state_badge(h_t2)
-        jstr(t, "binding", h_t2)
-        if s_len(h_t2) > 0 and s_eq(h_t2, h_bound) == 0:
-            outline_badge("", h_t2)
-        jstr(t, "worker_state", h_t2)
-        if s_len(h_t2) > 0 and s_eq(h_t2, h_ready) == 0:
-            outline_badge("worker ", h_t2)
+        thread_badges(t)
     span("mono muted")
     text_ref(h_sel)
     end()

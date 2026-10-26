@@ -251,6 +251,9 @@ on, and attaching it again pushes what it missed.
 
 ### Worker and thread states
 
+The full lifecycle, with diagrams, what you see in the UI and what Respawn
+does in each state: [docs/worker-lifecycle.md](../docs/worker-lifecycle.md).
+
 Workers, and each thread's hold on a worker (its binding), are two state
 machines, defined in one place: [control/states.py](control/states.py). Every
 change goes through `Orchestrator._worker_to` or `Orchestrator._bind_to`,

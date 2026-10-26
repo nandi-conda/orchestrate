@@ -1,0 +1,174 @@
+# Worker and thread lifecycle
+
+The control plane tracks two things for every running piece of work:
+
+- **the worker**: a machine (a sprite, or a local process) running the runner
+  that hosts threads;
+- **the thread's binding**: whether, and how, a thread is on a worker.
+
+Each is a small state machine, defined in one place:
+[`orchestrator/control/states.py`](https://github.com/nandi-conda/orchestrate/blob/main/orchestrator/control/states.py).
+On top of the binding sits the thread's **run state** (queued, working, idle,
+...), which the runner reports and which only means something while the
+thread is bound.
+
+The rule all three follow: **every state has a path back to happy** (a ready
+worker, a bound thread). The one exception is a lost worker, which is gone for
+good; its threads take the path back on another worker instead. `states.py`
+checks this when it loads, so a state with no way back cannot be added.
+
+## Worker states
+
+```mermaid
+stateDiagram-v2
+    [*] --> ready: made or attached
+    ready --> ready: runner restarted (new boot id)
+    ready --> unreachable: /health fails, provider still has it
+    ready --> lost: /health fails, provider says gone
+    unreachable --> ready: answers again
+    unreachable --> reattaching: 300 s without an answer, or Respawn
+    unreachable --> lost: provider says gone
+    reattaching --> ready: runner started again and answers
+    reattaching --> unreachable: reattach failed
+    reattaching --> lost: provider says gone
+    lost --> [*]
+```
+
+| State | Means | What moves it | Way back to ready |
+| --- | --- | --- | --- |
+| `ready` | its runner answers `/health` | | |
+| `unreachable` | `/health` fails but its provider still has it: a sprite waking from a pause, or this machine's network down | a failed health check (every 10 s, before every delivery, when picking a worker) | it answers again; or reattached |
+| `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable, or Respawn / a thread being put back on it | ready once it answers; unreachable again if it fails, and another try 300 s later |
+| `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its index never reused. Its threads are unbound and come back on another worker |
+
+`ready → ready` is a runner restart: `/health` returns a new `boot` id (the
+runner crashed, a sprite woke cold, or it was reattached). The new runner runs
+none of the old threads, so they are all unbound, keeping this worker as
+theirs: they come back on it, in their worktree, with their next message.
+
+A worker is never lost just for not answering. Only its provider saying it is
+gone loses it.
+
+## Thread binding
+
+```mermaid
+stateDiagram-v2
+    [*] --> binding: thread created
+    unbound --> binding: next message, file read, or Respawn
+    binding --> bound: worker picked, hub shipped, thread posted
+    binding --> unbound: failed, or called off (Respawn, Stop)
+    bound --> unbound: worker lost, runner restarted, control plane restarted
+    bound --> binding: Respawn, or a message to a thread whose turn ended
+```
+
+| Binding | Means | Way back to bound |
+| --- | --- | --- |
+| `bound` | a live worker's runner has the thread | |
+| `binding` | being put on a worker: one picked or made, the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
+| `unbound` | on no worker | its next message, opening its files, or Respawn |
+
+Each move is stored with its reason (`threads.binding_reason`) and logged as a
+`binding` event in the thread's log. Reasons you will see for `unbound`:
+
+- `worker … is lost (…)`: its provider says the worker is gone.
+- `worker …'s runner restarted`: a new runner on the same worker.
+- `the control plane that had it on worker … stopped`: this control plane
+  started after another one had the thread; attaching to that worker again
+  restarts its runner, so the thread is put back on it.
+- `could not put it on a worker: …`: the start failed; the error says why.
+- `Respawn called off putting it on a worker, to start over` /
+  `stopped before it was on a worker`.
+
+**Where a thread goes when it is bound.** On the worker it was last on, while
+that worker is not lost, so it continues in the same worktree (uncommitted
+and ignored files included); an unreachable one is reattached first.
+Otherwise on the least loaded ready worker (a new one when all are full),
+from its branch, snapshot and session in the hub. If its runner still runs it
+(only the control plane lost track), it is bound as it is: "found again on
+worker …". A thread with no saved turn yet gets its original request again;
+the rest come back idle and wait for their next message.
+
+## Run state, and what "queued" means
+
+The run state is the runner's: `queued`, `working`, `waiting`, `idle`,
+`done`, `failed`, `stopped`.
+
+- `queued`: the runner has the thread but its first turn has not started.
+  It lasts a moment; the runner moves it to `working` as soon as the turn
+  begins. It is also the state a thread is created with, before any runner
+  has reported on it.
+- `working`, `waiting`: a turn is under way (`waiting` on a peer).
+- `idle`: between turns, waiting for its next message.
+- `done`, `failed`, `stopped`: its turn ended; a message brings it back.
+
+A run state is only true while a runner has the thread, so **the UI shows it
+only for a bound thread**. A thread on its way to a worker shows `binding`,
+and one on none shows `unbound`, plus `failed` or `stopped` when its turn
+ended that way. Unbinding a thread mid-turn (queued, working, waiting) marks
+it `failed`, since its turn was cut short.
+
+So a thread showing `queued` for more than a moment is bound, and its runner
+has not started its turn. Check its Worker log; Respawn re-posts it.
+
+The other "queued" in the code is unrelated: sending a request returns
+`{"queued": true}` to say routing runs in the background. It is never shown
+as a thread's state.
+
+## What you see in the UI
+
+- **Badges** next to a thread's title (in the list and the open pane): its
+  run state while bound, plus `worker unreachable` / `worker reattaching`
+  when its worker is not ready; its binding (`binding`, `unbound`) otherwise.
+- **The red bar** under the title appears when a thread is unbound or its
+  worker is not ready. It shows the binding, its reason, the worker's state
+  and reason, and that Respawn brings it back.
+- **Now:** while binding, the activity line says `starting on a worker`.
+- **The project log** shows `worker_state` events (`worker unreachable`,
+  `worker ready`, ...) with their reasons; a thread's log shows its `unbound`
+  moves.
+- **The Worker log tab** opens with two lines, then the worker's runner log:
+
+  ```text
+  thread t_ab12 is bound: on worker orch-p_cd34-w1, idle until its next message
+  worker orch-p_cd34-w1 is ready: its runner answers again
+  ```
+
+  For a thread whose worker was lost, it shows the end of that worker's log
+  as it was followed before the worker was destroyed.
+
+## Respawn, from each state
+
+Respawn (the button on every thread, or `POST /api/threads/<id>/respawn`)
+returns at once; the thread's `binding` events show how it went.
+
+| The thread is | Respawn |
+| --- | --- |
+| `unbound` | binds it: on its last worker if that is not lost, else on a picked one |
+| `binding` (stuck starting, e.g. a sprite that never comes up) | calls the start off (`binding → unbound`) and starts again; messages sent meanwhile wait for the new start and are delivered |
+| `bound`, worker `ready` | stops it on its runner and posts it again (`bound → binding → bound`); a turn under way is cut short |
+| `bound`, worker `unreachable` or `reattaching` | reattaches the worker first (its runner is started again), then binds the thread on it |
+| worker `lost` | its threads are already unbound; Respawn binds them on another worker |
+
+## Messages to a thread in each state
+
+A message is logged at once and delivered in the background, in order:
+
+- **bound, worker ready:** delivered.
+- **binding:** waits for the binding to finish, then delivered.
+- **unbound, or its turn ended:** the thread is bound first, then delivered.
+- **bound, worker unreachable:** waits for the worker to be ready again (it
+  answers, or is reattached after 300 s); if a reattach fails, the message
+  fails with the worker's state and reason in the thread's log.
+
+## For developers
+
+- Change a worker's state only with `Orchestrator._worker_to`, and a
+  binding only with `Orchestrator._bind_to`. Both check the move against the
+  machine (`IllegalTransition` on a move it does not list: a control plane
+  bug), store the reason and log the event.
+- `_bind` is the single path that puts a thread on a worker, for a new thread
+  and a returning one alike; `live_worker` is what anything needing the
+  thread's worker calls.
+- `_probe` looks at a worker once and moves it; `_watch` calls it every 10 s.
+- Adding a state means adding it to `states.py` with its moves; the module
+  refuses to load if the new state has no way back to happy.
