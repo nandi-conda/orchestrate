@@ -27,8 +27,9 @@ A remote can be a folder on the control plane's machine (a project opened from
 disk): a git repository's own folder, or any folder, which becomes one
 (`folder`). Landings are pushed into its checked-out branch and update its
 files (receive.denyCurrentBranch=updateInstead), so they show up where its
-owner works; git refuses one while that checkout has changes not committed,
-and the thread's work lands again at the end of its next turn.
+owner works. Opening it commits what it had not, so it starts clean; git
+refuses a landing while that checkout has changes made since and not
+committed, and the thread's work lands again at the end of its next turn.
 
 Workers never reach the hub, nor the remote. The control plane moves commits
 as git bundles over the runner API, each way leaving out what the other side
@@ -56,7 +57,7 @@ from .gitio import AUTHOR, GitError, git
 
 LAND_ATTEMPTS = 5  # pushes rejected because the remote moved before giving up
 START, MAKE_PIXI = "Start the project", "Make the project a pixi project"  # the hub's own commits
-IMPORT = "Add the folder's files"  # a folder opened as a project whose branch had no commits
+IMPORT = "Add the folder's files"  # what a folder opened as a project had not committed
 # A new project's pixi workspace: on conda-forge, for the platforms workers run on.
 PLATFORMS = ("linux-64", "linux-aarch64")
 # What `pixi init` puts in .gitignore and .gitattributes: environments stay out
@@ -64,6 +65,7 @@ PLATFORMS = ("linux-64", "linux-aarch64")
 GITIGNORE = ("# pixi environments", ".pixi/*", "!.pixi/config.toml")
 GITATTRIBUTES = ("# SCM syntax highlighting & preventing 3-way merges",
                  "pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff")
+PIXI_FILES = ("pixi.toml", ".gitignore", ".gitattributes")  # what pixi_tree writes
 
 
 def manifest(name: str) -> str:
@@ -93,8 +95,8 @@ async def pixi_tree(repo: str | os.PathLike, commit: str | None, name: str) -> s
     with tempfile.TemporaryDirectory() as d:
         env = {"GIT_INDEX_FILE": os.path.join(d, "index")}
         await git(repo, "read-tree", *([commit] if commit else ["--empty"]), env=env)
-        files = {"pixi.toml": manifest(name)}
-        for path, lines in ((".gitignore", GITIGNORE), (".gitattributes", GITATTRIBUTES)):
+        files = {PIXI_FILES[0]: manifest(name)}
+        for path, lines in zip(PIXI_FILES[1:], (GITIGNORE, GITATTRIBUTES)):
             old = (await git(repo, "show", f"{commit}:{path}", check=False)).out if commit else ""
             have = old.splitlines()
             files[path] = "\n".join(have + [line for line in lines if line not in have]) + "\n"
@@ -123,10 +125,13 @@ async def folder(path: str) -> None:
     """Make the folder at `path` (as remote_url writes it) a remote the hub can
     land in. A bare repository is one as it is. A git repository's own folder
     lets pushes update its checked-out branch and files; a folder that is not
-    one becomes one (on `main`). A branch without commits yet gets one holding
-    the folder's files (what its .gitignore leaves out stays out), so the
-    project starts from what is there. Refused: no such folder, a folder inside
-    another repository (open that one), and a checkout on no branch."""
+    one becomes one (on `main`). The project starts from what is there: what
+    the folder has not committed (what its .gitignore leaves out stays out)
+    gets a commit, so threads see every file in it and no landing has to
+    write over one. The files that make it a pixi project are its own in that
+    commit even when ignored, so making it one edits them, never replaces
+    them. Refused: no such folder, a folder inside another repository (open
+    that one), and a checkout on no branch."""
     where = Path(path).resolve()
     if not where.is_dir():
         raise GitError(f"there is no folder {path}")
@@ -145,10 +150,14 @@ async def folder(path: str) -> None:
     if (await git(where, "symbolic-ref", "-q", "HEAD", check=False)).code:
         raise GitError(f"{path} has no branch checked out; check out the branch the project should follow")
     await git(where, "config", "receive.denyCurrentBranch", "updateInstead")
-    if (await git(where, "rev-parse", "-q", "--verify", "HEAD", check=False)).code:
-        who = ("-c", f"user.name={AUTHOR[0]}", "-c", f"user.email={AUTHOR[1]}")
-        await git(where, "add", "-A")
-        await git(where, *who, "commit", "-q", "--allow-empty", "-m", IMPORT)
+    await git(where, "add", "-A")
+    if own := [f for f in PIXI_FILES if (where / f).is_file()]:
+        await git(where, "add", "-f", "--", *own)
+    born = (await git(where, "rev-parse", "-q", "--verify", "HEAD", check=False)).code == 0
+    if born and (await git(where, "diff", "--cached", "--quiet", check=False)).code == 0:
+        return
+    who = ("-c", f"user.name={AUTHOR[0]}", "-c", f"user.email={AUTHOR[1]}")
+    await git(where, *who, "commit", "-q", "--allow-empty", "-m", IMPORT)
 
 
 def folders(path: str = "") -> dict:

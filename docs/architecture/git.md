@@ -151,17 +151,22 @@ What the folder is decides what is done to it first (`hub.folder`):
 | a git repository's own folder (a checkout) | its config gets `receive.denyCurrentBranch=updateInstead`, so a push to its checked-out branch also updates its files |
 | a bare repository | used as it is |
 | not a git repository | `git init` on `main`, then as a checkout |
-| a checkout whose branch has no commits yet | one commit, "Add the folder's files", of everything its `.gitignore` leaves in |
+| a checkout with anything not committed (or a branch with no commits yet) | one commit, "Add the folder's files", of everything its `.gitignore` leaves in: untracked files and changes to tracked ones, plus its own `pixi.toml`, `.gitignore` and `.gitattributes` even when ignored |
 | missing, inside another repository, a `.git` folder, or a checkout on no branch (detached HEAD) | refused with the reason |
 
-A project that is not a pixi project then gets "Make the project a pixi
-project", pushed into the folder like a landing. From then on every landing
+So the project starts from what is there and the folder starts clean: threads
+see every file in it, and no landing (nor the hub's own pixi commit) has to
+write over a file the project never had. A project
+that is not a pixi project then gets "Make the project a pixi project", pushed
+into the folder like a landing; it adds pixi's lines to the folder's own
+`.gitignore` and `.gitattributes`. From then on every landing
 is pushed into the checked-out branch, and commits you make there yourself
 are fetched before workers get the base and before every landing, so threads
 build on them.
 
-git never pushes over changes you have not committed: while the checkout has
-modified tracked files (or untracked ones a landing would overwrite), the
+git never pushes over changes you make after opening and do not commit: while
+the checkout has modified tracked files (or untracked ones a landing would
+overwrite), the
 push is refused ("Working directory has unstaged changes"), the thread shows
 the error, and nothing moves. Commit or stash, and the thread's work lands at
 the end of its next turn. Untracked files that a landing does not touch are

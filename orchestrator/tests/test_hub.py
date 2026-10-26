@@ -429,6 +429,61 @@ async def test_a_folder_that_is_not_a_repository_becomes_one_with_its_files(tmp_
     await s.close()
 
 
+async def test_a_folder_starts_from_what_it_has_not_committed(tmp_path):
+    # A checkout with an untracked .gitignore, a change to a tracked file, and
+    # a new file: opening commits them, so making it a pixi project edits its
+    # .gitignore (never pushes over it) and threads see every file.
+    bare, seed = remote(tmp_path)
+    (seed / ".gitignore").write_text("build/\n")
+    (seed / "notes.txt").write_text("hello again\n")
+    (seed / "todo.txt").write_text("x\n")
+    (seed / "build").mkdir()
+    (seed / "build" / "out.o").write_text("o\n")
+    s, p, orch = await opened(tmp_path, seed)
+    hub = orch.hub_path(p["id"])
+    assert git(hub, "log", "--format=%s", "trunk").splitlines() == [
+        "Make the project a pixi project", "Add the folder's files", "init"]
+    assert git(hub, "show", "trunk~1:.gitignore") == "build/"
+    assert git(hub, "show", "trunk:.gitignore").splitlines()[:2] == ["build/", "# pixi environments"]
+    assert git(hub, "show", "trunk:notes.txt") == "hello again" and git(hub, "show", "trunk:todo.txt") == "x"
+    assert git(seed, "rev-parse", "HEAD") == git(hub, "rev-parse", "trunk")
+    assert git(seed, "status", "--porcelain") == "" and (seed / "build" / "out.o").exists()
+
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
+    landed = await event(s, p, t["id"], "landed")
+    assert git(seed, "rev-parse", "HEAD") == landed["commit"] and (seed / "a.txt").exists()
+    await wait_for(lambda: idle(s, t["id"]))
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
+async def test_a_folder_with_nothing_to_commit_gets_no_commit(tmp_path):
+    bare, seed = remote(tmp_path)
+    commit(seed, "pixi.toml", '[workspace]\nname = "x"\n', "pixi")
+    head = git(seed, "rev-parse", "HEAD")
+    s, p, orch = await opened(tmp_path, seed)
+    assert git(seed, "rev-parse", "HEAD") == head == git(orch.hub_path(p["id"]), "rev-parse", "trunk")
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
+async def test_a_gitignore_that_ignores_itself_is_kept(tmp_path):
+    # Ignored files are written over by a push; the pixi files never are,
+    # because opening commits the folder's own.
+    folder = tmp_path / "plain"
+    folder.mkdir()
+    (folder / ".gitignore").write_text(".*\n")
+    s, p, orch = await opened(tmp_path, folder)
+    hub = orch.hub_path(p["id"])
+    assert git(hub, "show", "main~1:.gitignore") == ".*"
+    assert (folder / ".gitignore").read_text().splitlines()[:2] == [".*", "# pixi environments"]
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
 async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
     bare, seed = remote(tmp_path)
     (seed / "sub").mkdir()
