@@ -29,36 +29,36 @@ class TeamError(RuntimeError):
     pass
 
 
-async def _list_threads(t: "AgentThread", query: str | None = None) -> list[dict]:
+async def _list_threads(t: AgentThread, query: str | None = None) -> list[dict]:
     rows = await t.peers.list_threads(t.id, t.project, query)
     return [r for r in rows if r.get("id") != t.id]
 
 
-async def _read_thread(t: "AgentThread", id: str, last_n: int = 20) -> dict:
+async def _read_thread(t: AgentThread, id: str, last_n: int = 20) -> dict:
     return await t.peers.read_thread(t.id, id, int(last_n))
 
 
-async def _send_message(t: "AgentThread", to: str, body: str, reply_to: str | None = None) -> dict:
+async def _send_message(t: AgentThread, to: str, body: str, reply_to: str | None = None) -> dict:
     return await t.peers.send_message(t.id, to, body, reply_to)
 
 
-async def _spawn_thread(t: "AgentThread", title: str, request: str) -> dict:
+async def _spawn_thread(t: AgentThread, title: str, request: str) -> dict:
     if t.spawned >= t.limits.max_spawn:
         raise TeamError(f"spawn limit ({t.limits.max_spawn}) reached for this thread")
     t.spawned += 1
     return await t.peers.spawn_thread(t.id, t.project, title, request)
 
 
-async def _set_summary(t: "AgentThread", summary: str) -> None:
+async def _set_summary(t: AgentThread, summary: str) -> None:
     t.summary = summary
     await t.peers.set_summary(t.id, t.summary, sorted(t.files))
 
 
-async def _web_search(t: "AgentThread", query: str, count: int = 10, question: str | None = None) -> list[dict]:
+async def _web_search(t: AgentThread, query: str, count: int = 10, question: str | None = None) -> list[dict]:
     return await t.web.search(query, int(count), question)
 
 
-async def _web_fetch(t: "AgentThread", url: str) -> dict:
+async def _web_fetch(t: AgentThread, url: str) -> dict:
     return await t.web.fetch(url)
 
 
@@ -67,7 +67,7 @@ OPS = {"list_threads": _list_threads, "read_thread": _read_thread, "send_message
        "web_fetch": _web_fetch}
 
 
-async def answer(t: "AgentThread", line: bytes) -> dict:
+async def answer(t: AgentThread, line: bytes) -> dict:
     try:
         call = json.loads(line)
         op = OPS[call["op"]]
@@ -76,14 +76,14 @@ async def answer(t: "AgentThread", line: bytes) -> dict:
         return {"ok": False, "error": f"unknown call or missing field {e}"}
     except TypeError as e:  # arguments the op does not take
         return {"ok": False, "error": str(e)}
-    except Exception as e:  # the call's failure goes back to the model, not up the stack
+    except Exception as e:  # noqa: BLE001 - the call's failure goes back to the model, not up the stack
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 class TeamServer:
     """A thread's team socket."""
 
-    def __init__(self, t: "AgentThread", path: str):
+    def __init__(self, t: AgentThread, path: str):
         self.t, self.path = t, path
         self.server: asyncio.Server | None = None
 
