@@ -186,6 +186,35 @@ def live_row(first: dict, d: dict) -> dict:
     return {**first, "kind": kind, "label": label, "text": text, "live": 1}
 
 
+class Streaming:
+    """A model call's `delta` events, folded into the live rows a pane shows:
+    one row per part (reasoning, the reply, each tool call), which grows until
+    the event that ends the call (`ENDS_STREAM`) drops it. The panes and the SSE
+    streams both fold with this, so a row looks the same either way."""
+
+    def __init__(self) -> None:
+        self.parts: dict[str | None, list[tuple[dict, dict]]] = {}
+
+    def add(self, e: dict) -> tuple[dict, bool]:
+        """Fold delta event `e` into its thread's last part, or start a part.
+        Returns the thread's live row as it now stands, and whether it started
+        the part (which is when the thread's activity moved)."""
+        d, parts = e["payload"], self.parts.setdefault(e["thread_id"], [])
+        if parts and (parts[-1][1]["kind"], parts[-1][1].get("name")) == (d.get("kind"), d.get("name")):
+            parts[-1][1]["text"] += d.get("text", "")
+            return live_row(*parts[-1]), False
+        parts.append((e, {"kind": d.get("kind"), "name": d.get("name"), "text": d.get("text", "")}))
+        return live_row(*parts[-1]), True
+
+    def end(self, tid: str | None) -> None:
+        """The event that ends the call is in: its thread has no live rows."""
+        self.parts.pop(tid, None)
+
+    def rows(self) -> list[dict]:
+        """Every live row, per thread in order, then per part."""
+        return [live_row(first, d) for parts in self.parts.values() for first, d in parts]
+
+
 def fold(events: list[dict]) -> list[dict]:
     """Events for display. A model call's `delta` events become one live row
     per part (reasoning, reply, each tool call) at the end, until the event
@@ -193,9 +222,8 @@ def fold(events: list[dict]) -> list[dict]:
     deletes them too) and the call's own events stand."""
     out: list[dict] = []
     by_seq: dict[int, dict] = {}
-    streaming: dict[str | None, list[tuple[dict, dict]]] = {}
+    live = Streaming()
     for e in events:
-        tid = e["thread_id"]
         if e["type"] == "edited":
             # An edit shows on the message it edits: its text now, marked edited.
             target = by_seq.get(e["payload"].get("of"))
@@ -203,20 +231,14 @@ def fold(events: list[dict]) -> list[dict]:
                 target["text"], target["label"], target["edited"] = e["payload"].get("text", ""), "You · edited", 1
             continue
         if e["type"] == "delta":
-            d = e["payload"]
-            parts = streaming.setdefault(tid, [])
-            if parts and (parts[-1][1]["kind"], parts[-1][1].get("name")) == (d.get("kind"), d.get("name")):
-                parts[-1][1]["text"] += d.get("text", "")
-            else:
-                parts.append((e, {"kind": d.get("kind"), "name": d.get("name"), "text": d.get("text", "")}))
+            live.add(e)
             continue
         if e["type"] in ENDS_STREAM:
-            streaming.pop(tid, None)
+            live.end(e["thread_id"])
         if e["type"] not in HIDDEN:
             out.append(display(e))
             by_seq[e["seq"]] = out[-1]
-    for parts in streaming.values():
-        out.extend(live_row(first, d) for first, d in parts)
+    out.extend(live.rows())
     return out
 
 
@@ -503,6 +525,9 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         return JSONResponse(fold(await store.recent_events(req.path_params["pid"], limit=PAGE_EVENTS)))
 
     def sse(project_id: str, thread_id: str | None, after: int):
+        def frame(seq: int, typ: str, row: dict) -> str:
+            return f"id: {seq}\nevent: {typ}\ndata: {json.dumps(row)}\n\n"
+
         async def idle(last: int, seconds: float) -> bool:
             """Wait for events, or return True as soon as shutdown begins."""
             events_wait = asyncio.ensure_future(store.wait_events(project_id, last, seconds))
@@ -519,12 +544,31 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
 
         async def gen():
             last = after
+            live = Streaming()
             yield ": connected\n\n"
             while not stop.is_set():
                 events = await store.list_events(project_id, thread_id, last)
+                # A reply still streaming is one row that grows, so the deltas
+                # of a batch fold into the row they ended as, by its seq, and a
+                # pane patches it instead of refetching everything it shows.
+                # `began` marks the delta that started a part: only that one
+                # moved something off the pane (the thread list's activity).
+                # (On a replay, a whole turn's deltas arrive in one batch.)
+                grown: dict[int, dict] = {}
+                begun: set[int] = set()
                 for e in events:
                     last = e["seq"]
-                    yield f"id: {e['seq']}\nevent: {e['type']}\ndata: {json.dumps(display(e))}\n\n"
+                    if e["type"] == "delta":
+                        row, started = live.add(e)
+                        grown[row["seq"]] = row
+                        if started:
+                            begun.add(row["seq"])
+                        continue
+                    if e["type"] in ENDS_STREAM:
+                        live.end(e["thread_id"])
+                    yield frame(last, e["type"], display(e))
+                for seq, row in grown.items():
+                    yield frame(last, "delta", {**row, "began": 1} if seq in begun else row)
                 if not events:
                     if await idle(last, 15.0):
                         return

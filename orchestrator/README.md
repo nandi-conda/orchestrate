@@ -406,3 +406,11 @@ SQLite or Postgres database the first time the control plane opens it.
 | POST | `/api/threads/{id}/archive` | stops it if running, then archives it; the thread |
 | POST | `/api/threads/{id}/unarchive` | the thread |
 | GET | `/api/images/{id}` | a pasted image's bytes (`image/png`, `jpeg`, `webp` or `gif`), cacheable for good |
+
+A stream sends one frame per event, except for a reply still streaming: its
+`delta` events fold into the row they end up as — one per part (the reasoning,
+the reply, each tool call), under the `seq` the part started at, with
+`live: 1` and its `text` grown so far, and `began: 1` on the frame that started
+the part — so the window grows the row it shows instead of fetching the whole
+pane again. The event that ends the model call replaces them with the call's
+own events.

@@ -168,3 +168,9 @@ def on_zoom() -> None:
     """Clicking an image with the `zoom` class shows it enlarged, and again
     puts it back."""
     pass
+
+@jscall
+def j_put_row(rows: i32, row: i32) -> i32:
+    """Put JSON object row into the JSON array rows, by its `seq`: 1 when it
+    replaced the row already there, 0 when it started a new one."""
+    pass

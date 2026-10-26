@@ -498,6 +498,56 @@ async def test_a_pane_shows_the_newest_events_of_a_long_log(server, monkeypatch)
         assert 0 < len(tr) <= 4 and [e["seq"] for e in tr] == sorted(e["seq"] for e in tr)
 
 
+async def test_a_reply_in_flight_is_one_row_that_grows_on_the_stream(server):
+    """A pane patches the reply it is watching instead of refetching the whole
+    pane: the stream sends that reply as one row, under the seq it started at,
+    whose text grows with each delta."""
+    async with httpx.AsyncClient(base_url=server, timeout=30) as c:
+        pid = (await c.post("/api/projects", json={"name": "live"})).json()["id"]
+        tid = (await c.post(f"/api/projects/{pid}/requests",
+                            json={"text": "first", "mode": "new"})).json()["spawned"][0]["id"]
+
+        async def idle():
+            return (await c.get(f"/api/threads/{tid}")).json()["state"] == "idle"
+        await wait_for(idle)
+
+        growing: list[dict] = []
+        ended = None
+        after = (await c.get(f"/api/projects/{pid}/log")).json()[-1]["seq"]
+        async with c.stream("GET", f"/api/projects/{pid}/events", params={"after": after}) as s:
+            # The reply streams while the stream is open, as a pane sees it.
+            await c.post(f"/api/threads/{tid}/messages", json={"body": "y" * 1200})
+            event = ""
+            async for line in s.aiter_lines():
+                if line.startswith("event: "):
+                    event = line.removeprefix("event: ")
+                elif line.startswith("data: "):
+                    row = json.loads(line.removeprefix("data: "))
+                    if event == "delta":
+                        growing.append(row)
+                    elif event == "assistant":  # the end of the model call
+                        ended = row
+                        break
+
+        reply = [r for r in growing if r["kind"] == app_mod.K_ASSISTANT]
+        assert len(reply) > 1, "a long reply streams in several deltas"
+        assert len({r["seq"] for r in reply}) == 1, "one row, not one per delta"
+        assert all(r.get("live") == 1 for r in reply)
+        # Only the delta that started the part says so: a pane refreshes the
+        # thread list for that one, and patches the row for the rest.
+        assert [r.get("began") for r in reply] == [1] + [None] * (len(reply) - 1)
+        assert [len(r["text"]) for r in reply] == sorted(len(r["text"]) for r in reply)
+        assert len(reply[-1]["text"]) > len(reply[0]["text"]), "the row grew"
+        assert reply[-1]["label"] == "Agent (writing…)"
+
+        # The event that ends the call is the whole reply, and the deltas are
+        # gone: what the pane's next snapshot shows.
+        assert ended["text"].startswith("Echo: ")
+        rows = (await c.get(f"/api/projects/{pid}/log")).json()
+        assert not any(r.get("live") for r in rows)
+        assert [r["text"] for r in rows if r["type"] == "assistant"][-1] == ended["text"]
+
+
 class GatedRouter(HeuristicRouter):
     """A router whose model has not answered until `gate` is set."""
 

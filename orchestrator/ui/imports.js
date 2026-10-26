@@ -6,6 +6,8 @@ export function imports({ str, strs, vals, dispatch }) {
   const streams = new Map();
   let nextStream = 1;
   let doc = { op: [], s: [] }; // the markdown md_parse last parsed
+  const mdCache = new Map(); // markdown source -> its parsed doc
+  const MD_CACHE = 4096;
   const follow = new Map(); // element id -> keeps the bottom in view (scroll_follow)
   const placed = new WeakMap(); // element -> the scrollTop toEnd last set
   const toEnd = (sel) => {
@@ -111,9 +113,37 @@ export function imports({ str, strs, vals, dispatch }) {
     nav_push: (u) => { history.pushState(null, "", strs[u]); },
     on_nav: (msg) => { addEventListener("popstate", () => dispatch(msg, 0)); },
     set_title: (h) => { document.title = strs[h]; },
-    md_parse: (h) => { doc = parse(strs[h] ?? ""); return doc.op.length; },
+    // Parsed markdown, by its source: a pane with a long history re-renders every
+    // reply on each frame, and only the one still streaming changes. The cache
+    // is dropped whole rather than grown without bound: a session's tail is all
+    // a pane can show anyway.
+    md_parse: (h) => {
+      const src = strs[h] ?? "";
+      let d = mdCache.get(src);
+      if (d === undefined) {
+        if (mdCache.size >= MD_CACHE) mdCache.clear();
+        d = parse(src);
+        mdCache.set(src, d);
+      }
+      doc = d;
+      return doc.op.length;
+    },
     md_op: (i) => doc.op[i],
     md_str: (i, d) => { strs[d] = doc.s[i]; },
+    // A pane row by seq: a live row (a reply still streaming) is one seq that
+    // grows, and a part that starts is a new row at the end of the list. A row
+    // never shrinks: a stream resumed mid-reply after a reconnect starts its
+    // count again, and the row the pane has is the fuller one.
+    j_put_row: (rows, row) => {
+      const list = vals[rows], r = vals[row];
+      if (!Array.isArray(list) || !r) return 0;
+      const at = list.findIndex((x) => x && x.seq === r.seq);
+      if (at < 0) { list.push({ ...r }); return 0; }
+      const had = list[at];
+      if (String(r.text ?? "").length < String(had.text ?? "").length) return 1;
+      list[at] = { ...r };
+      return 1;
+    },
     // Copy: one path, the async Clipboard API. A click is a user gesture and
     // the page is served from localhost (a secure context), in a browser and
     // in the desktop window alike.

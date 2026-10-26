@@ -19,7 +19,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, focus_end, is_md, on_paste, img_count, img_url,
-                  img_drop, img_stash, img_restore, img_clear, on_zoom)
+                  img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -89,6 +89,7 @@ PROJ_UNARCHIVE: Const[i32] = 64
 PROJ_ARCHIVED: Const[i32] = 65
 RESPAWN: Const[i32] = 66
 RESPAWNED: Const[i32] = 67
+THREADS_REFRESH: Const[i32] = 68
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -136,6 +137,7 @@ creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
+threads_pending: i32 = 0 # a thread-list refresh is scheduled
 pane_tab: i32 = 0        # DIALOG, TOOLS, FILES or WLOG
 stream: i32 = 0          # the open project's event stream, 0 when none
 wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
@@ -439,6 +441,18 @@ def fetch_transcript() -> None:
     get(h_url, GOT_TRANSCRIPT)
 
 
+def put_live(e: i32) -> None:
+    """Grow the pane's row for live row e (a reply still streaming). Only the
+    pane that shows this thread's events has one."""
+    if s_len(h_sel) > 0:
+        jstr(e, "thread_id", h_t1)
+        if s_eq(h_sel, h_t1) == 0:
+            return  # another thread's reply: this pane does not show it
+        j_put_row(transcript, e)
+    else:
+        j_put_row(plog, e)
+
+
 def fetch_wlog() -> None:
     global wlog_loading
     if s_len(h_sel) == 0:
@@ -540,7 +554,7 @@ def land() -> None:
 
 def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
-    global mode, pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
+    global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     e: i32 = 0
     k: i32 = 0
@@ -750,10 +764,24 @@ def update(msg: i32, arg: i32) -> None:
             jstr(arg, "text", h_route)
         elif k == K_ERROR and j_has(arg, "thread_id") == 0:
             jstr(arg, "text", h_err)
-        j_free(arg)
-        if pending == 0:
+        # A reply still streaming is one row that grows, so the pane it is in
+        # patches that row. Its first delta is not: a part starting moves what
+        # the thread list says each thread is doing, and nothing in the pane.
+        if j_int(arg, "live") == 1:
+            if j_int(arg, "began") == 1:
+                if threads_pending == 0:
+                    threads_pending = 1
+                    after(150, THREADS_REFRESH, 0)
+            else:
+                put_live(arg)
+        elif pending == 0:
             pending = 1
             after(150, REFRESH, 0)
+        j_free(arg)
+    elif msg == THREADS_REFRESH:
+        threads_pending = 0
+        if screen == 1:
+            fetch_threads()
     elif msg == REFRESH:
         pending = 0
         if screen == 1:
