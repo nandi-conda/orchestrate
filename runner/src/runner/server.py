@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -23,11 +24,37 @@ from .secrets import get_secret, require
 from .thread import ThreadHost, dumps
 from .web import deepseek_web
 
+# The two requests that keep coming for as long as a worker lives: the control
+# plane's health check, and its long poll for peer calls.
+POLLS = ("/health", "/peer/calls")
+
 # The same limits the control plane enforces; a worker is reachable on its own,
 # so it checks what it accepts.
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+class QuietPolls(logging.Filter):
+    """Leave out the access line of a poll that came back fine. A worker
+    answers these every few seconds all day, so their 200s are most of the
+    worker log and bury the lines worth reading. A poll that fails still logs:
+    that is the one a reader is looking for."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn's access record: (client, method, path, version, status).
+        args = record.args
+        if not isinstance(args, tuple) or len(args) != 5:
+            return True
+        path, status = str(args[2]).split("?")[0], args[4]
+        return not (path in POLLS and isinstance(status, int) and 200 <= status < 300)
+
+
+def configure_logging() -> None:
+    """prime-agent's own log lines (runner.harness), thread failures, and one
+    access line per request worth reading."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(name)s: %(message)s")
+    logging.getLogger("uvicorn.access").addFilter(QuietPolls())
 
 
 def checkout_commit() -> str | None:
@@ -286,11 +313,9 @@ def host_from_env() -> ThreadHost:
 def main():
     import sys
 
-    import logging
-
     import uvicorn
-    # prime-agent's own log lines (runner.harness) and thread failures go to the worker log.
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(name)s: %(message)s")
+
+    configure_logging()
     require(["DEEPSEEK_API_KEY"])
     sandbox.check()
     PrimeAgent().check()

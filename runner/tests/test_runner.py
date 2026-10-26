@@ -411,6 +411,31 @@ async def test_http_bringing_a_thread_back_needs_its_id_or_a_request(tmp_path):
     await host.stop("t_x")
 
 
+def test_a_poll_that_came_back_fine_is_not_a_log_line(caplog):
+    """The worker log is for what happened, not for the polls that keep
+    coming back 200; a poll that fails is still there."""
+    import logging
+
+    from runner.server import configure_logging
+
+    configure_logging()
+    access = logging.getLogger("uvicorn.access")
+    access.setLevel(logging.INFO)
+
+    def poll(method, path, status):
+        # what uvicorn's access logger gets for one request
+        access.info('%s - "%s %s HTTP/%s" %d', "10.0.0.2:33294", method, path, "1.1", status)
+
+    with caplog.at_level(logging.INFO):
+        poll("GET", "/health", 200)
+        poll("GET", "/peer/calls?wait=25.0", 200)
+        assert caplog.records == []
+        poll("GET", "/threads", 200)
+        poll("GET", "/health", 500)
+        poll("POST", "/peer/calls/c_1", 404)
+        assert [r.args[2] for r in caplog.records] == ["/threads", "/health", "/peer/calls/c_1"]
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="making a user with ambient capabilities needs root")
 def test_sandbox_starts_for_a_user_with_ambient_capabilities():
     """A Sprite's services run as a non-root user with ambient capabilities,
