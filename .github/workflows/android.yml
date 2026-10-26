@@ -1,0 +1,110 @@
+# Build the Android app (android/) and publish it as the rolling release:
+# the `rolling` tag moves to each new main, and its GitHub Release carries
+# the APK at a fixed name, so
+#   https://github.com/nandi-conda/orchestrate/releases/download/rolling/orchestrator.apk
+# is always the newest build.
+#
+# The app carries the control plane (orchestrator/control), its ultra UI and
+# git, so a change to any of them is a new APK. It is signed with the release
+# key from the repository secrets (android/README.md): Android installs an
+# update only over an app signed with the same key.
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "orchestrator/control/**"
+      - "orchestrator/ui/**"
+      - "orchestrator/pixi.toml"
+      - "orchestrator/pixi.lock"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Releases go out in order: the rolling release has to be the newest main.
+concurrency:
+  group: android-rolling
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=""
+          for s in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [ -n "${!s}" ] || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing. See android/README.md, 'Release key'."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          manifest-path: orchestrator/pixi.toml
+          environments: default
+
+      - name: Build the UI
+        working-directory: orchestrator
+        run: pixi run build-ui
+
+      - name: Cache git for Android
+        id: git-cache
+        uses: actions/cache@v6
+        with:
+          path: android/git/out
+          key: android-git-${{ hashFiles('android/git/**', '!android/git/out/**') }}
+
+      - name: Build git for Android
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: android/git/build.sh android/git/out/arm64-v8a
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # Chaquopy builds the app's Python packages with the same Python
+          # version the app runs (3.12): the orchestrator's own.
+          export PATH="$GITHUB_WORKSPACE/orchestrator/.pixi/envs/default/bin:$PATH"
+          export ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$ANDROID_KEYSTORE"
+          ./gradlew --no-daemon assembleRelease -PbuildNumber=${{ github.run_number }}
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/orchestrator.apk"
+
+      - name: Publish the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f rolling "$GITHUB_SHA"
+          git push -f origin refs/tags/rolling
+          notes="Build ${{ github.run_number }} of main at ${GITHUB_SHA::7}. Install orchestrator.apk on an arm64 phone (Android 13+); it updates the app in place."
+          if gh release view rolling >/dev/null 2>&1; then
+            gh release edit rolling --title "Orchestrator (rolling)" --notes "$notes" --prerelease
+          else
+            gh release create rolling --title "Orchestrator (rolling)" --notes "$notes" --prerelease --verify-tag
+          fi
+          gh release upload rolling "$RUNNER_TEMP/orchestrator.apk" --clobber

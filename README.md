@@ -11,6 +11,7 @@ http://127.0.0.1:8001, `pixi run docs-build` builds it.
 | Directory | What | Docs |
 | --- | --- | --- |
 | [`orchestrator/`](orchestrator) | control plane + ultra UI, in a browser or a desktop window | [README](orchestrator/README.md) |
+| [`android/`](android) | the same UI and control plane as an Android app ([latest APK](https://github.com/nandi-conda/orchestrate/releases/download/rolling/orchestrator.apk)) | [README](android/README.md) |
 | [`runner/`](runner) | agent runner that hosts many threads per worker | [README](runner/README.md), [API](runner/API.md) |
 
 They're separate pixi projects and deploy separately. The root

@@ -1,0 +1,8 @@
+# The control plane's dependencies on the phone, pinned as orchestrator/pixi.lock
+# has them. asyncpg (Postgres) and keyring are left out: the app keeps SQLite
+# in its own storage and its keys on the Keys screen.
+starlette==1.9.0
+uvicorn==0.54.0
+httpx==0.28.1
+aiosqlite==0.22.1
+certifi

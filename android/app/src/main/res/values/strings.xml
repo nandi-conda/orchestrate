@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Orchestrator</string>
+    <string name="starting">Starting the control plane…</string>
+    <string name="stopped">The control plane stopped: %1$s</string>
+    <string name="no_reason">no error was given; its log is in logcat (python.stderr).</string>
+    <string name="retry">Retry</string>
+    <string name="keys">Keys</string>
+    <string name="reload">Reload</string>
+    <string name="keys_title">Keys for the control plane</string>
+    <string name="optional">(optional)</string>
+    <string name="required">Required</string>
+    <string name="save_keys">Save and start</string>
+    <string name="key_deepseek">DeepSeek API key, for the router and every worker. Sent as Authorization: Bearer &lt;key&gt; to api.deepseek.com.</string>
+    <string name="key_sprites">Fly Sprites org token. Workers run on Sprites; sent as Authorization: Bearer &lt;token&gt; to api.sprites.dev.</string>
+    <string name="key_github">GitHub fine-grained token with Contents: Read and write on the project repos, for projects with a GitHub remote. Workers never get it.</string>
+    <string name="downloading">Downloading %1$s</string>
+</resources>
