@@ -249,26 +249,56 @@ Attaching or changing the remote joins the two histories:
 Removing the remote keeps everything in the hub; landings stay local from then
 on, and attaching it again pushes what it missed.
 
-### Messaging a thread that runs nowhere
+### Worker and thread states
 
-A thread outlives its worker. When a message (yours, the router's or another
-thread's) is for a thread no live worker runs (the control plane restarted and
-its sprites are gone, its worker died, or the thread stopped or failed), the control plane
-brings it back first: it picks a worker as for a new thread and posts the
-thread to it after sending its branch, snapshot and session from the hub:
-the runner continues the worktree from `thread/<id>` and the snapshot, and
-prime-agent resumes the session (the conversation as the model last had it,
-compactions and images included) from `sessions/<id>`. The thread's log
-shows a `revived` line, then the message is delivered. `Orchestrator.live_worker`
-is that one path; anything that needs the thread's worker calls it.
+Workers, and each thread's hold on a worker (its binding), are two state
+machines, defined in one place: [control/states.py](control/states.py). Every
+change goes through `Orchestrator._worker_to` or `Orchestrator._bind_to`,
+which check it against the machine (a move it does not list raises
+`IllegalTransition`, a control plane bug), keep the reason beside the state in
+the store, and log it: `worker_state` events in the project log, `binding`
+events in the thread's. Every state has a path back to the happy one; only a
+lost worker is retired, and its threads take the path back on another worker.
+
+| Worker | Means | Way back to ready |
+| --- | --- | --- |
+| `ready` | its runner answers `/health` | |
+| `unreachable` | `/health` fails, its provider still has it (a sprite waking, this machine's network down) | it answers again; reattached after 300 s without an answer, or at once by Respawn |
+| `reattaching` | the provider is starting its runner again, same disk and token | ready when it answers; unreachable if it fails |
+| `lost` | its provider says it is gone; destroyed | retired: its threads are unbound and come back on another worker |
+
+| Binding | Means | Way back to bound |
+| --- | --- | --- |
+| `bound` | a live worker's runner has the thread | |
+| `binding` | being put on a worker: picked or made, the hub shipped, the thread posted | bound when that is done; unbound when it fails or Respawn starts it over |
+| `unbound` | on no worker: its worker lost or its runner restarted, its start failed, or an earlier control plane had it | its next message, or Respawn |
+
+Unbinding a thread that was mid-turn (queued, working, waiting) fails it.
+A runner that restarted (a new boot id in `/health`) unbinds its threads; they
+keep the worker as theirs and come back on it, in their worktree.
+
+Workers are watched every 10 s, before every delivery and when one is picked
+for a thread. A delivery to a thread whose worker is unreachable waits for it
+to be ready again (or reattached), and fails with the worker's state and why
+if a reattach fails.
+
+**Respawn** (the thread's button, `POST /api/threads/<id>/respawn`) is a way
+back from every state: a thread being put on a worker has that called off and
+started over; one on an unreachable worker has the worker reattached; one
+bound is stopped on its runner and posted again; one unbound is bound. A
+thread whose worker is not ready, or that is on none, shows a bar under its
+title with the state, why, and that Respawn brings it back.
+
+Binding a thread puts it on the worker it was last on while that one is not
+lost, so its worktree there (uncommitted and ignored files too) is the one it
+continues in; else on a picked worker after sending its branch, snapshot and
+session from the hub: the runner continues the worktree from `thread/<id>` and
+the snapshot, and prime-agent resumes the session (the conversation as the
+model last had it, compactions and images included) from `sessions/<id>`. A
+thread none of whose turns was saved is given its request again; the rest
+wait idle for their next message. `Orchestrator.live_worker` is the one path
+anything that needs the thread's worker takes.
 Details: [runner/API.md](../runner/API.md#resuming-a-thread).
-
-A worker is lost when its `/health` fails 3 times in a row, 1 s apart. The
-control plane checks every worker every 10 s, before every delivery to it and
-when picking one for a thread. A lost worker is dropped and destroyed (so it
-never runs a thread twice). Each of its threads gets a `worker lost` line,
-a thread that was mid-turn goes `failed`, and every one of them comes back on
-another worker with its next message.
 
 ### Worker logs
 
@@ -290,11 +320,10 @@ NDJSON) for a sprite, the log file for a local worker. Runner failures land
 there in full: tracebacks, prime-agent's stderr, failed model calls (the whole
 model message but its content) and failed tool calls.
 
-When a worker is dropped, the control plane keeps why (its failed `/health`
-checks) and the last 300 lines it followed, since destroying the worker takes
-its log. A thread on no worker shows that in its Worker log tab: which worker
-it lost, when and why, and how that worker's log ended; or, for a thread that
-never started on one, the error that stopped it.
+The Worker log tab starts with where the thread stands: its binding and why,
+and its worker's state and why. When a worker is lost, the control plane keeps
+why and the last 300 lines it followed, since destroying the worker takes its
+log; a thread whose worker was lost shows that log's end.
 
 To read a live sprite's log without the UI:
 
@@ -316,8 +345,7 @@ the same window. The control plane reads them from the worker that holds
 the thread (runner `GET /threads/<id>/files` and `/files/raw`; the worker never
 connects in) and serves them at `/api/threads/<id>/files?path=<dir>` (JSON) and
 `/api/threads/<id>/files/raw?path=<file>` (a download). `.git` is not shown.
-A thread whose worker is gone is revived first: a worker checks out its pushed
-`thread/<id>` branch, so its files are as of the end of its last turn.
+A thread on no worker is bound to one first (see Worker and thread states).
 
 ### Pasted images
 

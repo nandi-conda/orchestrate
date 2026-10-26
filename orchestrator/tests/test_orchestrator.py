@@ -37,6 +37,18 @@ PNG_1PX = base64.b64decode(
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG_1PX).decode()
 
 
+async def binds(s, pid, tid):
+    """The thread's moves to bound (states.BINDING), first one first: the
+    first puts a new thread on a worker, each later one brings it back."""
+    return [e["payload"] for e in await s.list_events(pid, tid)
+            if e["type"] == "binding" and e["payload"]["to"] == "bound"]
+
+
+async def unbinds(s, pid, tid):
+    return [e["payload"]["reason"] for e in await s.list_events(pid, tid)
+            if e["type"] == "binding" and e["payload"]["to"] == "unbound"]
+
+
 async def test_store_roundtrip(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
@@ -275,7 +287,7 @@ async def test_worker_logs_come_from_the_provider(tmp_path):
     orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
-        await asyncio.wait({orch.starting[t["id"]]})  # spawn returns before the worker is up
+        await asyncio.wait({orch.binding[t["id"]]})  # spawn returns before the worker is up
         log = await orch.worker_logs(t["id"], 50)
         assert "devrunner: echo runner on port" in log
         with pytest.raises(KeyError):
@@ -540,7 +552,8 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
             assert (t["state"], t["activity"]) == ("queued", "starting on a worker")
             assert (await post({"text": "check csv too", "mode": "thread", "target": tid})).status_code == 200
             tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
-            assert [(e["type"], e["text"]) for e in tr] == [("created", "fix export"), ("message_in", "check csv too")]
+            assert [(e["type"], e["text"]) for e in tr if e["type"] != "binding"] == [
+                ("created", "fix export"), ("message_in", "check csv too")]
 
             # A thread stopped before its worker is up never starts.
             gone = (await post({"text": "drop me", "mode": "new"})).json()["spawned"][0]["id"]
@@ -675,10 +688,10 @@ async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tm
             await c.post(f"/api/threads/{done}/messages", json={"body": "again"})
 
             async def revived():
-                tr = (await c.get(f"/api/threads/{done}/transcript")).json()
-                return [e for e in tr if e["type"] == "revived"] or None
+                return (await binds(app.state.orch.store, pid, done))[1:] or None
             back = (await wait_for(revived))[0]
-            assert back["payload"]["worker"] not in workers  # a new worker: the old ones are gone
+            assert back["worker"] not in workers  # a new worker: the old ones are gone
+            assert (await unbinds(app.state.orch.store, pid, done))[0] == "its project was archived"
             assert (await c.post("/api/projects/p_nope/archive")).status_code == 404
             assert (await c.post("/api/projects/p_nope/unarchive")).status_code == 404
 
@@ -898,9 +911,12 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     got = await wait_for(lambda: _second_reply(replies, t["id"]))
     await wait_for(lambda: idle(t["id"]))  # its work is saved before it goes idle
     assert got == "Echo: can I download it? (resumed after 1 earlier messages)"  # its session came along
-    types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
-    assert "revived" in types and "error" not in types
-    assert types.index("revived") > types.index("message_in")
+    events = await s.list_events(p["id"], t["id"])
+    types = [e["type"] for e in events]
+    assert "error" not in types
+    back = [i for i, e in enumerate(events) if e["type"] == "binding" and e["payload"]["to"] == "bound"][1]
+    assert back > types.index("message_in")
+    assert "the control plane that had it" in (await unbinds(s, p["id"], t["id"]))[0]
     assert [x for x in types if x == "message_in"] == ["message_in"]  # the runner's echo is dropped
     row = await s.get_thread(t["id"])
     assert row["worker_id"] == second.by_thread[t["id"]].worker.id and row["state"] == "idle"
@@ -941,8 +957,7 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     provider.procs[old.worker.id].kill()
 
     async def lost():
-        types = [e["type"] for e in await s.list_events(p["id"], busy["id"])]
-        return "worker_lost" in types or None
+        return any(f"worker {old.worker.id} is lost" in r for r in await unbinds(s, p["id"], busy["id"])) or None
     await wait_for(lost)
     assert (await s.get_thread(busy["id"]))["state"] == "failed"
     assert (await s.get_thread(idle_one["id"]))["state"] == "idle"
@@ -986,7 +1001,8 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
     types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
-    assert "error" not in types and types.index("worker_lost") < types.index("revived")
+    assert "error" not in types
+    assert "is lost" in (await unbinds(s, p["id"], t["id"]))[0] and len(await binds(s, p["id"], t["id"])) == 2
     await orch.close()
     await provider.close()
     await s.close()
@@ -1003,7 +1019,7 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     monkeypatch.setattr(service, "HEALTH_EVERY", 0.1)
     monkeypatch.setattr(service, "HEALTH_TIMEOUT", 0.2)
-    monkeypatch.setattr(service, "READY_TIMEOUT", 0.5)
+    monkeypatch.setattr(service, "READY_TIMEOUT", 60)
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
@@ -1022,8 +1038,10 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
         return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
-    types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
-    assert "worker_lost" not in types and "revived" not in types
+    assert await unbinds(s, p["id"], t["id"]) == [] and len(await binds(s, p["id"], t["id"])) == 1
+    states = [(e["payload"]["from"], e["payload"]["to"]) for e in await s.list_events(p["id"])
+              if e["type"] == "worker_state"]
+    assert ("ready", "unreachable") in states and states[-1] == ("unreachable", "ready")
     assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
     await orch.close()
     await provider.close()
@@ -1065,7 +1083,7 @@ async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(t
     await providers.wait_healthy(w.url, timeout=30)
 
     async def restarted():
-        return [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "worker_restarted"] or None
+        return [r for r in await unbinds(s, p["id"], t["id"]) if "runner restarted" in r] or None
     await wait_for(restarted)  # the relay reconnects to the new runner and notices
     th = await s.get_thread(t["id"])
     assert th["state"] == "failed" and th["worker_id"] == w.id and t["id"] not in orch.by_thread
@@ -1075,14 +1093,166 @@ async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(t
         return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
-    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
-    assert [e["payload"]["worker"] for e in revived] == [w.id]
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [w.id, w.id]
     assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
     listing = await orch.list_files(t["id"], "")
     assert "notes.txt" in [e["name"] for e in listing["entries"]]
     await orch.close()
     await provider.close()
     await s.close()
+
+
+async def test_a_worker_unreachable_for_too_long_is_reattached_and_its_thread_comes_back_on_it(tmp_path, monkeypatch):
+    """unreachable -> reattaching -> ready: a worker that has not answered for
+    READY_TIMEOUT while its provider still has it gets its runner started
+    again on the same disk; its threads are unbound (the new runner runs none
+    of them) and come back on it, worktree and all, with their next message."""
+    import signal
+
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.1)
+    monkeypatch.setattr(service, "HEALTH_TIMEOUT", 0.2)
+    monkeypatch.setattr(service, "READY_TIMEOUT", 0.5)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    lw = orch.by_thread[t["id"]]
+    provider.procs[lw.worker.id].send_signal(signal.SIGSTOP)
+
+    async def reattached():
+        states = [(e["payload"]["from"], e["payload"]["to"]) for e in await s.list_events(p["id"])
+                  if e["type"] == "worker_state"]
+        return states if ("reattaching", "ready") in states else None
+    states = await wait_for(reattached)
+    assert states[:3] == [("ready", "unreachable"), ("unreachable", "reattaching"), ("reattaching", "ready")]
+    assert lw.state == "ready" and "reattached" in lw.reason
+    assert any("runner restarted" in r for r in await unbinds(s, p["id"], t["id"]))
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [lw.worker.id] * 2
+    assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+class HangingOnceProvider(LocalProvider):
+    """A provider whose first worker never comes up (a sprite stuck booting)."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.hung = False
+
+    async def create(self, spec):
+        if not self.hung:
+            self.hung = True
+            await asyncio.Event().wait()
+        return await super().create(spec)
+
+
+async def test_respawn_starts_over_a_thread_stuck_being_put_on_a_worker(tmp_path, monkeypatch):
+    """binding -> unbound -> binding -> bound: Respawn calls off a start that
+    hangs and starts again; a message sent meanwhile waits for the new start
+    and is delivered."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = HangingOnceProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+    assert (await s.get_thread(t["id"]))["binding"] == "binding"
+    await orch.send(t["id"], "second")
+    await asyncio.sleep(0.2)
+    assert (await s.get_thread(t["id"]))["binding"] == "binding"  # stuck
+    await orch.respawn(t["id"])
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: second")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    moves = [(e["payload"]["from"], e["payload"]["to"]) for e in await s.list_events(p["id"], t["id"])
+             if e["type"] == "binding"]
+    assert moves == [("unbound", "binding"), ("binding", "unbound"), ("unbound", "binding"), ("binding", "bound")]
+    assert "Respawn called off" in (await unbinds(s, p["id"], t["id"]))[0]
+    assert "error" not in [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_respawn_puts_a_bound_thread_on_its_worker_again(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    lw = orch.by_thread[t["id"]]
+    await orch.respawn(t["id"])
+
+    async def twice():
+        return len(await binds(s, p["id"], t["id"])) == 2 or None
+    await wait_for(twice)
+    assert orch.by_thread[t["id"]] is lw and (await s.get_thread(t["id"]))["binding"] == "bound"
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_bound_thread_of_an_earlier_control_plane_is_unbound_when_its_project_is_opened(tmp_path):
+    from control.service import Orchestrator
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "T", "x")
+    await s.update_thread(t["id"], binding="bound", worker_id=f"{p['id']}-w1", state="working")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w")), HeuristicRouter(), tmp_path / "repos")
+    await orch.open_project(p["id"])
+    row = await s.get_thread(t["id"])
+    assert (row["binding"], row["state"], row["worker_id"]) == ("unbound", "failed", f"{p['id']}-w1")
+    assert "the control plane that had it on worker" in row["binding_reason"]
+    await orch.open_project(p["id"])  # once per control plane
+    assert len(await unbinds(s, p["id"], t["id"])) == 1
+    await s.close()
+
+
+def test_every_state_has_a_way_back_and_illegal_moves_raise():
+    from control.states import BINDING, WORKER, IllegalTransition, Machine
+
+    for m in (WORKER, BINDING):
+        for state in m.states - m.retired:
+            assert m.reaches_happy(state), (m.name, state)
+    with pytest.raises(IllegalTransition):
+        BINDING.check("thread t", "unbound", "bound")
+    with pytest.raises(IllegalTransition):
+        WORKER.check("worker w", "lost", "ready")
+    with pytest.raises(ValueError, match="no path back"):
+        Machine("m", "ok", {"ok": {"stuck"}, "stuck": set()})
 
 
 class FailingOnceProvider(LocalProvider):
@@ -1121,8 +1291,10 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
     events = await s.list_events(p["id"], t["id"])
-    revived = [e for e in events if e["type"] == "revived"]
-    assert len(revived) == 1 and revived[0]["payload"]["request"] is True
+    revived = await binds(s, p["id"], t["id"])
+    assert len(revived) == 1 and "working on its request" in revived[0]["reason"]
+    assert "could not put it on a worker: RuntimeError: the sprite did not come up" in \
+        (await unbinds(s, p["id"], t["id"]))[0]
     assert [e for e in events if e["type"] == "message_in"] == []  # the request's echo was expected
     # Once a turn is saved, respawning brings it back idle, its request not run again.
     await wait_for(lambda: idle_of(s, t["id"]))
@@ -1131,7 +1303,7 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
     await orch.respawn(t["id"])
 
     async def twice():
-        return len([e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]) == 2 or None
+        return len(await binds(s, p["id"], t["id"])) == 2 or None
     await wait_for(twice)
     await wait_for(lambda: idle_of(s, t["id"]))
     echoes = [e for e in await s.list_events(p["id"], t["id"])
@@ -1157,15 +1329,16 @@ async def test_respawning_an_idle_thread_with_no_worker_on_record_brings_it_back
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread.pop(t["id"])
     lw.threads.discard(t["id"])
-    await s.update_thread(t["id"], worker_id=None)
-    assert "has no record of one" in await orch.worker_logs(t["id"], 50)
+    await s.update_thread(t["id"], worker_id=None, binding="unbound", binding_reason="")
+    assert f"thread {t['id']} is unbound: nothing recorded yet" in await orch.worker_logs(t["id"], 50)
     await orch.respawn(t["id"])
 
     async def revived():
-        return [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"] or None
+        return (await binds(s, p["id"], t["id"]))[1:] or None
     (ev,) = await wait_for(revived)
     # Its runner still ran it: the control plane only lost track of where.
-    assert ev["payload"] == {"worker": lw.worker.id, "request": False, "found": True}
+    assert ev == {"from": "binding", "to": "bound", "worker": lw.worker.id,
+                  "reason": f"found again on worker {lw.worker.id}, which still runs it"}
     assert (await s.get_thread(t["id"]))["worker_id"] == lw.worker.id and orch.by_thread[t["id"]] is lw
     await orch.send(t["id"], "again")
 
@@ -1207,8 +1380,7 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
         return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
-    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
-    assert [e["payload"]["worker"] for e in revived] == [ran_on]
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])][1:] == [ran_on]
     await orch.close()
     await orch.provider.close()
     await s.close()
@@ -1238,8 +1410,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     assert "devrunner: echo runner on port" in await second.worker_logs(t["id"], 50)  # before it is attached
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
-    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
-    assert [e["payload"]["worker"] for e in revived] == [ran_on]
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])][1:] == [ran_on]
     assert second.by_thread[t["id"]].worker.token == token  # a runner still going answers to it
     # A new thread goes to that worker too rather than a new one.
     u = await second.spawn(p["id"], "U", "hello")
@@ -1534,10 +1705,10 @@ async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, mon
         provider.procs[wid].kill()
 
         async def lost():
-            return t["id"] not in orch.by_thread or None
+            return (await s.get_thread(t["id"]))["binding"] == "unbound" or None
         await wait_for(lost)
         text = await orch.worker_logs(t["id"], 50)
-        assert f"its worker {wid} was dropped" in text
+        assert f"thread {t['id']} is unbound: worker {wid} is lost" in text and f"worker {wid} is lost:" in text
         assert "provider no longer has it" in text
         assert "devrunner: echo runner on port" in text  # its log, as it was followed
     finally:
@@ -1559,9 +1730,10 @@ async def test_a_thread_that_never_started_says_why(tmp_path):
     orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
-        await asyncio.wait({orch.starting[t["id"]]})
+        await asyncio.wait({orch.binding[t["id"]]})
         text = await orch.worker_logs(t["id"], 50)
-        assert "never started on a worker" in text and "no capacity on sprites" in text
+        assert f"thread {t['id']} is unbound: could not put it on a worker" in text
+        assert "no capacity on sprites" in text and "It has not been on a worker" in text
     finally:
         await orch.close()
         await s.close()

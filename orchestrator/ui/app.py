@@ -174,6 +174,9 @@ h_idle: i32 = 0
 h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
+h_bound: i32 = 0
+h_unbound: i32 = 0
+h_ready: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_fpath: i32 = 0         # the worktree directory the Files tab shows ("" = its root)
 h_files_err: i32 = 0     # why the files could not be read
@@ -218,6 +221,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
+    global h_bound, h_unbound, h_ready
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
@@ -248,6 +252,12 @@ def init() -> None:
     s_set(h_queued, "queued")
     h_stopped = s_new()
     s_set(h_stopped, "stopped")
+    h_bound = s_new()
+    s_set(h_bound, "bound")
+    h_unbound = s_new()
+    s_set(h_unbound, "unbound")
+    h_ready = s_new()
+    s_set(h_ready, "ready")
     h_wlog_err = s_new()
     h_fpath = s_new()
     h_files_err = s_new()
@@ -764,8 +774,8 @@ def update(msg: i32, arg: i32) -> None:
             s_copy(h_act, h_sel)
             post_thread(h_act, "respawn", RESPAWNED)
     elif msg == RESPAWNED:
-        # The thread comes back in the background; its "revived" (or error)
-        # event refreshes the pane when it lands.
+        # The thread comes back in the background; its "binding" events
+        # refresh the pane as they land.
         if j_ok(arg) == 0:
             j_err(arg, h_err)
         j_free(arg)
@@ -1709,13 +1719,24 @@ def selected_thread() -> i32:
     return 0
 
 
-def needs_worker(t: i32) -> bool:
-    """Whether the thread runs on no worker: it never started on one, its
-    worker was lost, or it failed or was stopped."""
-    if j_has(t, "worker_id") == 0:
+def off_happy(t: i32) -> bool:
+    """Whether the thread is away from where it should be (states.py in the
+    control plane): on no worker, or bound to one that is not ready. One being
+    put on a worker is on its way, and says so in its activity."""
+    jstr(t, "binding", h_t2)
+    if s_eq(h_t2, h_unbound) == 1:
         return True
-    jstr(t, "state", h_t2)
-    return s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1
+    jstr(t, "worker_state", h_t2)
+    return s_len(h_t2) > 0 and s_eq(h_t2, h_ready) == 0
+
+
+def outline_badge(prefix: str, h: i32) -> None:
+    el("span")
+    cls("badge")
+    cls("outline")
+    text(prefix)
+    text_ref(h)
+    end()
 
 
 def thread_head(t: i32) -> None:
@@ -1733,6 +1754,12 @@ def thread_head(t: i32) -> None:
     if t != 0:
         jstr(t, "state", h_t2)
         state_badge(h_t2)
+        jstr(t, "binding", h_t2)
+        if s_len(h_t2) > 0 and s_eq(h_t2, h_bound) == 0:
+            outline_badge("", h_t2)
+        jstr(t, "worker_state", h_t2)
+        if s_len(h_t2) > 0 and s_eq(h_t2, h_ready) == 0:
+            outline_badge("worker ", h_t2)
     span("mono muted")
     text_ref(h_sel)
     end()
@@ -1744,10 +1771,10 @@ def thread_head(t: i32) -> None:
         text("Unarchive")
         end()
     else:
-        if t != 0 and needs_worker(t):
+        if t != 0:
             btn_open("ghost", RESPAWN, 0)
             cls("sm")
-            attr("title", "Start the thread again on a worker, from its branch, files and session")
+            attr("title", "Put the thread on a worker afresh, from its branch, files and session; a turn under way is stopped")
             text("Respawn")
             end()
         btn_open("ghost", STOP, 0)
@@ -1776,6 +1803,29 @@ def thread_head(t: i32) -> None:
             span("now-text mono")
             text_ref(h_t1)
             end()
+    end()
+    # Why the thread is away from bound on a ready worker, and the way back.
+    # Always there too, empty (hidden) while it is where it should be.
+    div("where")
+    if t != 0 and j_has(t, "archived_at") == 0 and off_happy(t):
+        jstr(t, "binding", h_t1)
+        span("now-label")
+        text_ref(h_t1)
+        end()
+        span("now-text")
+        jstr(t, "binding_reason", h_t1)
+        text_ref(h_t1)
+        jstr(t, "worker_state", h_t2)
+        if s_len(h_t2) > 0 and s_eq(h_t2, h_ready) == 0:
+            text(" · worker ")
+            text_ref(h_t2)
+            text(": ")
+            jstr(t, "worker_reason", h_t1)
+            text_ref(h_t1)
+        end()
+        span("muted")
+        text("Respawn brings it back")
+        end()
     end()
 
 

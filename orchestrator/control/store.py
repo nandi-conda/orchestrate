@@ -34,6 +34,8 @@ import time
 from collections import defaultdict
 from typing import Any, Protocol
 
+from .states import BINDING, WORKER
+
 THREAD_STATES = ("queued", "working", "waiting", "idle", "done", "failed", "stopped")
 
 
@@ -96,6 +98,8 @@ class Store(Protocol):
         """Mark a worker lost (destroyed); it is never attached to again.
         `reason` says why it was dropped, `log` is the end of its runner log
         then (the worker, and its log with it, is gone afterwards)."""
+    async def set_worker_state(self, worker_id: str, state: str, reason: str) -> None:
+        """A worker's state (states.WORKER) and why it is in it."""
     async def list_workers(self, project_id: str) -> list[dict]:
         """Every worker made for the project; `idx` is the number its worker
         spec was made with, `lost_at` is set once it was lost."""
@@ -130,7 +134,8 @@ SCHEMA = [
         title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
         activity TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
         token TEXT NOT NULL DEFAULT '', archived_at DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL,
-        updated_at DOUBLE PRECISION NOT NULL)""",
+        updated_at DOUBLE PRECISION NOT NULL, binding TEXT NOT NULL DEFAULT 'unbound',
+        binding_reason TEXT NOT NULL DEFAULT '')""",
     "CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id)",
     """CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, sender TEXT NOT NULL,
@@ -142,7 +147,8 @@ SCHEMA = [
         handle TEXT NOT NULL, url TEXT NOT NULL, token TEXT NOT NULL DEFAULT '',
         capacity INTEGER NOT NULL DEFAULT 16, idx INTEGER NOT NULL DEFAULT 0,
         created_at DOUBLE PRECISION NOT NULL, lost_at DOUBLE PRECISION,
-        lost_reason TEXT NOT NULL DEFAULT '', lost_log TEXT NOT NULL DEFAULT '')""",
+        lost_reason TEXT NOT NULL DEFAULT '', lost_log TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'ready', state_reason TEXT NOT NULL DEFAULT '')""",
 ]
 
 SQLITE_EVENTS = """CREATE TABLE IF NOT EXISTS events (
@@ -165,7 +171,7 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
-                 "archived_at")
+                 "archived_at", "binding", "binding_reason")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
@@ -175,7 +181,11 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("workers", "idx", "INTEGER NOT NULL DEFAULT 0"),
                  ("workers", "lost_at", "DOUBLE PRECISION"),
                  ("workers", "lost_reason", "TEXT NOT NULL DEFAULT ''"),
-                 ("workers", "lost_log", "TEXT NOT NULL DEFAULT ''")]
+                 ("workers", "lost_log", "TEXT NOT NULL DEFAULT ''"),
+                 ("threads", "binding", "TEXT NOT NULL DEFAULT 'unbound'"),
+                 ("threads", "binding_reason", "TEXT NOT NULL DEFAULT ''"),
+                 ("workers", "state", "TEXT NOT NULL DEFAULT 'ready'"),
+                 ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''")]
 
 
 def _thread(row: dict) -> dict:
@@ -246,7 +256,7 @@ class _SqlStore:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
-               "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t}
+               "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         await self._exec(self._q(f"INSERT INTO threads ({cols}) VALUES ({marks})"), *row.values())
@@ -270,6 +280,8 @@ class _SqlStore:
                 raise ValueError(f"unknown thread field {k}")
             if k == "state" and v not in THREAD_STATES:
                 raise ValueError(f"unknown thread state {v}")
+            if k == "binding" and v not in BINDING.states:
+                raise ValueError(f"unknown thread binding {v}")
             sets.append(f"{k} = ?")
             args.append(json.dumps(v) if k == "files" else v)
         if sets:
@@ -363,8 +375,14 @@ class _SqlStore:
         await self._exec(self._q(f"INSERT INTO workers ({cols}) VALUES ({marks})"), *w.values())
 
     async def lose_worker(self, worker_id: str, reason: str, log: str) -> None:
-        await self._exec(self._q("UPDATE workers SET lost_at = ?, lost_reason = ?, lost_log = ? WHERE id = ?"),
-                         now(), reason, log, worker_id)
+        await self._exec(self._q("UPDATE workers SET lost_at = ?, lost_reason = ?, lost_log = ?, state = 'lost', "
+                                 "state_reason = ? WHERE id = ?"), now(), reason, log, reason, worker_id)
+
+    async def set_worker_state(self, worker_id: str, state: str, reason: str) -> None:
+        if state not in WORKER.states:
+            raise ValueError(f"unknown worker state {state}")
+        await self._exec(self._q("UPDATE workers SET state = ?, state_reason = ? WHERE id = ?"),
+                         state, reason, worker_id)
 
     async def list_workers(self, project_id: str) -> list[dict]:
         return await self._fetch(self._q("SELECT * FROM workers WHERE project_id = ? ORDER BY created_at"),

@@ -25,6 +25,7 @@ from .providers import Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
 from .runner_client import RunnerClient
 from .secrets import get_secret
+from .states import BINDING, RUNNING, WORKER
 from .store import Store, now
 
 log = logging.getLogger("orchestrator")
@@ -34,7 +35,8 @@ MAX_HOPS = 6
 # answer does not lose it: a sprite pauses while nothing talks to it and its
 # runner starts afresh on a cold wake, and this control plane's own network
 # can be down. A worker is lost only when its provider says it is gone; one
-# that is still there gets READY_TIMEOUT seconds for its runner to answer.
+# that is still there is unreachable, and is reattached (its runner started
+# again) once it has not answered for READY_TIMEOUT seconds (states.py).
 HEALTH_EVERY = 10.0
 HEALTH_TIMEOUT = 5.0
 READY_TIMEOUT = 300.0
@@ -174,11 +176,17 @@ class LiveWorker:
     threads: set[str] = field(default_factory=set)
     starting: int = 0  # threads picked for it and not yet posted: they count as running
     log_tail: deque = field(default_factory=lambda: deque(maxlen=LOG_KEPT))
-    health_error: str = ""  # why its last /health failed, "" while it answers
     boot: str | None = None  # the runner process serving it, as /health names it
+    # Its state in states.WORKER and why it is in it; only Orchestrator._worker_to changes them.
+    state: str = "ready"
+    reason: str = ""
+    unreachable_since: float = 0.0
+    failures: int = 0  # reattaches that failed, so a waiter knows one did
+    reattach: asyncio.Task | None = None
+    changed: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     def tasks(self) -> list[asyncio.Task]:
-        return [task for task in (self.relay, self.pump, self.watch, self.logs) if task]
+        return [task for task in (self.relay, self.pump, self.watch, self.logs, self.reattach) if task]
 
 
 def print_worker_line(worker_id: str, line: str) -> None:
@@ -215,12 +223,17 @@ class Orchestrator:
         # and the runner has yet to echo back as message_in; the echo is dropped.
         self.unechoed: dict[str, list[str]] = {}
         # Work runs in the background, in order per key: a project's requests
-        # (routing them may ask a model) and a thread's start and deliveries
-        # (starting may create a worker). The API only logs and queues.
+        # (routing them may ask a model) and a thread's deliveries. The API
+        # only logs and queues.
         self.request_chain: dict[str, asyncio.Task] = {}
         self.thread_chain: dict[str, asyncio.Task] = {}
-        self.starting: dict[str, asyncio.Task] = {}
-        self.reviving: dict[str, asyncio.Task] = {}
+        # Per thread, the task putting it on a worker while its binding is
+        # "binding" (_begin_binding); deliveries wait for it.
+        self.binding: dict[str, asyncio.Task] = {}
+        # Projects whose threads' bindings this control plane has taken over
+        # from the store (open_project), and the lock each takeover holds.
+        self.recovered: set[str] = set()
+        self._recover_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
         # Every chained task, not only each chain's last: close() ends them all.
         self.background: set[asyncio.Task] = set()
@@ -275,13 +288,10 @@ class Orchestrator:
         lws = self.workers.setdefault(project["id"], [])
         best, best_load = None, None
         for lw in list(lws):
-            try:
-                h = await self._health(lw)
-            except Exception as e:  # there, and not answering: it has no room to offer
-                log.warning("worker %s is not answering: %s", lw.worker.id, describe(e))
+            if lw.state != "ready":  # it has no room to offer until it is back
                 continue
+            h = await self._probe(lw)
             if h is None:
-                await self._lose(lw, lw.health_error)
                 continue
             running = h.get("running", 0) + lw.starting
             if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
@@ -337,70 +347,174 @@ class Orchestrator:
                     return await self._attach(project, w["idx"])
         return None
 
-    async def _health(self, lw: LiveWorker) -> dict | None:
-        """The worker's /health once its runner answers, or None when its
-        provider says the worker is gone. A worker that is still there gets
-        READY_TIMEOUT seconds for its runner (a sprite's cold wake starts it
-        afresh); raises when it has not answered by then, or when the
-        provider cannot say."""
+    # Every change of a worker's state goes through _worker_to, and every change
+    # of a thread's binding through _bind_to: each checks the move against its
+    # machine in states.py, keeps the reason and logs it as an event.
+
+    async def _worker_to(self, lw: LiveWorker, to: str, reason: str) -> None:
+        """Move a worker to state `to` (states.WORKER), or raise IllegalTransition.
+        The move is made before anything is awaited, so two callers that
+        looked at the same state cannot both make it."""
+        frm, wid = lw.state, lw.worker.id
+        WORKER.check(f"worker {wid}", frm, to)
+        lw.state, lw.reason = to, reason
+        if to == "unreachable" and frm != "unreachable":
+            lw.unreachable_since = asyncio.get_running_loop().time()
+        (log.info if to == "ready" else log.warning)("worker %s: %s -> %s: %s", wid, frm, to, reason)
+        await self.store.set_worker_state(wid, to, reason)
+        await self.store.append_event(lw.worker.project_id, None, "worker_state",
+                                      {"worker": wid, "from": frm, "to": to, "reason": reason})
+        async with lw.changed:
+            lw.changed.notify_all()
+
+    async def _bind_to(self, tid: str, to: str, reason: str, worker: str | None = None, **fields) -> dict:
+        """Move a thread's binding to `to` (states.BINDING), or raise
+        IllegalTransition. Unbinding cuts a running turn short: the thread fails."""
+        t = await self.store.get_thread(tid)
+        frm = t["binding"]
+        BINDING.check(f"thread {tid}", frm, to)
+        fields.update(binding=to, binding_reason=reason)
+        fields.setdefault("activity", "starting on a worker" if to == "binding" else "")
+        if to == "unbound" and t["state"] in RUNNING:
+            fields["state"] = "failed"
+        (log.info if to != "unbound" else log.warning)("thread %s: %s -> %s: %s", tid, frm, to, reason)
+        t = await self.store.update_thread(tid, **fields)
+        payload = {"from": frm, "to": to, "reason": reason}
+        if worker is not None:
+            payload["worker"] = worker
+        await self.store.append_event(t["project_id"], tid, "binding", payload)
+        return t
+
+    async def _unbind_all(self, lw: LiveWorker, reason: str) -> None:
+        """Unbind every thread bound to the worker. Each keeps it as its
+        worker_id, the worker it was last on: it comes back there, in its
+        worktree, unless that worker is lost (_bind)."""
+        for tid in sorted(lw.threads):
+            if self.by_thread.get(tid) is not lw:
+                continue
+            del self.by_thread[tid]
+            await self._bind_to(tid, "unbound", reason, worker=lw.worker.id)
+        lw.threads.clear()
+
+    async def _probe(self, lw: LiveWorker) -> dict | None:
+        """Look at a ready or unreachable worker once and move it to the state
+        what was seen says: its /health when it answers, else None. One that
+        does not answer is lost when its provider says it is gone, unreachable
+        while the provider still has it (or cannot say), and reattached once
+        it has been unreachable for READY_TIMEOUT seconds."""
+        if lw.state not in ("ready", "unreachable"):
+            return None
         try:
             h = await lw.client.health(timeout=HEALTH_TIMEOUT)
         except Exception as e:
-            if not await self.provider.exists(lw.worker):
-                lw.health_error = (f"its /health failed with {describe(e)}, and its {lw.worker.provider} "
-                                   "provider no longer has it")
-                log.warning("worker %s is lost: %s", lw.worker.id, lw.health_error)
-                return None
-            h = await wait_healthy(lw.worker.url, timeout=READY_TIMEOUT)
-        lw.health_error = ""
+            failed = describe(e)
+            try:
+                there = await self.provider.exists(lw.worker)
+            except Exception as x:
+                there, failed = True, f"{failed}; its provider could not say whether it still has it ({describe(x)})"
+            if not there:
+                await self._lose(lw, f"its /health failed with {failed}, and its {lw.worker.provider} "
+                                     "provider no longer has it")
+            elif lw.state == "ready":
+                await self._worker_to(lw, "unreachable", f"its /health failed with {failed}; "
+                                                         "its provider still has it")
+            elif (lw.state == "unreachable"
+                  and asyncio.get_running_loop().time() - lw.unreachable_since >= READY_TIMEOUT):
+                await self._reattach(lw, f"it has not answered for {READY_TIMEOUT:.0f}s ({failed})")
+            return None
         await self._restarted(lw, h)
+        if lw.state == "unreachable":
+            await self._worker_to(lw, "ready", "its runner answers again")
         return h
+
+    async def _reattach(self, lw: LiveWorker, why: str) -> None:
+        """Have the provider start an unreachable worker's runner again, on the
+        same disk (provider.create with its index and token). Concurrent
+        callers share one attempt; it ends with the worker ready, unreachable
+        again (the attempt failed) or lost."""
+        if lw.reattach is None or lw.reattach.done():
+            lw.reattach = asyncio.create_task(self._do_reattach(lw, why))
+        await asyncio.shield(lw.reattach)
+
+    async def _do_reattach(self, lw: LiveWorker, why: str) -> None:
+        if lw.state != "unreachable":
+            return
+        await self._worker_to(lw, "reattaching", why)
+        project = await self.store.get_project(lw.worker.project_id)
+        spec = worker_spec(project, lw.worker.index)
+        spec.token = lw.worker.token
+        try:
+            worker = await self.provider.create(spec)
+            client = RunnerClient(worker.url, worker.token)
+            h = await client.health(timeout=HEALTH_TIMEOUT)
+        except Exception as e:
+            lw.failures += 1
+            failed = describe(e)
+            try:
+                there = await self.provider.exists(lw.worker)
+            except Exception as x:
+                there, failed = True, f"{failed}; its provider could not say whether it still has it ({describe(x)})"
+            if there:
+                await self._worker_to(lw, "unreachable", f"reattaching it failed: {failed}")
+            else:
+                await self._lose(lw, f"reattaching it failed ({failed}), and its {lw.worker.provider} "
+                                     "provider no longer has it")
+            return
+        old = lw.client
+        lw.worker, lw.client = worker, client
+        await old.close()
+        await self.store.upsert_worker(worker.record())
+        await self._restarted(lw, h)
+        await self._worker_to(lw, "ready", f"reattached: its {worker.provider} provider started its runner again")
+
+    async def _settled(self, lw: LiveWorker) -> None:
+        """Wait for a thread's worker to be ready, looking at it first: returns
+        once it is ready or lost (and its threads unbound), raises when it
+        is unreachable and a reattach fails meanwhile."""
+        if lw.state == "ready":
+            await self._probe(lw)
+        failures = lw.failures
+        async with lw.changed:
+            await lw.changed.wait_for(lambda: lw.state in ("ready", "lost") or lw.failures > failures)
+        if lw.state not in ("ready", "lost"):
+            raise RuntimeError(f"worker {lw.worker.id} is {lw.state}: {lw.reason}")
 
     async def _restarted(self, lw: LiveWorker, h: dict) -> None:
         """Take note of the runner process serving the worker. One started
-        since the last look (it crashed, or a sprite woke cold) runs none of
-        the worker's threads and numbers its events afresh: each thread is
-        let go, to come back on this worker, in its worktree here, with its
-        next message (live_worker)."""
+        since the last look (it crashed, or a sprite woke cold, or it was
+        reattached) runs none of the worker's threads and numbers its events
+        afresh: each thread is unbound, to come back on this worker, in its
+        worktree here, with its next message (live_worker)."""
         boot = h.get("boot")
         if boot == lw.boot:
             return
         lw.boot = boot
         lw.last_seq = 0
-        project_id, wid = lw.worker.project_id, lw.worker.id
-        reason = f"worker {wid}'s runner restarted; the thread comes back on it with its next message"
-        for tid in sorted(lw.threads):
-            if self.by_thread.get(tid) is not lw:
-                continue
-            del self.by_thread[tid]
-            t = await self.store.get_thread(tid)
-            fields = {"activity": ""}
-            if t["state"] in ("queued", "working"):  # its turn was cut short
-                fields["state"] = "failed"
-            await self.store.update_thread(tid, **fields)
-            await self.store.append_event(project_id, tid, "worker_restarted", {"worker": wid, "error": reason})
-        lw.threads.clear()
+        wid = lw.worker.id
+        await self._unbind_all(lw, f"worker {wid}'s runner restarted; it comes back on that worker with its "
+                                   "next message, or with Respawn")
+        if lw.state == "ready":
+            await self._worker_to(lw, "ready", "its runner restarted")
 
     async def _watch(self, lw: LiveWorker) -> None:
-        """Notice a worker that died, or whose runner restarted, while nothing
-        was sent to it, so its threads stop showing as running."""
-        while True:
+        """Look at the worker every HEALTH_EVERY seconds, so a worker that
+        died, stopped answering or came back is seen while nothing is sent
+        to it, and an unreachable one is reattached in time."""
+        while lw.state != "lost":
             await asyncio.sleep(HEALTH_EVERY)
             try:
-                h = await self._health(lw)
-            except Exception as e:
-                log.warning("worker %s is not answering: %s", lw.worker.id, describe(e))
-                continue
-            if h is None:
-                await self._lose(lw, lw.health_error)
-                return
+                await self._probe(lw)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("watching worker %s", lw.worker.id)
 
     async def _lose(self, lw: LiveWorker, why: str) -> None:
-        """Drop a worker that stopped answering: no thread runs on it any more,
-        so each comes back on another worker with its next message (live_worker).
-        It is destroyed too, so it can never run a thread a second time. Why,
-        and the end of its log as it was followed, stay with it in the store:
-        destroying it takes its log too."""
+        """Retire a worker its provider no longer has: it is lost, each of its
+        threads is unbound and comes back on another worker with its next
+        message (live_worker). It is destroyed too, so it can never run a
+        thread a second time. Why, and the end of its log as it was followed,
+        stay with it in the store: destroying it takes its log too."""
         lws = self.workers.get(lw.worker.project_id, [])
         if lw not in lws:
             return
@@ -410,22 +524,9 @@ class Orchestrator:
             if task is not me:
                 task.cancel()
         project_id, wid = lw.worker.project_id, lw.worker.id
-        log.warning("dropping worker %s: %s", wid, why)
-        reason = (f"worker {wid} stopped answering ({why}); "
-                  "the thread comes back on another worker with its next message")
-        for tid in sorted(lw.threads):
-            if self.by_thread.get(tid) is not lw:
-                continue
-            del self.by_thread[tid]
-            t = await self.store.get_thread(tid)
-            fields = {"worker_id": None, "activity": ""}
-            if t["state"] in ("queued", "working"):  # its turn was cut short
-                fields["state"] = "failed"
-            await self.store.update_thread(tid, **fields)
-            await self.store.append_event(project_id, tid, "worker_lost", {"worker": wid, "error": reason})
-        if not lw.threads:
-            await self.store.append_event(project_id, None, "worker_lost",
-                                          {"worker": wid, "error": f"worker {wid} stopped answering ({why})"})
+        await self._worker_to(lw, "lost", why)
+        await self._unbind_all(lw, f"worker {wid} is lost ({why}); it comes back on another worker with its "
+                                   "next message, or with Respawn")
         await self._made(project_id)
         self.lost[project_id].add(lw.worker.index)
         await self.store.lose_worker(wid, why, "\n".join(lw.log_tail))
@@ -658,46 +759,108 @@ class Orchestrator:
                    if t["state"] in ("queued", "working")]
         if len(running) >= self.max_running:
             raise RuntimeError(f"project has {len(running)} running threads (limit {self.max_running})")
-        thread = await self.store.create_thread(project_id, title, request, parent)
+        thread = await self.store.create_thread(project["id"], title, request, parent)
         tid = thread["id"]
         created = {"title": title, "request": request, "parent": parent}
         if images:
             created["images"] = images
         await self.store.append_event(project_id, tid, "created", created)
-        self._expect_echo(tid, request)
-        thread = await self.store.update_thread(tid, activity="starting on a worker")
-        self.starting[tid] = self._chain(self.thread_chain, tid,
-                                         lambda: self._start(project, thread, parent, images))
+        # Binding before it is returned: a new thread is never shown queued on no worker.
+        thread = await self._bind_to(tid, "binding", "a new thread, being put on a worker")
+        self._begin_binding(tid, thread["binding_reason"], entered=True)
         return thread
 
-    async def _start(self, project: dict, thread: dict, parent: str | None,
-                     images: list[dict] | None = None) -> None:
-        """Put a spawned thread on a worker, creating one when every worker is full."""
-        tid = thread["id"]
+    def _begin_binding(self, tid: str, why: str, entered: bool = False) -> asyncio.Task:
+        """Start putting a thread on a worker (_bind), in the background;
+        `entered` when the caller moved it to binding already. Its task is
+        registered at once, so callers that come after it wait for it
+        (live_worker) instead of starting another."""
+        task = asyncio.create_task(self._bind(tid, why, entered))
+        self.binding[tid] = task
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
+        task.add_done_callback(lambda t: self.binding.pop(tid) if self.binding.get(tid) is t else None)
+        # A failure is the thread's binding event; a waiter, if any, gets it too.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return task
+
+    async def _bind(self, tid: str, why: str, entered: bool = False) -> LiveWorker:
+        """Put a thread on a worker: unbound or bound -> binding -> bound, or
+        back to unbound with why it failed. It goes on the worker it was on
+        while that one is not lost (reattached first when it is unreachable),
+        so the worktree there is the one it continues in; else on a picked
+        worker, from its branch, snapshot and session in the hub. A thread
+        none of whose turns was saved (new, or its worker went before its
+        first turn ended) is given its request; the rest wait idle for their
+        next message. One the worker's runner still runs (only this control
+        plane lost track of it) is bound as it is: posting it would be refused."""
+        if not entered:
+            await self._bind_to(tid, "binding", why)
+        t = await self.store.get_thread(tid)
+        project = await self.store.get_project(t["project_id"])
+        old = self.by_thread.pop(tid, None)
+        if old is not None:
+            old.threads.discard(tid)
+        lw, picked, request, found = None, False, None, None
         try:
-            lw = await self._pick_worker(project, start=True)
-            try:
-                await self._ship(lw, project)
-                model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
-                await lw.client.create_thread(id=tid, request=thread["request"], title=thread["title"],
-                                              project=project["id"], parent=parent, model=model,
-                                              images=await self._inline_images(images) or None)
-            finally:
-                lw.starting -= 1
-        except asyncio.CancelledError:  # stopped before it started
-            self.unechoed.pop(tid, None)
+            lw = old or await self._home(project, t["worker_id"])
+            if lw is not None and lw.state in ("unreachable", "reattaching"):
+                await self._reattach(lw, f"thread {tid} is being put back on it")
+            if lw is not None and lw.state != "ready":
+                lw = None
+            if lw is None:
+                lw, picked = await self._pick_worker(project, start=True), True
+            if lw is not old:
+                there = await lw.client.get_thread(tid)
+                if there is not None and there.get("state") not in ENDED:
+                    found = there["state"]  # its runner still runs it; only this control plane lost track
+            if found is None:
+                request = await self._post(lw, t, project, again=lw is old)
+        except asyncio.CancelledError as e:
+            await self._bind_to(tid, "unbound", e.args[0] if e.args else "putting it on a worker was called off")
             raise
         except Exception as e:
-            self.unechoed.pop(tid, None)
-            await self.store.update_thread(tid, state="failed", activity="")
-            await self.store.append_event(project["id"], tid, "error",
-                                          {"error": f"could not start thread: {describe(e)}"})
-            return
+            await self._bind_to(tid, "unbound", f"could not put it on a worker: {describe(e)}")
+            raise
         finally:
-            self.starting.pop(tid, None)
+            if picked:
+                lw.starting -= 1
         lw.threads.add(tid)
         self.by_thread[tid] = lw
-        await self.store.update_thread(tid, worker_id=lw.worker.id)
+        wid = lw.worker.id
+        if found is not None:
+            reason, state = f"found again on worker {wid}, which still runs it", found
+        elif request is not None:
+            reason, state = f"on worker {wid}, working on its request", None
+        else:
+            reason, state = f"on worker {wid}, idle until its next message", "idle"
+        await self._bind_to(tid, "bound", reason, worker=wid, worker_id=wid, **({"state": state} if state else {}))
+        return lw
+
+    async def _post(self, lw: LiveWorker, t: dict, project: dict, again: bool) -> str | None:
+        """Ship the hub to a worker and post the thread to its runner (stopped
+        there first when `again`). Returns the request it was given, None
+        when it waits idle for its next message."""
+        tid = t["id"]
+        await self._ship(lw, project, tid)
+        if again:  # its runner may still run it: a respawn of a bound thread
+            await lw.client.stop_if_there(tid)
+        request, images = None, None
+        if not await (await self.hub(project)).saved(tid):
+            request = t["request"]
+            created = (await self.store.list_events(project["id"], tid, 0, limit=1) or [{}])[0]
+            images = (created.get("payload") or {}).get("images") if created.get("type") == "created" else None
+            self._expect_echo(tid, request)
+        model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
+        try:
+            await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
+                                          model=model, summary=t["summary"], request=request,
+                                          images=await self._inline_images(images) or None)
+        except BaseException:
+            if request is not None:
+                self._echoed(tid, request)
+            raise
+        return request
 
     def _expect_echo(self, tid: str, body: str) -> None:
         self.unechoed.setdefault(tid, []).append(body)
@@ -758,11 +921,10 @@ class Orchestrator:
         await self.store.mark_read([msg["id"]])
 
     async def live_worker(self, thread_id: str) -> LiveWorker:
-        """The worker running the thread. A thread that runs nowhere (its worker
-        went away with an earlier control plane, it stopped or it failed) is
-        brought back first, on the worker it ran on while that one is alive:
-        its worktree and its conversation, idle until its next message.
-        Concurrent callers share one revival.
+        """The worker running the thread, once it is ready. A thread being put
+        on a worker is waited for; one on no worker, or whose turn ended
+        (stopped, failed, done), is put on one first (_bind). Concurrent
+        callers share one binding.
 
         Raises KeyError for an unknown thread, ArchivedError for an archived
         one or one in an archived project."""
@@ -772,90 +934,42 @@ class Orchestrator:
         if t["archived_at"] is not None:
             raise ArchivedError(f"thread {thread_id} is archived; unarchive it to use it")
         await self.open_project(t["project_id"])
-        starting = self.starting.get(thread_id)
-        if starting is not None:
-            await asyncio.wait({starting})
-            t = await self.store.get_thread(thread_id)
-        lw = self.by_thread.get(thread_id)
-        if lw is not None:
-            if await self._health(lw) is None:
-                await self._lose(lw, lw.health_error)
-                lw = None
-            elif self.by_thread.get(thread_id) is not lw:  # its runner restarted
-                lw = None
-            elif t["state"] not in ENDED:
-                return lw
-        task = self.reviving.get(thread_id)
-        if task is None:
-            task = asyncio.create_task(self._revive(t, lw))
-            self.reviving[thread_id] = task
-            self.background.add(task)
-            task.add_done_callback(self.background.discard)
-            task.add_done_callback(lambda _: self.reviving.pop(thread_id, None))
-        return await asyncio.shield(task)
-
-    async def _revive(self, t: dict, lw: LiveWorker | None) -> LiveWorker:
-        """Start the thread again on the worker that ran it (`lw` when it is
-        live here, else the one an earlier control plane left), so its
-        worktree there is the one it continues in; on a picked worker when
-        that was lost, from its branch, snapshot and session in the hub.
-        A thread none of whose turns was saved (it never started, or its
-        worker went before its first turn ended) is given its request again."""
-        tid, project = t["id"], await self.store.get_project(t["project_id"])
-        if lw is None:
-            lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
-        there = await lw.client.get_thread(tid)
-        if there is not None and there.get("state") not in ENDED:
-            # The runner still runs it; only this control plane lost track of where.
-            return await self._bind(lw, tid, {"state": there["state"]}, {"worker": lw.worker.id, "request": False, "found": True})
-        await self._ship(lw, project, tid)
-        request, images = None, None
-        if not await (await self.hub(project)).saved(tid):
-            request = t["request"]
-            created = (await self.store.list_events(project["id"], tid, 0, limit=1) or [{}])[0]
-            images = (created.get("payload") or {}).get("images") if created.get("type") == "created" else None
-            self._expect_echo(tid, request)
-        model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
-        try:
-            await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
-                                          model=model, summary=t["summary"], request=request,
-                                          images=await self._inline_images(images) or None)
-        except BaseException:
-            if request is not None:
-                self._echoed(tid, request)
-            raise
-        return await self._bind(lw, tid, {} if request is not None else {"state": "idle"},
-                                {"worker": lw.worker.id, "request": request is not None})
-
-    async def _bind(self, lw: LiveWorker, tid: str, fields: dict, revived: dict) -> LiveWorker:
-        """Record that the thread now runs on `lw`, and log its revival."""
-        old = self.by_thread.get(tid)
-        if old is not None:
-            old.threads.discard(tid)
-        lw.threads.add(tid)
-        self.by_thread[tid] = lw
-        t = await self.store.update_thread(tid, worker_id=lw.worker.id, activity="", **fields)
-        await self.store.append_event(t["project_id"], tid, "revived", revived)
-        return lw
+        while True:
+            task = self.binding.get(thread_id)
+            if task is not None:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if task.cancelled() and not asyncio.current_task().cancelling():
+                        continue  # called off by Respawn or Stop: wait for what comes after it
+                    raise
+            lw = self.by_thread.get(thread_id)
+            if lw is not None:
+                await self._settled(lw)
+                t = await self.store.get_thread(thread_id)
+                if self.by_thread.get(thread_id) is lw and t["state"] not in ENDED:
+                    return lw
+            if thread_id not in self.binding:
+                self._begin_binding(thread_id, "brought back on a worker for a message to it or its files")
 
     async def respawn(self, thread_id: str) -> None:
-        """Bring a thread back on a worker now, rather than with its next
-        message: queued after its start and deliveries, like them; a failure
-        is reported as the thread's event."""
+        """Put a thread on a worker afresh, from whatever binding it is in
+        (states.py): one being put on a worker is called off and started
+        over; one on an unreachable worker has that worker reattached; one
+        bound is stopped on its runner and posted again. Returns at once; the
+        thread's binding events say how it went."""
         t = await self.store.get_thread(thread_id)
         if t is None:
             raise KeyError(thread_id)
         if t["archived_at"] is not None:
             raise ArchivedError(f"thread {thread_id} is archived; unarchive it to use it")
         await self.open_project(t["project_id"])
-
-        async def work() -> None:
-            try:
-                await self.live_worker(thread_id)
-            except Exception as e:
-                await self.store.append_event(t["project_id"], thread_id, "error",
-                                              {"error": f"could not bring the thread back: {describe(e)}"})
-        self._chain(self.thread_chain, thread_id, work)
+        task = self.binding.get(thread_id)
+        if task is not None:
+            task.cancel("Respawn called off putting it on a worker, to start over")
+            await asyncio.wait({task})
+        if thread_id not in self.binding:
+            self._begin_binding(thread_id, "Respawn")
 
     async def _inline_images(self, refs: list[dict] | None) -> list[dict]:
         """Image references as a runner needs them: the bytes, base64-encoded.
@@ -868,54 +982,48 @@ class Orchestrator:
                             "data": base64.b64encode(row["data"]).decode("ascii")})
         return out
 
+    def worker_state(self, t: dict) -> tuple[str, str]:
+        """The state of the worker a thread is bound to and why, ("", "") when
+        it is bound to none."""
+        lw = self.by_thread.get(t["id"])
+        return (lw.state, lw.reason) if lw is not None else ("", "")
+
     async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
-        """The runner log of the worker a thread runs on, or last ran on when
-        that one is not attached (the control plane reads it from the
-        provider; the worker never sends it). A thread on no worker gets why:
-        the worker it lost, why and when, and that worker's log as it ended;
-        or why it never started on one. KeyError for an unknown thread."""
-        lw = self.by_thread.get(thread_id)
-        if lw is not None:
-            return await self.provider.logs(lw.worker, lines)
+        """Where a thread stands (its binding, and its worker's state, each
+        with why), then the runner log of the worker it is on, or was last on
+        (the control plane reads it from the provider; the worker never sends
+        it). A worker that was lost left the end of its log as it was
+        followed. KeyError for an unknown thread."""
         t = await self.store.get_thread(thread_id)
         if t is None:
             raise KeyError(thread_id)
-        workers = {w["id"]: w for w in await self.store.list_workers(t["project_id"])}
-        w = workers.get(t["worker_id"])
-        if w is not None and w["lost_at"] is None:  # down now, or left by an earlier control plane
-            return await self.provider.logs(stored_worker(w), lines)
-        return await self._no_worker(t, workers, lines)
-
-    async def _no_worker(self, t: dict, workers: dict[str, dict], lines: int) -> str:
-        tid = t["id"]
-        events = await self.store.recent_events(t["project_id"], tid, limit=500)
-        last = next((e for e in reversed(events) if e["type"] in ("worker_lost", "revived")
-                     or (e["type"] == "error" and e["payload"].get("error", "").startswith("could not start"))),
-                    None)
-        if last is not None and last["type"] == "worker_lost":
-            wid = last["payload"].get("worker", "")
-            w = workers.get(wid) or {}
-            kept = (w.get("lost_log") or "").splitlines()[-lines:]
-            text = (f"thread {tid} is on no worker: its worker {wid} was dropped at {when(last['created_at'])}, "
-                    f"because {w.get('lost_reason') or 'no reason was recorded'}.\n"
-                    "It comes back on a worker with its next message, or with Respawn.\n\n")
-            if kept:
-                return text + f"The end of {wid}'s runner log when it was dropped:\n" + "\n".join(kept) + "\n"
-            return text + f"No log was read from {wid} before it was dropped.\n"
-        if last is not None and last["type"] == "error":
-            return (f"thread {tid} never started on a worker ({when(last['created_at'])}): "
-                    f"{last['payload']['error']}\nRespawn, or a message to it, starts it on its request.\n")
-        if tid in self.starting:
-            return (f"thread {tid} is waiting for a worker: one is being started or picked for it. "
-                    "The control plane's output shows the new worker's log as it starts.\n")
-        return (f"thread {tid} has no worker and has no record of one (state {t['state']}).\n"
-                "Respawn, or a message to it, starts it on a worker: from its branch, files and session "
-                "as its last turn saved them, or on its request if no turn was saved.\n")
+        head = f"thread {thread_id} is {t['binding']}: {t['binding_reason'] or 'nothing recorded yet'}\n"
+        lw = self.by_thread.get(thread_id)
+        if lw is not None:
+            head += f"worker {lw.worker.id} is {lw.state}: {lw.reason or 'its runner answers'}\n"
+            worker = lw.worker
+        else:
+            w = {w["id"]: w for w in await self.store.list_workers(t["project_id"])}.get(t["worker_id"])
+            if w is None:
+                return head + "It has not been on a worker, so there is no worker log.\n"
+            head += f"worker {w['id']} is {w['state']}: {w['state_reason'] or 'nothing recorded'}\n"
+            if w["lost_at"] is not None:
+                kept = (w.get("lost_log") or "").splitlines()[-lines:]
+                if not kept:
+                    return head + f"No log was read from {w['id']} before it was lost.\n"
+                return (head + f"\nThe end of {w['id']}'s runner log when it was lost "
+                        f"({when(w['lost_at'])}):\n" + "\n".join(kept) + "\n")
+            worker = stored_worker(w)
+        try:
+            text = await self.provider.logs(worker, lines)
+        except Exception as e:
+            return head + f"\nCould not read {worker.id}'s runner log: {describe(e)}\n"
+        return head + "\n" + text
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds
         it (the control plane asks; the worker never sends files on its own).
-        A thread with no live worker is revived first, from the hub."""
+        A thread on no worker is bound to one first."""
         lw = await self.live_worker(thread_id)
         return await lw.client.list_files(thread_id, path)
 
@@ -926,9 +1034,10 @@ class Orchestrator:
         return await lw.client.open_file(thread_id, path)
 
     async def stop(self, thread_id: str) -> None:
-        starting = self.starting.get(thread_id)
-        if starting:
-            starting.cancel()
+        task = self.binding.get(thread_id)
+        if task is not None:
+            task.cancel("stopped before it was on a worker")
+            await asyncio.wait({task})
         lw = self.by_thread.get(thread_id)
         if lw:
             await lw.client.stop(thread_id)
@@ -977,7 +1086,29 @@ class Orchestrator:
             raise KeyError(project_id)
         if p["archived_at"] is not None:
             raise ArchivedError(f"project {p['name']} is archived; unarchive it to use it")
+        await self.recover(project_id)
         return p
+
+    async def recover(self, project_id: str) -> None:
+        """Take over the project's threads from the store, once per control
+        plane: a thread an earlier control plane had bound, or was binding,
+        is on no worker of this one (attaching to its worker again starts
+        that worker's runner afresh), so it is unbound, to come back with its
+        next message or Respawn. Anything that uses a project's threads, or
+        shows them, calls this first."""
+        if project_id in self.recovered:
+            return
+        async with self._recover_locks.setdefault(project_id, asyncio.Lock()):
+            if project_id not in self.recovered:
+                await self._take_over(project_id)
+                self.recovered.add(project_id)
+
+    async def _take_over(self, project_id: str) -> None:
+        for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
+            if t["binding"] != "unbound" and t["id"] not in self.by_thread and t["id"] not in self.binding:
+                on = f" on worker {t['worker_id']}" if t["worker_id"] else ""
+                await self._bind_to(t["id"], "unbound", f"the control plane that had it{on} stopped; it comes "
+                                                        "back with its next message, or with Respawn")
 
     async def archive_project(self, project_id: str) -> dict:
         """Archive a project: it is marked first, so nothing new starts (requests
@@ -1004,9 +1135,8 @@ class Orchestrator:
             for lw in self.workers.pop(project_id, []):
                 for task in lw.tasks():
                     task.cancel()
-                for tid in lw.threads:
-                    if self.by_thread.get(tid) is lw:
-                        del self.by_thread[tid]
+                await self._worker_to(lw, "lost", "its project was archived")
+                await self._unbind_all(lw, "its project was archived")
                 await lw.client.close()
             await self._made(project_id)
             for w in await self.store.list_workers(project_id):

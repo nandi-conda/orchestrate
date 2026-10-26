@@ -213,6 +213,10 @@ class LocalProvider:
     async def create(self, spec: WorkerSpec) -> Worker:
         port = free_port()
         wid = f"{spec.project_id}-w{spec.index}"
+        old = self.procs.pop(wid, None)
+        if old is not None and old.returncode is None:  # its runner, started again as a sprite's service is
+            old.kill()
+            await old.wait()
         worker = Worker(id=wid, project_id=spec.project_id, provider=self.name, handle="",
                         url=f"http://127.0.0.1:{port}", capacity=spec.capacity, index=spec.index)
         worker.token = spec.token or worker.token

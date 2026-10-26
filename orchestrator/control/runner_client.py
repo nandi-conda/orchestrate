@@ -65,6 +65,12 @@ class RunnerClient:
         r = await self.http.post(f"/threads/{thread_id}/stop")
         r.raise_for_status()
 
+    async def stop_if_there(self, thread_id: str) -> None:
+        """Stop the thread if this runner has it; a runner that does not is fine."""
+        r = await self.http.post(f"/threads/{thread_id}/stop")
+        if r.status_code != 404:
+            r.raise_for_status()
+
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree (runner/API.md, files)."""
         r = await self.http.get(f"/threads/{thread_id}/files", params={"path": path})
