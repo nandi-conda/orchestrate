@@ -138,7 +138,7 @@ class PrimeAgent:
             args += ["--resume", str(session)]
         spec = model or {}
         args += ["--provider", spec.get("provider") or "deepseek",
-                 "--model", spec.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")]
+                 "--model", spec.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")]
         env = {**os.environ, **self.env, "HOME": place.view.home, "TMPDIR": place.view.tmp,
                "PRIME_AGENT_CODING_AGENT_DIR": str(place.agent_dir), "PRIME_AGENT_KERNEL_PYTHON": place.kernel,
                "DO_NOT_TRACK": "1"}

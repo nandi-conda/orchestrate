@@ -1,7 +1,7 @@
 # runner
 
 Hosts many agent threads in one process. Each thread is a
-[prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) harness (DeepSeek
+[prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) harness (deepseek-flash
 by default) with its own git worktree. Its Python kernel, where everything the
 model writes runs, is in a bubblewrap sandbox that holds the worktree and
 nothing of the runner, so the agent sees only the project
@@ -36,7 +36,7 @@ and environment variables are in [API.md](API.md).
 | `src/runner/sandbox.py` | `View` (what a thread's kernel sees), bubblewrap arguments, the kernel's environment |
 | `src/runner/team.py` | the runner's side of the team skill: a thread's socket for peer and web calls |
 | `skills/team/` | the team skill: its SKILL.md and the `team` module in the kernel |
-| `models.json` | the models prime-agent knows (it runs `--offline`): `deepseek-v4-pro`, and `deepseek-flash`, which takes image turns |
+| `models.json` | the models prime-agent knows (it runs `--offline`): `deepseek-flash` (the default, and it takes image turns), and `deepseek-v4-pro` |
 | `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` (prime-agent events to runner events, turns) and `ThreadHost` (workspaces, capacity) |
 | `src/runner/repo.py` | the worker's repository, per-thread worktrees, snapshots, sessions, bundles to and from the orchestrator |

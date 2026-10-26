@@ -65,7 +65,7 @@ def main():
                     "they land on its default branch in the workdir's repository, never on the source")
     ap.add_argument("--workdir")
     ap.add_argument("--project", default="local")
-    ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-v4-pro)")
+    ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-flash)")
     ap.add_argument("--timeout", type=float, default=1800)
     args = ap.parse_args()
     require(["DEEPSEEK_API_KEY"])
