@@ -7,6 +7,7 @@ import sys
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from control import paths
 from control.app import create_app
 from control.secrets import warn_optional
 from control.store import store_from_url
@@ -20,11 +21,12 @@ def main() -> None:
                                             "running in this process")
     p.add_argument("--port", type=int, default=8000,
                    help="the control plane's port (its UI is in a browser there too)")
-    p.add_argument("--db", default="orchestrator.db",
+    p.add_argument("--db", default=str(paths.DB),
                    help="SQLite path, or a postgresql:// URL, as for `python -m control`")
     a, rest = p.parse_known_args()
     faulthandler.enable()  # a crash in Qt or Chromium says where, instead of exiting silently
     logging.basicConfig(level=logging.INFO)
+    paths.migrate()
     logging.getLogger("httpx").setLevel(logging.WARNING)  # a line per request to every worker otherwise
     warn_optional(["DEEPSEEK_API_KEY", "SPRITES_TOKEN", "GITHUB_TOKEN"])
     prepare_qt()

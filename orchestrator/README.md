@@ -143,7 +143,7 @@ worked out at runtime.
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | router model, and passed to every worker. Sprites need it; the local fallback (used only when `SPRITES_TOKEN` is absent) runs the echo runner without it | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
 | `SPRITES_TOKEN` | stored, workers always run on Sprites; without it they fall back to this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
-| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: for a project with a remote (`repo_url`, set in its settings) it fetches the remote's default branch into the project's hub (`.orchestrator/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
+| `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: for a project with a remote (`repo_url`, set in its settings) it fetches the remote's default branch into the project's hub (`~/.orchestrate/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 
 Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
 the exact name, the header they're sent as, and the keyring backend that was
@@ -159,7 +159,8 @@ What the control plane works out for itself:
 | Where workers run | Sprites whenever `SPRITES_TOKEN` is stored, even when the browser is on this machine. Local only when no token is stored |
 | What a sprite checks out | This checkout's `origin` remote and current branch, with a warning when the sprite would not get this exact commit |
 | Which router | The model when `DEEPSEEK_API_KEY` is stored, the rule-based one otherwise |
-| Storage | SQLite in `orchestrator.db`, or `--db postgresql://…` for several control planes |
+| Where its data lives | `~/.orchestrate/`: the SQLite store, project hubs (`repos/`) and local workers (`workers/`). Data an older control plane kept in the checkout (`orchestrator.db`, `.orchestrator/`) is moved there once at startup; data in both places stops startup until one is removed |
+| Storage | SQLite in `~/.orchestrate/orchestrator.db`, or `--db postgresql://…` for several control planes |
 
 Flags: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db`.
 
@@ -227,7 +228,7 @@ credentials, so this repository must be publicly readable.
 ### Project repos and commits
 
 Every project has its own git repository on the control plane's machine, a
-bare repository at `.orchestrator/repos/<project id>.git` (the hub; its path is
+bare repository at `~/.orchestrate/repos/<project id>.git` (the hub; its path is
 under **Settings** in the project window). It starts from a commit that makes
 the project a pixi project, "Start the project": every project is one, and a
 main branch that is not (an older hub, an attached remote's history) gets a
@@ -318,7 +319,7 @@ Each thread's pane has a **Worker log** tab next to Dialog and Tools: the last
 text is served as plain text at `/api/threads/<id>/worker-logs?lines=N`.
 The control plane reads them itself: from `/.sprite/logs/services/runner.log`
 on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
-`.orchestrator/workers/<worker>/runner.log` for a local worker.
+`~/.orchestrate/workers/<worker>/runner.log` for a local worker.
 
 Every worker's runner log is also printed to the control plane's stdout as it
 is written (`pixi run desktop` or `pixi run serve`), each line prefixed with

@@ -14,6 +14,7 @@
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` |
 | `control/runner_client.py` | HTTP client for the runner API |
 | `control/devrunner.py` | the echo runner, speaking the same API with no model |
+| `control/paths.py` | where the data lives (`~/.orchestrate`), and the one-time move from the checkout |
 | `control/secrets.py` | environment-then-keyring secret lookup |
 | `control/server.py` | uvicorn server that ends SSE streams on shutdown |
 | `ui/app.py` | the ultra app (LPython compiled to wasm) |

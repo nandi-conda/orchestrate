@@ -45,9 +45,19 @@ variable (see [The runner and prime-agent](../architecture/runner.md#the-sandbox
 | What a sprite runs | This checkout's `origin` remote at its current branch, cloned to `/opt/orchestrate` on the sprite. A warning is printed when that is not your exact `HEAD`. |
 | Which router | `ModelRouter` with `deepseek-flash` when `DEEPSEEK_API_KEY` is stored, `HeuristicRouter` otherwise. |
 | Which model threads use | prime-agent's `deepseek` provider with `deepseek-flash` by default; a project's model is set in its **Settings**. Image turns on a text-only model go to `deepseek/deepseek-flash`. |
-| Storage | SQLite in `orchestrator.db` in the working directory, or `--db postgresql://…`. |
-| Project repos | Bare git repositories in `.orchestrator/repos/<project id>.git`. |
-| Local workers | `.orchestrator/workers/<worker id>/`, with the runner log in `runner.log`. |
+| Where its data lives | `~/.orchestrate/`, one directory per user, whichever checkout or directory the control plane runs from (below). |
+| Storage | SQLite in `~/.orchestrate/orchestrator.db`, or `--db postgresql://…`. |
+| Project repos | Bare git repositories in `~/.orchestrate/repos/<project id>.git`. |
+| Local workers | `~/.orchestrate/workers/<worker id>/`, with the runner log in `runner.log`. |
+
+### Data from before `~/.orchestrate`
+
+Control planes used to keep their data in the checkout: `orchestrator/orchestrator.db`
+and `orchestrator/.orchestrator/{repos,workers}`. `pixi run serve` and
+`pixi run desktop` move it to `~/.orchestrate/` when they start, once, and log
+each move. Worktrees that pointed at the old place are made again from the hub
+(a worker's threads, a hub's landings). If both places hold data, the control
+plane refuses to start and names both: keep one and remove the other.
 
 ## Flags
 
@@ -55,7 +65,7 @@ variable (see [The runner and prime-agent](../architecture/runner.md#the-sandbox
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | `pixi run serve` |
 | `--port` | `8000` | `serve` and `desktop` |
-| `--db` | `orchestrator.db` | `serve` and `desktop`: a SQLite path or a `postgresql://` URL |
+| `--db` | `~/.orchestrate/orchestrator.db` | `serve` and `desktop`: a SQLite path or a `postgresql://` URL |
 
 !!! danger "The UI API has no authentication"
     Keep `--host` on loopback unless the network in front of it is trusted.

@@ -9,7 +9,7 @@ flowchart TB
             orch["Orchestrator<br/>workers, bindings, relay, peer calls"]
             router["Router<br/>deepseek-flash or rules"]
             store[("Store<br/>SQLite / Postgres")]
-            hub[("Hub repos<br/>.orchestrator/repos/&lt;project&gt;.git")]
+            hub[("Hub repos<br/>~/.orchestrate/repos/&lt;project&gt;.git")]
         end
     end
     subgraph sprite["Worker (a Fly Sprite)"]

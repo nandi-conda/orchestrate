@@ -37,8 +37,10 @@ import json
 import secrets
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Protocol
 
+from . import paths
 from .states import BINDING, RUNNING, WORKER
 
 THREAD_STATES = ("queued", "working", "waiting", "idle", "done", "failed", "stopped")
@@ -445,7 +447,7 @@ class _SqlStore:
 
 
 class SqliteStore(_SqlStore):
-    def __init__(self, path: str = "orchestrator.db") -> None:
+    def __init__(self, path: str | Path = paths.DB) -> None:
         self.path = path
         self.notifier = Notifier()
         self.db = None
@@ -453,6 +455,7 @@ class SqliteStore(_SqlStore):
     async def open(self) -> None:
         import aiosqlite
 
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA journal_mode=WAL")
@@ -549,5 +552,5 @@ class PostgresStore(_SqlStore):
 def store_from_url(url: str | None) -> Store:
     if url and url.startswith(("postgres://", "postgresql://")):
         return PostgresStore(url)
-    path = url.removeprefix("sqlite:///") if url else "orchestrator.db"
+    path = url.removeprefix("sqlite:///") if url else paths.DB
     return SqliteStore(path)

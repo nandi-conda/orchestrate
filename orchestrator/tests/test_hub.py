@@ -230,12 +230,11 @@ async def test_a_worker_may_only_set_its_threads_refs(tmp_path):
 
 
 async def test_a_hub_at_a_relative_path_is_made_where_it_says(tmp_path, monkeypatch):
-    """The control plane's default is `.orchestrator/repos`, relative to where it runs."""
     monkeypatch.chdir(tmp_path)
-    hub = Hub(".orchestrator/repos/p.git", "p")
+    hub = Hub("repos/p.git", "p")
     await hub.open()
-    assert (tmp_path / ".orchestrator" / "repos" / "p.git" / "HEAD").exists()
-    assert git(tmp_path / ".orchestrator" / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"
+    assert (tmp_path / "repos" / "p.git" / "HEAD").exists()
+    assert git(tmp_path / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"
 
 
 async def test_an_empty_remote_gets_the_projects_history(tmp_path):

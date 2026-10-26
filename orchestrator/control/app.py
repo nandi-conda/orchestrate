@@ -22,6 +22,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from . import paths
 from .providers import WorkerProvider, default_provider
 from .gitio import GitError
 from .router import Router, default_router
@@ -257,7 +258,7 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
 
 def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
                router: Router | None = None,
-               shutdown_event: asyncio.Event | None = None, repos: str = ".orchestrator/repos") -> Starlette:
+               shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS) -> Starlette:
     store = store or store_from_url(None)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}

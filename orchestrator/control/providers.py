@@ -40,6 +40,8 @@ from typing import AsyncIterator, Protocol
 
 import httpx
 
+from . import paths
+
 log = logging.getLogger("orchestrator.providers")
 
 
@@ -198,7 +200,7 @@ def checkout_note(root: Path, ref: str) -> str:
 class LocalProvider:
     name = "local"
 
-    def __init__(self, runner_dir: str | None = None, workdir: str = ".orchestrator/workers",
+    def __init__(self, runner_dir: str | None = None, workdir: str | Path = paths.WORKERS,
                  use_devrunner: bool | None = None) -> None:
         default = Path(__file__).resolve().parents[2] / "runner"
         self.runner_dir = Path(runner_dir) if runner_dir else default

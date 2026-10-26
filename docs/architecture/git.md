@@ -1,7 +1,7 @@
 # Project repos and landing
 
 Every project has its own git repository on the control plane's machine: a
-bare repository at `.orchestrator/repos/<project id>.git`, the project's
+bare repository at `~/.orchestrate/repos/<project id>.git`, the project's
 **hub** (its path is under **Settings** in the project window). It starts from
 a commit that makes the project a pixi project, "Start the project". It is the
 only place commits live beyond a worker.

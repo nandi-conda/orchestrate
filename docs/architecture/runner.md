@@ -48,7 +48,7 @@ runtime masks parts of `/proc`.
 ### Local workers
 
 Without `SPRITES_TOKEN`, `LocalProvider` starts runners as subprocesses on this
-machine under `.orchestrator/workers/<id>/`: the real runner from `../runner`
+machine under `~/.orchestrate/workers/<id>/`: the real runner from `../runner`
 when `DEEPSEEK_API_KEY` is stored (Linux only), the echo runner otherwise.
 
 ## A thread is a prime-agent process
