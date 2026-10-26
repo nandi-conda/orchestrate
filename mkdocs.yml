@@ -1,4 +1,5 @@
 site_name: orchestrate
+site_url: https://nandi-conda.github.io/orchestrate/
 site_description: "A project-based agent orchestrator: a control plane with an ultra UI, and agent runners on Fly Sprites."
 repo_url: https://github.com/nandi-conda/orchestrate
 repo_name: nandi-conda/orchestrate

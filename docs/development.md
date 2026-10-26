@@ -60,6 +60,11 @@ pixi run docs          # live-reloading preview on http://127.0.0.1:8001
 pixi run docs-build    # strict build into site/ (ignored by git)
 ```
 
+The site is published to <https://nandi-conda.github.io/orchestrate/> by
+`.github/workflows/docs.yml` whenever a change under `docs/` or the files it
+is built from lands on `main`. Nothing to run by hand; `site/` never gets
+committed.
+
 - The build is strict: a broken link or a page missing from `nav` fails it.
   Add every new page to `nav` in `mkdocs.yml`.
 - Diagrams are Mermaid, in ` ```mermaid ` fences.

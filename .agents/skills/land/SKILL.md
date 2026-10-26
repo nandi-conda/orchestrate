@@ -25,8 +25,9 @@ merge, and do not stop to reconfirm permission; proceed until the change is on
 both `origin/main` and `local/main`, or until a genuine blocker (below) means it
 is not.
 
-There is no CI and there are no git hooks in this repository, and commits are
-not signed. The pixi test suites are the whole verification gate.
+There are no git hooks in this repository and commits are not signed. The
+only workflow, `.github/workflows/docs.yml`, publishes the MkDocs site; it
+runs no tests. The pixi test suites are the whole verification gate.
 
 ## Workflow
 

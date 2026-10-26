@@ -1,0 +1,53 @@
+# Publish the documentation site (mkdocs.yml, docs/) to GitHub Pages.
+#
+# There is one site for the whole repository, so it is built here rather than
+# in either subproject. main is the only published branch: the site is what
+# main says. Any other branch's build is checked locally with `pixi run
+# docs-build`, which is the same strict build (a broken link fails it).
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      # A page includes this file as a snippet, so its text is part of the site.
+      - "runner/API.md"
+      - "pixi.toml"
+      - "pixi.lock"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and a queued one is not dropped: each deploy
+# replaces the last, and the live site has to be the newest main, not an
+# older one that happened to finish later.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          # The root pixi.toml keeps mkdocs in the `docs` environment only.
+          environments: docs
+      - uses: actions/configure-pages@v6
+      - name: Build the site
+        run: pixi run -e docs docs-build
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v5
