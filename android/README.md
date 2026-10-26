@@ -61,16 +61,16 @@ signs every build with one key, from four repository secrets:
 | `ANDROID_KEY_ALIAS` | text |
 | `ANDROID_KEY_PASSWORD` | text |
 
-Make them once:
+Make them once, on your computer (needs a JDK's `keytool` and `gh` signed in):
 
 ```sh
-keytool -genkeypair -keystore orchestrator.jks -alias orchestrator -keyalg RSA -keysize 4096 \
-  -validity 36500 -dname CN=orchestrator
-gh secret set ANDROID_KEYSTORE_BASE64 -R nandi-conda/orchestrate < <(base64 -w0 orchestrator.jks)
-gh secret set ANDROID_KEYSTORE_PASSWORD -R nandi-conda/orchestrate
-gh secret set ANDROID_KEY_ALIAS -R nandi-conda/orchestrate --body orchestrator
-gh secret set ANDROID_KEY_PASSWORD -R nandi-conda/orchestrate
+android/release-key.sh            # keystore at ~/.config/orchestrate/android-release.jks
 ```
 
-Keep `orchestrator.jks` safe: with another key, phones have to uninstall the
+It makes the keystore with a random password, kept beside it in
+`android-release.jks.password` (both readable by you only), and sets the four
+secrets with `gh secret set`. Run again with the same path, it sets the
+secrets from the existing key.
+
+Keep the keystore and its password file safe: with another key, phones have to uninstall the
 app (and lose its data) before the next build installs.
