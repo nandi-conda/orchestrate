@@ -358,6 +358,7 @@ async def test_sprites_follow_reopens_the_log_stream_without_repeating_lines(env
     await p.http.aclose()
     assert got == ["a", "b", "c", "d", "[sprite] runner service exited with code 1"]
     assert asked[0]["lines"] == "50" and asked[1]["lines"] == "51"
+    assert asked[0]["duration"] == "1h"
 
 
 class SpriteLookup:

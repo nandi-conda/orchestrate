@@ -25,6 +25,7 @@ def main() -> None:
     a, rest = p.parse_known_args()
     faulthandler.enable()  # a crash in Qt or Chromium says where, instead of exiting silently
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # a line per request to every worker otherwise
     warn_optional(["DEEPSEEK_API_KEY", "SPRITES_TOKEN", "GITHUB_TOKEN"])
     prepare_qt()
     app = QApplication([sys.argv[0], *rest])

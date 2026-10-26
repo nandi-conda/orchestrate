@@ -54,6 +54,8 @@ def configure_logging() -> None:
     """prime-agent's own log lines (runner.harness), thread failures, and one
     access line per request worth reading."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(name)s: %(message)s")
+    # Web calls log what they did themselves (runner.web); model calls are prime-agent's.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").addFilter(QuietPolls())
 
 

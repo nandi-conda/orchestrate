@@ -92,8 +92,10 @@ class WorkerProvider(Protocol):
 
 # How often a local worker's log file is looked at for new lines.
 FOLLOW_EVERY = 0.2
-# How long one sprite log follow runs before it is opened again (seconds).
-SPRITE_FOLLOW = 3600
+# How long one sprite log follow runs before it is opened again: a Go duration
+# string, as the Sprites SDKs send it (sprites-js getServiceLogs). A bare
+# number is not one, and the stream then ends at once.
+SPRITE_FOLLOW = "1h"
 # How long a sprite log follow waits before it is opened again.
 FOLLOW_AGAIN = 1.0
 
