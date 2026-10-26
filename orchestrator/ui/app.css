@@ -191,6 +191,10 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .md strong { font-weight: 600; }
 .md a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
 .md a:hover { text-decoration-thickness: 2px; }
+.md img { max-width: 100%; height: auto; border-radius: 4px; vertical-align: middle; }
+.fview-img { padding: 14px; border: 1px solid var(--border); border-radius: 8px; text-align: center;
+  background: repeating-conic-gradient(var(--muted) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.fview-img img { max-width: 100%; max-height: 75vh; height: auto; }
 .md hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
 .md blockquote { padding: .1em 0 .1em 1em; border-left: 3px solid var(--border); color: var(--muted-foreground); }
 .md code { font-family: var(--font-mono); font-size: .86em; padding: .12em .35em; border-radius: 4px;

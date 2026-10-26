@@ -758,7 +758,8 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
             pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
-            text = "build hello\nwrite out/hello world: compiled\nwrite README.md: hi"
+            text = ("build hello\nwrite out/hello world: compiled\nwrite README.md: hi\n"
+                    "write out/dot.svg: <svg xmlns='http://www.w3.org/2000/svg'><script>x()</script></svg>")
             tid = (await c.post(f"/api/projects/{pid}/requests",
                                 json={"text": text, "mode": "new"})).json()["spawned"][0]["id"]
 
@@ -772,12 +773,19 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
                                                            "pixi.toml"]  # every project is a pixi project
             assert top["entries"][3] == {"name": "README.md", "dir": False, "size": 3}
             sub = (await c.get(f"/api/threads/{tid}/files", params={"path": "out/x/.."})).json()
-            assert sub["path"] == "out" and [e["name"] for e in sub["entries"]] == ["hello world"]
+            assert sub["path"] == "out" and [e["name"] for e in sub["entries"]] == ["dot.svg", "hello world"]
 
             r = await c.get(f"/api/threads/{tid}/files/raw", params={"path": "out/hello world"})
             assert r.status_code == 200 and r.content == b"compiled\n"
             assert r.headers["content-type"] == "application/octet-stream"
             assert r.headers["content-disposition"] == "attachment; filename*=UTF-8''hello%20world"
+            # An image is served inline as its type, for the window to show;
+            # nothing served runs (an SVG's script stays dead).
+            r = await c.get(f"/api/threads/{tid}/files/raw", params={"path": "out/dot.svg"})
+            assert r.status_code == 200 and r.headers["content-type"] == "image/svg+xml"
+            assert r.headers["content-disposition"] == "inline; filename*=UTF-8''dot.svg"
+            assert "sandbox" in r.headers["content-security-policy"]
+            assert r.headers["x-content-type-options"] == "nosniff"
 
             # The runner's refusals keep their status and words.
             r = await c.get(f"/api/threads/{tid}/files/raw", params={"path": "../../etc/passwd"})

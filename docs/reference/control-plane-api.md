@@ -56,7 +56,7 @@ a message is delivered, the images are inlined as base64 for the runner.
 | GET | `/api/threads/{id}/events` | `?after=seq` or `Last-Event-ID` | SSE: the thread's events |
 | GET | `/api/threads/{id}/worker-logs` | `?lines=300` (max 5000) | text: the thread's binding and worker state, then its worker's runner log |
 | GET | `/api/threads/{id}/files` | `?path=<dir>` | `{path, entries: [{name, dir, size}]}` of the thread's worktree |
-| GET | `/api/threads/{id}/files/raw` | `?path=<file>` | the file, as an attachment |
+| GET | `/api/threads/{id}/files/raw` | `?path=<file>` | the file: an image (png, jpg, gif, webp, svg) inline as its type, anything else as an attachment; served with a sandbox CSP and `nosniff`, so nothing in it runs |
 | GET | `/api/images/{id}` | | a pasted image's bytes, cacheable for good |
 | GET | `/health` | | the control plane is up |
 

@@ -62,6 +62,23 @@ def is_md(h: i32) -> i32:
     pass
 
 @jscall
+def is_img(h: i32) -> i32:
+    """1 if the file name in h is an image the window shows (png, jpg, jpeg,
+    gif, webp or svg, any case)."""
+    pass
+
+@jscall
+def path_join(dst: i32, base: i32, rel: i32) -> None:
+    """dst = worktree path rel, from directory base; a rel starting with "/"
+    starts at the worktree's root. ".." is left for the worker to resolve."""
+    pass
+
+@jscall
+def path_dir(dst: i32, path: i32) -> None:
+    """dst = the directory of worktree path path ("" for the root)."""
+    pass
+
+@jscall
 def page_project(dst: i32) -> i32:
     """If the address is a project's page (/p/<id>), write the id to dst and
     return 1."""

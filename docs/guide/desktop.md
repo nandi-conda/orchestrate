@@ -21,7 +21,7 @@ environment). conda-forge has no Qt WebEngine for osx-64.
 
 - The UI's own links, `window.open` and `target=_blank` stay in the window.
 - Links anywhere else (a URL in an agent's reply) open in your default browser.
-- Markdown files in the Files tab open rendered in the pane; other files
+- Markdown files and images in the Files tab open in the pane; other files
   download to your Downloads folder, never over an existing file
   (`name (1)`, …), with a line at the bottom saying where.
 - If the port is taken, the window says so, and how to free it

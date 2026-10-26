@@ -7,16 +7,17 @@
 // until its closer arrives.
 //
 // ops: END closes the open element, TEXT adds text, HREF / START set the open
-// element's href / start, ALIGN_* add a column alignment class, and any code
-// in TAGS opens that element ("tag.class"). app.py's md_open() mirrors TAGS.
+// element's href / start, ALIGN_* add a column alignment class, SRC / ALT set
+// an img's worktree path and alt text, and any code in TAGS opens that element
+// ("tag.class"). app.py's md_open() mirrors TAGS.
 
-export const END = 0, TEXT = 1, HREF = 2, START = 3, ALIGN_C = 4, ALIGN_R = 5;
+export const END = 0, TEXT = 1, HREF = 2, START = 3, ALIGN_C = 4, ALIGN_R = 5, SRC = 6, ALT = 7;
 export const TAGS = {
   10: "p", 11: "h1", 12: "h2", 13: "h3", 14: "h4", 15: "h5", 16: "h6",
   17: "ul", 18: "ol", 19: "li", 20: "pre", 21: "code", 22: "blockquote", 23: "hr",
   24: "table", 25: "thead", 26: "tbody", 27: "tr", 28: "th", 29: "td",
   30: "strong", 31: "em", 32: "del", 33: "a", 34: "br",
-  35: "div.md-code", 36: "div.md-lang", 37: "div.md-table",
+  35: "div.md-code", 36: "div.md-lang", 37: "div.md-table", 38: "img",
 };
 const T = Object.fromEntries(Object.entries(TAGS).map(([k, v]) => [v, +k]));
 
@@ -208,6 +209,8 @@ function table(lines, i, out) {
 
 const PUNCT = /[!-/:-@[-`{-~]/;
 const URL_OK = /^(https?:|mailto:|\/|#)/i;
+// A path in the thread's worktree: no scheme, not //host, not #anchor.
+const WORKTREE = /^(?![a-z][a-z0-9+.-]*:|\/\/|#)./i;
 const BARE = /^https?:\/\/[^\s<]*[^\s<.,:;"')\]!?*_~]/;
 const space = (c) => c === undefined || /\s/.test(c);
 const word = (c) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
@@ -233,9 +236,10 @@ function inline(s, out) {
       continue;
     }
     if (c === "!" && s[i + 1] === "[") {
-      // images are shown as links: replies should not pull in remote content
+      // An image in the thread's worktree is shown; a remote one is a link:
+      // replies should not pull in remote content.
       const l = link(s, i + 1);
-      if (l) { flush(); emitLink(l, out); i = l.next; continue; }
+      if (l) { flush(); if (WORKTREE.test(l.url)) emitImage(l, out); else emitLink(l, out); i = l.next; continue; }
     }
     if (c === "[") {
       const l = link(s, i);
@@ -295,6 +299,16 @@ function emitLink(l, out) {
   out.open("a");
   out.set(HREF, l.url);
   if (l.text === null) out.text(l.url); else inline(l.text, out);
+  out.end();
+}
+
+// The alt text is the image's text with its markup dropped.
+function emitImage(l, out) {
+  const alt = new Out();
+  inline(l.text, alt);
+  out.open("img");
+  out.set(SRC, l.url);
+  out.set(ALT, alt.op.map((o, k) => (o === TEXT ? alt.s[k] : "")).join(""));
   out.end();
 }
 

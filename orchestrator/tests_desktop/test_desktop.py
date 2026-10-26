@@ -264,3 +264,34 @@ def test_a_markdown_file_opens_rendered_in_the_files_tab(qtbot, up, tmp_path):
     click(qtbot, w, "[...document.querySelectorAll('.pane-actions .btn')].find(b => b.textContent === 'Back')")
     qtbot.waitUntil(lambda: js(qtbot, w, "!document.querySelector('.fview') && !!document.querySelector('.files')"),
                     timeout=WAIT)
+
+
+def test_images_show_in_the_files_tab_and_in_markdown(qtbot, up):
+    w, url = up
+    svg = "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><rect width='40' height='20'/></svg>"
+    with httpx.Client(base_url=url, timeout=20) as c:
+        pid = c.post("/api/projects", json={"name": "pics"}).json()["id"]
+        text = f"draw\nwrite img/box.svg: {svg}\nwrite docs/box.md: See ![the box](../img/box.svg)"
+        tid = c.post(f"/api/projects/{pid}/requests", json={"text": text, "mode": "new"}).json()["spawned"][0]["id"]
+        deadline = time.time() + 20
+        while c.get(f"/api/threads/{tid}").json()["state"] != "idle":
+            assert time.time() < deadline
+            time.sleep(0.1)
+    w.view.load(QUrl(f"{url}/p/{pid}"))
+    qtbot.waitUntil(lambda: js(qtbot, w, "document.querySelectorAll('.thread').length > 1"), timeout=WAIT)
+    click(qtbot, w, "document.querySelectorAll('.thread')[1]")
+    click(qtbot, w, "[...document.querySelectorAll('.tab')].find(t => t.textContent === 'Files')")
+    # An image opens shown in the pane, not downloaded.
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent === 'img/')")
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent.startsWith('box.svg'))")
+    qtbot.waitUntil(lambda: js(qtbot, w, "(document.querySelector('.fview-img img') || {}).naturalWidth") == 40,
+                    timeout=WAIT)
+    assert w.view.url().toString() == f"{url}/p/{pid}", "the image opens in the window's own pane"
+    click(qtbot, w, "[...document.querySelectorAll('.pane-actions .btn')].find(b => b.textContent === 'Back')")
+    click(qtbot, w, "[...document.querySelectorAll('.pane-actions .btn')].find(b => b.textContent === 'Up')")
+    # A markdown file shows the images it names, relative to its own directory.
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent === 'docs/')")
+    click(qtbot, w, "[...document.querySelectorAll('.file')].find(f => f.textContent.startsWith('box.md'))")
+    qtbot.waitUntil(lambda: js(qtbot, w, "(document.querySelector('.fview img') || {}).naturalWidth") == 40,
+                    timeout=WAIT)
+    assert js(qtbot, w, "document.querySelector('.fview img').alt") == "the box"

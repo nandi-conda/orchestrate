@@ -18,7 +18,8 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, on_paste, img_count, img_url,
+                  clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, is_img, path_join, path_dir,
+                  on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row)
 
 # ---- Msg
@@ -124,6 +125,8 @@ MD_HREF: Const[i32] = 2
 MD_START: Const[i32] = 3
 MD_ALIGN_C: Const[i32] = 4
 MD_ALIGN_R: Const[i32] = 5
+MD_SRC: Const[i32] = 6
+MD_ALT: Const[i32] = 7
 
 # ---- Model
 screen: i32 = 0          # 0 project list, 1 a project
@@ -145,7 +148,7 @@ wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text}
 wlog_loading: i32 = 0
 files: i32 = 0           # JSON handle: a directory of the selected thread's worktree ({path, entries})
 files_loading: i32 = 0
-fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text})
+fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text}); 0 for an image
 fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
@@ -186,9 +189,12 @@ h_backed_up: i32 = 0
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_fpath: i32 = 0         # the worktree directory the Files tab shows ("" = its root)
 h_files_err: i32 = 0     # why the files could not be read
-h_fview: i32 = 0         # worktree path of the markdown file the Files tab shows ("" = the listing)
+h_fview: i32 = 0         # worktree path of the markdown or image file the Files tab shows ("" = the listing)
 h_fview_err: i32 = 0     # why that file could not be read
 h_md: i32 = 0            # scratch for markdown text
+h_mdtid: i32 = 0         # thread whose worktree the markdown being drawn names images in ("" = none)
+h_mdbase: i32 = 0        # and the worktree directory its relative image paths start from
+h_mdsrc: i32 = 0         # scratch for an image's worktree path
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
 h_clip: i32 = 0          # the text being copied
@@ -229,7 +235,7 @@ def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_bound, h_unbound, h_ready, h_backed_up
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
-    global h_fview, h_fview_err
+    global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_set_name, h_set_model, h_set_err
     global h_img, h_when, h_when_full
@@ -274,6 +280,9 @@ def init() -> None:
     h_fview = s_new()
     h_fview_err = s_new()
     h_md = s_new()
+    h_mdtid = s_new()
+    h_mdbase = s_new()
+    h_mdsrc = s_new()
     h_run = s_new()
     h_tid = s_new()
     h_clip = s_new()
@@ -906,8 +915,9 @@ def update(msg: i32, arg: i32) -> None:
         s_add_ref(h_fpath, h_t1)
         fetch_files()
     elif msg == FILE_VIEW:
-        # arg indexes a markdown file of the listing shown: read it as text
-        # and show it rendered, in the pane.
+        # arg indexes a markdown or image file of the listing shown, to show
+        # in the pane: markdown is read as text and rendered; an image is
+        # loaded by the <img> itself.
         o = j_at(files, "entries")
         e = j_idx(o, arg)
         jstr(e, "name", h_t1)
@@ -918,8 +928,9 @@ def update(msg: i32, arg: i32) -> None:
         if s_len(h_fpath) > 0:
             s_add(h_fview, "/")
         s_add_ref(h_fview, h_t1)
-        file_url(h_url, h_t1)
-        fview_req = http_get_text(h_url, GOT_FVIEW)
+        if is_img(h_t1) == 0:
+            file_url(h_url, h_t1)
+            fview_req = http_get_text(h_url, GOT_FVIEW)
     elif msg == GOT_FVIEW:
         # A reply after Back, or for a file or thread no longer shown, is
         # dropped: only the read last asked for lands.
@@ -1486,6 +1497,12 @@ def event_row(e: i32, show_thread: i32) -> None:
             copy_button(j_int(e, "seq"))
         if j_int(e, "editable") == 1:
             edit_button(j_int(e, "seq"))
+        # an image in a reply names a file of the thread that wrote it
+        s_clear(h_mdtid)
+        j_str(e, "thread_id", h_mdtid)
+        if s_len(h_mdtid) == 0:
+            s_copy(h_mdtid, h_sel)
+        s_clear(h_mdbase)
         el("div")
         cls("ev-text")
         cls("md")
@@ -1597,7 +1614,8 @@ def quote_chip() -> None:
 
 def md(h: i32) -> None:
     """The markdown in handle h, as elements. A reply still streaming in is
-    parsed whole on each render, so it reads right at every step."""
+    parsed whole on each render, so it reads right at every step. Images name
+    files in thread h_mdtid's worktree, relative to its directory h_mdbase."""
     n: i32
     i: i32
     op: i32
@@ -1615,6 +1633,20 @@ def md(h: i32) -> None:
         elif op == MD_START:
             md_str(i, h_md)
             attr_ref("start", h_md)
+        elif op == MD_SRC:
+            # A worktree path: served from the thread's files, from the
+            # markdown's own directory unless it starts at the root ("/").
+            if s_len(h_mdtid) > 0:
+                md_str(i, h_md)
+                path_join(h_mdsrc, h_mdbase, h_md)
+                s_set(h_md, "/api/threads/")
+                s_add_ref(h_md, h_mdtid)
+                s_add(h_md, "/files/raw?path=")
+                s_add_enc(h_md, h_mdsrc)
+                attr_ref("src", h_md)
+        elif op == MD_ALT:
+            md_str(i, h_md)
+            attr_ref("alt", h_md)
         elif op == MD_ALIGN_C:
             cls("center")
         elif op == MD_ALIGN_R:
@@ -1681,6 +1713,8 @@ def md_open(op: i32) -> None:
     elif op == 36:
         el("div")
         cls("md-lang")
+    elif op == 38:
+        el("img")
     else:
         el("div")
         cls("md-table")
@@ -2006,6 +2040,8 @@ def thinking_steps(src: i32, n: i32) -> i32:
             cls("step-text")
             cls("md")
             jstr(e, "text", h_t1)
+            s_copy(h_mdtid, h_sel)
+            s_clear(h_mdbase)
             md(h_t1)
             end()
             end()
@@ -2059,7 +2095,7 @@ def size_text(n: i32) -> None:
 
 
 def file_view() -> None:
-    """The markdown file h_fview, rendered in the pane, with Back to its
+    """The markdown or image file h_fview, shown in the pane, with Back to its
     directory and a Download link (the browser saves it; the page stays)."""
     div("wlog-bar")
     span("mono")
@@ -2093,6 +2129,13 @@ def file_view() -> None:
         attr("role", "alert")
         text_ref(h_fview_err)
         end()
+    elif is_img(h_fview) == 1:
+        div("fview-img")
+        el("img")
+        attr_ref("src", h_t2)
+        attr_ref("alt", h_fview)
+        end()
+        end()
     elif fview_req != 0:
         el("p")
         cls("muted")
@@ -2104,6 +2147,8 @@ def file_view() -> None:
         cls("fview")
         cls("md")
         jstr(fview, "text", h_t1)
+        s_copy(h_mdtid, h_sel)
+        path_dir(h_mdbase, h_fview)
         md(h_t1)
         end()
 
@@ -2111,8 +2156,8 @@ def file_view() -> None:
 def file_list() -> None:
     """The selected thread's worktree, one directory at a time, read from the
     worker that holds it. A directory opens in place; a markdown file opens
-    rendered in the pane (file_view); any other file is a download link (the
-    browser saves it; the page stays)."""
+    rendered in the pane and an image opens shown there (file_view); any other
+    file is a download link (the browser saves it; the page stays)."""
     i: i32
     n: i32 = 0
     e: i32
@@ -2174,7 +2219,7 @@ def file_list() -> None:
             text("/")
             end()
             end()
-        elif is_md(h_t1) == 1:
+        elif is_md(h_t1) == 1 or is_img(h_t1) == 1:
             el("button")
             cls("file")
             key(i)

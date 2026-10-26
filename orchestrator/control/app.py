@@ -56,6 +56,9 @@ IMAGE_ALIASES = {"image/jpg": "image/jpeg"}
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 DATA_URL = re.compile(r"^data:([a-z]+/[a-z0-9.+-]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
+# Worktree files the window shows as images (Files tab, markdown), by extension.
+FILE_IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+                    "webp": "image/webp", "svg": "image/svg+xml"}
 
 
 def decode_images(raw) -> list[tuple[str, bytes]]:
@@ -490,17 +493,26 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return files_error(e)
 
     async def thread_file(req: Request):
-        """One file of the thread's worktree, as a download (?path=<file>)."""
+        """One file of the thread's worktree (?path=<file>). An image is served
+        inline as its type, so the window can show it (the Files tab, and
+        images a markdown file or reply refers to); anything else is a
+        download. Nothing served runs: the sandbox policy keeps an SVG's
+        scripts and links dead even when it is opened on its own."""
         tid, path = req.path_params["tid"], req.query_params.get("path", "")
         try:
             r = await orch().open_file(tid, path)
         except Exception as e:
             return files_error(e)
         name = path.rstrip("/").rsplit("/", 1)[-1] or "file"
-        headers = {"content-disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
+        media = FILE_IMAGE_TYPES.get(name.rsplit(".", 1)[-1].lower()) if "." in name else None
+        headers = {
+            "content-disposition": f"{'inline' if media else 'attachment'}; filename*=UTF-8''{quote(name)}",
+            "x-content-type-options": "nosniff",
+            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        }
         if "content-length" in r.headers:
             headers["content-length"] = r.headers["content-length"]
-        return StreamingResponse(r.aiter_raw(), media_type="application/octet-stream", headers=headers,
+        return StreamingResponse(r.aiter_raw(), media_type=media or "application/octet-stream", headers=headers,
                                  background=BackgroundTask(r.aclose))
 
     async def transcript(req: Request):

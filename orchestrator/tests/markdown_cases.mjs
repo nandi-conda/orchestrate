@@ -1,7 +1,7 @@
 // Runs ui/markdown.js on each case and prints [{name, got, want}] as JSON for
 // test_markdown.py. The ops are rendered to HTML the way app.py's md() replays
 // them into ultra, so a case reads as the markup the window ends up with.
-import { parse, TAGS, END, TEXT, HREF, START, ALIGN_C, ALIGN_R } from "../ui/markdown.js";
+import { parse, TAGS, END, TEXT, HREF, START, ALIGN_C, ALIGN_R, SRC, ALT } from "../ui/markdown.js";
 
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -14,13 +14,15 @@ export function html(src) {
   for (let i = 0; i < op.length; i++) {
     const o = op[i];
     if (o === HREF) { pending += ` href="${s[i]}"`; continue; }
+    if (o === SRC) { pending += ` src="${s[i]}"`; continue; }
+    if (o === ALT) { pending += ` alt="${esc(s[i])}"`; continue; }
     if (o === START) { pending += ` start="${s[i]}"`; continue; }
     if (o === ALIGN_C || o === ALIGN_R) { pending += ` class="${o === ALIGN_C ? "center" : "right"}"`; continue; }
     close();
     if (o === TEXT) { out += esc(s[i]); continue; }
     if (o === END) {
       const t = stack.pop();
-      if (t !== "br" && t !== "hr") out += `</${t}>`;
+      if (t !== "br" && t !== "hr" && t !== "img") out += `</${t}>`;
       continue;
     }
     const [tag, c] = TAGS[o].split(".");
@@ -43,7 +45,13 @@ const cases = [
    '<p>see <a href="https://x.dev/a_(b)">docs</a> and <a href="https://y.dev">https://y.dev</a></p>'],
   ["bare url without trailing period", "at https://z.dev/p.", '<p>at <a href="https://z.dev/p">https://z.dev/p</a>.</p>'],
   ["javascript links are not linked", "[x](javascript:alert(1))", "<p>x</p>"],
-  ["images show as links", "![logo](https://x.dev/l.png)", '<p><a href="https://x.dev/l.png">logo</a></p>'],
+  ["remote images show as links", "![logo](https://x.dev/l.png)", '<p><a href="https://x.dev/l.png">logo</a></p>'],
+  ["worktree images show", "see ![the **plot**](out/plot.png) and ![](/docs/a.svg)",
+   '<p>see <img src="out/plot.png" alt="the plot"> and <img src="/docs/a.svg" alt=""></p>'],
+  ["a linked worktree image", "[![x](../x.png)](https://x.dev)",
+   '<p><a href="https://x.dev"><img src="../x.png" alt="x"></a></p>'],
+  ["scheme images are not fetched", "![a](javascript:x) ![b](data:image/png;base64,AA) ![c](//evil.dev/c.png)",
+   '<p>a b <a href="//evil.dev/c.png">c</a></p>'],
   ["bullet list", "- a\n- b\n  - c\n- d",
    "<ul><li>a</li><li>b<ul><li>c</li></ul></li><li>d</li></ul>"],
   ["ordered list with start", "3. three\n4. four", '<ol start="3"><li>three</li><li>four</li></ol>'],

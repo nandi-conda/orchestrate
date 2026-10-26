@@ -118,6 +118,12 @@ export function imports({ str, strs, vals, dispatch }) {
       return 1;
     },
     is_md: (h) => /\.(md|markdown)$/i.test(strs[h] ?? "") ? 1 : 0,
+    is_img: (h) => /\.(png|jpe?g|gif|webp|svg)$/i.test(strs[h] ?? "") ? 1 : 0,
+    path_join: (d, b, r) => {
+      const rel = strs[r] ?? "", base = strs[b] ?? "";
+      strs[d] = rel.startsWith("/") ? rel.replace(/^\/+/, "") : base ? base + "/" + rel : rel;
+    },
+    path_dir: (d, h) => { const p = strs[h] ?? ""; strs[d] = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : ""; },
     page_project: (d) => {
       const m = location.pathname.match(/^\/p\/([^/]+)/);
       if (!m) return 0;

@@ -102,7 +102,7 @@ tabs:
 | **Dialog** | The conversation: your messages, messages from other threads and the router, and the agent's replies, rendered as Markdown. Replies grow live as the model streams them. Each message shows when it was sent in your local time (hover it for the full date and zone). |
 | **Tools** | Every tool call the agent made (`python_repl` code) with its result. |
 | **Thinking** | The agent's reasoning steps in order, numbered, each rendered as Markdown under its time in your local time. A step still streaming shows last and grows live. |
-| **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane, with **Back** and **Download**; any other file downloads. `.git` is hidden. |
+| **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane and images (png, jpg, gif, webp, svg) open shown there, each with **Back** and **Download**; any other file downloads. Images a markdown file or a reply names by a worktree path (`![plot](out/plot.png)`, relative to the markdown file, or from the root with a leading `/`) show inline; remote images stay links. `.git` is hidden. |
 | **Worker log** | Where the thread stands (its binding and its worker's state, each with the reason), then the last 300 lines its runner wrote, with **Refresh**. The runner logs in UTC; its times show here, and on the control plane's stdout, in the control plane's local time. |
 
 The buttons in the title bar:
