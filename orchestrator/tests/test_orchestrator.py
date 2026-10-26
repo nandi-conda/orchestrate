@@ -600,6 +600,7 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
             tid = r.json()["spawned"][0]["id"]
             t = (await c.get(f"/api/threads/{tid}")).json()
             assert (t["state"], t["activity"]) == ("queued", "starting on a worker")
+            assert t["load"]["level"] == "busy"
             assert (await post({"text": "check csv too", "mode": "thread", "target": tid})).status_code == 200
             tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
             assert [(e["type"], e["text"]) for e in tr if e["type"] != "binding"] == [
@@ -1841,3 +1842,90 @@ async def test_a_thread_that_never_started_says_why(tmp_path):
     finally:
         await orch.close()
         await s.close()
+
+
+def test_a_threads_load_comes_to_one_level():
+    from control.load import BACKLOG, load_of
+
+    t = {"state": "idle", "binding": "bound", "busy_since": None}
+    assert load_of(t, 0, "ready", 100.0) == {"level": "idle", "backlog": 0, "busy_for": 0}
+    # A message on its way to an idle thread: it is about to be busy.
+    assert load_of(t, 1, "ready", 100.0)["level"] == "busy"
+    working = {**t, "state": "working", "busy_since": 40.0}
+    assert load_of(working, 0, "ready", 100.0) == {"level": "busy", "backlog": 0, "busy_for": 60}
+    assert load_of(working, BACKLOG, "ready", 100.0) == {"level": "backed_up", "backlog": BACKLOG, "busy_for": 60}
+    # Being put on a worker counts as busy; whatever it is sent waits on a worker that is away.
+    assert load_of({**t, "binding": "binding"}, 0, "", 100.0)["level"] == "busy"
+    assert load_of(working, BACKLOG, "unreachable", 100.0)["level"] == "stalled"
+    assert load_of(t, 0, "reattaching", 100.0)["level"] == "stalled"
+
+
+async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tmp_path, monkeypatch):
+    from control import store as store_mod
+
+    clock = iter(range(1, 1000))
+    monkeypatch.setattr(store_mod, "now", lambda: float(next(clock)))
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "T", "do it")
+    assert t["busy_since"] is not None  # a new thread is queued: its first turn has begun
+    idle = await s.update_thread(t["id"], state="idle")
+    assert idle["busy_since"] is None
+    first = await s.add_message(p["id"], "user", t["id"], "go")  # the message that starts its turn
+    await s.mark_read([first["id"]])
+    began = (await s.update_thread(t["id"], state="queued"))["busy_since"]
+    assert began > first["created_at"]
+    assert (await s.update_thread(t["id"], state="working"))["busy_since"] == began  # the same turn
+    assert await s.backlog(p["id"]) == {}
+    steer = await s.add_message(p["id"], "user", t["id"], "also this")  # delivered mid-turn: still to do
+    await s.mark_read([steer["id"]])
+    await s.add_message(p["id"], "router", t["id"], "and this")  # not delivered yet
+    assert await s.backlog(p["id"]) == {t["id"]: 2}
+    await s.update_thread(t["id"], state="idle")
+    assert await s.backlog(p["id"]) == {t["id"]: 1}  # the turn took what it was sent; one is still on its way
+    await s.update_thread(t["id"], archived_at=1.0)
+    assert await s.backlog(p["id"]) == {}
+    await s.close()
+
+
+class RecordingRouter(HeuristicRouter):
+    """The heuristic router, keeping the directory each plan was given."""
+
+    def __init__(self) -> None:
+        self.directories: list[list[dict]] = []
+
+    async def plan(self, request, directory):
+        self.directories.append(directory)
+        return await super().plan(request, directory)
+
+
+async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "2")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    router = RecordingRouter()
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), router, tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def working():
+        return (await s.get_thread(t["id"]))["state"] == "working"
+    await wait_for(working)
+    await orch.send(t["id"], "second")
+    await orch.send(t["id"], "third")
+    await orch.handle_request(p["id"], "something else", "auto")
+    seen = {d["id"]: d["load"] for d in router.directories[-1]}[t["id"]]
+    assert (seen["level"], seen["backlog"]) == ("backed_up", 2)
+    new = next(d for d in await orch.directory(p["id"]) if d["id"] != t["id"])
+    assert new["load"]["level"] == "busy"  # a new thread starts on its request
+
+    async def idle():
+        load = {d["id"]: d["load"] for d in await orch.directory(p["id"])}[t["id"]]
+        return load == {"level": "idle", "backlog": 0, "busy_for": 0}
+    await wait_for(idle, timeout=30)
+    await orch.close()
+    await orch.provider.close()
+    await s.close()

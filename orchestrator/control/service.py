@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 
 from .hub import Hub
+from .load import load_of
 from .providers import Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
 from .runner_client import RunnerClient
@@ -1002,6 +1003,18 @@ class Orchestrator:
                             "data": base64.b64encode(row["data"]).decode("ascii")})
         return out
 
+    async def directory(self, project_id: str, archived: bool = False) -> list[dict]:
+        """The project's live threads (or archived ones), each with its "load"
+        (load.py): what the router, the UI and peers see."""
+        threads = await self.store.list_threads(project_id, archived)
+        backlog, at = await self.store.backlog(project_id), time.time()
+        return [{**t, "load": load_of(t, backlog.get(t["id"], 0), self.worker_state(t)[0], at)} for t in threads]
+
+    async def with_load(self, t: dict) -> dict:
+        """One thread with its "load" (load.py)."""
+        backlog = await self.store.backlog(t["project_id"])
+        return {**t, "load": load_of(t, backlog.get(t["id"], 0), self.worker_state(t)[0], time.time())}
+
     def worker_state(self, t: dict) -> tuple[str, str]:
         """The state of the worker a thread is bound to and why, ("", "") when
         it is bound to none."""
@@ -1219,7 +1232,7 @@ class Orchestrator:
         """mode: auto (router decides), thread (send to target), new (force a new thread).
         `of` is the seq of the request event it routes; the route event names it,
         so an edit of the request knows which threads it reached."""
-        directory = await self.store.list_threads(project_id)
+        directory = await self.directory(project_id)
         if mode == "thread" and target:
             plan = {"spawn": [], "send": [{"thread": target, "message": text}], "why": "sent directly"}
         elif mode == "new":
@@ -1323,7 +1336,7 @@ class Orchestrator:
 
     async def _revise(self, ev: dict, previous: str, text: str) -> None:
         project_id, seq = ev["project_id"], ev["seq"]
-        directory = await self.store.list_threads(project_id)
+        directory = await self.directory(project_id)
         live = {t["id"] for t in directory}
         reached = [tid for tid in await self.reached(ev) if tid in live]
         plan = await self.router.revise(text, previous, reached, directory)

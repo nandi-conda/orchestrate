@@ -244,10 +244,10 @@ def fold(events: list[dict]) -> list[dict]:
 
 def thread_view(t: dict, orch: Orchestrator) -> dict:
     """A thread for the UI, with its binding and the state of the worker it
-    is bound to (states.py), each with why."""
+    is bound to (states.py), each with why, and its load (load.py)."""
     view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
                               "binding", "binding_reason", "worker_id", "files", "archived_at", "created_at",
-                              "updated_at")}
+                              "updated_at", "load")}
     view["worker_state"], view["worker_reason"] = orch.worker_state(t)
     return view
 
@@ -383,7 +383,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         """Live threads; ?archived=1 lists the archived ones instead."""
         archived = req.query_params.get("archived", "0") == "1"
         await orch().recover(req.path_params["pid"])
-        return JSONResponse([thread_view(t, orch()) for t in await store.list_threads(req.path_params["pid"], archived)])
+        return JSONResponse([thread_view(t, orch()) for t in await orch().directory(req.path_params["pid"], archived)])
 
     async def create_thread(req: Request):
         b = await body(req)
@@ -403,11 +403,11 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             return JSONResponse({"error": "no such project"}, 404)
         except (RuntimeError, ArchivedError) as e:
             return JSONResponse({"error": str(e)}, 409)
-        return JSONResponse(thread_view(t, orch()), 201)
+        return JSONResponse(thread_view(await orch().with_load(t), orch()), 201)
 
     async def get_thread(req: Request):
         t = await store.get_thread(req.path_params["tid"])
-        return JSONResponse(thread_view(t, orch())) if t else JSONResponse({"error": "no such thread"}, 404)
+        return JSONResponse(thread_view(await orch().with_load(t), orch())) if t else JSONResponse({"error": "no such thread"}, 404)
 
     async def thread_message(req: Request):
         tid = req.path_params["tid"]
@@ -452,14 +452,14 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             t = await orch().archive(req.path_params["tid"])
         except KeyError:
             return JSONResponse({"error": "no such thread"}, 404)
-        return JSONResponse(thread_view(t, orch()))
+        return JSONResponse(thread_view(await orch().with_load(t), orch()))
 
     async def thread_unarchive(req: Request):
         try:
             t = await orch().unarchive(req.path_params["tid"])
         except KeyError:
             return JSONResponse({"error": "no such thread"}, 404)
-        return JSONResponse(thread_view(t, orch()))
+        return JSONResponse(thread_view(await orch().with_load(t), orch()))
 
     async def worker_logs(req: Request):
         tid = req.path_params["tid"]

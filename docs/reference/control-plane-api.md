@@ -38,9 +38,9 @@ a message is delivered, the images are inlined as base64 for the runner.
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/projects/{id}/threads` | `?archived=1` for archived ones | the thread directory |
+| GET | `/api/projects/{id}/threads` | `?archived=1` for archived ones | the thread directory, each thread with its [load](../architecture/routing.md#thread-load) |
 | POST | `/api/projects/{id}/threads` | `{request?, images?, title?}` | 201 + a new thread, bypassing the router |
-| GET | `/api/threads/{id}` | | the thread, with its state, binding and reason |
+| GET | `/api/threads/{id}` | | the thread, with its state, binding and reason, and its load |
 | POST | `/api/threads/{id}/stop` | | `{ok}` |
 | POST | `/api/threads/{id}/respawn` | | 202 `{ok}`; the outcome arrives as the thread's `binding` events ([worker lifecycle](../worker-lifecycle.md)) |
 | POST | `/api/threads/{id}/archive` | | the thread, stopped first if running |

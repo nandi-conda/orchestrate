@@ -13,9 +13,11 @@ corrections leave out: threads for parts none of them covers, and notes to
 threads about what changed for them. An empty revision is a fine answer.
 
 `ModelRouter` asks a fast OpenAI-compatible model (deepseek-flash by default)
-with the thread directory as context. `HeuristicRouter` needs no model and is
-used when no key is set, or when the model's answer can't be used.
-Both lean toward spawning.
+with the thread directory as context, each thread with its load (load.py), so
+busy and backed-up threads get no new work: it goes to a new thread.
+`HeuristicRouter` needs no model and is used when no key is set, or when the
+model's answer can't be used. Both lean toward spawning; the heuristic one
+sends to an existing thread only when the person names it, whatever its load.
 """
 
 from __future__ import annotations
@@ -26,17 +28,30 @@ from typing import Protocol
 
 import httpx
 
-SYSTEM = """You route requests in a software project to agent threads.
-Each thread is a long-lived agent working in its own git worktree.
-Threads are cheap: prefer spawning a new thread. Reuse a thread only when the
-request clearly continues that thread's work. Split a request with several
-independent parts into several new threads. A request can also spawn threads
-and notify existing threads whose work it touches.
+LOAD = """Each thread has a `load` (how much it already has on its plate):
+`level` is "idle" (between turns, nothing waiting: it takes work at once),
+"busy" (in a turn), "backed_up" (`backlog` messages it has not got to are
+waiting on it) or "stalled" (its worker is not answering, so anything sent
+waits); `busy_for` is seconds into its current turn.
+"""
 
-Reply with JSON only:
+REPLY_FORMAT = """Reply with JSON only:
 {"spawn": [{"title": "<3-6 word title>", "request": "<the task for that thread>"}],
  "send": [{"thread": "<existing thread id>", "message": "<what to tell it>"}],
  "why": "<one sentence>"}"""
+
+SYSTEM = """You route requests in a software project to agent threads.
+Each thread is a long-lived agent working in its own git worktree.
+Threads are cheap: prefer spawning a new thread. Reuse a thread only when the
+request clearly continues that thread's work and the thread is idle. Split a
+request with several independent parts into several new threads. A request can
+also spawn threads and notify existing threads whose work it touches.
+""" + LOAD + """Send a busy thread a message only when it is about the work it is doing now
+(a correction, something it needs); new work, even work that follows on from
+it, goes to a new thread instead. Send a backed_up or stalled thread nothing
+it could do without: its messages wait behind the rest.
+
+""" + REPLY_FORMAT
 
 
 REVISE = """You route requests in a software project to agent threads.
@@ -49,11 +64,10 @@ spawn a thread for each part of the new text that no reached thread covers, and
 send a reached or other thread a message only to say what changed for it (for
 example that a part it had now has its own thread). An empty plan is a fine
 answer when the corrections cover the edit.
+""" + LOAD + """Send a busy thread only what concerns the work it is doing now, and a
+backed_up or stalled thread nothing it could do without.
 
-Reply with JSON only:
-{"spawn": [{"title": "<3-6 word title>", "request": "<the task for that thread>"}],
- "send": [{"thread": "<existing thread id>", "message": "<what to tell it>"}],
- "why": "<one sentence>"}"""
+""" + REPLY_FORMAT
 
 
 class Router(Protocol):
@@ -127,7 +141,7 @@ class ModelRouter:
         self.fallback = fallback or HeuristicRouter()
 
     async def _ask(self, system: str, content: dict, directory: list[dict]) -> dict:
-        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files")} for t in directory]
+        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load")} for t in directory]
         r = await self.http.post("/chat/completions", json={
             "model": self.model,
             "response_format": {"type": "json_object"},

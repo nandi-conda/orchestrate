@@ -31,7 +31,10 @@ worker with their next message.
 ## The project window
 
 The left side is the thread list: **Project activity** first, then the
-project's threads, each with its state. The right side is the pane for what
+project's threads, each with its state, and an "N waiting" badge when
+messages to it are piling up (red once it is backed up: the router then gives
+new work to a new thread instead; see
+[thread load](../architecture/routing.md#thread-load)). The right side is the pane for what
 you selected, with the request box under it.
 
 **Project activity** shows the router's decisions and every thread's events,

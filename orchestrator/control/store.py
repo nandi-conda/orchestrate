@@ -15,6 +15,11 @@ or only the archived ones. Working threads (queued or working) come first,
 then the rest; each group newest first, so a thread moves up when its turn
 starts and back when it ends, and nothing else reshuffles.
 
+A thread's `busy_since` is when the turn it is in began (its state queued,
+working or waiting), NULL between turns; `update_thread` keeps it as the state
+changes. With `backlog` (the messages to a thread it has not got to) it is
+what load.py makes a thread's load from.
+
 Events carry a project-wide sequence number (`seq`), so a client can resume a
 project or thread stream from `?after=seq`.
 
@@ -34,9 +39,10 @@ import time
 from collections import defaultdict
 from typing import Any, Protocol
 
-from .states import BINDING, WORKER
+from .states import BINDING, RUNNING, WORKER
 
 THREAD_STATES = ("queued", "working", "waiting", "idle", "done", "failed", "stopped")
+RUNNING_SQL = ", ".join(f"'{s}'" for s in sorted(RUNNING))
 
 
 def new_id(prefix: str) -> str:
@@ -91,6 +97,11 @@ class Store(Protocol):
                           reply_to: str | None = None, hops: int = 0) -> dict: ...
     async def list_messages(self, thread_id: str, unread_only: bool = False) -> list[dict]: ...
     async def mark_read(self, message_ids: list[str]) -> None: ...
+    async def backlog(self, project_id: str) -> dict[str, int]:
+        """Per live thread of the project, the messages to it it has not got
+        to: those not yet delivered to its runner, and those that came in
+        during the turn it is in (they steer that turn, so they are still on
+        its plate). Threads with none are left out."""
 
     async def add_image(self, project_id: str, media_type: str, data: bytes, name: str = "") -> dict:
         """Store an image's bytes; returns its reference for an event or message."""
@@ -139,7 +150,7 @@ SCHEMA = [
         activity TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
         token TEXT NOT NULL DEFAULT '', archived_at DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL, binding TEXT NOT NULL DEFAULT 'unbound',
-        binding_reason TEXT NOT NULL DEFAULT '')""",
+        binding_reason TEXT NOT NULL DEFAULT '', busy_since DOUBLE PRECISION)""",
     "CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id)",
     """CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, sender TEXT NOT NULL,
@@ -190,7 +201,8 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("threads", "binding_reason", "TEXT NOT NULL DEFAULT ''"),
                  ("workers", "state", "TEXT NOT NULL DEFAULT 'ready'"),
                  ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''"),
-                 ("events", "peer_id", "TEXT")]
+                 ("events", "peer_id", "TEXT"),
+                 ("threads", "busy_since", "DOUBLE PRECISION")]
 
 
 def _thread(row: dict) -> dict:
@@ -261,7 +273,8 @@ class _SqlStore:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
-               "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t}
+               "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
+               "busy_since": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         await self._exec(self._q(f"INSERT INTO threads ({cols}) VALUES ({marks})"), *row.values())
@@ -289,6 +302,16 @@ class _SqlStore:
                 raise ValueError(f"unknown thread binding {v}")
             sets.append(f"{k} = ?")
             args.append(json.dumps(v) if k == "files" else v)
+        if "state" in fields:
+            # busy_since: when its current turn began, kept while it stays in
+            # one (queued -> working), NULL when it is not in one. Read from
+            # the row as it was, so two updates cannot both start the turn.
+            if fields["state"] in RUNNING:
+                sets.append(f"busy_since = CASE WHEN state IN ({RUNNING_SQL}) AND busy_since IS NOT NULL "
+                            "THEN busy_since ELSE ? END")
+                args.append(now())
+            else:
+                sets.append("busy_since = NULL")
         if sets:
             sets.append("updated_at = ?")
             args += [now(), thread_id]
@@ -362,6 +385,14 @@ class _SqlStore:
         if unread_only:
             sql += " AND read_at IS NULL"
         return await self._fetch(self._q(sql + " ORDER BY created_at"), thread_id)
+
+    async def backlog(self, project_id: str) -> dict[str, int]:
+        rows = await self._fetch(self._q(
+            "SELECT m.to_thread AS id, COUNT(*) AS n FROM messages m JOIN threads t ON t.id = m.to_thread "
+            "WHERE t.project_id = ? AND t.archived_at IS NULL "
+            "AND (m.read_at IS NULL OR (t.busy_since IS NOT NULL AND m.created_at >= t.busy_since)) "
+            "GROUP BY m.to_thread"), project_id)
+        return {r["id"]: int(r["n"]) for r in rows}
 
     async def mark_read(self, message_ids: list[str]) -> None:
         t = now()

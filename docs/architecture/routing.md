@@ -27,7 +27,8 @@ sequenceDiagram
 2. Routing runs on the project's `request_chain`, so requests are planned in
    the order they were sent.
 3. The router gets the text and the project's thread directory (each live
-   thread's id, title, state, summary and files) and returns a plan:
+   thread's id, title, state, summary, files and [load](#thread-load)) and
+   returns a plan:
 
     ```json
     {"spawn": [{"title": "Fix Safari export", "request": "..."}],
@@ -51,12 +52,41 @@ image-only request also skips it and spawns one thread.
 
 | Router | When | How it decides |
 | --- | --- | --- |
-| `ModelRouter` | `DEEPSEEK_API_KEY` stored | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work, split independent parts into several threads, and notify threads whose work the request touches. |
-| `HeuristicRouter` | no key | `@t_xxx` sends to that thread; a bulleted or numbered list of two or more items spawns one thread per item; anything else spawns one thread. |
+| `ModelRouter` | `DEEPSEEK_API_KEY` stored | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
+| `HeuristicRouter` | no key | `@t_xxx` sends to that thread, whatever its load (you named it); a bulleted or numbered list of two or more items spawns one thread per item; anything else spawns one thread. |
 
 Plans are cleaned before use (`clean_plan`): sends to unknown threads and
 empty entries are dropped, titles are capped at 80 characters. A project runs
 at most 64 threads at once; a spawn past that is refused.
+
+### Thread load
+
+Each thread in the directory carries a `load`, made by `control/load.py` from
+what the control plane already knows:
+
+```json
+{"level": "backed_up", "backlog": 2, "busy_for": 312}
+```
+
+- `backlog` is the messages to the thread it has not got to
+  (`Store.backlog`): those not yet delivered to its runner, and those that
+  came in during its current turn (they steer that turn, so they are still on
+  its plate). The message that started the turn is not counted.
+- `busy_for` is seconds since its current turn began (`threads.busy_since`,
+  set when its state enters queued, working or waiting and cleared when it
+  leaves them), 0 between turns.
+- `level` is one of:
+
+| Level | When |
+| --- | --- |
+| `idle` | not in a turn, nothing waiting: takes new work at once |
+| `busy` | in a turn, being put on a worker, or one message on its way |
+| `backed_up` | `backlog` is 2 (`load.BACKLOG`) or more: what it is sent now waits behind them |
+| `stalled` | its worker is unreachable or being reattached: whatever it is sent waits for the worker |
+
+The thread list API (`GET /api/projects/{id}/threads`, `GET /api/threads/{id}`)
+returns the same `load`, and the UI shows the backlog as an "N waiting" badge
+beside the thread's state, marked once the thread is backed up.
 
 ## Sending never waits
 
