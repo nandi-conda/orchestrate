@@ -69,7 +69,9 @@ takes a minute to boot.
   on a worker"); binding runs as a background task.
 - `send` logs `message_in` itself and delivers on the thread's `thread_chain`
   once its binding is done, so messages to a thread still starting arrive, in
-  order, when it starts.
+  order, when it starts. A message from another thread is that one event,
+  with the sender as its `peer_id`, so both threads' logs list it and the UI
+  shows it once, as "sender → recipient".
 
 ## Threads
 

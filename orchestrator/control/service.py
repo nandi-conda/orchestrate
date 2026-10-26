@@ -638,13 +638,10 @@ class Orchestrator:
                                 reply_to: str | None = None, hops: int = 0) -> dict:
         project_id = lw.worker.project_id
         t = await self._own_thread(project_id, to)
-        src = await self.store.get_thread(sender) if sender else None
         try:
             await self.send(t["id"], str(body), sender or "unknown", int(hops or 0) + 1, reply_to)
         except ArchivedError as e:
             raise PeerCallError(str(e)) from None
-        if src and src["project_id"] == project_id:
-            await self.store.append_event(project_id, sender, "message_out", {"to": to, "body": body})
         return {"ok": True}
 
     async def peer_spawn_thread(self, lw: LiveWorker, parent: str | None, project: str, title: str,
@@ -897,7 +894,10 @@ class Orchestrator:
             payload["edit"] = edit
         if images:
             payload["images"] = images
-        await self.store.append_event(thread["project_id"], to, "message_in", payload)
+        # A message from another thread is one event, which the sender lists too.
+        src = await self.store.get_thread(sender)
+        peer = sender if src and src["project_id"] == thread["project_id"] else None
+        await self.store.append_event(thread["project_id"], to, "message_in", payload, peer)
         self._expect_echo(to, body)
         self._chain(self.thread_chain, to,
                     lambda: self._deliver(thread["project_id"], msg, hops, images))

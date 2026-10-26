@@ -1317,6 +1317,22 @@ def thread_link(id: i32) -> None:
     end()
 
 
+def peer_label(e: i32) -> None:
+    """A message to a thread from another one (or the router), shown once in
+    every pane: sender → recipient, a thread by its title."""
+    jstr(e, "from", h_t3)
+    if thread_index(h_t3) >= 0:
+        thread_link(h_t3)
+    else:
+        text_ref(h_t3)
+    el("span")
+    cls("ev-arrow")
+    text("→")
+    end()
+    jstr(e, "thread_id", h_t2)
+    thread_link(h_t2)
+
+
 def thread_tag(e: i32, show_thread: i32) -> None:
     if show_thread == 1:
         if j_str(e, "thread_id", h_t2) == 1:
@@ -1408,9 +1424,12 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls_if("ev-live", live == 1)
     cls_if("ev-editing", editing != 0 and editing == j_int(e, "seq"))
     div("ev-label")
-    jstr(e, "label", h_t1)
-    text_ref(h_t1)
-    thread_tag(e, show_thread)
+    if k == K_PEER:
+        peer_label(e)
+    else:
+        jstr(e, "label", h_t1)
+        text_ref(h_t1)
+        thread_tag(e, show_thread)
     end()
     event_images(e)
     jstr(e, "text", h_t1)

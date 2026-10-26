@@ -107,12 +107,10 @@ def display(ev: dict) -> dict:
         kind, label, text = K_USER, "You", d.get("text", "")
     elif t == "message_in":
         frm = d.get("from", "user")
-        kind, label = (K_USER, "You") if frm == "user" else (K_PEER, f"from {frm}")
+        kind, label = (K_USER, "You") if frm == "user" else (K_PEER, f"{frm} → {ev.get('thread_id')}")
         if "edit" in d:
             label = "You · edit"
         text = d.get("body", "")
-    elif t == "message_out":
-        kind, label, text = K_PEER, f"to {d.get('to', '?')}", d.get("body", "")
     elif t == "created":
         kind, label, text = K_REQUEST, "Request", d.get("request", "")
     elif t == "assistant":
@@ -169,6 +167,8 @@ def display(ev: dict) -> dict:
     else:
         kind, label, text = K_STATUS, t, short(json.dumps(d), 300)
     out = {**ev, "kind": kind, "label": label, "text": text, "editable": int(editable(ev))}
+    if kind == K_PEER:
+        out["from"] = d.get("from", "")
     images = d.get("images") or []
     if images:
         out["images"] = images

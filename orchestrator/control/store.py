@@ -71,9 +71,13 @@ class Store(Protocol):
     async def update_thread(self, thread_id: str, **fields: Any) -> dict | None: ...
 
     async def append_event(self, project_id: str, thread_id: str | None, type: str,
-                           payload: dict) -> dict: ...
+                           payload: dict, peer_id: str | None = None) -> dict:
+        """Log an event on a thread. `peer_id` is a second thread the event
+        belongs to: a message between threads is one event, on the thread it
+        went to, that the thread it came from lists too."""
     async def list_events(self, project_id: str, thread_id: str | None = None,
-                          after: int = 0, limit: int = 500) -> list[dict]: ...
+                          after: int = 0, limit: int = 500) -> list[dict]:
+        """The project's events, or a thread's (its own and those it is the peer of)."""
     async def recent_events(self, project_id: str, thread_id: str | None = None, *,
                             limit: int) -> list[dict]:
         """The newest `limit` events, oldest first: the window a pane shows of a
@@ -185,7 +189,8 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("threads", "binding", "TEXT NOT NULL DEFAULT 'unbound'"),
                  ("threads", "binding_reason", "TEXT NOT NULL DEFAULT ''"),
                  ("workers", "state", "TEXT NOT NULL DEFAULT 'ready'"),
-                 ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''")]
+                 ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''"),
+                 ("events", "peer_id", "TEXT")]
 
 
 def _thread(row: dict) -> dict:
@@ -292,19 +297,30 @@ class _SqlStore:
 
     # events
     async def append_event(self, project_id: str, thread_id: str | None, type: str,
-                           payload: dict) -> dict:
+                           payload: dict, peer_id: str | None = None) -> dict:
         t = now()
-        seq = await self._insert_event((project_id, thread_id, type, json.dumps(payload), t))
+        seq = await self._insert_event((project_id, thread_id, type, json.dumps(payload), t, peer_id))
         self.notifier.poke(project_id)
         return {"seq": seq, "project_id": project_id, "thread_id": thread_id, "type": type,
-                "payload": payload, "created_at": t}
+                "payload": payload, "created_at": t, "peer_id": peer_id}
+
+    async def _merge_peer_messages(self) -> None:
+        """Once, when events gain `peer_id`: a message between threads used to
+        be two events, `message_out` on the sender and `message_in` on the
+        recipient. The `message_in` becomes the one event, listed by both."""
+        threads = {r["id"] for r in await self._fetch("SELECT id FROM threads")}
+        for r in await self._fetch("SELECT seq, payload FROM events WHERE type = 'message_in'"):
+            frm = json.loads(r["payload"]).get("from")
+            if frm in threads:
+                await self._exec(self._q("UPDATE events SET peer_id = ? WHERE seq = ?"), frm, r["seq"])
+        await self._exec("DELETE FROM events WHERE type = 'message_out'")
 
     async def list_events(self, project_id: str, thread_id: str | None = None,
                           after: int = 0, limit: int = 500) -> list[dict]:
         if thread_id:
-            rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND thread_id = ? "
+            rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND (thread_id = ? OR peer_id = ?) "
                                              "AND seq > ? ORDER BY seq LIMIT ?"),
-                                     project_id, thread_id, after, limit)
+                                     project_id, thread_id, thread_id, after, limit)
         else:
             rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND seq > ? "
                                              "ORDER BY seq LIMIT ?"), project_id, after, limit)
@@ -313,8 +329,8 @@ class _SqlStore:
     async def recent_events(self, project_id: str, thread_id: str | None = None, *,
                             limit: int) -> list[dict]:
         if thread_id:
-            rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND thread_id = ? "
-                                             "ORDER BY seq DESC LIMIT ?"), project_id, thread_id, limit)
+            rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? AND (thread_id = ? OR peer_id = ?) "
+                                             "ORDER BY seq DESC LIMIT ?"), project_id, thread_id, thread_id, limit)
         else:
             rows = await self._fetch(self._q("SELECT * FROM events WHERE project_id = ? "
                                              "ORDER BY seq DESC LIMIT ?"), project_id, limit)
@@ -403,12 +419,16 @@ class SqliteStore(_SqlStore):
         await self.db.execute("PRAGMA journal_mode=WAL")
         for stmt in SCHEMA + [SQLITE_EVENTS, EVENTS_INDEX, SQLITE_IMAGES]:
             await self.db.execute(stmt)
+        added = set()
         for table, column, definition in ADDED_COLUMNS:
             async with self.db.execute(f"PRAGMA table_info({table})") as cur:
                 have = {r["name"] for r in await cur.fetchall()}
             if column not in have:
                 await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                added.add((table, column))
         await self.db.commit()
+        if ("events", "peer_id") in added:
+            await self._merge_peer_messages()
 
     async def close(self) -> None:
         if self.db is not None:
@@ -423,8 +443,8 @@ class SqliteStore(_SqlStore):
             return [dict(r) for r in await cur.fetchall()]
 
     async def _insert_event(self, row: tuple) -> int:
-        cur = await self.db.execute("INSERT INTO events (project_id, thread_id, type, payload, created_at) "
-                                    "VALUES (?, ?, ?, ?, ?)", row)
+        cur = await self.db.execute("INSERT INTO events (project_id, thread_id, type, payload, created_at, "
+                                    "peer_id) VALUES (?, ?, ?, ?, ?, ?)", row)
         await self.db.commit()
         return cur.lastrowid
 
@@ -455,8 +475,12 @@ class PostgresStore(_SqlStore):
         async with self.pool.acquire() as c:
             for stmt in SCHEMA + [PG_EVENTS, EVENTS_INDEX, PG_IMAGES]:
                 await c.execute(stmt)
+            had_peer_id = await c.fetchval("SELECT 1 FROM information_schema.columns "
+                                           "WHERE table_name = 'events' AND column_name = 'peer_id'")
             for table, column, definition in ADDED_COLUMNS:
                 await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+        if not had_peer_id:
+            await self._merge_peer_messages()
         # A dedicated connection hears appends made by any instance.
         self._listener = await asyncpg.connect(self.dsn)
         await self._listener.add_listener(self.CHANNEL, lambda *a: self.notifier.poke(a[3]))
@@ -477,8 +501,8 @@ class PostgresStore(_SqlStore):
 
     async def _insert_event(self, row: tuple) -> int:
         async with self.pool.acquire() as c:
-            seq = await c.fetchval("INSERT INTO events (project_id, thread_id, type, payload, created_at) "
-                                   "VALUES ($1, $2, $3, $4, $5) RETURNING seq", *row)
+            seq = await c.fetchval("INSERT INTO events (project_id, thread_id, type, payload, created_at, peer_id) "
+                                   "VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq", *row)
             await c.execute("SELECT pg_notify($1, $2)", self.CHANNEL, row[0])
             return seq
 

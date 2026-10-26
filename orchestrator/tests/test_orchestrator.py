@@ -1506,6 +1506,58 @@ def test_only_what_the_person_typed_is_a_user_row():
     assert kind("message_in", {"from": "router", "body": "x"}) == app_mod.K_PEER
 
 
+async def test_a_message_between_threads_is_one_event_both_list(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
+    a = await orch.spawn(p["id"], "A", "first")
+    b = await orch.spawn(p["id"], "B", "second")
+    await orch.send(b["id"], "hello b", a["id"], 1)
+    sent = [e for e in await s.list_events(p["id"]) if e["payload"].get("body") == "hello b"]
+    assert [(e["type"], e["thread_id"], e["peer_id"]) for e in sent] == [("message_in", b["id"], a["id"])]
+    for tid in (a["id"], b["id"]):
+        assert [e["seq"] for e in await s.list_events(p["id"], tid) if e["payload"].get("body") == "hello b"] \
+            == [sent[0]["seq"]]
+        assert [e["seq"] for e in await s.recent_events(p["id"], tid, limit=50)
+                if e["payload"].get("body") == "hello b"] == [sent[0]["seq"]]
+    row = app_mod.display(sent[0])
+    assert (row["kind"], row["from"], row["label"]) == (app_mod.K_PEER, a["id"], f"{a['id']} → {b['id']}")
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
+async def test_old_two_event_peer_messages_merge_into_one(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "db.sqlite")
+    s = SqliteStore(path)
+    await s.open()
+    p = await s.create_project("demo")
+    a = await s.create_thread(p["id"], "A", "")
+    b = await s.create_thread(p["id"], "B", "")
+    await s.close()
+    # A log from before events had peer_id: the message is logged on both sides.
+    async with aiosqlite.connect(path) as db:
+        await db.execute("ALTER TABLE events DROP COLUMN peer_id")
+        for tid, typ, payload in ((a["id"], "message_out", {"to": b["id"], "body": "hi"}),
+                                  (b["id"], "message_in", {"from": a["id"], "body": "hi"}),
+                                  (b["id"], "message_in", {"from": "user", "body": "yo"})):
+            await db.execute("INSERT INTO events (project_id, thread_id, type, payload, created_at) "
+                             "VALUES (?, ?, ?, ?, 0)", (p["id"], tid, typ, json.dumps(payload)))
+        await db.commit()
+    s = SqliteStore(path)
+    await s.open()
+    got = [(e["type"], e["thread_id"], e["peer_id"], e["payload"]["body"]) for e in await s.list_events(p["id"])]
+    assert got == [("message_in", b["id"], a["id"], "hi"), ("message_in", b["id"], None, "yo")]
+    assert [e["payload"]["body"] for e in await s.list_events(p["id"], a["id"])] == ["hi"]
+    await s.close()
+
+
 async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     from control.service import Orchestrator
 
@@ -1519,7 +1571,7 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     await orch.handle_request(p["id"], "direct", "thread", t["id"])
     got = [(e["payload"]["from"], app_mod.display(e)["label"]) for e in await s.list_events(p["id"], t["id"])
            if e["type"] == "message_in"]
-    assert got == [("router", "from router"), ("user", "You")]
+    assert got == [("router", f"router → {t['id']}"), ("user", "You")]
     await orch.close()
     await orch.provider.close()
     await s.close()
