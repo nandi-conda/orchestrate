@@ -11,6 +11,7 @@ from control import paths
 from control.app import create_app
 from control.hub import Hub
 from control.providers import LocalProvider
+from tests.doubles import ECHO_RUNNER
 from control.store import SqliteStore, store_from_url
 
 pytestmark = pytest.mark.anyio
@@ -29,7 +30,7 @@ def test_the_defaults_are_in_the_users_data_directory():
     assert paths.DATA == Path.home() / ".orchestrate"
     assert SqliteStore().path == paths.DB == paths.DATA / "orchestrator.db"
     assert store_from_url(None).path == paths.DB
-    assert LocalProvider(use_devrunner=True).workdir == paths.WORKERS == paths.DATA / "workers"
+    assert LocalProvider(command=ECHO_RUNNER).workdir == paths.WORKERS == paths.DATA / "workers"
     assert inspect.signature(create_app).parameters["repos"].default == paths.REPOS == paths.DATA / "repos"
 
 

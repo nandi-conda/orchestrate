@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from control import paths
 from control.app import create_app
-from control.secrets import warn_optional
+from control.secrets import require, warn_optional
 from control.store import store_from_url
 
 from .server import ControlPlane
@@ -28,7 +28,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     paths.migrate()
     logging.getLogger("httpx").setLevel(logging.WARNING)  # a line per request to every worker otherwise
-    warn_optional(["DEEPSEEK_API_KEY", "SPRITES_TOKEN", "GITHUB_TOKEN"])
+    require(["DEEPSEEK_API_KEY"])  # the router and every worker's model
+    warn_optional(["SPRITES_TOKEN", "GITHUB_TOKEN"])
     prepare_qt()
     app = QApplication([sys.argv[0], *rest])
     app.setApplicationName("Orchestrator")

@@ -52,8 +52,11 @@ image-only request also skips it and spawns one thread.
 
 | Router | When | How it decides |
 | --- | --- | --- |
-| `ModelRouter` | `DEEPSEEK_API_KEY` stored | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
-| `HeuristicRouter` | no key | `@t_xxx` sends to that thread, whatever its load (you named it); a bulleted or numbered list of two or more items spawns one thread per item; anything else spawns one thread. |
+| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
+
+A request the model cannot plan (unreachable, an answer that is not a plan, or
+a plan that does nothing) is logged as an `error` event in the project; there
+is no rule-based stand-in outside the tests (`tests/doubles.py`).
 
 Plans are cleaned before use (`clean_plan`): sends to unknown threads and
 empty entries are dropped, titles are capped at 80 characters. A project runs
@@ -138,8 +141,7 @@ change). Re-assessment runs on `request_chain`, after the original's routing:
    Nothing is stopped; ended threads come back and act on it.
 3. `Router.revise(request, previous, reached, directory)` plans only what the
    corrections leave out. `ModelRouter` uses a revision prompt for which an
-   empty plan is a fine answer; `HeuristicRouter` spawns one thread per list
-   item that is new in the edit. The result is logged as a `route` event with
+   empty plan is a fine answer. The result is logged as a `route` event with
    `mode: "edit"`.
 
 ## Events

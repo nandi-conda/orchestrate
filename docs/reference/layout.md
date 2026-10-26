@@ -7,13 +7,13 @@
 | `control/app.py` | Starlette app: the UI API, SSE streams, the static UI |
 | `control/service.py` | `Orchestrator`: workers, bindings, spawning, messaging, event relay, peer calls, requests and edits |
 | `control/states.py` | the worker and binding state machines |
-| `control/router.py` | `ModelRouter` (DeepSeek) and `HeuristicRouter` |
+| `control/router.py` | `ModelRouter` (DeepSeek) |
 | `control/store.py` | the `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/hub.py` | the per-project hub repository: join a remote, take a thread's refs, land |
 | `control/gitio.py` | git subprocess and bundle helpers |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` |
 | `control/runner_client.py` | HTTP client for the runner API |
-| `control/devrunner.py` | the echo runner, speaking the same API with no model |
+| `tests/devrunner.py` | the tests' echo runner, speaking the same API with no model |
 | `control/paths.py` | where the data lives (`~/.orchestrate`), and the one-time move from the checkout |
 | `control/secrets.py` | environment-then-keyring secret lookup |
 | `control/server.py` | uvicorn server that ends SSE streams on shutdown |

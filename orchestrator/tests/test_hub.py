@@ -12,7 +12,7 @@ import pytest
 from control.gitio import GitError
 from control.hub import Hub
 from control.providers import LocalProvider
-from control.router import HeuristicRouter
+from tests.doubles import ECHO_RUNNER, HeuristicRouter
 from control.service import Orchestrator
 from control.store import SqliteStore
 
@@ -48,7 +48,7 @@ async def setup(tmp_path, repo_url="", workers="w"):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / workers), use_devrunner=True),
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / workers), command=ECHO_RUNNER),
                         HeuristicRouter(), tmp_path / "repos")
     if repo_url:
         p = await orch.update_project(p["id"], repo_url=repo_url)
@@ -210,7 +210,7 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
     await first.provider.close()
 
     # Its worker's disk is gone: the next control plane makes the worker again in a new directory.
-    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), use_devrunner=True),
+    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), command=ECHO_RUNNER),
                           HeuristicRouter(), tmp_path / "repos")
     await second.respawn(t["id"])
 
@@ -365,7 +365,7 @@ async def opened(tmp_path, folder):
     """A project opened from `folder` on disk, and its orchestrator."""
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True),
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
                         HeuristicRouter(), tmp_path / "repos")
     p = await orch.create_project("demo", "", str(folder))
     return s, p, orch
@@ -490,7 +490,7 @@ async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
     git(seed, "checkout", "-q", "--detach")
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True),
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
                         HeuristicRouter(), tmp_path / "repos")
     for folder, reason in ((tmp_path / "nope", "there is no folder"),
                            (seed / "sub", "inside the git repository"),

@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from control import providers, secrets
+from tests.doubles import ECHO_RUNNER
 from control.service import worker_spec
 
 pytestmark = pytest.mark.anyio
@@ -47,14 +48,14 @@ def test_a_devrunner_goes_when_the_process_that_started_it_is_gone(tmp_path):
     behind (control/app.py's lifespan, LocalProvider.close), but one that is
     killed without the chance -- a test run that dies, a window killed
     mid-start -- used to leave its runner behind for days
-    (control/devrunner.py, watch_parent)."""
+    (tests/devrunner.py, watch_parent)."""
     port = providers.free_port()
     # A parent of our own that starts the runner and then waits, so this test
     # can kill it outright and watch what the runner does about it.
     parent = subprocess.Popen(
         [sys.executable, "-c",
          "import subprocess, sys, time\n"
-         "subprocess.Popen([sys.executable, '-m', 'control.devrunner'])\n"
+         "subprocess.Popen([sys.executable, '-m', 'tests.devrunner'])\n"
          "time.sleep(60)\n"],
         cwd=str(Path(providers.__file__).resolve().parents[1]),
         env={**os.environ, "RUNNER_PORT": str(port), "RUNNER_WORKDIR": str(tmp_path)})
@@ -197,6 +198,29 @@ async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
         await p.close()
 
 
+def test_without_the_model_key_there_are_no_local_workers_and_no_router(env):
+    """No echo runner and no rule-based router stand in for the model: a
+    missing DEEPSEEK_API_KEY is refused, by name."""
+    from control.router import default_router
+
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+        providers.LocalProvider()
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+        default_router()
+
+
+async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
+    from control.router import ModelRouter
+
+    async def empty(*_):
+        return {"spawn": [], "send": [], "why": ""}
+
+    r = ModelRouter("key")
+    monkeypatch.setattr(r, "_ask", empty)
+    with pytest.raises(ValueError, match="planned nothing"):
+        await r.plan("do it", [])
+
+
 async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
@@ -337,7 +361,7 @@ async def test_a_sprite_serving_other_code_is_refused(env):
 async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypatch):
     import sys
 
-    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    p = providers.LocalProvider(workdir=str(tmp_path), command=ECHO_RUNNER)
     monkeypatch.setattr(p, "command", lambda: [sys.executable, "-c",
                                                "print('bubblewrap cannot make a sandbox here'); raise SystemExit(1)"])
     with pytest.raises(RuntimeError, match="exited with code 1.*\n.*bubblewrap cannot make a sandbox here"):
@@ -345,7 +369,7 @@ async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypat
 
 
 async def test_local_follow_yields_the_backlog_then_each_new_line(tmp_path):
-    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    p = providers.LocalProvider(workdir=str(tmp_path), command=ECHO_RUNNER)
     w = providers.Worker(id="p-w0", provider="local", handle="", url="")
     (tmp_path / "p-w0").mkdir()
     path = p.log_path("p-w0")
@@ -470,7 +494,7 @@ async def test_sprites_sweep_destroys_ours_outside_the_slots_only(env):
 async def test_local_sweep_deletes_worker_directories_outside_the_slots(tmp_path):
     for d in ("w1", "w2", "w3", "p_1-w1"):
         (tmp_path / d).mkdir()
-    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    p = providers.LocalProvider(workdir=str(tmp_path), command=ECHO_RUNNER)
     assert await p.sweep(2) == ["p_1-w1", "w3"]
     assert sorted(d.name for d in tmp_path.iterdir()) == ["w1", "w2"]
 

@@ -7,9 +7,8 @@ a slot always names the same worker, so the pool never holds more workers
 than it has slots, and a provider can tell which of the workers it has are
 the pool's (`sweep` destroys the rest).
 
-- `LocalProvider` starts runners as subprocesses on this machine. It runs the
-  real runner from ../runner when that exists, else the built-in echo runner
-  (control.devrunner), so the whole loop works without any credentials.
+- `LocalProvider` starts runners from ../runner as subprocesses on this
+  machine. It needs DEEPSEEK_API_KEY, as the runner does.
 - `SpritesProvider` makes a Fly Sprite per slot, `orch-w<n>`, labeled
   `orchestrator`, installs the runner on it and runs it as a sprite service
   on port 8080.
@@ -210,26 +209,26 @@ class LocalProvider:
     name = "local"
 
     def __init__(self, runner_dir: str | None = None, workdir: str | Path = paths.WORKERS,
-                 use_devrunner: bool | None = None) -> None:
+                 command: list[str] | None = None) -> None:
+        """Runs the runner from `runner_dir` (../runner by default). `command`
+        replaces it, for the tests' echo runner (tests/doubles.py)."""
         default = Path(__file__).resolve().parents[2] / "runner"
         self.runner_dir = Path(runner_dir) if runner_dir else default
-        if use_devrunner is None:
-            from .secrets import get_secret
+        if command is None:
+            from .secrets import get_secret, missing_message
 
-            use_devrunner = (not (self.runner_dir / "pixi.toml").exists()
-                             or not get_secret("DEEPSEEK_API_KEY"))
-            if use_devrunner:
-                print("LocalProvider: using the echo runner (control.devrunner). The real runner needs "
-                      "runner/ and DEEPSEEK_API_KEY (env or keyring).", file=sys.stderr)
-        self.use_devrunner = use_devrunner
+            if not (self.runner_dir / "pixi.toml").exists():
+                raise RuntimeError(f"LocalProvider needs the runner project at {self.runner_dir}")
+            if not get_secret("DEEPSEEK_API_KEY"):
+                raise RuntimeError(missing_message(["DEEPSEEK_API_KEY"]))
+            pixi = shutil.which("pixi") or "pixi"
+            command = [pixi, "run", "--manifest-path", str(self.runner_dir / "pixi.toml"), "serve"]
+        self._command = command
         self.workdir = Path(workdir)
         self.procs: dict[str, asyncio.subprocess.Process] = {}
 
     def command(self) -> list[str]:
-        if self.use_devrunner:
-            return [sys.executable, "-m", "control.devrunner"]
-        pixi = shutil.which("pixi") or "pixi"
-        return [pixi, "run", "--manifest-path", str(self.runner_dir / "pixi.toml"), "serve"]
+        return self._command
 
     async def create(self, spec: WorkerSpec) -> Worker:
         port = free_port()
@@ -652,9 +651,8 @@ def service_log_lines(ev: dict) -> list[str]:
 
 
 class AutoProvider:
-    """Remote first: workers are sprites whenever a token is stored. Without a
-    token the control plane falls back to local workers, so the offline echo
-    demo still works. Either way the control plane opens every connection, so
+    """Remote first: workers are sprites whenever a token is stored, local
+    runner processes otherwise. Either way the control plane opens every connection, so
     where it runs never matters to the worker."""
 
     name = "auto"

@@ -37,8 +37,8 @@ pixi run set-key SPRITES_TOKEN        # run workers on Fly Sprites
 pixi run desktop                      # the UI in a window, control plane in-process
 ```
 
-No keys at all still works: the control plane falls back to an echo runner and
-a rule-based router, so you can click through the whole UI offline. See
+`DEEPSEEK_API_KEY` is required: without it the control plane stops at startup
+and says how to store it. See
 [Getting started](guide/getting-started.md) for the details and
 [Credentials and configuration](guide/configuration.md) for exactly what each
 key is and how it is sent.

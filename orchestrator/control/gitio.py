@@ -1,5 +1,5 @@
-"""Git plumbing shared by the hub (control/hub.py) and the echo runner's
-worker repository (control/devrunner.py): running git, and git bundles, which
+"""Git plumbing shared by the hub (control/hub.py) and the tests' echo runner's
+worker repository (tests/devrunner.py): running git, and git bundles, which
 carry commits between a project's hub and its workers (runner/API.md,
 "Repository"). The runner has its own copy in runner/src/runner/repo.py; the
 two are separate pixi projects."""

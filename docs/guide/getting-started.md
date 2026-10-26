@@ -63,8 +63,8 @@ Then create a project, type a request, and press Enter. The
 
 | Stored | Workers | Router |
 | --- | --- | --- |
-| nothing | local echo runner (`control.devrunner`), a pool of 3 shared by every project | rule-based (`HeuristicRouter`) |
-| `DEEPSEEK_API_KEY` | the real runner as a local subprocess (Linux) | `deepseek-flash` (`ModelRouter`) |
+| nothing | the control plane does not start: `DEEPSEEK_API_KEY` is required | |
+| `DEEPSEEK_API_KEY` | the real runner as a local subprocess (Linux), a pool of 3 shared by every project | `deepseek-flash` (`ModelRouter`) |
 | `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, a pool of 3: `orch-w1`..`orch-w3` | `deepseek-flash` |
 
 !!! warning "Sprites cost money"
@@ -84,11 +84,12 @@ Then create a project, type a request, and press Enter. The
     commit. The clone uses no credentials, so the repository must be publicly
     readable.
 
-## The echo runner
+## The echo runner (tests only)
 
-Without `DEEPSEEK_API_KEY`, threads run on `control.devrunner`, which speaks
-the runner API with no model. It understands a few lines, so thread-to-thread
-traffic and the git path can be exercised offline:
+The orchestrator's tests run threads on `tests/devrunner.py`, which speaks the
+runner API with no model; the control plane never uses it. It understands a
+few lines, so thread-to-thread traffic and the git path can be exercised
+offline:
 
 | Line | Effect |
 | --- | --- |

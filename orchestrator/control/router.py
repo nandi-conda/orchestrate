@@ -15,9 +15,9 @@ threads about what changed for them. An empty revision is a fine answer.
 `ModelRouter` asks a fast OpenAI-compatible model (deepseek-flash by default)
 with the thread directory as context, each thread with its load (load.py), so
 busy and backed-up threads get no new work: it goes to a new thread.
-`HeuristicRouter` needs no model and is used when no key is set, or when the
-model's answer can't be used. Both lean toward spawning; the heuristic one
-sends to an existing thread only when the person names it, whatever its load.
+It leans toward spawning. A request it cannot plan (the model unreachable,
+an answer that is not a plan) is an error the project shows; there is no
+model-less router outside the tests (tests/doubles.py).
 """
 
 from __future__ import annotations
@@ -83,43 +83,6 @@ def title_for(text: str) -> str:
     return (title[:60] + "…") if len(title) > 60 else (title or "New thread")
 
 
-ITEM = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.*\S)\s*$")
-MENTION = re.compile(r"(?<!\w)@(t_[0-9a-zA-Z]+)")
-
-
-class HeuristicRouter:
-    """No model: `@t_xxx` sends to that thread, a bulleted or numbered list
-    fans out one thread per item, anything else spawns one thread."""
-
-    async def plan(self, request: str, directory: list[dict]) -> dict:
-        known = {t["id"] for t in directory}
-        targets = [m for m in MENTION.findall(request) if m in known]
-        if targets:
-            body = MENTION.sub("", request).strip()
-            return {"spawn": [], "send": [{"thread": t, "message": body} for t in targets],
-                    "why": "the request names existing threads"}
-        items = [m.group(1) for line in request.splitlines() if (m := ITEM.match(line))]
-        if len(items) >= 2:
-            return {"spawn": [{"title": title_for(i), "request": i} for i in items], "send": [],
-                    "why": f"{len(items)} independent items, one thread each"}
-        return {"spawn": [{"title": title_for(request), "request": request}], "send": [],
-                "why": "new work gets a new thread"}
-
-
-    async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict]) -> dict:
-        """Items of a list that are new in the edit get a thread each; the
-        rest is left to the corrections. An edit that reached no thread is
-        planned like a new request."""
-        if not reached:
-            return await self.plan(request, directory)
-        old = {m.group(1) for line in previous.splitlines() if (m := ITEM.match(line))}
-        new = [m.group(1) for line in request.splitlines() if (m := ITEM.match(line)) and m.group(1) not in old]
-        if new:
-            return {"spawn": [{"title": title_for(i), "request": i} for i in new], "send": [],
-                    "why": f"{len(new)} new item{'s' if len(new) > 1 else ''} in the edit, one thread each"}
-        return {"spawn": [], "send": [], "why": "the threads on it take the edit as a correction"}
-
-
 def clean_plan(plan: dict, directory: list[dict]) -> dict:
     """Keep only well-formed entries that point at real threads."""
     known = {t["id"] for t in directory}
@@ -134,11 +97,10 @@ def clean_plan(plan: dict, directory: list[dict]) -> dict:
 
 class ModelRouter:
     def __init__(self, api_key: str, model: str = "deepseek-flash",
-                 base_url: str = "https://api.deepseek.com", fallback: Router | None = None) -> None:
+                 base_url: str = "https://api.deepseek.com") -> None:
         self.model = model
         self.http = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0,
                                       headers={"authorization": f"Bearer {api_key}"})
-        self.fallback = fallback or HeuristicRouter()
 
     async def _ask(self, system: str, content: dict, directory: list[dict]) -> dict:
         threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load")} for t in directory]
@@ -152,24 +114,14 @@ class ModelRouter:
         return clean_plan(json.loads(r.json()["choices"][0]["message"]["content"]), directory)
 
     async def plan(self, request: str, directory: list[dict]) -> dict:
-        try:
-            plan = await self._ask(SYSTEM, {"request": request}, directory)
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as e:
-            plan = await self.fallback.plan(request, directory)
-            plan["why"] += f" (router model unavailable: {type(e).__name__})"
-            return plan
+        plan = await self._ask(SYSTEM, {"request": request}, directory)
         if not plan["spawn"] and not plan["send"]:
-            return await self.fallback.plan(request, directory)
+            raise ValueError(f"the router model ({self.model}) planned nothing for the request")
         return plan
 
     async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict]) -> dict:
-        try:
-            return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
-                                   directory)
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as e:
-            plan = await self.fallback.revise(request, previous, reached, directory)
-            plan["why"] += f" (router model unavailable: {type(e).__name__})"
-            return plan
+        return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
+                               directory)
 
 
 ROUTER_MODEL = "deepseek-flash"
@@ -177,9 +129,12 @@ MODEL_BASE_URL = "https://api.deepseek.com"
 
 
 def default_router() -> Router:
-    """The router asks a model when the DeepSeek key is stored, and decides by
-    rule when it is not, so the UI works without credentials."""
-    from .secrets import get_secret
+    """The router asks the model; the control plane does not start without
+    DEEPSEEK_API_KEY (control/__main__.py, desktop/__main__.py, the Android
+    app's Keys screen)."""
+    from .secrets import get_secret, missing_message
 
     key = get_secret("DEEPSEEK_API_KEY")
-    return ModelRouter(key, ROUTER_MODEL, MODEL_BASE_URL) if key else HeuristicRouter()
+    if not key:
+        raise RuntimeError(missing_message(["DEEPSEEK_API_KEY"]))
+    return ModelRouter(key, ROUTER_MODEL, MODEL_BASE_URL)

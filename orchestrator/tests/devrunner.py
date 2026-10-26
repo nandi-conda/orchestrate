@@ -1,4 +1,4 @@
-"""An echo runner that speaks runner/API.md, for tests and offline UI work.
+"""An echo runner that speaks runner/API.md, for the tests only.
 
 It has no model. Each turn it says what it got, and:
 - a line `spawn: <task>` in a request spawns a child thread through the peer API,
@@ -26,8 +26,8 @@ per line, so a thread brought back on another worker says how many it had.
 Peer calls wait on /peer/calls for the control plane to collect, as in
 runner/API.md.
 
-The control plane uses it when ../runner is missing or DEEPSEEK_API_KEY is not
-stored.
+The tests start it through LocalProvider(command=ECHO_RUNNER) (tests/doubles.py);
+the control plane itself never does.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .gitio import Checkout, GitError, refs_header
+from control.gitio import Checkout, GitError, refs_header
 
 SPAWN = re.compile(r"^\s*spawn:\s*(.+)$", re.M)
 TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
