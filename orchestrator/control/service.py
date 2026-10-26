@@ -804,6 +804,10 @@ class Orchestrator:
         tid, project = t["id"], await self.store.get_project(t["project_id"])
         if lw is None:
             lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
+        there = await lw.client.get_thread(tid)
+        if there is not None and there.get("state") not in ENDED:
+            # The runner still runs it; only this control plane lost track of where.
+            return await self._bind(lw, tid, {"state": there["state"]}, {"worker": lw.worker.id, "request": False, "found": True})
         await self._ship(lw, project, tid)
         request, images = None, None
         if not await (await self.hub(project)).saved(tid):
@@ -820,17 +824,18 @@ class Orchestrator:
             if request is not None:
                 self._echoed(tid, request)
             raise
+        return await self._bind(lw, tid, {} if request is not None else {"state": "idle"},
+                                {"worker": lw.worker.id, "request": request is not None})
+
+    async def _bind(self, lw: LiveWorker, tid: str, fields: dict, revived: dict) -> LiveWorker:
+        """Record that the thread now runs on `lw`, and log its revival."""
         old = self.by_thread.get(tid)
         if old is not None:
             old.threads.discard(tid)
         lw.threads.add(tid)
         self.by_thread[tid] = lw
-        fields = {"worker_id": lw.worker.id, "activity": ""}
-        if request is None:
-            fields["state"] = "idle"
-        await self.store.update_thread(tid, **fields)
-        await self.store.append_event(project["id"], tid, "revived",
-                                      {"worker": lw.worker.id, "request": request is not None})
+        t = await self.store.update_thread(tid, worker_id=lw.worker.id, activity="", **fields)
+        await self.store.append_event(t["project_id"], tid, "revived", revived)
         return lw
 
     async def respawn(self, thread_id: str) -> None:
@@ -903,7 +908,9 @@ class Orchestrator:
         if tid in self.starting:
             return (f"thread {tid} is waiting for a worker: one is being started or picked for it. "
                     "The control plane's output shows the new worker's log as it starts.\n")
-        return f"thread {tid} has no worker and has no record of one (state {t['state']}).\n"
+        return (f"thread {tid} has no worker and has no record of one (state {t['state']}).\n"
+                "Respawn, or a message to it, starts it on a worker: from its branch, files and session "
+                "as its last turn saved them, or on its request if no turn was saved.\n")
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds

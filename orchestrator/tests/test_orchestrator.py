@@ -1142,6 +1142,42 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
     await s.close()
 
 
+async def test_respawning_an_idle_thread_with_no_worker_on_record_brings_it_back(tmp_path, monkeypatch):
+    """An idle thread bound to no worker, with nothing saying why (a row from
+    an older control plane), comes back with Respawn, its saved turn kept."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    lw = orch.by_thread.pop(t["id"])
+    lw.threads.discard(t["id"])
+    await s.update_thread(t["id"], worker_id=None)
+    assert "has no record of one" in await orch.worker_logs(t["id"], 50)
+    await orch.respawn(t["id"])
+
+    async def revived():
+        return [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"] or None
+    (ev,) = await wait_for(revived)
+    # Its runner still ran it: the control plane only lost track of where.
+    assert ev["payload"] == {"worker": lw.worker.id, "request": False, "found": True}
+    assert (await s.get_thread(t["id"]))["worker_id"] == lw.worker.id and orch.by_thread[t["id"]] is lw
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
 async def idle_or_stopped(s, tid):
     return (await s.get_thread(tid))["state"] in ("idle", "stopped") or None
 

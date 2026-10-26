@@ -142,8 +142,12 @@ def display(ev: dict) -> dict:
     elif t == "worker_restarted":
         kind, label, text = K_ERROR, "worker restarted", d.get("error", "")
     elif t == "revived":
-        then = "working on its request again" if d.get("request") else "idle until its next message"
-        kind, label, text = K_STATUS, "revived", f"back on worker {d.get('worker')}, {then}"
+        if d.get("found"):
+            text = f"found again on worker {d.get('worker')}, which still runs it"
+        else:
+            then = "working on its request again" if d.get("request") else "idle until its next message"
+            text = f"back on worker {d.get('worker')}, {then}"
+        kind, label = K_STATUS, "revived"
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     elif t == "saved":

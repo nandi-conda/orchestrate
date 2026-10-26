@@ -40,6 +40,14 @@ class RunnerClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_thread(self, thread_id: str) -> dict | None:
+        """The runner's entry for the thread, None when it has none."""
+        r = await self.http.get(f"/threads/{thread_id}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
     async def create_thread(self, **body: Any) -> dict:
         r = await self.http.post("/threads", json={k: v for k, v in body.items() if v is not None})
         r.raise_for_status()

@@ -229,6 +229,14 @@ def create_app(host: Host, token: str) -> Starlette:
             return JSONResponse({"error": "unauthorized"}, 401)
         return JSONResponse([host.entry(t) for t in host.threads.values()])
 
+    async def get_thread(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        t = host.threads.get(req.path_params["tid"])
+        if t is None:
+            return JSONResponse({"error": "not found"}, 404)
+        return JSONResponse(host.entry(t))
+
     async def create_thread(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
@@ -399,6 +407,7 @@ def create_app(host: Host, token: str) -> Starlette:
         Route("/peer/calls/{cid}", peer_answer, methods=["POST"]),
         Route("/threads", list_threads, methods=["GET"]),
         Route("/threads", create_thread, methods=["POST"]),
+        Route("/threads/{tid}", get_thread, methods=["GET"]),
         Route("/threads/{tid}/messages", message, methods=["POST"]),
         Route("/threads/{tid}/stop", stop, methods=["POST"]),
         Route("/threads/{tid}/events", thread_events),
