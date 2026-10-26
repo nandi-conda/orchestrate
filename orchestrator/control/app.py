@@ -139,8 +139,11 @@ def display(ev: dict) -> dict:
         text = f"project {label}"
     elif t == "worker_lost":
         kind, label, text = K_ERROR, "worker lost", d.get("error", "")
+    elif t == "worker_restarted":
+        kind, label, text = K_ERROR, "worker restarted", d.get("error", "")
     elif t == "revived":
-        kind, label, text = K_STATUS, "revived", f"back on worker {d.get('worker')}, idle until its next message"
+        then = "working on its request again" if d.get("request") else "idle until its next message"
+        kind, label, text = K_STATUS, "revived", f"back on worker {d.get('worker')}, {then}"
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     elif t == "saved":
@@ -394,6 +397,17 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         await orch().stop(req.path_params["tid"])
         return JSONResponse({"ok": True})
 
+    async def thread_respawn(req: Request):
+        """Bring the thread back on a worker now (Orchestrator.respawn); 202, the
+        revival or its error arrives as the thread's event."""
+        try:
+            await orch().respawn(req.path_params["tid"])
+        except KeyError:
+            return JSONResponse({"error": "no such thread"}, 404)
+        except ArchivedError as e:
+            return JSONResponse({"error": str(e)}, 409)
+        return JSONResponse({"ok": True}, 202)
+
     async def thread_archive(req: Request):
         try:
             t = await orch().archive(req.path_params["tid"])
@@ -545,6 +559,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/threads/{tid}", get_thread, methods=["GET"]),
         Route("/api/threads/{tid}/messages", thread_message, methods=["POST"]),
         Route("/api/threads/{tid}/stop", thread_stop, methods=["POST"]),
+        Route("/api/threads/{tid}/respawn", thread_respawn, methods=["POST"]),
         Route("/api/threads/{tid}/archive", thread_archive, methods=["POST"]),
         Route("/api/threads/{tid}/unarchive", thread_unarchive, methods=["POST"]),
         Route("/api/threads/{tid}/transcript", transcript, methods=["GET"]),

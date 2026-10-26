@@ -191,6 +191,10 @@ class Hub:
         refs = await gitio.tips(self.path, [f"refs/heads/{self.base}", *thread_refs(tid)])
         return list(refs.values())
 
+    async def saved(self, tid: str) -> bool:
+        """Whether a turn of the thread ever ended and was saved here (its session)."""
+        return bool(await gitio.tips(self.path, [f"refs/sessions/{tid}"]))
+
     async def receive(self, tid: str, data: bytes, refs: dict[str, str]) -> None:
         """A turn's work from a worker: the thread's branch, snapshot and session."""
         allowed = set(thread_refs(tid))

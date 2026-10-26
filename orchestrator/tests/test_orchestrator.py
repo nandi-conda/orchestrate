@@ -923,7 +923,6 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     monkeypatch.setattr(service, "HEALTH_EVERY", 0.2)
-    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
@@ -969,7 +968,6 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     monkeypatch.setattr(service, "HEALTH_EVERY", 3600)
-    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
@@ -992,6 +990,160 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
     await orch.close()
     await provider.close()
     await s.close()
+
+
+async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monkeypatch):
+    """A worker whose runner stops answering (a sprite waking, this machine's
+    network down) is not lost while its provider still has it: its threads
+    stay on it and carry on once it answers again."""
+    import signal
+
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.1)
+    monkeypatch.setattr(service, "HEALTH_TIMEOUT", 0.2)
+    monkeypatch.setattr(service, "READY_TIMEOUT", 0.5)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    lw = orch.by_thread[t["id"]]
+    proc = provider.procs[lw.worker.id]
+    proc.send_signal(signal.SIGSTOP)
+    await asyncio.sleep(1.5)  # several watches that get no answer
+    proc.send_signal(signal.SIGCONT)
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    types = [e["type"] for e in await s.list_events(p["id"], t["id"])]
+    assert "worker_lost" not in types and "revived" not in types
+    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(tmp_path, monkeypatch):
+    """A runner that restarts (it crashed, a sprite woke cold) runs none of
+    its threads any more: a thread cut short mid-turn fails, and each comes
+    back on the same worker, in its worktree there, with its next message."""
+    import os
+
+    from control import providers
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 3600)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    await s.update_thread(t["id"], state="working")  # as if the restart cut its turn short
+    lw = orch.by_thread[t["id"]]
+    w = lw.worker
+    old = provider.procs[w.id]
+    old.kill()
+    await old.wait()
+    # The same runner command again, on the same port and disk: what a sprite service does.
+    env = {**os.environ, "RUNNER_PORT": w.url.rsplit(":", 1)[1], "RUNNER_HOST": "127.0.0.1",
+           "RUNNER_TOKEN": w.token, "RUNNER_WORKDIR": str((tmp_path / "w" / w.id).resolve()),
+           "RUNNER_CAPACITY": str(w.capacity)}
+    with open(provider.log_path(w.id), "ab") as log:
+        provider.procs[w.id] = await asyncio.create_subprocess_exec(
+            *provider.command(), env=env, cwd=str(providers.Path(providers.__file__).resolve().parents[1]),
+            stdout=log, stderr=subprocess.STDOUT)
+    await providers.wait_healthy(w.url, timeout=30)
+
+    async def restarted():
+        return [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "worker_restarted"] or None
+    await wait_for(restarted)  # the relay reconnects to the new runner and notices
+    th = await s.get_thread(t["id"])
+    assert th["state"] == "failed" and th["worker_id"] == w.id and t["id"] not in orch.by_thread
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    revived = [e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]
+    assert [e["payload"]["worker"] for e in revived] == [w.id]
+    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    listing = await orch.list_files(t["id"], "")
+    assert "notes.txt" in [e["name"] for e in listing["entries"]]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+class FailingOnceProvider(LocalProvider):
+    """A provider whose first worker cannot be made (a sprite that would not come up)."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.failed = False
+
+    async def create(self, spec):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("the sprite did not come up")
+        return await super().create(spec)
+
+
+async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_path, monkeypatch):
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = FailingOnceProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def failed():
+        return (await s.get_thread(t["id"]))["state"] == "failed" or None
+    await wait_for(failed)
+    assert (await s.get_thread(t["id"]))["worker_id"] is None
+    await orch.respawn(t["id"])
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: first")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    events = await s.list_events(p["id"], t["id"])
+    revived = [e for e in events if e["type"] == "revived"]
+    assert len(revived) == 1 and revived[0]["payload"]["request"] is True
+    assert [e for e in events if e["type"] == "message_in"] == []  # the request's echo was expected
+    # Once a turn is saved, respawning brings it back idle, its request not run again.
+    await wait_for(lambda: idle_of(s, t["id"]))
+    await orch.stop(t["id"])
+    await wait_for(lambda: idle_or_stopped(s, t["id"]))
+    await orch.respawn(t["id"])
+
+    async def twice():
+        return len([e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "revived"]) == 2 or None
+    await wait_for(twice)
+    await wait_for(lambda: idle_of(s, t["id"]))
+    echoes = [e for e in await s.list_events(p["id"], t["id"])
+              if e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: first")]
+    assert len(echoes) == 1
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def idle_or_stopped(s, tid):
+    return (await s.get_thread(tid))["state"] in ("idle", "stopped") or None
 
 
 async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
@@ -1326,7 +1478,6 @@ async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, mon
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     monkeypatch.setattr(service, "HEALTH_EVERY", 0.2)
-    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
@@ -1351,7 +1502,7 @@ async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, mon
         await wait_for(lost)
         text = await orch.worker_logs(t["id"], 50)
         assert f"its worker {wid} was dropped" in text
-        assert "/health failed 3 times in a row" in text
+        assert "provider no longer has it" in text
         assert "devrunner: echo runner on port" in text  # its log, as it was followed
     finally:
         await orch.close()

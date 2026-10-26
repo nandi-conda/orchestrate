@@ -87,6 +87,8 @@ PROJ_SHOW_ARCHIVED: Const[i32] = 62
 PROJ_ARCHIVE: Const[i32] = 63
 PROJ_UNARCHIVE: Const[i32] = 64
 PROJ_ARCHIVED: Const[i32] = 65
+RESPAWN: Const[i32] = 66
+RESPAWNED: Const[i32] = 67
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -757,6 +759,16 @@ def update(msg: i32, arg: i32) -> None:
             s_add_ref(h_url, h_sel)
             s_add(h_url, "/stop")
             post(h_url, o, STOPPED)
+    elif msg == RESPAWN:
+        if s_len(h_sel) > 0:
+            s_copy(h_act, h_sel)
+            post_thread(h_act, "respawn", RESPAWNED)
+    elif msg == RESPAWNED:
+        # The thread comes back in the background; its "revived" (or error)
+        # event refreshes the pane when it lands.
+        if j_ok(arg) == 0:
+            j_err(arg, h_err)
+        j_free(arg)
     elif msg == ARCHIVE:
         if s_len(h_sel) > 0:
             s_copy(h_act, h_sel)
@@ -1697,6 +1709,15 @@ def selected_thread() -> i32:
     return 0
 
 
+def needs_worker(t: i32) -> bool:
+    """Whether the thread runs on no worker: it never started on one, its
+    worker was lost, or it failed or was stopped."""
+    if j_has(t, "worker_id") == 0:
+        return True
+    jstr(t, "state", h_t2)
+    return s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1
+
+
 def thread_head(t: i32) -> None:
     """Title, state, Stop and Archive (Unarchive once archived) for the selected thread, and a line saying what it
     is doing right now (the running tool, or "thinking") while it works."""
@@ -1723,6 +1744,12 @@ def thread_head(t: i32) -> None:
         text("Unarchive")
         end()
     else:
+        if t != 0 and needs_worker(t):
+            btn_open("ghost", RESPAWN, 0)
+            cls("sm")
+            attr("title", "Start the thread again on a worker, from its branch, files and session")
+            text("Respawn")
+            end()
         btn_open("ghost", STOP, 0)
         cls("sm")
         text("Stop thread")

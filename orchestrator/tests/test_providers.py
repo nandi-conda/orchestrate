@@ -308,3 +308,37 @@ async def test_sprites_follow_reopens_the_log_stream_without_repeating_lines(env
     await p.http.aclose()
     assert got == ["a", "b", "c", "d", "[sprite] runner service exited with code 1"]
     assert asked[0]["lines"] == "50" and asked[1]["lines"] == "51"
+
+
+class SpriteLookup:
+    """GET /sprites/<name> as the Sprites API answers it for a sprite that is there, or not."""
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    async def get(self, url, **kw):
+        return httpx.Response(self.status, json={}, request=httpx.Request("GET", url))
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.parametrize("status,there", [(200, True), (404, False)])
+async def test_a_sprite_exists_until_the_api_no_longer_has_it(env, status, there):
+    """A paused sprite is still there (it wakes on the next request); only
+    one the API does not know any more is gone."""
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    await p.http.aclose()
+    p.http = SpriteLookup(status)
+    w = providers.Worker(id="orch-p-1-w1", project_id="p_1", provider="sprites", handle="orch-p-1-w1",
+                         url="https://worker.invalid")
+    assert await p.exists(w) is there
+
+
+async def test_a_sprite_lookup_that_fails_is_not_an_answer(env):
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    await p.http.aclose()
+    p.http = SpriteLookup(503)
+    w = providers.Worker(id="w", project_id="p_1", provider="sprites", handle="w", url="https://worker.invalid")
+    with pytest.raises(httpx.HTTPStatusError):
+        await p.exists(w)

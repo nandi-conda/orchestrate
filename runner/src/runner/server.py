@@ -7,6 +7,7 @@ import base64
 import hmac
 import json
 import os
+import secrets
 import subprocess
 
 from starlette.applications import Starlette
@@ -100,9 +101,12 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         return host.threads.get(req.path_params["id"])
 
     commit = checkout_commit()
+    # Names this runner process: a control plane that sees another one knows
+    # the runner restarted and its threads are no longer running here.
+    boot = secrets.token_hex(8)
 
     async def health(req: Request):
-        return JSONResponse({**host.health(), "commit": commit})
+        return JSONResponse({**host.health(), "commit": commit, "boot": boot})
 
     async def list_threads(req: Request):
         return JSONResponse([t.directory_entry() for t in host.threads.values()])

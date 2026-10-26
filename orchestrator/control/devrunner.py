@@ -217,10 +217,12 @@ def create_app(host: Host, token: str) -> Starlette:
     def authed(req: Request) -> bool:
         return not token or req.headers.get("authorization") == f"Bearer {token}"
 
+    boot = secrets.token_hex(8)  # this runner process (runner/API.md, /health)
+
     async def health(req: Request):
         running = sum(1 for t in host.threads.values() if t["state"] in ("queued", "working"))
         return JSONResponse({"ok": True, "threads": len(host.threads), "running": running,
-                             "capacity": host.capacity})
+                             "capacity": host.capacity, "boot": boot})
 
     async def list_threads(req: Request):
         if not authed(req):

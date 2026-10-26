@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 
 from .hub import Hub
-from .providers import Worker, WorkerProvider, WorkerSpec
+from .providers import Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
 from .runner_client import RunnerClient
 from .secrets import get_secret
@@ -30,12 +30,14 @@ from .store import Store, now
 log = logging.getLogger("orchestrator")
 
 MAX_HOPS = 6
-# A worker is watched every HEALTH_EVERY seconds; one whose /health fails
-# HEALTH_TRIES times in a row (HEALTH_GAP seconds apart) is lost.
+# A worker is watched every HEALTH_EVERY seconds. A /health that does not
+# answer does not lose it: a sprite pauses while nothing talks to it and its
+# runner starts afresh on a cold wake, and this control plane's own network
+# can be down. A worker is lost only when its provider says it is gone; one
+# that is still there gets READY_TIMEOUT seconds for its runner to answer.
 HEALTH_EVERY = 10.0
-HEALTH_TRIES = 3
-HEALTH_GAP = 1.0
 HEALTH_TIMEOUT = 5.0
+READY_TIMEOUT = 300.0
 CAPACITY = 16  # running threads per worker before another one starts
 # A worker's runner log goes to this process's stdout as it is written, each
 # line tagged with the worker; following starts LOG_BACKLOG lines back, and the
@@ -173,6 +175,7 @@ class LiveWorker:
     starting: int = 0  # threads picked for it and not yet posted: they count as running
     log_tail: deque = field(default_factory=lambda: deque(maxlen=LOG_KEPT))
     health_error: str = ""  # why its last /health failed, "" while it answers
+    boot: str | None = None  # the runner process serving it, as /health names it
 
     def tasks(self) -> list[asyncio.Task]:
         return [task for task in (self.relay, self.pump, self.watch, self.logs) if task]
@@ -272,7 +275,11 @@ class Orchestrator:
         lws = self.workers.setdefault(project["id"], [])
         best, best_load = None, None
         for lw in list(lws):
-            h = await self._health(lw)
+            try:
+                h = await self._health(lw)
+            except Exception as e:  # there, and not answering: it has no room to offer
+                log.warning("worker %s is not answering: %s", lw.worker.id, describe(e))
+                continue
             if h is None:
                 await self._lose(lw, lw.health_error)
                 continue
@@ -306,6 +313,7 @@ class Orchestrator:
         await self.store.upsert_worker(worker.record())
         (await self._made(project["id"])).add(index)
         lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
+        lw.boot = (await lw.client.health(timeout=HEALTH_TIMEOUT)).get("boot")
         lw.logs = asyncio.create_task(self._follow_logs(lw))
         lw.relay = asyncio.create_task(self._relay(project["id"], lw))
         lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
@@ -330,26 +338,60 @@ class Orchestrator:
         return None
 
     async def _health(self, lw: LiveWorker) -> dict | None:
-        """The worker's /health, or None when it failed HEALTH_TRIES times in a row."""
-        for attempt in range(HEALTH_TRIES):
-            try:
-                h = await lw.client.health(timeout=HEALTH_TIMEOUT)
-                lw.health_error = ""
-                return h
-            except Exception as e:
-                last = e
-            if attempt + 1 < HEALTH_TRIES:
-                await asyncio.sleep(HEALTH_GAP)
-        lw.health_error = f"its /health failed {HEALTH_TRIES} times in a row, last with {describe(last)}"
-        log.warning("worker %s is lost: %s", lw.worker.id, lw.health_error)
-        return None
+        """The worker's /health once its runner answers, or None when its
+        provider says the worker is gone. A worker that is still there gets
+        READY_TIMEOUT seconds for its runner (a sprite's cold wake starts it
+        afresh); raises when it has not answered by then, or when the
+        provider cannot say."""
+        try:
+            h = await lw.client.health(timeout=HEALTH_TIMEOUT)
+        except Exception as e:
+            if not await self.provider.exists(lw.worker):
+                lw.health_error = (f"its /health failed with {describe(e)}, and its {lw.worker.provider} "
+                                   "provider no longer has it")
+                log.warning("worker %s is lost: %s", lw.worker.id, lw.health_error)
+                return None
+            h = await wait_healthy(lw.worker.url, timeout=READY_TIMEOUT)
+        lw.health_error = ""
+        await self._restarted(lw, h)
+        return h
+
+    async def _restarted(self, lw: LiveWorker, h: dict) -> None:
+        """Take note of the runner process serving the worker. One started
+        since the last look (it crashed, or a sprite woke cold) runs none of
+        the worker's threads and numbers its events afresh: each thread is
+        let go, to come back on this worker, in its worktree here, with its
+        next message (live_worker)."""
+        boot = h.get("boot")
+        if boot == lw.boot:
+            return
+        lw.boot = boot
+        lw.last_seq = 0
+        project_id, wid = lw.worker.project_id, lw.worker.id
+        reason = f"worker {wid}'s runner restarted; the thread comes back on it with its next message"
+        for tid in sorted(lw.threads):
+            if self.by_thread.get(tid) is not lw:
+                continue
+            del self.by_thread[tid]
+            t = await self.store.get_thread(tid)
+            fields = {"activity": ""}
+            if t["state"] in ("queued", "working"):  # its turn was cut short
+                fields["state"] = "failed"
+            await self.store.update_thread(tid, **fields)
+            await self.store.append_event(project_id, tid, "worker_restarted", {"worker": wid, "error": reason})
+        lw.threads.clear()
 
     async def _watch(self, lw: LiveWorker) -> None:
-        """Notice a worker that died while nothing was sent to it, so its
-        threads stop showing as running."""
+        """Notice a worker that died, or whose runner restarted, while nothing
+        was sent to it, so its threads stop showing as running."""
         while True:
             await asyncio.sleep(HEALTH_EVERY)
-            if await self._health(lw) is None:
+            try:
+                h = await self._health(lw)
+            except Exception as e:
+                log.warning("worker %s is not answering: %s", lw.worker.id, describe(e))
+                continue
+            if h is None:
                 await self._lose(lw, lw.health_error)
                 return
 
@@ -407,9 +449,12 @@ class Orchestrator:
             log.warning("cannot follow the log of worker %s: %s", wid, describe(e))
 
     async def _relay(self, project_id: str, lw: LiveWorker) -> None:
-        """Copy a worker's event stream into the store; reconnect on drops."""
+        """Copy a worker's event stream into the store; reconnect on drops.
+        Each connection starts with a look at which runner serves the worker,
+        so one that restarted is streamed from its first event."""
         while True:
             try:
+                await self._restarted(lw, await lw.client.health(timeout=HEALTH_TIMEOUT))
                 async for ev in lw.client.events(after=lw.last_seq):
                     lw.last_seq = max(lw.last_seq, ev.get("seq", 0))
                     await self._ingest(project_id, ev)
@@ -736,6 +781,8 @@ class Orchestrator:
             if await self._health(lw) is None:
                 await self._lose(lw, lw.health_error)
                 lw = None
+            elif self.by_thread.get(thread_id) is not lw:  # its runner restarted
+                lw = None
             elif t["state"] not in ENDED:
                 return lw
         task = self.reviving.get(thread_id)
@@ -751,22 +798,59 @@ class Orchestrator:
         """Start the thread again on the worker that ran it (`lw` when it is
         live here, else the one an earlier control plane left), so its
         worktree there is the one it continues in; on a picked worker when
-        that was lost, from its branch, snapshot and session in the hub."""
+        that was lost, from its branch, snapshot and session in the hub.
+        A thread none of whose turns was saved (it never started, or its
+        worker went before its first turn ended) is given its request again."""
         tid, project = t["id"], await self.store.get_project(t["project_id"])
         if lw is None:
             lw = await self._home(project, t["worker_id"]) or await self._pick_worker(project)
         await self._ship(lw, project, tid)
+        request, images = None, None
+        if not await (await self.hub(project)).saved(tid):
+            request = t["request"]
+            created = (await self.store.list_events(project["id"], tid, 0, limit=1) or [{}])[0]
+            images = (created.get("payload") or {}).get("images") if created.get("type") == "created" else None
+            self._expect_echo(tid, request)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
-        await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
-                                      model=model, summary=t["summary"])
+        try:
+            await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
+                                          model=model, summary=t["summary"], request=request,
+                                          images=await self._inline_images(images) or None)
+        except BaseException:
+            if request is not None:
+                self._echoed(tid, request)
+            raise
         old = self.by_thread.get(tid)
         if old is not None:
             old.threads.discard(tid)
         lw.threads.add(tid)
         self.by_thread[tid] = lw
-        await self.store.update_thread(tid, worker_id=lw.worker.id, state="idle", activity="")
-        await self.store.append_event(project["id"], tid, "revived", {"worker": lw.worker.id})
+        fields = {"worker_id": lw.worker.id, "activity": ""}
+        if request is None:
+            fields["state"] = "idle"
+        await self.store.update_thread(tid, **fields)
+        await self.store.append_event(project["id"], tid, "revived",
+                                      {"worker": lw.worker.id, "request": request is not None})
         return lw
+
+    async def respawn(self, thread_id: str) -> None:
+        """Bring a thread back on a worker now, rather than with its next
+        message: queued after its start and deliveries, like them; a failure
+        is reported as the thread's event."""
+        t = await self.store.get_thread(thread_id)
+        if t is None:
+            raise KeyError(thread_id)
+        if t["archived_at"] is not None:
+            raise ArchivedError(f"thread {thread_id} is archived; unarchive it to use it")
+        await self.open_project(t["project_id"])
+
+        async def work() -> None:
+            try:
+                await self.live_worker(thread_id)
+            except Exception as e:
+                await self.store.append_event(t["project_id"], thread_id, "error",
+                                              {"error": f"could not bring the thread back: {describe(e)}"})
+        self._chain(self.thread_chain, thread_id, work)
 
     async def _inline_images(self, refs: list[dict] | None) -> list[dict]:
         """Image references as a runner needs them: the bytes, base64-encoded.
@@ -809,13 +893,13 @@ class Orchestrator:
             kept = (w.get("lost_log") or "").splitlines()[-lines:]
             text = (f"thread {tid} is on no worker: its worker {wid} was dropped at {when(last['created_at'])}, "
                     f"because {w.get('lost_reason') or 'no reason was recorded'}.\n"
-                    "It comes back on a worker with its next message.\n\n")
+                    "It comes back on a worker with its next message, or with Respawn.\n\n")
             if kept:
                 return text + f"The end of {wid}'s runner log when it was dropped:\n" + "\n".join(kept) + "\n"
             return text + f"No log was read from {wid} before it was dropped.\n"
         if last is not None and last["type"] == "error":
             return (f"thread {tid} never started on a worker ({when(last['created_at'])}): "
-                    f"{last['payload']['error']}\n")
+                    f"{last['payload']['error']}\nRespawn, or a message to it, starts it on its request.\n")
         if tid in self.starting:
             return (f"thread {tid} is waiting for a worker: one is being started or picked for it. "
                     "The control plane's output shows the new worker's log as it starts.\n")

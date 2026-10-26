@@ -76,6 +76,10 @@ class WorkerProvider(Protocol):
 
     async def destroy(self, worker: Worker) -> None: ...
 
+    async def exists(self, worker: Worker) -> bool:
+        """Whether the worker is still there, whatever its runner answers now.
+        Only False loses it (Orchestrator._health); raises when it cannot tell."""
+
     async def logs(self, worker: Worker, lines: int) -> str:
         """The last `lines` lines the worker's runner wrote to stdout/stderr."""
 
@@ -242,6 +246,10 @@ class LocalProvider:
             proc.kill()
             raise
         return worker
+
+    async def exists(self, worker: Worker) -> bool:
+        proc = self.procs.get(worker.id)
+        return proc is not None and proc.returncode is None
 
     def log_path(self, wid: str) -> Path:
         return (self.workdir / wid).resolve() / "runner.log"
@@ -490,6 +498,14 @@ class SpritesProvider:
             # some lines more, in case one event held several.
             lines = seen + 50
 
+    async def exists(self, worker: Worker) -> bool:
+        """A sprite that pauses is still there: it wakes on the next request."""
+        r = await self.http.get(f"/sprites/{worker.handle}")
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        return True
+
     async def destroy(self, worker: Worker) -> None:
         await self.http.delete(f"/sprites/{shlex.quote(worker.handle)}")
 
@@ -557,6 +573,12 @@ class AutoProvider:
         provider = self._of(worker)
         if provider is not None:
             await provider.destroy(worker)
+
+    async def exists(self, worker: Worker) -> bool:
+        provider = self._of(worker)
+        if provider is None:
+            raise RuntimeError(f"no {worker.provider} provider in this control plane")
+        return await provider.exists(worker)
 
     async def logs(self, worker: Worker, lines: int) -> str:
         provider = self._of(worker)
