@@ -30,7 +30,9 @@ import json
 import os
 import re
 import secrets
+import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -420,6 +422,26 @@ def create_app(host: Host, token: str) -> Starlette:
     ])
 
 
+def watch_parent(every: float = 1.0) -> None:
+    """Exit once the process that started us is gone.
+
+    Nothing else knows a devrunner's port, so with its control plane gone it is
+    only a listener nobody will call: it stands for a worker that cannot be
+    reached. A control plane that stops its workers (the app's lifespan, or
+    LocalProvider.close) leaves nothing behind, but one that is killed without
+    the chance -- a test process that dies, a window killed mid-start -- used to
+    leave its runner listening for as long as the machine was up. Being
+    reparented is how a survivor knows: the pid we started under is no longer
+    our parent's.
+    """
+    started_with = os.getppid()
+    while True:
+        time.sleep(every)
+        if os.getppid() != started_with:
+            os.kill(os.getpid(), signal.SIGTERM)  # uvicorn's graceful shutdown
+            return
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=int(os.environ.get("RUNNER_PORT", "8080")))
@@ -430,6 +452,7 @@ def main() -> None:
     # /events streams stay open for subscribers (the control plane's relay), and
     # so does the peer long poll, so bound the wait for them; otherwise Ctrl+C
     # never completes (the real runner, runner/server.py).
+    threading.Thread(target=watch_parent, name="parent-watch", daemon=True).start()
     uvicorn.run(create_app(host, os.environ.get("RUNNER_TOKEN", "")),
                 host=os.environ.get("RUNNER_HOST", "127.0.0.1"), port=a.port, log_level="warning",
                 timeout_graceful_shutdown=int(os.environ.get("RUNNER_GRACEFUL_SHUTDOWN", "5")))

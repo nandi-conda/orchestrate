@@ -5,7 +5,11 @@ run anywhere.
 """
 
 import json
+import os
 import subprocess
+import sys
+import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +18,52 @@ from control import providers, secrets
 from control.service import worker_spec
 
 pytestmark = pytest.mark.anyio
+
+
+def _wait_port(port: int, up: bool, patience: float) -> bool:
+    """Whether the port starts (up) or stops answering within `patience`."""
+    deadline = time.time() + patience
+    while True:
+        try:
+            httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.5)
+            answered = True
+        except Exception:  # refused, reset, or slower than a dead runner is worth
+            answered = False
+        if answered is up:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="only Unix reparents a child, which is how it sees its parent go")
+def test_a_devrunner_goes_when_the_process_that_started_it_is_gone(tmp_path):
+    """A devrunner only serves the control plane that started it, so it must not
+    outlive it: one that does is a port nobody will call, listening until the
+    machine goes down. A control plane that stops its workers leaves nothing
+    behind (control/app.py's lifespan, LocalProvider.close), but one that is
+    killed without the chance -- a test run that dies, a window killed
+    mid-start -- used to leave its runner behind for days
+    (control/devrunner.py, watch_parent)."""
+    port = providers.free_port()
+    # A parent of our own that starts the runner and then waits, so this test
+    # can kill it outright and watch what the runner does about it.
+    parent = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time\n"
+         "subprocess.Popen([sys.executable, '-m', 'control.devrunner'])\n"
+         "time.sleep(60)\n"],
+        cwd=str(Path(providers.__file__).resolve().parents[1]),
+        env={**os.environ, "RUNNER_PORT": str(port), "RUNNER_WORKDIR": str(tmp_path)})
+    try:
+        assert _wait_port(port, up=True, patience=30.0), "the devrunner never answered on its port"
+        parent.kill()  # no chance to stop its workers, like a test run that is killed
+        parent.wait(timeout=10)
+        assert _wait_port(port, up=False, patience=15.0), "the devrunner outlived its parent"
+    finally:
+        if parent.poll() is None:
+            parent.kill()
 
 
 @pytest.fixture
