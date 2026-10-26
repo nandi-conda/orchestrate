@@ -279,7 +279,24 @@ The control plane reads them itself: from `/.sprite/logs/services/runner.log`
 on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
 `.orchestrator/workers/<worker>/runner.log` for a local worker. Stopping the
 control plane destroys its sprites, so read a sprite's log while it is still
-running. To read it without the UI:
+running.
+
+Every worker's runner log is also printed to the control plane's stdout as it
+is written (`pixi run desktop` or `pixi run serve`), each line prefixed with
+its worker, e.g. `orch-p_ab12-w0 | INFO: runner.harness: ...`. Attaching a
+worker prints its last 50 lines first. The control plane follows it itself:
+the Sprites log stream (`GET /v1/sprites/<name>/services/runner/logs?duration=…`,
+NDJSON) for a sprite, the log file for a local worker. Runner failures land
+there in full: tracebacks, prime-agent's stderr, failed model calls (the whole
+model message but its content) and failed tool calls.
+
+When a worker is dropped, the control plane keeps why (its failed `/health`
+checks) and the last 300 lines it followed, since destroying the worker takes
+its log. A thread on no worker shows that in its Worker log tab: which worker
+it lost, when and why, and how that worker's log ended; or, for a thread that
+never started on one, the error that stopped it.
+
+To read a live sprite's log without the UI:
 
 ```sh
 curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \

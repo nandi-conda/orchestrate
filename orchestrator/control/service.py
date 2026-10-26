@@ -12,6 +12,9 @@ import asyncio
 import base64
 import json
 import logging
+import sys
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +37,11 @@ HEALTH_TRIES = 3
 HEALTH_GAP = 1.0
 HEALTH_TIMEOUT = 5.0
 CAPACITY = 16  # running threads per worker before another one starts
+# A worker's runner log goes to this process's stdout as it is written, each
+# line tagged with the worker; following starts LOG_BACKLOG lines back, and the
+# last LOG_KEPT lines are kept with the worker when it is lost.
+LOG_BACKLOG = 50
+LOG_KEPT = 300
 RUNNER_STATES = {"queued", "working", "idle", "failed", "stopped", "waiting", "done"}
 # States in which a thread is done with its runner; archiving any other thread stops it first.
 ENDED = {"done", "failed", "stopped"}
@@ -160,8 +168,23 @@ class LiveWorker:
     relay: asyncio.Task | None = None
     pump: asyncio.Task | None = None
     watch: asyncio.Task | None = None
+    logs: asyncio.Task | None = None
     threads: set[str] = field(default_factory=set)
     starting: int = 0  # threads picked for it and not yet posted: they count as running
+    log_tail: deque = field(default_factory=lambda: deque(maxlen=LOG_KEPT))
+    health_error: str = ""  # why its last /health failed, "" while it answers
+
+    def tasks(self) -> list[asyncio.Task]:
+        return [task for task in (self.relay, self.pump, self.watch, self.logs) if task]
+
+
+def print_worker_line(worker_id: str, line: str) -> None:
+    sys.stdout.write(f"{worker_id} | {line}\n")
+    sys.stdout.flush()
+
+
+def when(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
 
 
 class Orchestrator:
@@ -223,7 +246,7 @@ class Orchestrator:
         tasks = list(self.background)
         for lws in self.workers.values():
             for lw in lws:
-                tasks += [task for task in (lw.relay, lw.pump, lw.watch) if task]
+                tasks += lw.tasks()
         for task in tasks:
             task.cancel()
         # Wait for them to end, so none touches the store after it closes.
@@ -251,7 +274,7 @@ class Orchestrator:
         for lw in list(lws):
             h = await self._health(lw)
             if h is None:
-                await self._lose(lw)
+                await self._lose(lw, lw.health_error)
                 continue
             running = h.get("running", 0) + lw.starting
             if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
@@ -283,6 +306,7 @@ class Orchestrator:
         await self.store.upsert_worker(worker.record())
         (await self._made(project["id"])).add(index)
         lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
+        lw.logs = asyncio.create_task(self._follow_logs(lw))
         lw.relay = asyncio.create_task(self._relay(project["id"], lw))
         lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
         lw.watch = asyncio.create_task(self._watch(lw))
@@ -309,12 +333,15 @@ class Orchestrator:
         """The worker's /health, or None when it failed HEALTH_TRIES times in a row."""
         for attempt in range(HEALTH_TRIES):
             try:
-                return await lw.client.health(timeout=HEALTH_TIMEOUT)
+                h = await lw.client.health(timeout=HEALTH_TIMEOUT)
+                lw.health_error = ""
+                return h
             except Exception as e:
                 last = e
             if attempt + 1 < HEALTH_TRIES:
                 await asyncio.sleep(HEALTH_GAP)
-        log.warning("worker %s is lost: %s", lw.worker.id, describe(last))
+        lw.health_error = f"its /health failed {HEALTH_TRIES} times in a row, last with {describe(last)}"
+        log.warning("worker %s is lost: %s", lw.worker.id, lw.health_error)
         return None
 
     async def _watch(self, lw: LiveWorker) -> None:
@@ -323,23 +350,27 @@ class Orchestrator:
         while True:
             await asyncio.sleep(HEALTH_EVERY)
             if await self._health(lw) is None:
-                await self._lose(lw)
+                await self._lose(lw, lw.health_error)
                 return
 
-    async def _lose(self, lw: LiveWorker) -> None:
+    async def _lose(self, lw: LiveWorker, why: str) -> None:
         """Drop a worker that stopped answering: no thread runs on it any more,
         so each comes back on another worker with its next message (live_worker).
-        It is destroyed too, so it can never run a thread a second time."""
+        It is destroyed too, so it can never run a thread a second time. Why,
+        and the end of its log as it was followed, stay with it in the store:
+        destroying it takes its log too."""
         lws = self.workers.get(lw.worker.project_id, [])
         if lw not in lws:
             return
         lws.remove(lw)
         me = asyncio.current_task()
-        for task in (lw.relay, lw.pump, lw.watch):
-            if task and task is not me:
+        for task in lw.tasks():
+            if task is not me:
                 task.cancel()
         project_id, wid = lw.worker.project_id, lw.worker.id
-        reason = f"worker {wid} stopped answering; the thread comes back on another worker with its next message"
+        log.warning("dropping worker %s: %s", wid, why)
+        reason = (f"worker {wid} stopped answering ({why}); "
+                  "the thread comes back on another worker with its next message")
         for tid in sorted(lw.threads):
             if self.by_thread.get(tid) is not lw:
                 continue
@@ -352,15 +383,28 @@ class Orchestrator:
             await self.store.append_event(project_id, tid, "worker_lost", {"worker": wid, "error": reason})
         if not lw.threads:
             await self.store.append_event(project_id, None, "worker_lost",
-                                          {"worker": wid, "error": f"worker {wid} stopped answering"})
+                                          {"worker": wid, "error": f"worker {wid} stopped answering ({why})"})
         await self._made(project_id)
         self.lost[project_id].add(lw.worker.index)
-        await self.store.lose_worker(wid)
+        await self.store.lose_worker(wid, why, "\n".join(lw.log_tail))
         try:
             await self.provider.destroy(lw.worker)
         except Exception as e:
             log.warning("destroying lost worker %s: %s", wid, describe(e))
         await lw.client.close()
+
+    async def _follow_logs(self, lw: LiveWorker) -> None:
+        """Print the worker's runner log to stdout as it is written, and keep
+        its end for when the worker is lost (see _lose)."""
+        wid = lw.worker.id
+        try:
+            async for line in self.provider.follow(lw.worker, LOG_BACKLOG):
+                lw.log_tail.append(line)
+                print_worker_line(wid, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("cannot follow the log of worker %s: %s", wid, describe(e))
 
     async def _relay(self, project_id: str, lw: LiveWorker) -> None:
         """Copy a worker's event stream into the store; reconnect on drops."""
@@ -690,7 +734,7 @@ class Orchestrator:
         lw = self.by_thread.get(thread_id)
         if lw is not None:
             if await self._health(lw) is None:
-                await self._lose(lw)
+                await self._lose(lw, lw.health_error)
                 lw = None
             elif t["state"] not in ENDED:
                 return lw
@@ -738,15 +782,44 @@ class Orchestrator:
     async def worker_logs(self, thread_id: str, lines: int = 300) -> str:
         """The runner log of the worker a thread runs on, or last ran on when
         that one is not attached (the control plane reads it from the
-        provider; the worker never sends it). KeyError when it has none."""
+        provider; the worker never sends it). A thread on no worker gets why:
+        the worker it lost, why and when, and that worker's log as it ended;
+        or why it never started on one. KeyError for an unknown thread."""
         lw = self.by_thread.get(thread_id)
         if lw is not None:
             return await self.provider.logs(lw.worker, lines)
         t = await self.store.get_thread(thread_id)
-        for w in await self.store.list_workers(t["project_id"]) if t else []:
-            if w["id"] == t["worker_id"]:  # down now, or left by an earlier control plane
-                return await self.provider.logs(stored_worker(w), lines)
-        raise KeyError(thread_id)
+        if t is None:
+            raise KeyError(thread_id)
+        workers = {w["id"]: w for w in await self.store.list_workers(t["project_id"])}
+        w = workers.get(t["worker_id"])
+        if w is not None and w["lost_at"] is None:  # down now, or left by an earlier control plane
+            return await self.provider.logs(stored_worker(w), lines)
+        return await self._no_worker(t, workers, lines)
+
+    async def _no_worker(self, t: dict, workers: dict[str, dict], lines: int) -> str:
+        tid = t["id"]
+        events = await self.store.recent_events(t["project_id"], tid, limit=500)
+        last = next((e for e in reversed(events) if e["type"] in ("worker_lost", "revived")
+                     or (e["type"] == "error" and e["payload"].get("error", "").startswith("could not start"))),
+                    None)
+        if last is not None and last["type"] == "worker_lost":
+            wid = last["payload"].get("worker", "")
+            w = workers.get(wid) or {}
+            kept = (w.get("lost_log") or "").splitlines()[-lines:]
+            text = (f"thread {tid} is on no worker: its worker {wid} was dropped at {when(last['created_at'])}, "
+                    f"because {w.get('lost_reason') or 'no reason was recorded'}.\n"
+                    "It comes back on a worker with its next message.\n\n")
+            if kept:
+                return text + f"The end of {wid}'s runner log when it was dropped:\n" + "\n".join(kept) + "\n"
+            return text + f"No log was read from {wid} before it was dropped.\n"
+        if last is not None and last["type"] == "error":
+            return (f"thread {tid} never started on a worker ({when(last['created_at'])}): "
+                    f"{last['payload']['error']}\n")
+        if tid in self.starting:
+            return (f"thread {tid} is waiting for a worker: one is being started or picked for it. "
+                    "The control plane's output shows the new worker's log as it starts.\n")
+        return f"thread {tid} has no worker and has no record of one (state {t['state']}).\n"
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds
@@ -838,9 +911,8 @@ class Orchestrator:
         lost, so its index (and its sprite's name) is never used again."""
         async with self._lock:
             for lw in self.workers.pop(project_id, []):
-                for task in (lw.relay, lw.pump, lw.watch):
-                    if task:
-                        task.cancel()
+                for task in lw.tasks():
+                    task.cancel()
                 for tid in lw.threads:
                     if self.by_thread.get(tid) is lw:
                         del self.by_thread[tid]
@@ -850,7 +922,7 @@ class Orchestrator:
                 if w["lost_at"] is None and attachable(w):
                     await self.provider.destroy(stored_worker(w))
                     self.lost[project_id].add(w["idx"])
-                    await self.store.lose_worker(w["id"])
+                    await self.store.lose_worker(w["id"], "its project was archived", "")
 
     async def unarchive_project(self, project_id: str) -> dict:
         p = await self.store.get_project(project_id)

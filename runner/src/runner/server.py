@@ -286,7 +286,7 @@ def main():
 
     import uvicorn
     # prime-agent's own log lines (runner.harness) and thread failures go to the worker log.
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(name)s: %(message)s")
     require(["DEEPSEEK_API_KEY"])
     sandbox.check()
     PrimeAgent().check()

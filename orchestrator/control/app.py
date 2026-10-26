@@ -416,9 +416,6 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         lines = min(int(q), 5000) if q.isdigit() else 300
         try:
             text = await orch().worker_logs(tid, lines)
-        except KeyError:
-            return PlainTextResponse(f"thread {tid} has no worker: it has not started on one yet, "
-                                     "or its worker stopped answering and was dropped\n", 404)
         except Exception as e:
             return PlainTextResponse(f"could not read the worker log: {describe(e)}\n", 502)
         return PlainTextResponse(text)

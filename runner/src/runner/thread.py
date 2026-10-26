@@ -128,6 +128,8 @@ class AgentThread:
         self.task: asyncio.Task | None = None
 
     def emit(self, type: str, data: Any = None):
+        if type == "error":  # every failure a thread reports is in the worker log too
+            log.error("thread %s: %s", self.id, data.get("error"))
         self._emit(self, type, data)
 
     def set_state(self, state: str):
@@ -209,7 +211,8 @@ class AgentThread:
             if self.parent:
                 await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary or turn.final}")
         except Exception as e:
-            self.emit("error", {"error": f"peer update failed: {e}"})
+            log.warning("thread %s: peer update failed", self.id, exc_info=True)
+            self.emit("error", {"error": f"peer update failed: {type(e).__name__}: {e}"})
 
     async def _commit_work(self, land: bool):
         """Commit the turn's work, snapshot the worktree and save the agent's
@@ -226,6 +229,7 @@ class AgentThread:
             if result.get("landed"):
                 await self.workspace.follow()
         except (GitError, PeerError) as e:
+            log.warning("thread %s: saving the turn's work failed", self.id, exc_info=True)
             self.emit("error", {"error": str(e)})
             return
         if not land:
@@ -267,6 +271,9 @@ class Turn:
             self.deltas.flush()
             self._step(ev["message"])
         elif typ == "tool_execution_end":
+            if ev.get("isError"):
+                log.warning("thread %s: tool %s failed:\n%s", self.t.id, ev.get("toolName"),
+                            result_text(ev.get("result")))
             self.t.emit("tool_result", {"id": ev.get("toolCallId"), "name": ev.get("toolName"),
                                         "result": result_text(ev.get("result"))[:4000]})
         elif typ == "agent_end":
@@ -303,6 +310,8 @@ class Turn:
         if m.get("usage"):
             self.t.emit("usage", m["usage"])
         if m.get("stopReason") == "error":
+            log.error("thread %s: model call failed: %s", self.t.id,
+                      json.dumps({k: v for k, v in m.items() if k != "content"}, default=str))
             self.failed = True
             self.t.emit("error", {"error": m.get("errorMessage") or "the model call failed"})
         self.steps += 1

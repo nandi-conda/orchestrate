@@ -20,6 +20,8 @@ peer calls. So a provider only has to hand back a URL the control plane can reac
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import secrets
 import shlex
@@ -29,9 +31,11 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import AsyncIterator, Protocol
 
 import httpx
+
+log = logging.getLogger("orchestrator.providers")
 
 
 @dataclass
@@ -74,6 +78,20 @@ class WorkerProvider(Protocol):
 
     async def logs(self, worker: Worker, lines: int) -> str:
         """The last `lines` lines the worker's runner wrote to stdout/stderr."""
+
+    def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
+        """The worker's runner log as it is written, line by line: the last
+        `backlog` lines first, then each new one, until cancelled. The control
+        plane reads it (the worker never sends it), so the follower reconnects
+        on its own when its connection ends."""
+
+
+# How often a local worker's log file is looked at for new lines.
+FOLLOW_EVERY = 0.2
+# How long one sprite log follow runs before it is opened again (seconds).
+SPRITE_FOLLOW = 3600
+# How long a sprite log follow waits before it is opened again.
+FOLLOW_AGAIN = 1.0
 
 
 def tail(data: bytes, lines: int) -> str:
@@ -199,7 +217,7 @@ class LocalProvider:
         env = {**os.environ, **passthrough_env(), **spec.env,
                "RUNNER_PORT": str(port), "RUNNER_HOST": "127.0.0.1",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": str(wdir),
-               "RUNNER_CAPACITY": str(spec.capacity)}
+               "RUNNER_CAPACITY": str(spec.capacity), "PYTHONUNBUFFERED": "1"}
         cwd = Path(__file__).resolve().parents[1]
         with open(self.log_path(wid), "ab") as log:
             proc = await asyncio.create_subprocess_exec(*self.command(), env=env, cwd=str(cwd),
@@ -230,6 +248,23 @@ class LocalProvider:
 
     async def logs(self, worker: Worker, lines: int) -> str:
         return tail(self.log_path(worker.id).read_bytes(), lines)
+
+    async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
+        path = self.log_path(worker.id)
+        with open(path, "rb") as f:
+            data = f.read()
+            end = data.rfind(b"\n") + 1  # a last line still being written comes with its rest
+            for line in data[:end].decode(errors="replace").splitlines()[-backlog:] if backlog else []:
+                yield line
+            partial = data[end:]
+            while True:
+                chunk = f.read()
+                if not chunk:
+                    await asyncio.sleep(FOLLOW_EVERY)
+                    continue
+                *lines, partial = (partial + chunk).split(b"\n")
+                for line in lines:
+                    yield line.decode(errors="replace")
 
     async def destroy(self, worker: Worker) -> None:
         proc = self.procs.pop(worker.id, None)
@@ -338,7 +373,7 @@ class SpritesProvider:
         await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
-               "RUNNER_CAPACITY": str(spec.capacity)}
+               "RUNNER_CAPACITY": str(spec.capacity), "PYTHONUNBUFFERED": "1"}
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
                    "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
@@ -412,11 +447,68 @@ class SpritesProvider:
             raise RuntimeError(f"reading {self.LOG} on sprite {worker.handle} failed ({r.status_code}): {r.text[:300]}")
         return tail(r.content, lines)
 
+    async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
+        """The runner service's log, from the Sprites API's log stream (NDJSON
+        of stdout/stderr/exit/error events, then `complete` when the follow
+        time is up). Each stream after the first starts with lines the last
+        one read; those are skipped by timestamp, and by count at the last
+        timestamp it read."""
+        seen_at, seen = 0, 0  # the last timestamp read, and lines read at it
+        lines = backlog
+        while True:
+            try:
+                async with self.http.stream("GET", f"/sprites/{worker.handle}/services/runner/logs",
+                                            params={"lines": lines, "duration": SPRITE_FOLLOW},
+                                            timeout=httpx.Timeout(60.0, read=None)) as r:
+                    if r.status_code >= 400:
+                        body = (await r.aread()).decode(errors="replace")
+                        raise RuntimeError(f"following the runner log of sprite {worker.handle} failed "
+                                           f"({r.status_code}): {body[:300]}")
+                    skip = seen
+                    async for raw in r.aiter_lines():
+                        if not raw.strip():
+                            continue
+                        ev = json.loads(raw)
+                        if ev.get("type") == "complete":
+                            continue
+                        ts = int(ev.get("timestamp") or 0)
+                        if ts < seen_at:
+                            continue
+                        if ts == seen_at and skip:
+                            skip -= 1
+                            continue
+                        seen, seen_at = (seen + 1 if ts == seen_at else 1), ts
+                        skip = 0
+                        for line in service_log_lines(ev):
+                            yield line
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("worker %s log follow: %s: %s", worker.id, type(e).__name__, e)
+            await asyncio.sleep(FOLLOW_AGAIN)
+            # Overlap the last stream: what it read at its last timestamp, and
+            # some lines more, in case one event held several.
+            lines = seen + 50
+
     async def destroy(self, worker: Worker) -> None:
         await self.http.delete(f"/sprites/{shlex.quote(worker.handle)}")
 
     async def close(self) -> None:
         await self.http.aclose()
+
+
+def service_log_lines(ev: dict) -> list[str]:
+    """A Sprites service log event as log lines; `complete` ends a follow and is none."""
+    typ = ev.get("type")
+    if typ in ("stdout", "stderr"):
+        return (ev.get("data") or "").splitlines()
+    if typ == "exit":
+        return [f"[sprite] runner service exited with code {ev.get('exit_code')}"]
+    if typ == "error":
+        return [f"[sprite] runner service error: {ev.get('data')}"]
+    if typ == "started":
+        return ["[sprite] runner service started"]
+    return []
 
 
 class AutoProvider:
@@ -471,6 +563,13 @@ class AutoProvider:
         if provider is None:
             raise RuntimeError(f"no {worker.provider} provider in this control plane")
         return await provider.logs(worker, lines)
+
+    async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
+        provider = self._of(worker)
+        if provider is None:
+            raise RuntimeError(f"no {worker.provider} provider in this control plane")
+        async for line in provider.follow(worker, backlog):
+            yield line
 
     async def close(self) -> None:
         for provider in (self._local, self._sprites):

@@ -262,3 +262,49 @@ async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypat
                                                "print('bubblewrap cannot make a sandbox here'); raise SystemExit(1)"])
     with pytest.raises(RuntimeError, match="exited with code 1.*\n.*bubblewrap cannot make a sandbox here"):
         await p.create(providers.WorkerSpec(project_id="p_1", index=1))
+
+
+async def test_local_follow_yields_the_backlog_then_each_new_line(tmp_path):
+    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    w = providers.Worker(id="p-w0", project_id="p", provider="local", handle="", url="")
+    (tmp_path / "p-w0").mkdir()
+    path = p.log_path("p-w0")
+    path.write_bytes(b"one\ntwo\nthree\npart")
+    env_lines = p.follow(w, 2)
+    got = [await env_lines.__anext__(), await env_lines.__anext__()]
+    with open(path, "ab") as f:
+        f.write(b"ial\nfour\n")
+    got += [await env_lines.__anext__(), await env_lines.__anext__()]
+    await env_lines.aclose()
+    assert got == ["two", "three", "partial", "four"]
+
+
+async def test_sprites_follow_reopens_the_log_stream_without_repeating_lines(env, monkeypatch):
+    """Each log stream ends when its follow time is up; the next one starts with
+    lines the last one read, and those are not yielded twice."""
+    monkeypatch.setattr(providers, "FOLLOW_AGAIN", 0)
+    ev = lambda ts, data, typ="stdout": json.dumps({"type": typ, "data": data, "timestamp": ts})
+    complete = json.dumps({"type": "complete", "timestamp": 9})
+    streams = [
+        [ev(1, "a\n"), ev(2, "b\nc\n"), complete],
+        [ev(1, "a\n"), ev(2, "b\nc\n"), ev(2, "d\n", "stderr"),
+         json.dumps({"type": "exit", "exit_code": 1, "timestamp": 3}), complete],
+    ]
+    asked = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/v1/sprites/orch-p-w0/services/runner/logs"
+        asked.append(dict(req.url.params))
+        body = "\n".join(streams.pop(0)) + "\n" if streams else ""
+        return httpx.Response(200, content=body.encode())
+
+    p = providers.SpritesProvider(token="tok", source="https://example.com/r.git", ref="main")
+    await p.http.aclose()
+    p.http = httpx.AsyncClient(base_url=p.API, transport=httpx.MockTransport(handler))
+    w = providers.Worker(id="orch-p-w0", project_id="p", provider="sprites", handle="orch-p-w0", url="")
+    lines = p.follow(w, 50)
+    got = [await lines.__anext__() for _ in range(5)]
+    await lines.aclose()
+    await p.http.aclose()
+    assert got == ["a", "b", "c", "d", "[sprite] runner service exited with code 1"]
+    assert asked[0]["lines"] == "50" and asked[1]["lines"] == "51"

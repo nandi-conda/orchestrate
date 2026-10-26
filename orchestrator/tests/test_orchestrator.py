@@ -1316,3 +1316,65 @@ async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monke
             assert fix["text"].startswith("I edited my message to you. It now reads:\n\n> use passkeys")
             tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
             assert [e["text"] for e in tr if e["seq"] == msg["seq"]] == ["use passkeys"]
+
+
+async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, monkeypatch, capsys):
+    """Each worker's runner log is printed as it is written, tagged with the
+    worker. Once the worker is lost, its thread's worker log says which worker
+    it was, why it was dropped, and how its log ended."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.2)
+    monkeypatch.setattr(service, "HEALTH_GAP", 0.05)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    try:
+        t = await orch.spawn(p["id"], "Echo", "say hi")
+
+        async def idle():
+            return (await s.get_thread(t["id"]))["state"] == "idle" or None
+        await wait_for(idle)
+        lw = orch.by_thread[t["id"]]
+        wid = lw.worker.id
+
+        async def printed():
+            return f"{wid} | devrunner: echo runner on port" in capsys.readouterr().out or None
+        await wait_for(printed)
+        provider.procs[wid].kill()
+
+        async def lost():
+            return t["id"] not in orch.by_thread or None
+        await wait_for(lost)
+        text = await orch.worker_logs(t["id"], 50)
+        assert f"its worker {wid} was dropped" in text
+        assert "/health failed 3 times in a row" in text
+        assert "devrunner: echo runner on port" in text  # its log, as it was followed
+    finally:
+        await orch.close()
+        await provider.close()
+        await s.close()
+
+
+async def test_a_thread_that_never_started_says_why(tmp_path):
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+
+    class Broken(LocalProvider):
+        async def create(self, spec):
+            raise RuntimeError("no capacity on sprites")
+
+    provider = Broken(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    try:
+        t = await orch.spawn(p["id"], "Echo", "say hi")
+        await asyncio.wait({orch.starting[t["id"]]})
+        text = await orch.worker_logs(t["id"], 50)
+        assert "never started on a worker" in text and "no capacity on sprites" in text
+    finally:
+        await orch.close()
+        await s.close()
