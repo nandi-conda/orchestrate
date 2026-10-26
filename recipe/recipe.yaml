@@ -1,0 +1,67 @@
+# The orchestrate conda package: the desktop window and the control plane, with
+# the runner a local worker runs. .github/workflows/package.yml builds it and,
+# on every push to main, publishes it to prefix.dev/nandi-testing.
+#
+# Every build is a new version: ORCHESTRATE_VERSION is 0.1.<workflow run
+# number> in CI (ci/pre-package.sh). Build it locally with `pixi run package`.
+context:
+  version: ${{ env.get("ORCHESTRATE_VERSION") }}
+
+package:
+  name: orchestrate
+  version: ${{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  noarch: python
+  script:
+    - python orchestrator/ui/build.py
+    - mkdir -p $SP_DIR/orchestrate/orchestrator/ui $SP_DIR/orchestrate/runner
+    - cp recipe/orchestrate/__init__.py $SP_DIR/orchestrate/
+    - cp -R orchestrator/control orchestrator/desktop $SP_DIR/orchestrate/orchestrator/
+    - cp -R orchestrator/ui/dist orchestrator/ui/icon.svg $SP_DIR/orchestrate/orchestrator/ui/
+    - cp -R runner/pixi.toml runner/pixi.lock runner/pyproject.toml runner/models.json runner/src runner/skills runner/deploy $SP_DIR/orchestrate/runner/
+  python:
+    entry_points:
+      - orchestrate = orchestrate:desktop
+      - orchestrate-serve = orchestrate:serve
+
+requirements:
+  build:
+    - python 3.12.*
+    - ultra >=0.1.20,<0.2
+  host:
+    - python 3.12.*
+  run:
+    # orchestrator/pixi.toml: the default environment and the desktop feature
+    - python 3.12.*
+    - starlette >=0.46
+    - uvicorn >=0.34
+    - httpx >=0.28
+    - aiosqlite >=0.21
+    - asyncpg >=0.30
+    - keyring >=25
+    - pyside6 >=6.8
+    - qt6-webengine >=6.8
+    # project hubs, and a local worker's runner (`pixi run` in runner/)
+    - git
+    - pixi
+
+tests:
+  - script:
+      - orchestrate --help
+      - orchestrate-serve --help
+      - python -c "import orchestrate; ui = orchestrate.ORCHESTRATOR / 'ui'; assert (ui / 'dist/app.wasm').stat().st_size and (ui / 'icon.svg').is_file()"
+
+about:
+  homepage: https://github.com/nandi-conda/orchestrate
+  repository: https://github.com/nandi-conda/orchestrate
+  summary: Project-based agent orchestrator, in a desktop window or a browser
+  description: |
+    `orchestrate` opens the desktop window, with the control plane in the same
+    process; `orchestrate-serve` serves the control plane and its UI on
+    http://127.0.0.1:8000 for a browser. Workers are Fly Sprites when
+    SPRITES_TOKEN is stored, local runner processes (Linux) otherwise.

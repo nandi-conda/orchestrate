@@ -15,6 +15,7 @@ serve = { cmd = "pixi run --manifest-path orchestrator serve", description = "Bu
 desktop = { cmd = "pixi run --manifest-path orchestrator desktop", description = "Open the UI in a desktop window, with the control plane running in the same process (--port, --db)" }
 worker = { cmd = "pixi run --manifest-path runner serve", description = "Run a runner service on :8080 (a worker; the control plane starts one per project itself)" }
 test = { cmd = "pixi run --manifest-path runner test && pixi run --manifest-path orchestrator test && pixi run --manifest-path orchestrator test-desktop", description = "Run every test suite: runner, orchestrator, the desktop window" }
+package = { cmd = "pixi exec rattler-build build --recipe recipe/recipe.yaml -c conda-forge -c https://prefix.dev/nandi-testing --output-dir output", env = { ORCHESTRATE_VERSION = "0.1.0" }, description = "Build the orchestrate conda package into output/ (CI publishes it on every push to main)" }
 set-key = { cmd = "pixi run --manifest-path runner set-key", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }
 
 # The documentation site (mkdocs.yml, docs/). It documents both subprojects, so

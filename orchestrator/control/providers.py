@@ -185,8 +185,12 @@ def _git(root: Path, *args: str) -> str:
 def repo_source_default(root: Path | None = None) -> tuple[str, str]:
     """What a sprite should check out: this checkout's `origin` and branch, so a
     run against sprites exercises the code in front of you. A tarball or a
-    detached checkout has neither, hence the public repository as fallback."""
+    detached checkout has neither, hence the public repository as fallback, as
+    for the conda package (recipe/), which is no checkout at all: git is not
+    asked about its directory, or it would answer for a repository around it."""
     root = root or Path(__file__).resolve().parents[2]
+    if not (root / ".git").exists():
+        return DEFAULT_SOURCE, DEFAULT_REF
     branch = _git(root, "symbolic-ref", "--short", "HEAD")
     return (_git(root, "remote", "get-url", "origin") or DEFAULT_SOURCE,
             branch or DEFAULT_REF)

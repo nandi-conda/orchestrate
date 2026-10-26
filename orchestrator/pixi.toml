@@ -52,7 +52,7 @@ desktop = ["desktop"]
 desktop-test = ["desktop", "desktop-test"]
 
 [tasks]
-build-ui = { cmd = "python -c \"import os;os.makedirs('ui/dist',exist_ok=True)\" && ultra build ui/app.py -o ui/dist/app.wasm && python -c \"import shutil;[shutil.copy('ui/'+f,'ui/dist/'+f) for f in ('index.html','imports.js','markdown.js','app.css','icon.svg')]\"" }
+build-ui = { cmd = "python ui/build.py", description = "Compile the ultra UI into ui/dist (ui/build.py)" }
 serve = { cmd = "python -m control", depends-on = ["build-ui"] }
 set-key = { cmd = "keyring set orchestrate", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }
 

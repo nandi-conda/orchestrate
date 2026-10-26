@@ -95,7 +95,7 @@ def missing_message(names: list[str]) -> str:
         what, sent = KNOWN.get(n, ("", ""))
         lines.append(f"  {n}" + (f"  ({what}; sent as {sent})" if what else ""))
     lines += ["", "Environment:  export NAME=value",
-              f"Keyring:      pixi run set-key NAME     (stores it under service '{SERVICE}')"]
+              f"Keyring:      keyring set {SERVICE} NAME     (`pixi run set-key NAME` in a checkout)"]
     backend = keyring_backend()
     lines.append(f"              keyring backend: {backend}" if backend
                  else "              no keyring backend in this session; use the environment")

@@ -168,6 +168,13 @@ def test_source_falls_back_to_the_public_repository(tmp_path):
     assert providers.repo_source_default(tmp_path) == (providers.DEFAULT_SOURCE, providers.DEFAULT_REF)
 
 
+def test_an_install_inside_another_repository_uses_the_public_repository(tmp_path):
+    # The conda package under a home directory that is itself a git repository.
+    install = _checkout(tmp_path) / "envs" / "orchestrate"
+    install.mkdir(parents=True)
+    assert providers.repo_source_default(install) == (providers.DEFAULT_SOURCE, providers.DEFAULT_REF)
+
+
 def test_checkout_note_warns_when_the_branch_was_never_pushed(tmp_path):
     root = _checkout(tmp_path)
     assert "clone will fail" in providers.checkout_note(root, "feature/x")

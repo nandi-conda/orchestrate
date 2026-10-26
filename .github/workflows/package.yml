@@ -1,0 +1,23 @@
+# Builds the orchestrate conda package (recipe/recipe.yaml) with the shared
+# nandi-conda workflow and, on every push to main, publishes it to
+# prefix.dev/nandi-testing with the org's PREFIX_API_KEY secret.
+# All the logic lives in https://github.com/nandi-conda/ci; ci/pre-package.sh
+# gives each run its own version, so every push is a new package.
+name: Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    uses: nandi-conda/ci/.github/workflows/conda-package.yml@main
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # ultra, which compiles the UI, is on nandi-testing
+      build-channels: conda-forge https://prefix.dev/nandi-testing
