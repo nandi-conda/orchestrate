@@ -6,13 +6,12 @@ It has no model. Each turn it says what it got, and:
 - a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
 - a line `write <path>: <text>` writes text to that file of the thread's workspace
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
-- a line `finish` lands the thread's branch at the end of the turn,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
 Its git flow is the real runner's (runner/API.md, "Repository"): a worktree
 per thread in a repository the control plane fills (`POST /repo`), and at the
 end of every turn a commit, a snapshot and a session that the control plane
-takes (peer call `save`). Its session is the messages a thread received, one
+takes, landing the branch (peer call `save`). Its session is the messages a thread received, one
 per line, so a thread brought back on another worker says how many it had.
 
 Peer calls wait on /peer/calls for the control plane to collect, as in
@@ -48,7 +47,6 @@ TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
 LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
-FINISH = re.compile(r"^\s*finish\s*$", re.M)
 THREAD_ID = re.compile(r"^[\w-]+$")
 
 
@@ -169,7 +167,7 @@ class Host:
             await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
         summary = f"echoed {len(text)} chars"
         t["summary"] = summary
-        await self.save(t, bool(FINISH.search(text)))
+        await self.save(t)
         await self.emit(t["id"], "turn_done", {"summary": summary, "final": f"Echo: {text}"})
         await self.peer_call("set_summary", thread_id=t["id"], summary=summary, files=[])
         if t.get("parent") and not text.startswith("Finished:"):
@@ -177,14 +175,14 @@ class Host:
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
 
-    async def save(self, t: dict, land: bool) -> None:
-        """Commit and snapshot the worktree; the control plane takes both, and
-        lands the branch when the turn asked to."""
+    async def save(self, t: dict) -> None:
+        """Commit and snapshot the worktree; the control plane takes both and
+        lands the branch."""
         tid, branch = t["id"], f"thread/{t['id']}"
         try:
             commit = await self.repo.save(self.workdir / tid, tid, f"{t['title']}\n\nThread: {tid}")
             await self.repo.save_session(tid, self.session_dir(t))
-            reply = await self.peer("save", thread_id=tid, land=land)
+            reply = await self.peer("save", thread_id=tid, land=True)
             if not reply.get("ok"):
                 raise GitError(reply.get("error") or "save failed")
             result = reply["result"]
@@ -193,9 +191,7 @@ class Host:
         except (GitError, asyncio.TimeoutError) as e:
             await self.emit(tid, "error", {"error": f"saving the work failed: {e or type(e).__name__}"})
             return
-        if not land:
-            await self.emit(tid, "saved", {"branch": branch, "commit": commit})
-        elif result.get("landed"):
+        if result.get("landed"):
             await self.emit(tid, "landed", {"branch": branch, "base": result["base"], "commit": result["commit"]})
         elif result.get("conflict") is not None:
             await self.emit(tid, "land_conflict", {"branch": branch, "base": result["base"], "files": result["conflict"]})

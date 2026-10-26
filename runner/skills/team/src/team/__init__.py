@@ -63,7 +63,3 @@ async def web_search(query: str, count: int = 10, question: str | None = None) -
 
 async def web_fetch(url: str) -> dict:
     return await _call("web_fetch", url=url)
-
-
-async def finish(summary: str) -> None:
-    await _call("finish", summary=summary)

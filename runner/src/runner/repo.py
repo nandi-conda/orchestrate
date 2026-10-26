@@ -30,8 +30,8 @@ thread's previous session commit, so the thread's agent picks up where it
 was on any worker.
 
 At the end of every turn the runner commits whatever the thread left and
-makes a snapshot; the orchestrator takes both (peer call `save`). A turn
-that ends with `finish` asks it to land the branch: the orchestrator rebases
+makes a snapshot; the orchestrator takes both (peer call `save`) and lands
+the branch, unless a model call failed in the turn: the orchestrator rebases
 it onto the default branch in the hub and brings both back, and the worktree
 follows the rebased branch. A rebase that conflicts goes back to the thread
 to resolve against `origin/<base>`.

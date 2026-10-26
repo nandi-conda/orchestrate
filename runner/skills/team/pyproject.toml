@@ -1,7 +1,7 @@
 [project]
 name = "team"
 version = "0.1.0"
-description = "Orchestrate team skill: a thread's peer, web and finish calls, answered by its runner"
+description = "Orchestrate team skill: a thread's peer and web calls, answered by its runner"
 requires-python = ">=3.11"
 dependencies = []
 

@@ -225,8 +225,8 @@ bare repository at `.orchestrator/repos/<project id>.git` (the hub; its path is
 under **Settings** in the project window). It starts from an empty commit,
 "Start the project". Each thread works in its own worktree on `thread/<id>` on
 its worker; every turn ends with the thread's branch and a snapshot of its
-whole worktree (ignored files too) taken into the hub, and a turn that ends
-with `finish` lands it on the hub's main branch (rebase, fast-forward;
+whole worktree (ignored files too) taken into the hub and the branch landed
+on the hub's main branch (a turn a model call failed in is only taken) (rebase, fast-forward;
 conflicts go back to the thread). Workers never reach the hub: the control
 plane moves commits to and from them as git bundles. So destroying sprites
 when the control plane stops loses nothing a thread had at the end of its last

@@ -93,14 +93,14 @@ async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
     await stop_all(h)
 
 
-async def test_turn_end_commits_leftovers_and_snapshots_the_worktree(tmp_path):
+async def test_turn_end_commits_leftovers_snapshots_the_worktree_and_lands(tmp_path):
     source(tmp_path)
     h = await host(tmp_path, [sh("printf 'build/\\n' > .gitignore; mkdir -p build; "
                                  "echo bin > build/app; echo draft > new.txt"), "stopping here"])
     t = await h.start(project="p", title="t", request="draft")
     await h.wait_idle(t.id)
     await h.stop(t.id)
-    assert "saved" in types(t) and "landed" not in types(t) and "error" not in types(t), t.events
+    assert "landed" in types(t) and "saved" not in types(t) and "error" not in types(t), t.events
     assert sorted(t.files) == [".gitignore", "new.txt"]
     repo = h.repo.path
     assert git(repo, "show", f"{t.branch}:new.txt") == "draft"
@@ -108,19 +108,33 @@ async def test_turn_end_commits_leftovers_and_snapshots_the_worktree(tmp_path):
     snap = f"refs/snapshots/{t.id}"
     assert git(repo, "show", f"{snap}:build/app") == "bin"
     assert git(repo, "rev-parse", f"{snap}^") == git(repo, "rev-parse", t.branch)
-    assert "new.txt" not in git(repo, "ls-tree", "--name-only", "origin/main")
+    assert git(repo, "show", "origin/main:new.txt") == "draft"
+    assert "build" not in git(repo, "ls-tree", "--name-only", "origin/main").split()
     session = f"refs/sessions/{t.id}"
     files = git(repo, "ls-tree", "-r", "--name-only", session).splitlines()
     assert any(f.startswith("sessions/") and f.endswith(".jsonl") for f in files), files
     assert '"draft"' in git(repo, "show", f"{session}:{next(f for f in files if f.endswith('.jsonl'))}")
 
 
-async def test_finish_lands_concurrent_threads_linearly(tmp_path):
+async def test_a_turn_a_model_call_failed_in_is_saved_not_landed(tmp_path):
+    source(tmp_path)
+    h = await host(tmp_path, [sh("echo half > half.txt"),
+                              {"content": [{"type": "text", "text": ""}], "stopReason": "error",
+                               "errorMessage": "HTTP 402: Insufficient Balance"}])
+    t = await h.start(project="p", title="t", request="draft")
+    await h.wait_idle(t.id)
+    await h.stop(t.id)
+    assert "saved" in types(t) and "landed" not in types(t), t.events
+    assert git(h.repo.path, "show", f"{t.branch}:half.txt") == "half"
+    assert "half.txt" not in git(h.repo.path, "ls-tree", "--name-only", "origin/main")
+
+
+async def test_every_turn_lands_concurrent_threads_linearly(tmp_path):
     source(tmp_path)
     h = await host(tmp_path,
-                   [py("open('a.txt', 'w').write('a\\n')"), py("await team.finish('added a')"), "done"],
+                   [py("open('a.txt', 'w').write('a\\n')"), py("await team.set_summary('added a')"), "done"],
                    [sh("echo b > b.txt && git add b.txt && git commit -qm 'add b'"),
-                    py("await team.finish('added b')"), "done"])
+                    py("await team.set_summary('added b')"), "done"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
@@ -138,11 +152,11 @@ async def test_conflict_goes_back_to_the_thread(tmp_path):
     fix = ("git rebase origin/main; printf 'one\\nTWO-b\\nthree\\n' > notes.txt && "
            "git add notes.txt && git rebase --continue")
     h = await host(tmp_path,
-                   [py("await edit('notes.txt', 'two', 'TWO-a')"), py("await team.finish('a edits two')"), "done"],
+                   [py("await edit('notes.txt', 'two', 'TWO-a')"), py("await team.set_summary('a edits two')"), "done"],
                    [py("await edit('notes.txt', 'two', 'TWO-b')"),
                     sh("sleep 2"),  # let a land first
-                    py("await team.finish('b edits two')"), "done",
-                    sh(fix), py("await team.finish('b resolved')"), "done"])
+                    py("await team.set_summary('b edits two')"), "done",
+                    sh(fix), py("await team.set_summary('b resolved')"), "done"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
     await h.wait_idle(a.id)
@@ -167,7 +181,7 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     outbox = PeerOutbox()
     repo = Repo(tmp_path / "threads" / ".repo")
     h = ThreadHost(agent=Scripted([sh("echo x > x.txt; printf 'out/\\n' > .gitignore; mkdir out; echo o > out/o"),
-                                   py("await team.finish('added x')"), "done"]),
+                                   py("await team.set_summary('added x')"), "done"]),
                    web=Web(), peers=OrchestratorPeers(outbox), workdir=str(tmp_path / "threads"), repo=repo)
 
     async def ship():

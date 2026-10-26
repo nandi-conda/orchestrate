@@ -34,7 +34,7 @@ and environment variables are in [API.md](API.md).
 | --- | --- |
 | `src/runner/harness.py` | `PrimeAgent` (how a thread's prime-agent starts, its kernel wrapper), `Harness` (its RPC) |
 | `src/runner/sandbox.py` | `View` (what a thread's kernel sees), bubblewrap arguments, the kernel's environment |
-| `src/runner/team.py` | the runner's side of the team skill: a thread's socket for peer, web and `finish` calls |
+| `src/runner/team.py` | the runner's side of the team skill: a thread's socket for peer and web calls |
 | `skills/team/` | the team skill: its SKILL.md and the `team` module in the kernel |
 | `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` (prime-agent events to runner events, turns) and `ThreadHost` (workspaces, capacity) |

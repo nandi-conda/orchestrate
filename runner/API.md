@@ -63,8 +63,8 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | prime-agent's token counts for one model call |
 | `turn_done` | `{"summary", "final"}` |
-| `saved` | `{"branch", "commit"}`: a turn ended without `finish`; leftovers committed, the orchestrator took the branch and snapshot |
-| `landed` | `{"branch", "base", "commit"}`: a turn ended with `finish` and the branch is now the tip of `base` in the orchestrator's repository |
+| `saved` | `{"branch", "commit"}`: a turn a model call failed in ended; leftovers committed, the orchestrator took the branch and snapshot but did not land it |
+| `landed` | `{"branch", "base", "commit"}`: a turn ended and the branch is now the tip of `base` in the orchestrator's repository |
 | `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
 | `dropped` | `{"from", "reason"}` |
 | `error` | `{"error"}` |
@@ -117,7 +117,7 @@ wait and then fail; the CLI (`pixi run run`) uses in-process peers instead.
 A thread makes these calls from its kernel with the team skill
 (`skills/team`, `await team.send_message(...)`), over a unix socket of its own
 bound into its sandbox; the runner queues them here. `web_search`,
-`web_fetch` and `finish` go through the same socket but are answered by the
+`web_fetch` go through the same socket but are answered by the
 runner itself.
 
 | `op` (the tool) | `args` | `result` |
@@ -227,9 +227,9 @@ own worktree, index and branch. A turn's work leaves the worker on one path:
    files included, whose parent is the branch tip (`refs/snapshots/<id>`), and
    commits the session (`refs/sessions/<id>`). It then asks the orchestrator
    to `save` (a peer call), which takes all three with
-   `GET /threads/{id}/repo` (`saved`).
-3. When the turn ended with `finish`, `save` has `land: true`: the
-   orchestrator rebases the branch onto the default branch in its hub (and,
+   `GET /threads/{id}/repo`.
+3. `save` has `land: true` unless a model call failed in the turn (the work
+   is then only taken, and the runner logs `saved`): the orchestrator rebases the branch onto the default branch in its hub (and,
    when the project has a GitHub repository, pushes the new tip there first),
    sends back the new `origin/<base>` and `origin/thread/<id>`, and answers
    `{"landed": true, "base", "commit"}`. The worktree's branch follows
@@ -237,7 +237,7 @@ own worktree, index and branch. A turn's work leaves the worker on one path:
 4. A conflicting rebase is answered `{"landed": false, "base", "conflict":
    [files]}`, with the latest `origin/<base>` sent first. The thread gets a
    message from `runner` (`land_conflict`), rebases onto `origin/<base>`,
-   resolves, and calls `finish` again. A run of conflicts ends at the hop limit.
+   resolves, and ends the turn, which lands again. A run of conflicts ends at the hop limit.
 
 The CLI (`pixi run run --repo <path or URL>`) has no orchestrator: `--repo`
 seeds the worker repository (its branches become `origin/*`, its HEAD the

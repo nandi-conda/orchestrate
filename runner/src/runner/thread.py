@@ -41,14 +41,14 @@ How the team works, through the `team` skill (read its SKILL.md):
   messages that start with [from <thread id>] or [from router]; the user's own come as they are.
 - Keep your directory entry current with `team.set_summary` when your focus changes.
 - `team.web_search` and `team.web_fetch` search and read the web.
-- When the work for this request is done, `await team.finish(summary)`. You may get follow-ups later.
 
 Commits: commit your work on {branch} with clear messages; there is no remote to push to.
-At the end of every turn the runner commits anything left over and the orchestrator saves your
-branch, and every file in your workspace, to the project's repository. When you call finish it
-lands your branch on the project's main branch (rebase, fast-forward). If that rebase conflicts
-you get a message from "runner" listing the files: rebase onto the named branch yourself,
-resolve, `git rebase --continue`, and call finish again.
+At the end of every turn the runner commits anything left over and your branch lands on the
+project's main branch (rebase, fast-forward), and every file in your workspace is saved to the
+project's repository. So end a turn with the work in a state fit for main: when you stop to ask
+something, leave what you have working. If landing conflicts you get a message from "runner"
+listing the files: rebase onto the named branch yourself, resolve, `git rebase --continue`, and
+end the turn; it lands again.
 """
 
 
@@ -121,7 +121,6 @@ class AgentThread:
         self.summary = summary
         self.files: set[str] = set()
         self.spawned = 0
-        self.finish_requested = False
         self.events: list[dict] = []
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
         self.harness: Harness | None = None
@@ -178,7 +177,6 @@ class AgentThread:
         """One turn: the agent's run from the message just sent until it is idle
         again. Messages that arrive meanwhile steer it."""
         self.set_state("working")
-        self.finish_requested = False
         turn = Turn(self)
         events = self.harness.events
         ev_get = asyncio.ensure_future(events.get())
@@ -200,10 +198,10 @@ class AgentThread:
         finally:
             in_get.cancel()
             ev_get.cancel()
-        if not self.summary:  # the model ended without finish/set_summary: its last words stand in
+        if not self.summary:  # the model never called set_summary: its last words stand in
             self.summary = (turn.final or self.title)[:500]
         if self.workspace:
-            await self._commit_work()
+            await self._commit_work(land=not turn.failed)
         self.set_state("idle")
         self.emit("turn_done", {"summary": self.summary, "final": turn.final})
         try:
@@ -213,9 +211,10 @@ class AgentThread:
         except Exception as e:
             self.emit("error", {"error": f"peer update failed: {e}"})
 
-    async def _commit_work(self):
+    async def _commit_work(self, land: bool):
         """Commit the turn's work, snapshot the worktree and save the agent's
-        session; the orchestrator saves all three, and lands the branch after finish."""
+        session; the orchestrator saves all three and lands the branch. A turn
+        a model call failed in is cut short, so its work is saved, not landed."""
         message = f"{self.title}\n\n{self.summary}\n\nThread: {self.id}"
         repo = self.workspace.repo
         try:
@@ -223,13 +222,13 @@ class AgentThread:
             self.files = set(await self.workspace.changed())
             await self.workspace.snapshot()
             await repo.save_session(self.id, self.place.agent_dir, SESSION)
-            result = await self.peers.save(self.id, land=self.finish_requested)
+            result = await self.peers.save(self.id, land=land)
             if result.get("landed"):
                 await self.workspace.follow()
         except (GitError, PeerError) as e:
             self.emit("error", {"error": str(e)})
             return
-        if not self.finish_requested:
+        if not land:
             self.emit("saved", {"branch": self.branch, "commit": commit})
         elif result.get("landed"):
             self.conflicts = 0
@@ -242,7 +241,7 @@ class AgentThread:
             self.deliver(f"Landing {self.branch} on {base} failed: rebasing onto origin/{base} "
                          f"conflicts in {', '.join(files) or 'some files'}. Run "
                          f"`git rebase origin/{base}`, resolve the conflicts, `git rebase --continue`, "
-                         "then call finish again.", sender="runner", hops=self.conflicts)
+                         "then end the turn; it lands again.", sender="runner", hops=self.conflicts)
         else:
             self.emit("error", {"error": f"landing {self.branch} failed: {result.get('message') or 'no reason given'}"})
 
@@ -257,6 +256,7 @@ class Turn:
         self.deltas = DeltaBuffer(t.emit)
         self.steps = 0
         self.final = ""
+        self.failed = False  # a model call failed: the turn ended early
 
     async def on(self, ev: dict) -> bool:
         """Take one event; True when the agent's run has ended."""
@@ -303,6 +303,7 @@ class Turn:
         if m.get("usage"):
             self.t.emit("usage", m["usage"])
         if m.get("stopReason") == "error":
+            self.failed = True
             self.t.emit("error", {"error": m.get("errorMessage") or "the model call failed"})
         self.steps += 1
 

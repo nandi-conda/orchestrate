@@ -83,18 +83,18 @@ async def test_the_kernel_runs_in_the_sandbox_with_no_secrets(tmp_path, monkeypa
     await host.stop(t.id)
 
 
-async def test_thread_runs_python_and_finishes(tmp_path):
+async def test_thread_runs_python_and_sets_its_summary(tmp_path):
     host = host_with([
         py("open('hello.py', 'w').write(\"print('hi')\\n\")"),
         sh("python3 hello.py"),
-        py("await team.finish('added hello.py')", text="done"),
+        py("await team.set_summary('added hello.py')", text="done"),
         "all done",
     ], tmp_path=tmp_path)
     t = await host.start(project="p", title="t", request="add hello.py")
     await host.wait_idle(t.id)
     assert "turn_done" in [e["type"] for e in t.events] and t.state == "idle"
     assert results(t)[1].strip() == "0 hi"
-    assert t.summary == "added hello.py" and t.finish_requested
+    assert t.summary == "added hello.py"
     await host.stop(t.id)
 
 
@@ -135,8 +135,8 @@ async def test_a_message_during_a_turn_steers_it(tmp_path):
 async def test_spawn_and_child_reports_back(tmp_path):
     host = host_with(
         [py("print(await team.spawn_thread('child', 'do the child work'))"),
-         py("await team.finish('spawned child')"), "waiting for child", "child reported"],
-        [py("await team.finish('child work done')"), "done"],
+         py("await team.set_summary('spawned child')"), "waiting for child", "child reported"],
+        [py("await team.set_summary('child work done')"), "done"],
         tmp_path=tmp_path)
     p = await host.start(project="p", title="parent", request="split this")
     await until(lambda: len(host.threads) == 2)
@@ -202,7 +202,7 @@ async def test_http_api(tmp_path):
         tid = r.json()["id"]
         await host.wait_idle(tid)
         done = [e for e in host.threads[tid].events if e["type"] == "turn_done"][0]
-        assert done["data"]["summary"] == "hi there"  # no finish call: last reply becomes the summary
+        assert done["data"]["summary"] == "hi there"  # no set_summary call: last reply becomes the summary
         threads = (await c.get("/threads", headers=h)).json()
         assert threads[0]["id"] == tid and threads[0]["state"] == "idle"
         assert (await c.post(f"/threads/{tid}/messages", json={"body": "again"}, headers=h)).status_code == 202

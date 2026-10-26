@@ -1,6 +1,6 @@
 ---
 name: team
-description: Work with the other threads of this project and with the orchestrator - list and read threads, message them, spawn a thread for independent work, keep your summary current, search and fetch the web, and finish a request (which lands your branch).
+description: Work with the other threads of this project and with the orchestrator - list and read threads, message them, spawn a thread for independent work, keep your summary current, and search and fetch the web.
 ---
 
 # Team
@@ -15,7 +15,6 @@ child = await team.spawn_thread("Fix Safari export", "The export button does not
 await team.set_summary("Owns ui/export.py: rewriting the export flow.")
 results = await team.web_search("bubblewrap user namespace proc mount", question="why does bwrap fail to mount proc")
 page = await team.web_fetch(results[0]["url"])
-await team.finish("Rewrote the export flow; tests pass.")
 ```
 
 ## API
@@ -27,6 +26,5 @@ await team.finish("Rewrote the export flow; tests pass.")
 - `set_summary(summary: str) -> None`: your one-paragraph status in the thread directory, so other threads and the router know what you own.
 - `web_search(query: str, count: int = 10, question: str | None = None) -> list[dict]`: ranked results (`title`, `url`, `date`, `summary`). `query` is at most 128 characters and takes `site:`, `-site:`, `"exact phrase"`, `-term`, `lang:en`, `after:2025-01-01`, `before:2026`; `question` is the question behind it, at most 128 characters.
 - `web_fetch(url: str) -> dict`: a page as Markdown (`title`, `content`).
-- `finish(summary: str) -> None`: the work for this request is done. When the turn ends, your branch lands on the project's main branch. Give a one-paragraph summary of what you did and the state you left things in.
 
 A failed call raises `team.TeamError` with the reason.

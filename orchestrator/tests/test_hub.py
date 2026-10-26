@@ -1,5 +1,5 @@
 """One git repository per project (control/hub.py): threads' work reaches it
-every turn, finished threads land there (and on the project's repository
+every turn and land there (and on the project's repository
 first, when it has one), and a thread brought back on a fresh worker gets its
 files from it. Against the echo runner, which keeps the real runner's git flow."""
 
@@ -61,6 +61,14 @@ def commit(seed, name, text, message):
     git(seed, "push", "-q", "origin", "HEAD:trunk")
 
 
+async def landing(s, p, tid, n):
+    """The thread's n-th `landed` event (from 1), once there is one."""
+    async def find():
+        found = [e["payload"] for e in await s.list_events(p["id"], tid) if e["type"] == "landed"]
+        return found[n - 1] if len(found) >= n else None
+    return await wait_for(find)
+
+
 async def event(s, p, tid, typ):
     async def find():
         return next((e["payload"] for e in await s.list_events(p["id"], tid) if e["type"] == typ), None)
@@ -93,18 +101,18 @@ async def test_a_project_without_a_repository_starts_from_an_empty_commit(tmp_pa
     assert git(hub.path, "rev-list", "--count", "main") == "1"
 
 
-async def test_every_turn_reaches_the_hub_and_finish_lands(tmp_path):
+async def test_every_turn_lands_on_the_hub(tmp_path):
     s, p, orch = await setup(tmp_path)
     t = await orch.spawn(p["id"], "T", "write a.txt: one")
-    saved = await event(s, p, t["id"], "saved")
+    landed = await event(s, p, t["id"], "landed")
     hub = orch.hub_path(p["id"])
-    assert git(hub, "rev-parse", f"thread/{t['id']}") == saved["commit"]
-    assert git(hub, "show", f"thread/{t['id']}:a.txt") == "one"
-    assert "a.txt" not in git(hub, "ls-tree", "--name-only", "main")
+    assert git(hub, "rev-parse", f"thread/{t['id']}") == landed["commit"] == git(hub, "rev-parse", "main")
+    assert git(hub, "show", "main:a.txt") == "one"
     await wait_for(lambda: idle(s, t["id"]))
 
-    await orch.send(t["id"], "write b.txt: two\nfinish")
-    landed = await event(s, p, t["id"], "landed")
+    await orch.send(t["id"], "write b.txt: two")
+    landed = await landing(s, p, t["id"], 2)
+    assert git(hub, "ls-tree", "--name-only", "main").split() == ["a.txt", "b.txt"]
     assert landed["base"] == "main" and git(hub, "rev-parse", "main") == landed["commit"]
     assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "b.txt"}
     assert git(hub, "rev-list", "--merges", "--count", "main") == "0"
@@ -116,17 +124,16 @@ async def test_every_turn_reaches_the_hub_and_finish_lands(tmp_path):
 async def test_landing_rebases_onto_what_landed_before_and_conflicts_go_back(tmp_path):
     s, p, orch = await setup(tmp_path)
     a = await orch.spawn(p["id"], "A", "write a.txt: a")
+    await event(s, p, a["id"], "landed")
+    c = await orch.spawn(p["id"], "C", "hold on")  # its worker base is a's main
+    await event(s, p, c["id"], "landed")
+    await wait_for(lambda: idle(s, c["id"]))
     b = await orch.spawn(p["id"], "B", "write same.txt: b")
-    c = await orch.spawn(p["id"], "C", "write same.txt: c")
-    for t in (a, b, c):
-        await wait_for(lambda: idle(s, t["id"]))
-    for t, text in ((a, "finish"), (b, "finish")):
-        await orch.send(t["id"], text)
-        await event(s, p, t["id"], "landed")
+    await event(s, p, b["id"], "landed")
     hub = orch.hub_path(p["id"])
     assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "same.txt"}
 
-    await orch.send(c["id"], "finish")
+    await orch.send(c["id"], "write same.txt: c")
     conflict = await event(s, p, c["id"], "land_conflict")
     assert conflict["files"] == ["same.txt"] and conflict["base"] == "main"
     assert git(hub, "show", "main:same.txt") == "b"
@@ -146,13 +153,15 @@ async def test_a_project_repository_gets_the_landing_first_and_nothing_else(tmp_
     hub = orch.hub_path(p["id"])
     assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/trunk"
 
-    # Someone pushes to the repository meanwhile; the landing goes on top.
+    await landing(s, p, t["id"], 1)
+    # Someone pushes to the repository meanwhile; the next landing goes on top.
+    git(seed, "pull", "-q", "--ff-only", "origin", "trunk")
     commit(seed, "theirs.txt", "x\n", "theirs")
 
-    await orch.send(t["id"], "finish")
-    landed = await event(s, p, t["id"], "landed")
+    await orch.send(t["id"], "write b.txt: two")
+    landed = await landing(s, p, t["id"], 2)
     assert git(bare, "rev-parse", "trunk") == landed["commit"] == git(hub, "rev-parse", "trunk")
-    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "theirs.txt", "a.txt"}
+    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "theirs.txt", "a.txt", "b.txt"}
     assert git(bare, "for-each-ref", "--format=%(refname)") == "refs/heads/trunk"  # no thread branches
     await orch.close()
     await orch.provider.close()
@@ -163,7 +172,7 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
     s, p, first = await setup(tmp_path, workers="w1")
     t = await first.spawn(p["id"], "T", "write .gitignore: build/\nwrite build/app: binary\nwrite src.txt: code")
     await wait_for(lambda: idle(s, t["id"]))
-    await event(s, p, t["id"], "saved")
+    await event(s, p, t["id"], "landed")
     hub = first.hub_path(p["id"])
     assert "build" not in git(hub, "ls-tree", "--name-only", f"thread/{t['id']}").split()
     assert git(hub, "show", f"refs/snapshots/{t['id']}:build/app") == "binary"
@@ -199,36 +208,9 @@ async def test_a_hub_at_a_relative_path_is_made_where_it_says(tmp_path, monkeypa
     assert git(tmp_path / ".orchestrator" / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"
 
 
-async def test_a_remote_attached_later_gives_a_new_project_its_history(tmp_path):
-    """A thread begun before the remote was attached lands on the remote's
-    history, without the hub's empty first commit."""
-    bare, seed = remote(tmp_path)
-    s, p, orch = await setup(tmp_path)
-    t = await orch.spawn(p["id"], "T", "write a.txt: one")
-    await wait_for(lambda: idle(s, t["id"]))
-    hub = orch.hub_path(p["id"])
-    assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/main"
-
-    p = await orch.update_project(p["id"], repo_url=str(bare))
-    assert p["repo_url"] == str(bare)
-    assert git(hub, "symbolic-ref", "HEAD") == "refs/heads/trunk"
-    assert git(hub, "for-each-ref", "--format=%(refname)", "refs/heads/main") == ""
-    assert git(hub, "rev-parse", "trunk") == git(bare, "rev-parse", "trunk")
-
-    await orch.send(t["id"], "finish")
-    landed = await event(s, p, t["id"], "landed")
-    assert landed["base"] == "trunk" and git(bare, "rev-parse", "trunk") == landed["commit"]
-    assert git(bare, "log", "--format=%s", "trunk").splitlines()[-1] == "init"
-    assert "Start the project" not in git(bare, "log", "--format=%s", "trunk")
-    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "a.txt"}
-    await orch.close()
-    await orch.provider.close()
-    await s.close()
-
-
 async def test_an_empty_remote_gets_the_projects_history(tmp_path):
     s, p, orch = await setup(tmp_path)
-    t = await orch.spawn(p["id"], "T", "write a.txt: one\nfinish")
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
     landed = await event(s, p, t["id"], "landed")
     empty = tmp_path / "empty.git"
     git(tmp_path, "init", "-q", "--bare", str(empty))
@@ -243,7 +225,7 @@ async def test_an_empty_remote_gets_the_projects_history(tmp_path):
 async def test_a_remote_with_another_history_is_refused(tmp_path):
     bare, seed = remote(tmp_path)
     s, p, orch = await setup(tmp_path)
-    t = await orch.spawn(p["id"], "T", "write a.txt: one\nfinish")
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
     landed = await event(s, p, t["id"], "landed")
 
     with pytest.raises(GitError, match="each gone their own way"):
@@ -262,12 +244,12 @@ async def test_a_remote_ahead_or_behind_follows_and_removing_it_keeps_the_hub(tm
     bare, seed = remote(tmp_path)
     s, p, orch = await setup(tmp_path, str(bare))
     hub = orch.hub_path(p["id"])
-    a = await orch.spawn(p["id"], "A", "write a.txt: a\nfinish")
+    a = await orch.spawn(p["id"], "A", "write a.txt: a")
     landed = await event(s, p, a["id"], "landed")
 
     # Off the remote, the next landing stays here; the remote is left as it was.
     await orch.update_project(p["id"], repo_url="")
-    b = await orch.spawn(p["id"], "B", "write b.txt: b\nfinish")
+    b = await orch.spawn(p["id"], "B", "write b.txt: b")
     ours = (await event(s, p, b["id"], "landed"))["commit"]
     assert git(bare, "rev-parse", "trunk") == landed["commit"]
     assert git(hub, "rev-parse", "trunk") == ours

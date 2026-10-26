@@ -1,5 +1,5 @@
 """The runner's side of the team skill (runner/skills/team): a thread's calls
-to its peers, the web and `finish`, from its kernel in the sandbox.
+to its peers and the web, from its kernel in the sandbox.
 
 Each thread has a unix socket of its own, bound into its sandbox; the kernel
 connects once per call, writes `{"op", "args"}` as a JSON line and reads
@@ -62,15 +62,9 @@ async def _web_fetch(t: "AgentThread", url: str) -> dict:
     return await t.web.fetch(url)
 
 
-async def _finish(t: "AgentThread", summary: str) -> None:
-    t.finish_requested = True
-    if summary:
-        t.summary = summary
-
-
 OPS = {"list_threads": _list_threads, "read_thread": _read_thread, "send_message": _send_message,
        "spawn_thread": _spawn_thread, "set_summary": _set_summary, "web_search": _web_search,
-       "web_fetch": _web_fetch, "finish": _finish}
+       "web_fetch": _web_fetch}
 
 
 async def answer(t: "AgentThread", line: bytes) -> dict:
