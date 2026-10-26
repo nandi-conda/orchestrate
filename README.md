@@ -3,8 +3,9 @@
 A project-based agent orchestrator. Each project has one main window; each
 request becomes one or more agent threads running on remote workers.
 
-Full documentation (architecture, setup, credentials, UI, worker lifecycle) is
-an MkDocs site in [`docs/`](docs/index.md): `pixi run docs` serves it on
+Full documentation (architecture, setup, credentials, UI, worker lifecycle)
+is published at <https://nandi-conda.github.io/orchestrate/>. The site's source
+is [`docs/`](docs/index.md): `pixi run docs` serves it locally on
 http://127.0.0.1:8001, `pixi run docs-build` builds it.
 
 | Directory | What | Docs |
