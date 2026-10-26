@@ -3,6 +3,10 @@
 A project-based agent orchestrator. Each project has one main window; each
 request becomes one or more agent threads running on remote workers.
 
+Full documentation (architecture, setup, credentials, UI, worker lifecycle) is
+an MkDocs site in [`docs/`](docs/index.md): `pixi run docs` serves it on
+http://127.0.0.1:8001, `pixi run docs-build` builds it.
+
 | Directory | What | Docs |
 | --- | --- | --- |
 | [`orchestrator/`](orchestrator) | control plane + ultra UI, in a browser or a desktop window | [README](orchestrator/README.md) |

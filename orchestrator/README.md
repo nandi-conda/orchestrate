@@ -24,8 +24,8 @@ cd orchestrator
 pixi run serve            # builds the UI, then serves http://127.0.0.1:8000
 ```
 
-Open http://127.0.0.1:8000, create a project and give it the path or URL of a
-git repo. It opens in the same window at `/p/<project id>`, and
+Open http://127.0.0.1:8000 and create a project (a name is all it needs; a
+GitHub remote can be attached later in its Settings). It opens in the same window at `/p/<project id>`, and
 **← All projects**, Back and Forward move between the list and projects
 without reloading or opening anything new. Type a request and press Enter:
 
@@ -92,7 +92,8 @@ The same UI in a desktop window instead of a browser tab. Qt (PySide6) draws
 the window and the ultra UI fills it. The control plane runs in the same
 process, on a thread next to the window, so it ends when the window does,
 however the window ends; closing the window (or Ctrl+C in the terminal) stops
-it gracefully, which also destroys its sprites. While it runs, the UI is at
+it gracefully. Workers are let go, not destroyed: the next control plane
+attaches to them again. While it runs, the UI is at
 http://127.0.0.1:8000 in a browser too. `--port N` and `--db …` are as for
 `python -m control`.
 
@@ -228,10 +229,10 @@ its worker; every turn ends with the thread's branch and a snapshot of its
 whole worktree (ignored files too) taken into the hub and the branch landed
 on the hub's main branch (a turn a model call failed in is only taken) (rebase, fast-forward;
 conflicts go back to the thread). Workers never reach the hub: the control
-plane moves commits to and from them as git bundles. So destroying sprites
-when the control plane stops loses nothing a thread had at the end of its last
-turn; only a turn still running then is cut short.
-Details: [runner/API.md](../runner/API.md#commits), `control/hub.py`.
+plane moves commits to and from them as git bundles. So losing a worker
+loses nothing a thread had at the end of its last turn; only a turn still
+running on it is cut short.
+Details: [runner/API.md](../runner/API.md#repository), `control/hub.py`.
 
 A project can get a remote (a GitHub repository) at any time from its
 **Settings**; a new project has none. With a remote, the hub's main branch
@@ -310,9 +311,7 @@ Each thread's pane has a **Worker log** tab next to Dialog and Tools: the last
 text is served as plain text at `/api/threads/<id>/worker-logs?lines=N`.
 The control plane reads them itself: from `/.sprite/logs/services/runner.log`
 on a sprite (Sprites `GET /v1/sprites/<name>/fs/read`), or from
-`.orchestrator/workers/<worker>/runner.log` for a local worker. Stopping the
-control plane destroys its sprites, so read a sprite's log while it is still
-running.
+`.orchestrator/workers/<worker>/runner.log` for a local worker.
 
 Every worker's runner log is also printed to the control plane's stdout as it
 is written (`pixi run desktop` or `pixi run serve`), each line prefixed with
@@ -380,7 +379,6 @@ SQLite or Postgres database the first time the control plane opens it.
 | `control/router.py` | `ModelRouter` (DeepSeek), `HeuristicRouter` |
 | `control/store.py` | `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` (Sprites whenever a token is stored, local otherwise) |
-| `control/context.py` | the address the current request came in on |
 | `control/runner_client.py` | HTTP client for `runner/API.md` |
 | `control/devrunner.py` | echo runner speaking the same API |
 | `control/secrets.py` | env-then-keyring lookup (shared convention with the runner) |

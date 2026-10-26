@@ -1,0 +1,118 @@
+# Using the UI
+
+Everything happens in one window. Projects, threads, files and logs open in
+place; nothing opens a new tab or window. Back and Forward move between the
+project list and projects without reloading.
+
+## Projects
+
+The start page lists your projects. **New project** asks only for a name; a
+project starts with its own local git repository and no remote (cards say
+"local only"). Click a card to open the project at `/p/<project id>`;
+**← All projects** goes back.
+
+**Settings** in a project's top bar opens a dialog with:
+
+- **Name**, and the **model** its threads use.
+- **GitHub remote (optional)**: attach, change or remove a GitHub repository at
+  any time. How the two histories are joined is described in
+  [Project repos and landing](../architecture/git.md#attaching-a-remote). A
+  remote that cannot be joined is refused with git's reason, and nothing
+  changes.
+- **Local repository**: the path of the project's hub repository on this
+  machine, read-only.
+
+Hover a project card for its **Archive** button. Archiving stops every running
+thread and destroys the project's workers, so it holds no compute; its log and
+repository stay. **Archived** in the top bar lists archived projects, which
+open read-only; **Unarchive** brings one back, and its threads return on a new
+worker with their next message.
+
+## The project window
+
+The left side is the thread list: **Project activity** first, then the
+project's threads, each with its state. The right side is the pane for what
+you selected, with the request box under it.
+
+**Project activity** shows the router's decisions and every thread's events,
+newest last (up to the newest 2,000), with a live line per working thread
+saying what it is doing.
+
+### Sending a request
+
+Type in the request box and press Enter. The toggles above it decide where it
+goes:
+
+| Toggle | What happens |
+| --- | --- |
+| **Router decides** (default) | The router spawns new threads or messages existing ones, leaning toward spawning. A bulleted or numbered list fans out into one thread per item. |
+| **This thread** | Shown when a thread is open: sends the text straight to it. |
+| **New thread** | Always starts a fresh thread. |
+
+Enter never waits on the router, a worker or a runner: the box clears at once
+and the request shows in the log. The router's decision appears above the box
+("routing…" until the model answers) and in Project activity. A new thread
+shows up in the list right away, saying "starting on a worker" until its worker
+is up (a new sprite can take a while); messages sent to it meanwhile are
+delivered in order once it starts.
+
+Spawning never moves you into a thread. You stay where you are; you open a
+thread only by clicking it.
+
+### Images
+
+Paste a screenshot or a copied picture into the request box and it becomes an
+attachment above the box: up to 4 per message, each up to 8 MB (PNG, JPEG,
+WebP or GIF), and a very large screenshot is scaled down in the browser first.
+An image-only request skips the router and starts one new thread titled for the
+image. Images show in transcripts and open enlarged on a click.
+
+### Replying to a selection, copying
+
+Select text in a pane and a **Reply** button appears over it. The next message
+you send goes out as Markdown: the selection quoted, then your text. Every
+reply from an agent has a **Copy** button.
+
+### Editing your messages
+
+Your own messages are the blue, right-aligned bubbles. Each has an edit
+button. Save, and the bubble shows the new text marked "edited" while the
+router re-assesses it in the background:
+
+- Every thread the message reached (the threads its routing spawned or told,
+  or the thread you messaged directly) gets a correction from you with both
+  versions, and decides what to keep, drop or undo. Nothing is stopped: a
+  thread mid-turn reads the correction before its next model call, and a
+  finished one comes back and acts on it.
+- The router plans the new text knowing those threads, so it starts threads
+  only for parts none of them covers. Its decision shows as an "edit:" line in
+  Project activity.
+
+## A thread's pane
+
+Open a thread from the list. The pane has a title bar, a **Now** line saying
+what the thread is doing ("thinking", "running python_repl: …"), and four
+tabs:
+
+| Tab | Shows |
+| --- | --- |
+| **Dialog** | The conversation: your messages, messages from other threads and the router, and the agent's replies, rendered as Markdown. Replies grow live as the model streams them. |
+| **Tools** | Every tool call the agent made (`python_repl` code) with its result. |
+| **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane, with **Back** and **Download**; any other file downloads. `.git` is hidden. |
+| **Worker log** | Where the thread stands (its binding and its worker's state, each with the reason), then the last 300 lines its runner wrote, with **Refresh**. |
+
+The buttons in the title bar:
+
+- **Stop thread** stops its current turn on the runner.
+- **Respawn** brings the thread back on a worker from whatever state it is in.
+  When a thread is on no worker, or its worker is not ready, a red bar under
+  the title says which state, why, and that Respawn brings it back. See
+  [Worker lifecycle](../worker-lifecycle.md).
+- **Archive** stops the thread if it is running, then hides it from the
+  thread list, the router and the other threads. **Archived** at the top of
+  the thread list shows archived threads; **Unarchive** brings one back
+  (stopped). An archived thread takes no messages.
+
+Reading a thread's files or sending it a message when it is on no worker puts
+it on one first. Nothing is lost by that: its branch, a snapshot of its whole
+worktree and its model session come back from the project's repository.

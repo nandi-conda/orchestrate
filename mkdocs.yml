@@ -1,0 +1,73 @@
+site_name: orchestrate
+site_description: "A project-based agent orchestrator: a control plane with an ultra UI, and agent runners on Fly Sprites."
+repo_url: https://github.com/nandi-conda/orchestrate
+repo_name: nandi-conda/orchestrate
+edit_uri: edit/main/docs/
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: info
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Getting started: guide/getting-started.md
+      - Credentials and configuration: guide/configuration.md
+      - Using the UI: guide/ui.md
+      - The desktop window: guide/desktop.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Workers never connect in: architecture/pull-mode.md
+      - Requests, routing and threads: architecture/routing.md
+      - The runner and prime-agent: architecture/runner.md
+      - Project repos and landing: architecture/git.md
+      - Worker lifecycle: worker-lifecycle.md
+  - Reference:
+      - Control plane HTTP API: reference/control-plane-api.md
+      - Runner HTTP API: reference/runner-api.md
+      - Code layout: reference/layout.md
+  - Development: development.md
