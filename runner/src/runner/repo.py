@@ -228,6 +228,11 @@ class Repo:
         await self.git("update-ref", session_ref(tid), commit)
         return commit
 
+    async def session_commit(self, tid: str) -> str:
+        """The thread's session commit on this worker, "" while it has none."""
+        r = await self.git("rev-parse", "-q", "--verify", session_ref(tid), check=False)
+        return r.out if r.code == 0 else ""
+
     async def session(self, tid: str, directory: str | os.PathLike, parts: tuple[str, ...]) -> None:
         """Make the thread's agent directory hold its latest session: the one
         the worker has, while that holds everything the hub has of it, else

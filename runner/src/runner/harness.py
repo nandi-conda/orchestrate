@@ -70,12 +70,26 @@ class HarnessError(RuntimeError):
     pass
 
 
+def exit_reason(code: int | None) -> str:
+    """How a prime-agent process ended, as its exit code says: a signal that
+    ended it is named (asyncio gives -N for one it died of, a shell 128+N)."""
+    if code is None:
+        return "is still running"
+    n = -code if code < 0 else code - 128 if code > 128 else 0
+    try:
+        name = signal.Signals(n).name if n else ""
+    except ValueError:
+        name = ""
+    return f"was terminated by {name} (exit {code})" if name else f"exited ({code})"
+
+
 @dataclass(frozen=True)
 class Place:
     """Where a thread's harness keeps its things on the worker."""
     view: View
     socket: str   # the team socket, outside the view and bound into it (team.py)
     kernel: str   # the kernel wrapper, outside the view
+    turn: str     # there while a turn is under way (thread.py, "Interrupted turns"), outside the view
 
     @property
     def agent_dir(self) -> Path:
@@ -198,7 +212,7 @@ class Harness:
                     self.events.put_nowait(msg)
         finally:
             await self.proc.wait()
-            error = HarnessError(f"prime-agent exited ({self.proc.returncode}): {self.tail()}")
+            error = HarnessError(f"prime-agent {self.ended()}")
             for fut in self.pending.values():
                 if not fut.done():
                     fut.set_exception(error)
@@ -214,11 +228,15 @@ class Harness:
     def tail(self) -> str:
         return "\n".join(self.stderr) or "no output"
 
+    def ended(self) -> str:
+        """How the process ended, and the last it wrote to stderr."""
+        return f"{exit_reason(self.proc.returncode)}: {self.tail()}"
+
     async def command(self, type: str, **fields: Any) -> Any:
         """Send one RPC command; its response's data. Raises HarnessError when
         prime-agent refuses it or has exited."""
         if self.proc.returncode is not None or self.proc.stdin.is_closing():
-            raise HarnessError(f"prime-agent has exited ({self.proc.returncode}): {self.tail()}")
+            raise HarnessError(f"prime-agent {self.ended()}")
         self._n += 1
         cid = f"c{self._n}"
         fut = asyncio.get_running_loop().create_future()

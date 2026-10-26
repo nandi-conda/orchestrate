@@ -1143,13 +1143,30 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     await s.close()
 
 
-async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(tmp_path, monkeypatch):
-    """A runner that restarts (it crashed, a sprite woke cold) runs none of
-    its threads any more: a thread cut short mid-turn fails, and each comes
-    back on the same worker, in its worktree there, with its next message."""
+async def restart_runner(provider, w, tmp_path) -> None:
+    """Kill a local worker's runner and start the same command again, on the
+    same port and disk: what a sprite's service does when it restarts."""
     import os
 
     from control import providers
+
+    old = provider.procs[w.id]
+    old.kill()
+    await old.wait()
+    env = {**os.environ, "RUNNER_PORT": w.url.rsplit(":", 1)[1], "RUNNER_HOST": "127.0.0.1",
+           "RUNNER_TOKEN": w.token, "RUNNER_WORKDIR": str((tmp_path / "w" / w.id).resolve()),
+           "RUNNER_CAPACITY": str(w.capacity)}
+    with open(provider.log_path(w.id), "ab") as log:
+        provider.procs[w.id] = await asyncio.create_subprocess_exec(
+            *provider.command(), env=env, cwd=str(providers.Path(providers.__file__).resolve().parents[1]),
+            stdout=log, stderr=subprocess.STDOUT)
+    await providers.wait_healthy(w.url, timeout=30)
+
+
+async def test_a_restarted_runner_lets_its_idle_threads_go_and_they_come_back_on_it(tmp_path, monkeypatch):
+    """A runner that restarts (it crashed, a sprite woke cold) runs none of
+    its threads any more: an idle thread is unbound, and comes back on the
+    same worker, in its worktree there, with its next message."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
@@ -1161,27 +1178,15 @@ async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(t
     orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
     await wait_for(lambda: idle_of(s, t["id"]))
-    await s.update_thread(t["id"], state="working")  # as if the restart cut its turn short
     lw = orch.by_thread[t["id"]]
     w = lw.worker
-    old = provider.procs[w.id]
-    old.kill()
-    await old.wait()
-    # The same runner command again, on the same port and disk: what a sprite service does.
-    env = {**os.environ, "RUNNER_PORT": w.url.rsplit(":", 1)[1], "RUNNER_HOST": "127.0.0.1",
-           "RUNNER_TOKEN": w.token, "RUNNER_WORKDIR": str((tmp_path / "w" / w.id).resolve()),
-           "RUNNER_CAPACITY": str(w.capacity)}
-    with open(provider.log_path(w.id), "ab") as log:
-        provider.procs[w.id] = await asyncio.create_subprocess_exec(
-            *provider.command(), env=env, cwd=str(providers.Path(providers.__file__).resolve().parents[1]),
-            stdout=log, stderr=subprocess.STDOUT)
-    await providers.wait_healthy(w.url, timeout=30)
+    await restart_runner(provider, w, tmp_path)
 
     async def restarted():
         return [r for r in await unbinds(s, p["id"], t["id"]) if "runner restarted" in r] or None
     await wait_for(restarted)  # the relay reconnects to the new runner and notices
     th = await s.get_thread(t["id"])
-    assert th["state"] == "failed" and th["worker_id"] == w.id and t["id"] not in orch.by_thread
+    assert th["state"] == "idle" and th["worker_id"] == w.id and t["id"] not in orch.by_thread
     await orch.send(t["id"], "again")
 
     async def answered():
@@ -1192,6 +1197,84 @@ async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(t
     assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     listing = await orch.list_files(t["id"], "")
     assert "notes.txt" in [e["name"] for e in listing["entries"]]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_turn_a_runner_restart_cuts_short_resumes_on_that_worker(tmp_path, monkeypatch):
+    """A thread mid-turn when its runner restarts is not failed: it is put back
+    on the same worker at once, and that runner resumes the turn it cut short
+    (runner/API.md, "Interrupted turns") instead of taking the request again."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "30")  # the first turn is still running when the runner dies
+    monkeypatch.setattr(service, "HEALTH_EVERY", 3600)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "write notes.txt: never")
+
+    async def working():
+        return (await s.get_thread(t["id"]))["state"] == "working" or None
+    await wait_for(working)
+    w = orch.by_thread[t["id"]].worker
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    await restart_runner(provider, w, tmp_path)
+
+    async def resumed():
+        return [e for e in await s.list_events(p["id"], t["id"])
+                if e["type"] == "assistant" and "[from runner] Your last turn was cut short" in e["payload"]["content"]]
+    await wait_for(resumed)
+    await wait_for(lambda: idle_of(s, t["id"]))
+    events = await s.list_events(p["id"], t["id"])
+    assert [e["payload"]["from"] for e in events if e["type"] == "message_in"] == ["runner"]
+    assert not [e for e in events if e["type"] == "assistant" and "write notes" in e["payload"]["content"]]
+    assert "error" not in [e["type"] for e in events] and await unbinds(s, p["id"], t["id"]) == []
+    moves = [(e["payload"]["from"], e["payload"]["to"]) for e in events if e["type"] == "binding"]
+    assert moves == [("unbound", "binding"), ("binding", "bound"), ("bound", "binding"), ("binding", "bound")]
+    bound = await binds(s, p["id"], t["id"])
+    assert [b["worker"] for b in bound] == [w.id, w.id] and "resuming the turn" in bound[-1]["reason"]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_turn_under_way_goes_on_after_a_control_plane_restart(tmp_path, monkeypatch):
+    """A control plane that takes over a thread mid-turn puts it back on its
+    worker at once. Attaching to that worker starts its runner afresh here
+    (a local provider's runners are its own), and the runner resumes the cut
+    turn; a sprite already running as it would be started is left running,
+    and the thread is found again there (test_providers)."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "30")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    first = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    t = await first.spawn(p["id"], "T", "write notes.txt: never")
+
+    async def working():
+        return (await s.get_thread(t["id"]))["state"] == "working" or None
+    await wait_for(working)
+    wid = first.by_thread[t["id"]].worker.id
+    await first.close()  # its workers are left running, as a stopped control plane leaves them
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    await orch.open_project(p["id"])
+
+    async def resumed():
+        return [e for e in await s.list_events(p["id"], t["id"])
+                if e["type"] == "assistant" and "Your last turn was cut short" in e["payload"]["content"]]
+    await wait_for(resumed)
+    events = await s.list_events(p["id"], t["id"])
+    assert "error" not in [e["type"] for e in events] and await unbinds(s, p["id"], t["id"]) == []
+    bound = await binds(s, p["id"], t["id"])
+    assert [b["worker"] for b in bound] == [wid, wid] and "resuming the turn" in bound[-1]["reason"]
     await orch.close()
     await provider.close()
     await s.close()
@@ -1318,18 +1401,18 @@ async def test_respawn_puts_a_bound_thread_on_its_worker_again(tmp_path, monkeyp
     await s.close()
 
 
-async def test_a_bound_thread_of_an_earlier_control_plane_is_unbound_when_its_project_is_opened(tmp_path):
+async def test_an_idle_thread_of_an_earlier_control_plane_is_unbound_when_its_project_is_opened(tmp_path):
     from control.service import Orchestrator
 
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
     t = await s.create_thread(p["id"], "T", "x")
-    await s.update_thread(t["id"], binding="bound", worker_id=f"{p['id']}-w1", state="working")
+    await s.update_thread(t["id"], binding="bound", worker_id=f"{p['id']}-w1", state="idle")
     orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w")), HeuristicRouter(), tmp_path / "repos")
     await orch.open_project(p["id"])
     row = await s.get_thread(t["id"])
-    assert (row["binding"], row["state"], row["worker_id"]) == ("unbound", "failed", f"{p['id']}-w1")
+    assert (row["binding"], row["state"], row["worker_id"]) == ("unbound", "idle", f"{p['id']}-w1")
     assert "the control plane that had it on worker" in row["binding_reason"]
     await orch.open_project(p["id"])  # once per control plane
     assert len(await unbinds(s, p["id"], t["id"])) == 1

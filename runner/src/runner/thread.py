@@ -62,6 +62,20 @@ listing the files: rebase onto the named branch yourself, resolve, `git rebase -
 end the turn; it lands again.
 """
 
+# Interrupted turns. A turn under way when the runner stops (the control plane
+# restarts its service, a sprite is stopped, the process crashes) is not lost
+# with it: the thread's session file holds the conversation up to the cut and
+# its worktree everything it changed, both on the worker's disk. While a turn
+# is under way its thread's `Place.turn` file exists, naming the session commit
+# the turn started from; it goes when the turn ends, or the thread fails or is
+# stopped, but not when the runner itself is stopping. A thread started on a
+# worker that still has the file, with that session, resumes the cut turn
+# (ThreadHost.start): the agent gets RESUME instead of the request it already
+# has.
+RESUME = ("Your last turn was cut short: the runner restarted while it ran. Your conversation and your "
+          "workspace (uncommitted files included) are as they were when it stopped; a command that was "
+          "running then did not finish. Pick up where you left off and finish that turn.")
+
 # A thread's team socket is a file under the worker's workdir, so the workdir's
 # depth is bounded by the socket's address: sun_path is 108 bytes, NUL included.
 SOCKET_ADDRESS_MAX = 108
@@ -141,6 +155,11 @@ class AgentThread:
         self.harness: Harness | None = None
         self.team = TeamServer(self, place.socket)
         self.task: asyncio.Task | None = None
+        # The runner is stopping (ThreadHost.shut_down): a turn its end cuts
+        # short is interrupted, to resume, not failed.
+        self.stopping = ""
+        self.session = ""  # the thread's session commit on this worker, as its last turn left it
+        self.resumed = False  # started to resume a turn cut short here
 
     def emit(self, type: str, data: Any = None):
         if type == "error":  # every failure a thread reports is in the worker log too
@@ -179,10 +198,18 @@ class AgentThread:
                 if await self._send(await self.inbox.get()):
                     await self._turn()
         except asyncio.CancelledError:
-            self.set_state("stopped")
+            if not self.stopping:
+                self._turn_over()
+                self.set_state("stopped")
             raise
         except Exception as e:
+            if self.stopping:
+                log.warning("thread %s: its turn was cut short by the runner's shutdown (%s); it resumes when "
+                            "the thread is started on this worker again (%s: %s)",
+                            self.id, self.stopping, type(e).__name__, e)
+                return
             log.exception("thread %s failed", self.id)
+            self._turn_over()
             self.emit("error", {"error": f"{type(e).__name__}: {e or repr(e)}"})
             self.set_state("failed")
         finally:
@@ -194,6 +221,7 @@ class AgentThread:
         """One turn: the agent's run from the message just sent until it is idle
         again. Messages that arrive meanwhile steer it."""
         self.set_state("working")
+        Path(self.place.turn).write_text(json.dumps({"session": self.session, "since": time.time()}))
         turn = Turn(self)
         events = self.harness.events
         ev_get = asyncio.ensure_future(events.get())
@@ -207,7 +235,7 @@ class AgentThread:
                 if ev_get in done:
                     ev = ev_get.result()
                     if ev is None:
-                        raise HarnessError(f"prime-agent exited: {self.harness.tail()}")
+                        raise HarnessError(f"prime-agent {self.harness.ended()}")
                     ended = await turn.on(ev)
                     ev_get = asyncio.ensure_future(events.get())
                     if ended and not await self.harness.busy() and not in_get.done():
@@ -219,6 +247,7 @@ class AgentThread:
             self.summary = (turn.final or self.title)[:500]
         if self.workspace:
             await self._commit_work(land=not turn.failed)
+        self._turn_over()
         self.set_state("idle")
         self.emit("turn_done", {"summary": self.summary, "final": turn.final})
         try:
@@ -228,6 +257,10 @@ class AgentThread:
         except Exception as e:
             log.warning("thread %s: peer update failed", self.id, exc_info=True)
             self.emit("error", {"error": f"peer update failed: {type(e).__name__}: {e}"})
+
+    def _turn_over(self):
+        """No turn of the thread's is under way any more: none to resume."""
+        Path(self.place.turn).unlink(missing_ok=True)
 
     async def _commit_work(self, land: bool):
         """Commit the turn's work, snapshot the worktree and save the agent's
@@ -239,7 +272,7 @@ class AgentThread:
             commit = await self.workspace.commit(message)
             self.files = set(await self.workspace.changed())
             await self.workspace.snapshot()
-            await repo.save_session(self.id, self.place.agent_dir, SESSION)
+            self.session = await repo.save_session(self.id, self.place.agent_dir, SESSION)
             result = await self.peers.save(self.id, land=land)
             if result.get("landed"):
                 await self.workspace.follow()
@@ -350,6 +383,7 @@ class ThreadHost:
         self.threads: dict[str, AgentThread] = {}
         self.subscribers: dict[str | None, set[asyncio.Queue]] = {}
         self._seq = 0
+        self.stopping = ""  # why the runner is stopping, once it is (shut_down)
 
     # events -----------------------------------------------------------------
     def _emit(self, t: AgentThread, type: str, data: Any):
@@ -388,7 +422,16 @@ class ThreadHost:
                     + (socket,),
                     hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")),
                     tools=(pixi(),))
-        return Place(view=view, socket=socket, kernel=str(work / ".team" / f"{tid}.kernel"))
+        return Place(view=view, socket=socket, kernel=str(work / ".team" / f"{tid}.kernel"),
+                     turn=str(work / ".team" / f"{tid}.turn"))
+
+    def shut_down(self, why: str) -> None:
+        """The runner is stopping: the turns its end cuts short are interrupted,
+        to resume when their threads are started here again, not failed.
+        Called from the signal handler, before anything else hears of it."""
+        self.stopping = why
+        for t in self.threads.values():
+            t.stopping = why
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
                     model: dict | None = None, id: str | None = None, summary: str = "",
@@ -396,26 +439,38 @@ class ThreadHost:
         """Start a thread on this worker. A thread the orchestrator brings back
         continues its branch and its agent's session; with no `request` it
         waits idle for its next message. `images` belong to the request. An
-        id whose thread here has ended (stopped or failed) is started afresh."""
+        id whose thread here has ended (stopped or failed) is started afresh.
+
+        A thread whose turn this worker's runner was cut off in resumes that
+        turn ("Interrupted turns" above): its session has the turn's messages,
+        the request among them when it was the first turn, so it gets RESUME
+        and not the request again."""
         tid = id or _id()
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
         place = self._place(tid, project)
         workspace = None
+        session = ""
         if self.repos:
             repo = self.repos.get(project)
             Path(place.view.root).parent.mkdir(parents=True, exist_ok=True)
             workspace = await repo.worktree(place.view.root, tid)
             await repo.session(tid, place.agent_dir, SESSION)
+            session = await repo.session_commit(tid)
+        resumed = self._interrupted(place, session)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
                         peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=workspace,
                         emit=self._emit, summary=summary)
+        t.session, t.resumed, t.stopping = session, resumed, self.stopping
         if old is not None:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
-        if request is not None:
+        if resumed:
+            log.info("thread %s: resuming the turn the runner's restart cut short", tid)
+            t.deliver(RESUME, sender="runner")
+        elif request is not None:
             t.deliver(request, sender="user" if parent is None else parent, images=images)
         else:
             t.set_state("idle")
@@ -442,6 +497,25 @@ class ThreadHost:
             self.repos.remove(project)
             log.info("project %s is no longer on this worker", project)
         return gone
+
+    @staticmethod
+    def _interrupted(place: Place, session: str) -> bool:
+        """Whether the thread has a turn on this worker to resume: one was under
+        way when this worker's runner stopped, and the thread's session is
+        still the one that turn went on from. A thread that went on on
+        another worker since has a newer one (Repo.session took it from the
+        hub), and the cut turn is history there."""
+        path = Path(place.turn)
+        try:
+            was = json.loads(path.read_text())
+        except FileNotFoundError:
+            return False
+        except ValueError:  # cut off while it was written: the turn had only just started
+            was = {"session": session}
+        if was.get("session", "") == session:
+            return True
+        path.unlink()
+        return False
 
     def deliver(self, thread_id: str, body: str, sender: str = "user", hops: int = 0,
                 images: list[dict] | None = None):

@@ -24,6 +24,7 @@ peer calls. So a provider only has to hand back a URL the control plane can reac
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -108,6 +109,9 @@ FOLLOW_EVERY = 0.2
 SPRITE_FOLLOW = "1h"
 # How long a sprite log follow waits before it is opened again.
 FOLLOW_AGAIN = 1.0
+# How long SpritesProvider.serves waits for a defined runner service to answer
+# (a paused sprite wakes and starts it) before it restarts the service instead.
+SERVES_WAIT = 60.0
 
 
 def tail(data: bytes, lines: int) -> str:
@@ -433,21 +437,32 @@ class SpritesProvider:
         worker = Worker(id=name, provider=self.name, handle=name,
                         url=info["url"].rstrip("/"), capacity=spec.capacity, index=spec.index)
         worker.token = spec.token or worker.token
-        # A sprite an earlier control plane made still has its runner service,
-        # and `start` does not replace a running process: that runner would go
-        # on with the code and environment (the model key) it was started
-        # with. So a service already there is restarted from the definition
-        # put below, and the runner serving the worker is always this
-        # checkout's, with this control plane's key and token.
-        defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
-
         commit = await remote_commit(self.source, self.ref)
-        await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity), "PYTHONUNBUFFERED": "1"}
         service = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"],
-                   "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate"}, "http_port": 8080}
+                   "env": {**env, "ORCHESTRATE_HOME": "/opt/orchestrate", "ORCHESTRATE_COMMIT": commit},
+                   "http_port": 8080}
+        want = service_spec(service)
+        service["env"]["RUNNER_SPEC"] = want
+        # A sprite an earlier control plane made (or this one, before the
+        # worker stopped answering) still has its runner service. Restarting
+        # it ends every turn under way there, so it is left running when it
+        # is exactly the runner this would start: the same commit, model key,
+        # token and settings, as the fingerprint it reports says. Otherwise
+        # it is restarted from the definition put below (`start` does not
+        # replace a running process), so the runner serving the worker is
+        # always this checkout's, with this control plane's key and token;
+        # the turns that cuts short resume when their threads are posted
+        # again (runner/API.md, "Interrupted turns").
+        defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
+        if defined and await self.serves(worker, want):
+            log.info("worker %s already runs orchestrate %s as this control plane would start it; "
+                     "left running", name, commit[:12])
+            return worker
+
+        await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
         await self.service_action(name, "restart" if defined else "start")
         health = await self.wait_ready(worker)
@@ -458,6 +473,18 @@ class SpritesProvider:
             raise RuntimeError(f"worker {name}'s runner does not accept the token it was started "
                                f"with; its log ends:\n{await self.logs(worker, 20)}")
         return worker
+
+    async def serves(self, worker: Worker, want: str) -> bool:
+        """Whether the runner serving the sprite now was started from the
+        service definition fingerprinted `want` (its token among it). A
+        paused sprite wakes for the look, its service with it, so the look
+        waits SERVES_WAIT for an answer; one that gives none, or another
+        fingerprint, is not that runner."""
+        try:
+            health = await wait_healthy(worker.url, timeout=SERVES_WAIT)
+        except TimeoutError:
+            return False
+        return health.get("spec") == want
 
     async def service_action(self, name: str, action: str, timeout: float = 300.0) -> None:
         """Run `start`/`restart`/`stop` on the runner service to completion.
@@ -577,6 +604,14 @@ class SpritesProvider:
 
     async def close(self) -> None:
         await self.http.aclose()
+
+
+def service_spec(service: dict) -> str:
+    """A fingerprint of a runner service definition (its command, and its
+    environment with the commit, model key and token): the runner reports it
+    in /health as `spec`, from $RUNNER_SPEC, so a control plane can tell a
+    runner it would start the same way. One-way, since /health is open."""
+    return hashlib.sha256(json.dumps(service, sort_keys=True).encode()).hexdigest()
 
 
 def service_log_lines(ev: dict) -> list[str]:

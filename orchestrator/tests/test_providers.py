@@ -256,10 +256,11 @@ class FakeStream:
         yield '{"type": "complete"}'
 
 
-async def _sprites_create(env, defined: bool, serving: str = "c0ffee"):
+async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str = "", fake=None):
     env.setattr(secrets, "get_secret", lambda name: "key")
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
-    fake = FakeSprites(defined)
+    fake = fake or FakeSprites(defined)
+    fake.bootstrap = None
     p.http = fake
 
     async def no_exec(name, script, env=None):
@@ -267,7 +268,7 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee"):
         return ""
 
     async def healthy(url, timeout=120.0):
-        return {"ok": True, "commit": serving}
+        return {"ok": True, "commit": serving, "spec": spec}
 
     async def accepts(worker):
         return True
@@ -297,6 +298,27 @@ async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started
     assert fake.actions == ["restart"]
     assert worker.token == "stored" and fake.service["env"]["RUNNER_TOKEN"] == "stored"
     assert fake.service["env"]["DEEPSEEK_API_KEY"] == "key"
+
+
+async def test_sprites_create_leaves_running_a_runner_it_would_start_the_same_way(env):
+    """Restarting a runner ends the turns under way on it. A control plane
+    attaching to a sprite whose runner reports the fingerprint of the very
+    service it would define (same commit, key, token) leaves it running."""
+    _, fake = await _sprites_create(env, defined=True)
+    want = fake.service["env"]["RUNNER_SPEC"]
+    assert want == providers.service_spec({**fake.service, "env": {
+        k: v for k, v in fake.service["env"].items() if k != "RUNNER_SPEC"}})
+    assert fake.service["env"]["ORCHESTRATE_COMMIT"] == "c0ffee"
+    worker, fake = await _sprites_create(env, defined=True, spec=want, fake=fake)
+    assert fake.actions == ["restart"] and fake.bootstrap is None  # nothing more: no bootstrap, no restart
+    assert worker.token == "stored"
+
+
+async def test_sprites_create_restarts_a_runner_started_otherwise(env):
+    """Another fingerprint (another commit, key or token) is another runner:
+    the service is restarted from this control plane's definition."""
+    _, fake = await _sprites_create(env, defined=True, spec="not-this-one")
+    assert fake.actions == ["restart"] and fake.bootstrap is not None
 
 
 async def test_sprites_create_starts_a_new_service(env):

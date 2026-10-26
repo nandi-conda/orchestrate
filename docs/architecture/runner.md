@@ -29,9 +29,13 @@ Making a worker (`SpritesProvider.create`):
 4. `runner/deploy/start.sh` is registered as the sprite service `runner` on
    port 8080, with `DEEPSEEK_API_KEY`, the worker's `RUNNER_TOKEN`,
    `RUNNER_WORKDIR=/home/sprite/threads`, `RUNNER_CAPACITY` and
-   `PYTHONUNBUFFERED=1`, then started (or restarted, when a service from an
-   earlier control plane is there, so the runner is always this checkout's
-   with this control plane's key and token).
+   `PYTHONUNBUFFERED=1`, plus `ORCHESTRATE_COMMIT` and `RUNNER_SPEC` (a
+   fingerprint of the whole definition), then started. A service already
+   there whose runner reports that very fingerprint in `/health` is left
+   running, with no bootstrap and no new definition; any other is restarted, so the
+   runner is always this checkout's with this control plane's key and token.
+   Turns a restart cuts short resume
+   ([Interrupted turns](../worker-lifecycle.md#interrupted-turns)).
 5. The control plane waits for `/health`, then checks the runner runs the
    expected commit and accepts the token. Either mismatch is an error carrying
    the end of the worker's log.

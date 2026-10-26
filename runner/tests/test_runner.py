@@ -487,7 +487,8 @@ def test_image_turns_go_to_a_model_that_takes_images(tmp_path):
     image turn to deepseek-flash, which takes images."""
     from runner.harness import HARNESS, IMAGE_MODEL, Place, PrimeAgent
 
-    place = Place(view=view(tmp_path), socket=str(tmp_path / "team.sock"), kernel=str(tmp_path / "kernel"))
+    place = Place(view=view(tmp_path), socket=str(tmp_path / "team.sock"), kernel=str(tmp_path / "kernel"),
+                  turn=str(tmp_path / "turn"))
     PrimeAgent().prepare(place)
     out = subprocess.run([str(HARNESS / "prime-agent"), "--offline", "model", "list", "deepseek"],
                          env={"PATH": os.environ["PATH"], "HOME": place.view.home, "DEEPSEEK_API_KEY": "unused",

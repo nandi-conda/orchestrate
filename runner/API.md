@@ -9,9 +9,9 @@ between all its projects. Default port 8080. Every route except `/health` needs
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit", "boot"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout); `boot` is random per runner process, so a control plane can tell the runner restarted (its threads are gone from memory, its event `seq` starts again at 1) |
+| GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit", "boot", "spec"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout); `boot` is random per runner process, so a control plane can tell the runner restarted (its threads are gone from memory, its event `seq` starts again at 1); `spec` is `$RUNNER_SPEC`, the control plane's fingerprint of how it started this runner ("" when unset) |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry; 400 without `project`; 409 if `id` is running here |
+| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry + `"resumed"` (it resumes a turn cut short here, below); 400 without `project`; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
 | POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
@@ -94,6 +94,20 @@ thread's `id`, `title`, `parent` and `summary`, and usually no `request`:
 - Without `request` the thread goes `idle` (a `state` event) and waits for
   its next message; nothing runs until one is posted.
 
+### Interrupted turns
+
+A turn under way when the runner stops (SIGTERM from its service manager, a
+crash) is interrupted, not failed: on a signal the runner marks itself
+stopping before its threads' prime-agents die, logs each cut turn ("cut short
+by the runner's shutdown") and sends no `error` for it. While a turn runs,
+`<workdir>/.team/<id>.turn` exists, naming the session commit it started
+from. Posting the thread to this worker again (any `request` is ignored)
+resumes the turn when that file is there and the thread's session is still
+that commit: the worktree and the session file are as the cut left them, and
+the model gets a `message_in` from `runner` saying the turn was cut short and
+to finish it. The response says `"resumed": true`. A thread that went on on
+another worker since has a newer session, and its stale file is dropped.
+
 ## Peer calls (collected by the orchestrator)
 
 The orchestrator is never reachable from a worker, by design: it may run on a
@@ -152,6 +166,7 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`) are read from the environment first
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
 | `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repos/<project>/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
+| `RUNNER_SPEC` | | reported in `/health` as `spec`: the control plane's fingerprint of the service it started |
 
 ## Sandbox
 

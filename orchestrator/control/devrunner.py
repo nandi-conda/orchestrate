@@ -8,6 +8,13 @@ It has no model. Each turn it says what it got, and:
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
+A turn its process is stopped in is interrupted, as the real runner's is
+(runner/API.md, "Interrupted turns"): while a turn runs `.team/<id>.turn`
+exists in its workdir, and a thread posted while it does resumes that turn
+with RESUME from `runner` instead of taking a request. (The real runner also
+checks the thread's session is still the one the turn went on from; this one
+does not move threads between workers on its own, so it leaves that out.)
+
 Like the real runner it hosts threads of any number of projects. Its git flow
 is the real runner's (runner/API.md, "Repository"): a worktree per thread in
 its project's repository, which the control plane fills
@@ -53,6 +60,7 @@ LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
 THREAD_ID = re.compile(r"^[\w-]+$")
+RESUME = "Your last turn was cut short: the runner restarted while it ran. Finish that turn."
 
 
 async def gone(req: Request) -> None:
@@ -158,8 +166,13 @@ class Host:
         t["state"] = state
         await self.emit(t["id"], "state", {"state": state})
 
+    def turn_file(self, tid: str) -> Path:
+        return self.workdir / ".team" / f"{tid}.turn"
+
     async def turn(self, t: dict, text: str, images: list | None = None) -> None:
         await self.set_state(t, "working")
+        self.turn_file(t["id"]).parent.mkdir(parents=True, exist_ok=True)
+        self.turn_file(t["id"]).write_text("{}")
         await asyncio.sleep(self.delay)
         # Stream the reply the way the real runner does (runner/API.md, `delta`).
         log = self.session_dir(t) / "messages.txt"
@@ -200,6 +213,7 @@ class Host:
         if t.get("parent") and not text.startswith("Finished:"):
             await self.peer_call("send_message", t["id"], sender=t["id"], to=t["parent"],
                                  body=f"Finished: {summary}")
+        self.turn_file(t["id"]).unlink(missing_ok=True)
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
 
@@ -289,13 +303,17 @@ def create_app(host: Host, token: str) -> Starlette:
             return JSONResponse({"error": str(e)}, 500)
         host.threads[tid] = t
         await host.emit(tid, "created", host.entry(t))
-        if b.get("request") or b.get("images"):
+        cut = host.turn_file(tid).exists()
+        if cut:  # the request, if any, is the cut turn's: the thread has it already
+            await host.emit(tid, "message_in", {"from": "runner", "body": RESUME, "images": []})
+            asyncio.create_task(host.turn(t, f"[from runner] {RESUME}"))
+        elif b.get("request") or b.get("images"):
             await host.emit(tid, "message_in", {"from": "user", "body": b.get("request") or "",
                                                 "images": b.get("images") or []})
             asyncio.create_task(host.turn(t, b.get("request") or "", b.get("images") or []))
         else:  # resumed: idle until its next message (runner/API.md, "Resuming a thread")
             await host.set_state(t, "idle")
-        return JSONResponse(host.entry(t), 201)
+        return JSONResponse({**host.entry(t), "resumed": cut}, 201)
 
     async def message(req: Request):
         if not authed(req):
@@ -315,6 +333,7 @@ def create_app(host: Host, token: str) -> Starlette:
         t = host.threads.get(req.path_params["tid"])
         if t is None:
             return JSONResponse({"error": "no such thread"}, 404)
+        host.turn_file(t["id"]).unlink(missing_ok=True)
         await host.set_state(t, "stopped")
         return JSONResponse({"ok": True})
 

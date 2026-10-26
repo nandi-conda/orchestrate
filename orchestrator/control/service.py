@@ -458,11 +458,12 @@ class Orchestrator:
         return t
 
     async def _unbind_all(self, lw: LiveWorker, reason: str) -> None:
-        """Unbind every thread bound to the worker. Each keeps it as its
-        worker_id, the worker it was last on: it comes back there, in its
-        worktree, unless that worker is lost (_bind)."""
+        """Unbind every thread bound to the worker, but those being put back
+        on a worker already (_bind has them). Each keeps it as its worker_id,
+        the worker it was last on: it comes back there, in its worktree,
+        unless that worker is lost (_bind)."""
         for tid in sorted(lw.threads):
-            if self.by_thread.get(tid) is not lw:
+            if self.by_thread.get(tid) is not lw or tid in self.binding:
                 continue
             del self.by_thread[tid]
             await self._bind_to(tid, "unbound", reason, worker=lw.worker.id)
@@ -556,14 +557,23 @@ class Orchestrator:
         """Take note of the runner process serving the worker. One started
         since the last look (it crashed, or a sprite woke cold, or it was
         reattached) runs none of the worker's threads and numbers its events
-        afresh: each thread is unbound, to come back on this worker, in its
-        worktree here, with its next message (live_worker)."""
+        afresh. A thread whose turn was under way is put back on this worker
+        at once, where its runner resumes the turn the restart cut short
+        (runner/API.md, "Interrupted turns"); the rest are unbound, to come
+        back on this worker, in their worktrees here, with their next message
+        (live_worker)."""
         boot = h.get("boot")
         if boot == lw.boot:
             return
         lw.boot = boot
         lw.last_seq = 0
         wid = lw.worker.id
+        for tid in sorted(lw.threads):
+            t = await self.store.get_thread(tid)
+            if self.by_thread.get(tid) is lw and t["state"] in RUNNING and tid not in self.binding:
+                await self._bind_to(tid, "binding", f"worker {wid}'s runner restarted mid-turn; putting it "
+                                                    "back there to resume the turn")
+                self._begin_binding(tid, "its runner restarted mid-turn", entered=True)
         await self._unbind_all(lw, f"worker {wid}'s runner restarted; it comes back on that worker with its "
                                    "next message, or with Respawn")
         if lw.state == "ready":
@@ -914,7 +924,7 @@ class Orchestrator:
         old = self.by_thread.pop(tid, None)
         if old is not None:
             old.threads.discard(tid)
-        lw, picked, request, found = None, False, None, None
+        lw, picked, posted, found = None, False, None, None
         try:
             lw = old or await self._home(project, t["worker_id"])
             if lw is not None and lw.state in ("unreachable", "reattaching"):
@@ -928,7 +938,7 @@ class Orchestrator:
                 if there is not None and there.get("state") not in ENDED:
                     found = there["state"]  # its runner still runs it; only this control plane lost track
             if found is None:
-                request = await self._post(lw, t, project, again=lw is old)
+                posted = await self._post(lw, t, project, again=lw is old)
         except asyncio.CancelledError as e:
             await self._bind_to(tid, "unbound", e.args[0] if e.args else "putting it on a worker was called off")
             raise
@@ -944,17 +954,22 @@ class Orchestrator:
         wid = lw.worker.id
         if found is not None:
             reason, state = f"found again on worker {wid}, which still runs it", found
-        elif request is not None:
-            reason, state = f"on worker {wid}, working on its request", None
-        else:
+        elif posted.get("resumed"):
+            reason, state = f"on worker {wid}, resuming the turn its runner's restart cut short", None
+        elif posted.get("state") == "idle":
             reason, state = f"on worker {wid}, idle until its next message", "idle"
+        else:
+            reason, state = f"on worker {wid}, working on its request", None
         await self._bind_to(tid, "bound", reason, worker=wid, worker_id=wid, **({"state": state} if state else {}))
         return lw
 
-    async def _post(self, lw: LiveWorker, t: dict, project: dict, again: bool) -> str | None:
+    async def _post(self, lw: LiveWorker, t: dict, project: dict, again: bool) -> dict:
         """Ship the hub to a worker and post the thread to its runner (stopped
-        there first when `again`). Returns the request it was given, None
-        when it waits idle for its next message."""
+        there first when `again`). It is given its request when none of its
+        turns was saved. Returns what the runner answered: the thread's
+        directory entry, `idle` when it waits for its next message, and
+        whether it resumes a turn cut short on that worker (runner/API.md,
+        "Interrupted turns"), which it does instead of taking the request."""
         tid = t["id"]
         await self._ship(lw, project, tid)
         if again:  # its runner may still run it: a respawn of a bound thread
@@ -967,14 +982,16 @@ class Orchestrator:
             self._expect_echo(tid, request)
         model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
         try:
-            await lw.client.create_thread(id=tid, title=t["title"], project=project["id"], parent=t["parent_id"],
-                                          model=model, summary=t["summary"], request=request,
-                                          images=await self._inline_images(images) or None)
+            entry = await lw.client.create_thread(id=tid, title=t["title"], project=project["id"],
+                                                  parent=t["parent_id"], model=model, summary=t["summary"],
+                                                  request=request, images=await self._inline_images(images) or None)
         except BaseException:
             if request is not None:
                 self._echoed(tid, request)
             raise
-        return request
+        if request is not None and entry.get("resumed"):
+            self._echoed(tid, request)  # it resumes the turn that took it: no echo comes
+        return entry
 
     def _expect_echo(self, tid: str, body: str) -> None:
         self.unechoed.setdefault(tid, []).append(body)
@@ -1221,11 +1238,15 @@ class Orchestrator:
 
     async def recover(self, project_id: str) -> None:
         """Take over the project's threads from the store, once per control
-        plane: a thread an earlier control plane had bound, or was binding,
-        is on no worker of this one (attaching to its worker again starts
-        that worker's runner afresh), so it is unbound, to come back with its
-        next message or Respawn. Anything that uses a project's threads, or
-        shows them, calls this first."""
+        plane. A thread an earlier control plane had bound is on no worker of
+        this one. One whose turn was under way is put back on its worker at
+        once: attaching to a worker leaves its runner running when it is the
+        runner this control plane would start (providers.py), so the turn
+        goes on there and the thread is found again; else the runner is
+        started afresh and resumes the turn it cut short. The rest, and any
+        thread an earlier control plane was still binding, are unbound, to
+        come back with their next message or Respawn. Anything that uses a
+        project's threads, or shows them, calls this first."""
         if project_id in self.recovered:
             return
         async with self._recover_locks.setdefault(project_id, asyncio.Lock()):
@@ -1235,8 +1256,14 @@ class Orchestrator:
 
     async def _take_over(self, project_id: str) -> None:
         for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
-            if t["binding"] != "unbound" and t["id"] not in self.by_thread and t["id"] not in self.binding:
-                on = f" on worker {t['worker_id']}" if t["worker_id"] else ""
+            if t["binding"] == "unbound" or t["id"] in self.by_thread or t["id"] in self.binding:
+                continue
+            on = f" on worker {t['worker_id']}" if t["worker_id"] else ""
+            if t["binding"] == "bound" and t["state"] in RUNNING and t["archived_at"] is None:
+                await self._bind_to(t["id"], "binding", f"the control plane that had it{on} stopped mid-turn; "
+                                                        "putting it back there to go on with the turn")
+                self._begin_binding(t["id"], "its control plane stopped mid-turn", entered=True)
+            else:
                 await self._bind_to(t["id"], "unbound", f"the control plane that had it{on} stopped; it comes "
                                                         "back with its next message, or with Respawn")
 

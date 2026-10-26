@@ -80,8 +80,41 @@ stateDiagram-v2
 
 `ready → ready` is a runner restart: `/health` returns a new `boot` id (the
 runner crashed, a sprite woke cold, or it was reattached). The new runner runs
-none of the old threads, so they are all unbound, keeping this worker as
-theirs: they come back on it, in their worktree, with their next message.
+none of the old threads. A thread whose turn was under way (queued, working,
+waiting) is put back on this worker at once, and the runner resumes the turn
+it cut short (see [Interrupted turns](#interrupted-turns)). The rest are
+unbound, keeping this worker as theirs: they come back on it, in their
+worktree, with their next message.
+
+## Interrupted turns
+
+Restarting a runner ends every turn under way on it, so it is restarted only
+when it has to be:
+
+- **Attaching does not restart a runner that is already right.** The control
+  plane fingerprints the sprite service it would define (the commit, model
+  key, token and settings) and passes it as `RUNNER_SPEC`; the runner reports
+  it in `/health` as `spec`. When a sprite's runner already reports the
+  fingerprint this control plane would start it with, attaching (a new
+  control plane, a reattach) leaves it running. A different commit on the
+  branch, another key or another token restarts it.
+- **A cut turn resumes; it does not fail.** When the runner is stopped
+  (SIGTERM from the service manager), it marks itself stopping before its
+  threads' prime-agents die, logs `turn was cut short by the runner's
+  shutdown` and reports no error. While a turn runs the runner keeps
+  `.team/<id>.turn` on the worker's disk. The control plane puts each thread
+  that was mid-turn back on its worker (`binding` reason `… restarted
+  mid-turn; putting it back there …`), the runner sees the file, and the
+  thread gets a message from `runner` saying its turn was cut short, with its
+  conversation and worktree (uncommitted files included) as the cut left them.
+  It is bound with `resuming the turn its runner's restart cut short`. A crash
+  resumes the same way; a prime-agent that dies while its runner goes on
+  fails the thread, with the signal named (`prime-agent was terminated by
+  SIGTERM (exit 143)`).
+- **A control plane restart goes on with turns under way.** Taking over a
+  project, a new control plane puts its mid-turn threads back on their
+  workers at once: one whose runner still runs it is found again there; one
+  whose runner had to restart resumes. Idle threads are unbound as before.
 
 A worker is never lost just for not answering. Only its provider saying it is
 gone loses it.
@@ -94,8 +127,8 @@ stateDiagram-v2
     unbound --> binding: next message, file read, or Respawn
     binding --> bound: worker picked, hub shipped, thread posted
     binding --> unbound: failed, or called off (Respawn, Stop)
-    bound --> unbound: worker lost, runner restarted, control plane restarted
-    bound --> binding: Respawn, or a message to a thread whose turn ended
+    bound --> unbound: worker lost; runner or control plane restarted (idle threads)
+    bound --> binding: Respawn, a message to a thread whose turn ended, or a restart mid-turn
 ```
 
 | Binding | Means | Way back to bound |
@@ -108,10 +141,11 @@ Each move is stored with its reason (`threads.binding_reason`) and logged as a
 `binding` event in the thread's log. Reasons you will see for `unbound`:
 
 - `worker … is lost (…)`: its provider says the worker is gone.
-- `worker …'s runner restarted`: a new runner on the same worker.
+- `worker …'s runner restarted`: a new runner on the same worker; the thread
+  was idle.
 - `the control plane that had it on worker … stopped`: this control plane
-  started after another one had the thread; attaching to that worker again
-  restarts its runner, so the thread is put back on it.
+  started after another one had the thread, which was idle; it comes back on
+  that worker with its next message.
 - `could not put it on a worker: …`: the start failed; the error says why.
 - `Respawn called off putting it on a worker, to start over` /
   `stopped before it was on a worker`.
@@ -143,7 +177,8 @@ A run state is only true while a runner has the thread, so **the UI shows it
 only for a bound thread**. A thread on its way to a worker shows `binding`,
 and one on none shows `unbound`, plus `failed` or `stopped` when its turn
 ended that way. Unbinding a thread mid-turn (queued, working, waiting) marks
-it `failed`, since its turn was cut short.
+it `failed`, since its turn was cut short; a runner or control plane restart
+does not unbind one, it resumes the turn instead.
 
 So a thread showing `queued` for more than a moment is bound, and its runner
 has not started its turn. Check its Worker log; Respawn re-posts it.

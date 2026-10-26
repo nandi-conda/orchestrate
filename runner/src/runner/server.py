@@ -141,9 +141,13 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
     # Names this runner process: a control plane that sees another one knows
     # the runner restarted and its threads are no longer running here.
     boot = secrets.token_hex(8)
+    # What the control plane started this runner with, as it fingerprinted it
+    # (RUNNER_SPEC, orchestrator/control/providers.py): one that would start
+    # it the same way leaves it running.
+    spec = os.environ.get("RUNNER_SPEC", "")
 
     async def health(req: Request):
-        return JSONResponse({**host.health(), "commit": commit, "boot": boot})
+        return JSONResponse({**host.health(), "commit": commit, "boot": boot, "spec": spec})
 
     async def list_threads(req: Request):
         return JSONResponse([t.directory_entry() for t in host.threads.values()])
@@ -172,7 +176,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             return JSONResponse({"error": str(e)}, status_code=409)
         except Exception as e:
             return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
-        return JSONResponse(t.directory_entry(), status_code=201)
+        return JSONResponse({**t.directory_entry(), "resumed": t.resumed}, status_code=201)
 
     async def get_thread(req: Request):
         t = thread_or_404(req)
@@ -339,10 +343,25 @@ def host_from_env() -> ThreadHost:
     )
 
 
-def main():
-    import sys
+def serve(app: Starlette, host: ThreadHost, **config) -> None:
+    """Serve `app` with uvicorn. A signal that stops the runner (SIGTERM from
+    a service manager, Ctrl+C) reaches the threads first (ThreadHost.shut_down):
+    their agents get it too, and the turns that cuts short are interrupted,
+    not failed."""
+    import signal
 
     import uvicorn
+
+    class Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            host.shut_down(f"the runner got {signal.Signals(sig).name}")
+            super().handle_exit(sig, frame)
+
+    Server(uvicorn.Config(app, **config)).run()
+
+
+def main():
+    import sys
 
     configure_logging()
     require(["DEEPSEEK_API_KEY"])
@@ -351,11 +370,12 @@ def main():
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)
-    app = create_app(host_from_env(), token)
+    host = host_from_env()
     # /events streams stay open for subscribers (the control plane's relay), so
     # bound the wait for them; otherwise Ctrl+C never completes.
-    uvicorn.run(app, host=os.environ.get("RUNNER_HOST", "0.0.0.0"), port=int(os.environ.get("RUNNER_PORT", "8080")),
-                timeout_graceful_shutdown=int(os.environ.get("RUNNER_GRACEFUL_SHUTDOWN", "5")))
+    serve(create_app(host, token), host, host=os.environ.get("RUNNER_HOST", "0.0.0.0"),
+          port=int(os.environ.get("RUNNER_PORT", "8080")),
+          timeout_graceful_shutdown=int(os.environ.get("RUNNER_GRACEFUL_SHUTDOWN", "5")))
 
 
 if __name__ == "__main__":

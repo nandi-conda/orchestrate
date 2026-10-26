@@ -24,7 +24,9 @@ Worker (one per LiveWorker):
     lost         its provider says it is gone. Retired.
 
     A ready worker whose runner restarted (a new boot id) moves ready -> ready:
-    its threads are unbound, because the new runner runs none of them.
+    the new runner runs none of its threads. Those mid-turn go bound ->
+    binding -> bound on it again, and the runner resumes the cut turn; the
+    rest are unbound.
 
 Binding (one per thread):
 
@@ -37,7 +39,9 @@ Binding (one per thread):
     bound        a live worker's runner has it. Happy.
 
     Leaving bound for unbound cuts a running turn short: a thread queued,
-    working or waiting is failed (Orchestrator._bind_to).
+    working or waiting is failed (Orchestrator._bind_to). A runner or control
+    plane restart does not unbind such a thread: it is bound again on its
+    worker, where the turn resumes (runner/API.md, "Interrupted turns").
 """
 
 from __future__ import annotations
