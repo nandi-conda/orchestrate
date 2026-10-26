@@ -354,3 +354,92 @@ async def test_a_thread_begun_before_the_remote_lands_on_it_without_the_hubs_sta
     await orch.close()
     await orch.provider.close()
     await s.close()
+
+
+async def opened(tmp_path, folder):
+    """A project opened from `folder` on disk, and its orchestrator."""
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True),
+                        HeuristicRouter(), tmp_path / "repos")
+    p = await orch.create_project("demo", "", str(folder))
+    return s, p, orch
+
+
+async def test_a_project_opened_from_a_checkout_lands_in_its_files(tmp_path):
+    bare, seed = remote(tmp_path)  # seed: a checkout of trunk, holding notes.txt
+    s, p, orch = await opened(tmp_path, seed)
+    hub = orch.hub_path(p["id"])
+    assert p["repo_url"] == str(seed.resolve())
+    # Its history is the project's, made a pixi project: in its files too.
+    assert git(hub, "log", "--format=%s", "trunk").splitlines() == ["Make the project a pixi project", "init"]
+    assert git(seed, "rev-parse", "HEAD") == git(hub, "rev-parse", "trunk")
+    assert (seed / "pixi.toml").exists() and git(seed, "status", "--porcelain") == ""
+
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
+    landed = await event(s, p, t["id"], "landed")
+    assert git(seed, "rev-parse", "HEAD") == landed["commit"]
+    assert (seed / "a.txt").read_text() == "one\n" and git(seed, "status", "--porcelain") == ""
+    await wait_for(lambda: idle(s, t["id"]))
+
+    # What its owner commits there reaches the threads; a landing goes on top.
+    commit(seed, "mine.txt", "m\n", "mine")
+    await orch.send(t["id"], "write b.txt: two")
+    landed = await landing(s, p, t["id"], 2)
+    assert git(seed, "log", "-2", "--format=%s").splitlines()[1] == "mine"
+    assert (seed / "b.txt").read_text() == "two\n" and (seed / "mine.txt").exists()
+    await wait_for(lambda: idle(s, t["id"]))
+
+    # Changes not committed there are never overwritten: the landing is refused.
+    (seed / "notes.txt").write_text("editing\n")
+    before = git(hub, "rev-parse", "trunk")
+    await orch.send(t["id"], "write c.txt: three")
+    error = await event(s, p, t["id"], "error")
+    assert "unstaged changes" in error["error"]
+    assert git(hub, "rev-parse", "trunk") == before and not (seed / "c.txt").exists()
+    assert (seed / "notes.txt").read_text() == "editing\n"
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
+async def test_a_folder_that_is_not_a_repository_becomes_one_with_its_files(tmp_path):
+    folder = tmp_path / "plain"
+    (folder / "src").mkdir(parents=True)
+    (folder / "src" / "app.py").write_text("print(1)\n")
+    (folder / ".gitignore").write_text("secret.txt\n")
+    (folder / "secret.txt").write_text("x\n")
+    s, p, orch = await opened(tmp_path, folder)
+    hub = orch.hub_path(p["id"])
+    assert git(folder, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert git(hub, "log", "--format=%s", "main").splitlines() == ["Make the project a pixi project",
+                                                                   "Add the folder's files"]
+    assert set(git(hub, "ls-tree", "-r", "--name-only", "main").split()) == {
+        "src/app.py", ".gitignore", ".gitattributes", "pixi.toml"}
+    assert git(hub, "show", "main:.gitignore").splitlines()[0] == "secret.txt"
+    assert (folder / "pixi.toml").exists() and (folder / "secret.txt").exists()
+    assert git(folder, "status", "--porcelain") == ""
+    await orch.close()
+    await orch.provider.close()
+    await s.close()
+
+
+async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
+    bare, seed = remote(tmp_path)
+    (seed / "sub").mkdir()
+    git(seed, "checkout", "-q", "--detach")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True),
+                        HeuristicRouter(), tmp_path / "repos")
+    for folder, reason in ((tmp_path / "nope", "there is no folder"),
+                           (seed / "sub", "inside the git repository"),
+                           (seed / ".git", "inside a repository's .git folder"),
+                           (seed, "no branch checked out")):
+        with pytest.raises(GitError, match=reason):
+            await orch.create_project("demo", "", str(folder))
+    assert await s.list_projects() == []
+    assert list((tmp_path / "repos").iterdir()) == []
+    await orch.close()
+    await orch.provider.close()
+    await s.close()

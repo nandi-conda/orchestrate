@@ -14,6 +14,7 @@ import calendar
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from collections import deque
@@ -22,14 +23,14 @@ from pathlib import Path
 
 import httpx
 
-from .hub import Hub
+from .hub import Hub, remote_url
 from .load import load_of
 from .providers import Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
 from .runner_client import RunnerClient
 from .secrets import get_secret
 from .states import BINDING, RUNNING, WORKER
-from .store import Store, now
+from .store import Store, new_id, now
 
 log = logging.getLogger("orchestrator")
 
@@ -794,13 +795,35 @@ class Orchestrator:
                 self.hubs[project["id"]] = hub
         return hub
 
+    async def create_project(self, name: str, model: str = "", repo_url: str = "") -> dict:
+        """A new project; with `repo_url` (a project opened from a folder on
+        disk), its hub is made and joined to that remote before the project
+        exists (Hub.connect), so one that cannot be leaves nothing behind."""
+        if not repo_url:
+            return await self.store.create_project(name, model)
+        repo_url, pid = remote_url(repo_url), new_id("p")
+        hub = Hub(self.hub_path(pid), name, get_secret("GITHUB_TOKEN"))
+        try:
+            await hub.open()
+            await hub.connect(repo_url)
+        except BaseException:
+            shutil.rmtree(hub.path, ignore_errors=True)
+            raise
+        project = await self.store.create_project(name, model, repo_url, pid)
+        async with self._hubs_lock:
+            self.hubs[pid] = hub
+        return project
+
     async def update_project(self, project_id: str, **fields) -> dict:
         """Rename a project, change its model, or attach, change or remove its
-        remote (`repo_url`, "" for none). A new remote is connected to the hub
-        first (Hub.connect); one that cannot be leaves the project as it was."""
+        remote (`repo_url`, "" for none; a folder is kept as remote_url writes
+        it). A new remote is connected to the hub first (Hub.connect); one that
+        cannot be leaves the project as it was."""
         project = await self.store.get_project(project_id)
         if project is None:
             raise KeyError(project_id)
+        if "repo_url" in fields:
+            fields["repo_url"] = remote_url(fields["repo_url"])
         if "repo_url" in fields and fields["repo_url"] != project["repo_url"]:
             hub = await self.hub(project)
             await hub.connect(fields["repo_url"])

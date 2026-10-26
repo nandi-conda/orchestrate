@@ -91,6 +91,7 @@ PROJ_ARCHIVED: Const[i32] = 65
 RESPAWN: Const[i32] = 66
 RESPAWNED: Const[i32] = 67
 THREADS_REFRESH: Const[i32] = 68
+FOLDER_IN: Const[i32] = 69
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -136,7 +137,7 @@ threads: i32 = 0         # JSON handle: thread directory
 transcript: i32 = 0      # JSON handle: selected thread's events
 plog: i32 = 0            # JSON handle: project orchestrator
 loading: i32 = 0
-show_new: i32 = 0
+show_new: i32 = 0        # 1 the New project dialog is up, 2 the Open folder one
 creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
@@ -167,6 +168,8 @@ h_repo: i32 = 0          # the settings' remote ("" = none)
 h_set_name: i32 = 0      # the settings' name
 h_set_model: i32 = 0     # the settings' model ("" = the default)
 h_set_err: i32 = 0       # why the settings could not be saved
+h_folder: i32 = 0        # the Open folder dialog's folder
+h_new_err: i32 = 0       # why the project could not be created
 h_req: i32 = 0
 h_last: i32 = 0          # the request being sent, put back if the send fails
 h_err: i32 = 0
@@ -237,7 +240,7 @@ def init() -> None:
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
-    global h_set_name, h_set_model, h_set_err
+    global h_set_name, h_set_model, h_set_err, h_folder, h_new_err
     global h_img, h_when, h_when_full
     h_pid = s_new()
     h_sel = s_new()
@@ -246,6 +249,8 @@ def init() -> None:
     h_set_name = s_new()
     h_set_model = s_new()
     h_set_err = s_new()
+    h_folder = s_new()
+    h_new_err = s_new()
     h_req = s_new()
     h_last = s_new()
     h_err = s_new()
@@ -605,16 +610,27 @@ def update(msg: i32, arg: i32) -> None:
             j_err(arg, h_err)
         j_free(arg)
     elif msg == NEW_SHOW:
-        show_new = 1
+        # arg 0: a new project; 1: one opened from a folder on disk.
+        if creating == 0:
+            s_clear(h_new_err)
+            show_new = arg + 1
     elif msg == NEW_HIDE:
-        show_new = 0
+        if creating == 0:
+            show_new = 0
     elif msg == NAME_IN:
         s_copy(h_name, arg)
+    elif msg == FOLDER_IN:
+        s_copy(h_folder, arg)
     elif msg == CREATE:
-        if s_len(h_name) > 0 and creating == 0:
+        # A folder is joined to the project's repository before the reply comes
+        # back, so opening one can take as long as copying its history.
+        if creating == 0 and ((show_new == 1 and s_len(h_name) > 0) or (show_new == 2 and s_len(h_folder) > 0)):
             creating = 1
+            s_clear(h_new_err)
             o = o_new()
             o_str(o, "name", h_name)
+            if show_new == 2:
+                o_str(o, "folder", h_folder)
             s_set(h_url, "/api/projects")
             post(h_url, o, CREATED)
     elif msg == CREATED:
@@ -623,9 +639,10 @@ def update(msg: i32, arg: i32) -> None:
             show_new = 0
             jstr(arg, "id", h_t1)
             s_clear(h_name)
+            s_clear(h_folder)
             open_project(h_t1)
         else:
-            j_err(arg, h_err)
+            j_err(arg, h_new_err)
         j_free(arg)
     elif msg == GOT_PROJECT:
         project = take(project, arg)
@@ -1093,6 +1110,7 @@ def project_list() -> None:
         btn("← Projects", "ghost", PROJ_SHOW_ARCHIVED, 0)
     else:
         btn("Archived", "ghost", PROJ_SHOW_ARCHIVED, 1)
+        btn("Open folder", "outline", NEW_SHOW, 1)
         btn("New project", "", NEW_SHOW, 0)
     end()
     end()
@@ -1113,6 +1131,7 @@ def project_list() -> None:
         card_open()
         card_header("No projects yet", "A project is a git repository plus the threads working on it.")
         card_footer_open()
+        btn("Open a folder", "outline", NEW_SHOW, 1)
         btn("Create a project", "", NEW_SHOW, 0)
         end()
         end()
@@ -1175,6 +1194,8 @@ def project_list() -> None:
     end()
     if show_new == 1:
         new_project_dialog()
+    elif show_new == 2:
+        open_folder_dialog()
 
 
 def new_project_dialog() -> None:
@@ -1187,12 +1208,59 @@ def new_project_dialog() -> None:
     autofocus()
     on_enter(CREATE, 0)
     end()
+    new_project_error()
     end()
+    create_footer()
+
+
+def open_folder_dialog() -> None:
+    """A project opened from a folder on the control plane's machine: the
+    folder becomes its remote (control/hub.py, `folder`)."""
+    dialog_open("Open folder", "A project from a folder on this computer. Finished threads land in "
+                "its checked-out branch, so their work shows up in its files.", NEW_HIDE)
+    el("div")
+    cls("form")
+    label("Folder")
+    input_open("/home/you/my-app", h_folder, FOLDER_IN)
+    autofocus()
+    on_enter(CREATE, 0)
+    end()
+    el("p")
+    cls("help")
+    text("A git repository's folder, or any folder: one that is not a repository becomes one, "
+         "its files the first commit. A project that is not a pixi project gets pixi's files, "
+         "committed there. Keep your own changes there committed or stashed while threads "
+         "finish: git will not land over them.")
+    end()
+    label("Name (optional)")
+    input_open("the folder's name", h_name, NAME_IN)
+    on_enter(CREATE, 0)
+    end()
+    new_project_error()
+    end()
+    create_footer()
+
+
+def new_project_error() -> None:
+    if s_len(h_new_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_new_err)
+        end()
+
+
+def create_footer() -> None:
     dialog_footer_open()
     btn("Cancel", "outline", NEW_HIDE, 0)
     btn_open("", CREATE, 0)
-    if creating == 1:
+    if creating == 1 and show_new == 2:
+        text("Opening…")
+    elif creating == 1:
         text("Creating…")
+    elif show_new == 2:
+        text("Open")
     else:
         text("Create")
     end()
@@ -2510,15 +2578,16 @@ def settings_dialog() -> None:
     input_open("the runner's default", h_set_model, SET_MODEL_IN)
     on_enter(SETTINGS_SAVE, 0)
     end()
-    label("GitHub remote (optional)")
-    input_open("https://github.com/you/repo", h_repo, REPO_IN)
+    label("Remote (optional)")
+    input_open("https://github.com/you/repo or /home/you/my-app", h_repo, REPO_IN)
     on_enter(SETTINGS_SAVE, 0)
     end()
     el("p")
     cls("help")
     text("With a remote, the project's main branch follows its default branch and finished threads "
          "are pushed there. An empty repository gets this project's history; one with history must "
-         "share it, unless nothing has landed here yet. Clearing it keeps everything here.")
+         "share it, unless nothing has landed here yet. A folder on this computer works too: "
+         "threads land in its checked-out branch. Clearing it keeps everything here.")
     end()
     label("Local repository")
     el("p")

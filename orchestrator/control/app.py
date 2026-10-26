@@ -25,6 +25,7 @@ from starlette.staticfiles import StaticFiles
 from . import paths
 from .providers import WorkerProvider, default_provider
 from .gitio import GitError
+from .hub import is_folder, remote_url
 from .router import Router, default_router
 from .runner_client import FileError
 from .service import (ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, image_title,
@@ -301,11 +302,22 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         return JSONResponse([project_view(p) for p in await store.list_projects(archived)])
 
     async def create_project(req: Request):
+        """A new project: {name, model?}, or one opened from a folder on disk,
+        {folder, name?, model?}, named after the folder unless named. The
+        folder becomes the project's remote (Orchestrator.create_project); one
+        that cannot be is refused with the reason, and nothing is made."""
         b = await body(req)
-        name = str(b.get("name", "")).strip()
+        folder = str(b.get("folder", "")).strip()
+        if folder and not is_folder(folder):
+            return JSONResponse({"error": f"{folder} is not a folder path; give its full path, "
+                                          "like /home/you/my-app or ~/my-app"}, 400)
+        name = str(b.get("name", "")).strip() or (Path(remote_url(folder)).name if folder else "")
         if not name:
             return JSONResponse({"error": "name is required"}, 400)
-        p = await store.create_project(name, str(b.get("model", "")).strip())
+        try:
+            p = await orch().create_project(name, str(b.get("model", "")).strip(), folder)
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p), 201)
 
     async def project_settings(req: Request):

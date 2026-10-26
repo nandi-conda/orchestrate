@@ -8,14 +8,20 @@ project list and projects without reloading.
 
 The start page lists your projects. **New project** asks only for a name; a
 project starts with its own local git repository and no remote (cards say
-"local only"). Click a card to open the project at `/p/<project id>`;
+"local only"). **Open folder** makes a project from a folder on the machine
+the control plane runs on: give its full path (`~/` works) and, optionally, a
+name (the folder's name otherwise). The folder becomes the project's remote,
+so finished threads land in its checked-out branch and their work shows up in
+its files; see [Opening a folder](../architecture/git.md#opening-a-folder).
+A folder that cannot be opened is refused with the reason, and no project is
+made. Click a card to open the project at `/p/<project id>`;
 **← All projects** goes back.
 
 **Settings** in a project's top bar opens a dialog with:
 
 - **Name**, and the **model** its threads use.
-- **GitHub remote (optional)**: attach, change or remove a GitHub repository at
-  any time. How the two histories are joined is described in
+- **Remote (optional)**: attach, change or remove a GitHub repository, or a
+  folder on this machine, at any time. How the two histories are joined is described in
   [Project repos and landing](../architecture/git.md#attaching-a-remote). A
   remote that cannot be joined is refused with git's reason, and nothing
   changes.

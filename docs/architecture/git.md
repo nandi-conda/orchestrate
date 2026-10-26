@@ -132,3 +132,37 @@ remote's: it lands on top without the hub's own commits it starts from
 before every project began as one). Removing the remote keeps
 everything in the hub; landings stay local from then on, and attaching it
 again pushes what it missed.
+
+## Opening a folder
+
+**Open folder** (`POST /api/projects` with `folder`) makes a project whose
+remote is a folder on the control plane's machine, so the work threads finish
+shows up where you work on it. There is one path: the folder is the project's
+remote, exactly as a GitHub repository would be. The hub is made and joined to
+it (the table above; a new hub has nothing landed, so it takes the folder's
+history) before the project exists, so a folder that cannot be opened leaves
+nothing behind. A folder can also be attached later as a project's remote in
+**Settings**; it is kept as its full path, without `~`, `..` or symlinks.
+
+What the folder is decides what is done to it first (`hub.folder`):
+
+| The folder | What happens |
+| --- | --- |
+| a git repository's own folder (a checkout) | its config gets `receive.denyCurrentBranch=updateInstead`, so a push to its checked-out branch also updates its files |
+| a bare repository | used as it is |
+| not a git repository | `git init` on `main`, then as a checkout |
+| a checkout whose branch has no commits yet | one commit, "Add the folder's files", of everything its `.gitignore` leaves in |
+| missing, inside another repository, a `.git` folder, or a checkout on no branch (detached HEAD) | refused with the reason |
+
+A project that is not a pixi project then gets "Make the project a pixi
+project", pushed into the folder like a landing. From then on every landing
+is pushed into the checked-out branch, and commits you make there yourself
+are fetched before workers get the base and before every landing, so threads
+build on them.
+
+git never pushes over changes you have not committed: while the checkout has
+modified tracked files (or untracked ones a landing would overwrite), the
+push is refused ("Working directory has unstaged changes"), the thread shows
+the error, and nothing moves. Commit or stash, and the thread's work lands at
+the end of its next turn. Untracked files that a landing does not touch are
+left alone.

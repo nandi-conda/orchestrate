@@ -23,6 +23,13 @@ attached, changed or removed at any time from the project's settings
 fetched before workers get it and before every landing, and a landing is
 pushed there first. Without one, the hub is the only copy.
 
+A remote can be a folder on the control plane's machine (a project opened from
+disk): a git repository's own folder, or any folder, which becomes one
+(`folder`). Landings are pushed into its checked-out branch and update its
+files (receive.denyCurrentBranch=updateInstead), so they show up where its
+owner works; git refuses one while that checkout has changes not committed,
+and the thread's work lands again at the end of its next turn.
+
 Workers never reach the hub, nor the remote. The control plane moves commits
 as git bundles over the runner API, each way leaving out what the other side
 has (runner/API.md, "Repository"): it sends the base before a thread starts
@@ -49,6 +56,7 @@ from .gitio import AUTHOR, GitError, git
 
 LAND_ATTEMPTS = 5  # pushes rejected because the remote moved before giving up
 START, MAKE_PIXI = "Start the project", "Make the project a pixi project"  # the hub's own commits
+IMPORT = "Add the folder's files"  # a folder opened as a project whose branch had no commits
 # A new project's pixi workspace: on conda-forge, for the platforms workers run on.
 PLATFORMS = ("linux-64", "linux-aarch64")
 # What `pixi init` puts in .gitignore and .gitattributes: environments stay out
@@ -96,6 +104,51 @@ async def pixi_tree(repo: str | os.PathLike, commit: str | None, name: str) -> s
             blob = (await git(repo, "hash-object", "-w", str(src))).out
             await git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
         return (await git(repo, "write-tree", env=env)).out
+
+
+def is_folder(url: str) -> bool:
+    """Whether a remote is a folder on this machine: an absolute path, or one
+    from the home folder (~), not a URL or an scp-like host:path."""
+    return Path(url).expanduser().is_absolute()
+
+
+def remote_url(url: str) -> str:
+    """A remote as a project keeps it: a folder as its absolute path, without
+    ~, .. or symlinks, so the same folder is always written the same way."""
+    url = url.strip()
+    return str(Path(url).expanduser().resolve()) if url and is_folder(url) else url
+
+
+async def folder(path: str) -> None:
+    """Make the folder at `path` (as remote_url writes it) a remote the hub can
+    land in. A bare repository is one as it is. A git repository's own folder
+    lets pushes update its checked-out branch and files; a folder that is not
+    one becomes one (on `main`). A branch without commits yet gets one holding
+    the folder's files (what its .gitignore leaves out stays out), so the
+    project starts from what is there. Refused: no such folder, a folder inside
+    another repository (open that one), and a checkout on no branch."""
+    where = Path(path).resolve()
+    if not where.is_dir():
+        raise GitError(f"there is no folder {path}")
+    repo = await git(where, "rev-parse", "--is-bare-repository", "--is-inside-git-dir", check=False)
+    if repo.code:
+        await git(where, "init", "-q", "-b", "main")
+    else:
+        bare, in_git_dir = repo.out.split()
+        if bare == "true":
+            return
+        if in_git_dir == "true":
+            raise GitError(f"{path} is inside a repository's .git folder; open the folder it belongs to")
+        top = (await git(where, "rev-parse", "--show-toplevel")).out
+        if Path(top).resolve() != where:
+            raise GitError(f"{path} is inside the git repository {top}; open that folder instead")
+    if (await git(where, "symbolic-ref", "-q", "HEAD", check=False)).code:
+        raise GitError(f"{path} has no branch checked out; check out the branch the project should follow")
+    await git(where, "config", "receive.denyCurrentBranch", "updateInstead")
+    if (await git(where, "rev-parse", "-q", "--verify", "HEAD", check=False)).code:
+        who = ("-c", f"user.name={AUTHOR[0]}", "-c", f"user.email={AUTHOR[1]}")
+        await git(where, "add", "-A")
+        await git(where, *who, "commit", "-q", "--allow-empty", "-m", IMPORT)
 
 
 def worker_ref(ref: str, base: str) -> str:
@@ -175,10 +228,13 @@ class Hub:
           project keeps the remote it had.
         The base takes the name of the remote's default branch, and is made a
         pixi project if it is not one (pushed there, as a landing would be).
-        Removing the remote keeps everything here; landings stay on this
-        machine from then on."""
+        A folder (is_folder; as remote_url writes it) is made a remote the hub
+        can land in first (`folder`). Removing the remote keeps everything
+        here; landings stay on this machine from then on."""
         async with self.lock:
             if url:
+                if is_folder(url):
+                    await folder(url)
                 env = self.auth(url)
                 await self._join(url, env)
                 await self.git("config", "orchestrate.remote", url)

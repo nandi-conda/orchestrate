@@ -831,6 +831,31 @@ async def test_project_settings_change_name_model_and_remote(tmp_path):
             assert (await c.post("/api/projects/p_nope/settings", json={"name": "x"})).status_code == 404
 
 
+async def test_a_project_opens_from_a_folder_named_after_it(tmp_path):
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    folder = tmp_path / "my-app"
+    folder.mkdir()
+    (folder / "README.md").write_text("hi\n")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            r = await c.post("/api/projects", json={"folder": "my-app"})
+            assert r.status_code == 400 and "full path" in r.json()["error"]
+            r = await c.post("/api/projects", json={"folder": str(tmp_path / "nope")})
+            assert r.status_code == 400 and "no folder" in r.json()["error"]
+            assert (await c.get("/api/projects")).json() == []
+
+            r = await c.post("/api/projects", json={"folder": f" {tmp_path}/x/../my-app/ "})
+            assert r.status_code == 201
+            p = r.json()
+            assert (p["name"], p["repo_url"]) == ("my-app", str(folder.resolve()))
+            assert (folder / "pixi.toml").exists()
+            r = await c.post("/api/projects", json={"folder": str(folder), "name": "named"})
+            assert r.status_code == 201 and r.json()["name"] == "named"
+
+
 async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypatch):
     """An image's bytes live in the store: events and the transcript carry only
     its id, /api/images/<id> serves the bytes, and the runner gets them base64

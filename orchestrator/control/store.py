@@ -59,7 +59,10 @@ class Store(Protocol):
     async def open(self) -> None: ...
     async def close(self) -> None: ...
 
-    async def create_project(self, name: str, model: str = "") -> dict: ...
+    async def create_project(self, name: str, model: str = "", repo_url: str = "",
+                             project_id: str | None = None) -> dict:
+        """A new project; `repo_url` and `project_id` are given when its hub
+        was made and joined to its remote first (Orchestrator.create_project)."""
     async def list_projects(self, archived: bool = False) -> list[dict]:
         """The projects that are not archived, or with archived=True only the
         archived ones; oldest first."""
@@ -247,8 +250,9 @@ class _SqlStore:
         return rows[0] if rows else None
 
     # projects
-    async def create_project(self, name: str, model: str = "") -> dict:
-        p = {"id": new_id("p"), "name": name, "repo_url": "", "model": model,
+    async def create_project(self, name: str, model: str = "", repo_url: str = "",
+                             project_id: str | None = None) -> dict:
+        p = {"id": project_id or new_id("p"), "name": name, "repo_url": repo_url, "model": model,
              "settings": "{}", "archived_at": None, "created_at": now()}
         cols = ", ".join(p)
         marks = ", ".join("?" for _ in p)
