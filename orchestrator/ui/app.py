@@ -18,7 +18,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, focus_end, is_md, on_paste, img_count, img_url,
+                  clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row)
 
 # ---- Msg
@@ -171,6 +171,8 @@ h_url: i32 = 0
 h_t1: i32 = 0
 h_t2: i32 = 0
 h_t3: i32 = 0
+h_when: i32 = 0         # an event's time, local
+h_when_full: i32 = 0    # and its full date, time and zone
 h_working: i32 = 0
 h_idle: i32 = 0
 h_failed: i32 = 0
@@ -228,7 +230,7 @@ def init() -> None:
     global h_fview, h_fview_err
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_set_name, h_set_model, h_set_err
-    global h_img
+    global h_img, h_when, h_when_full
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -244,6 +246,8 @@ def init() -> None:
     h_t1 = s_new()
     h_t2 = s_new()
     h_t3 = s_new()
+    h_when = s_new()
+    h_when_full = s_new()
     h_working = s_new()
     s_set(h_working, "working")
     h_idle = s_new()
@@ -1339,6 +1343,16 @@ def thread_tag(e: i32, show_thread: i32) -> None:
             thread_link(h_t2)
 
 
+def event_time(e: i32) -> None:
+    """When the event happened, in the viewer's local time."""
+    if j_when(e, "created_at", h_when, h_when_full) == 1:
+        el("time")
+        cls("ev-time")
+        attr_ref("title", h_when_full)
+        text_ref(h_when)
+        end()
+
+
 def working_now() -> None:
     """Project activity's live line per working thread: its title and what it
     is doing, instead of every thread's reasoning."""
@@ -1430,6 +1444,7 @@ def event_row(e: i32, show_thread: i32) -> None:
         jstr(e, "label", h_t1)
         text_ref(h_t1)
         thread_tag(e, show_thread)
+    event_time(e)
     end()
     event_images(e)
     jstr(e, "text", h_t1)

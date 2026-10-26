@@ -50,6 +50,13 @@ def s_add_enc(dst: i32, src: i32) -> None:
     pass
 
 @jscall
+def j_when(e: i32, k: str, dst: i32, full: i32) -> i32:
+    """Write the time in key k of JSON object e (seconds since the epoch) to
+    dst in the viewer's local time zone, and the full date, time and zone to
+    full. 0 when e has no such time."""
+    pass
+
+@jscall
 def is_md(h: i32) -> i32:
     """1 if the file name in h is markdown (ends in .md or .markdown, any case)."""
     pass

@@ -103,6 +103,20 @@ export function imports({ str, strs, vals, dispatch }) {
     },
     sse_close: (id) => { const es = streams.get(id); if (es) { es.close(); streams.delete(id); } },
     s_add_enc: (d, h) => { strs[d] = (strs[d] ?? "") + encodeURIComponent(strs[h] ?? ""); },
+    // An event's time (its `created_at`, seconds since the epoch) in the
+    // viewer's own time zone: the time of day, with the date when it is not
+    // today; the full date, time and zone in `full` for the hover title.
+    j_when: (e, k, d, full) => {
+      const t = Number(vals[e]?.[str(k)]);
+      if (!Number.isFinite(t) || t <= 0) return 0;
+      const at = new Date(t * 1000);
+      const hm = { hour: "2-digit", minute: "2-digit" };
+      strs[d] = at.toDateString() === new Date().toDateString()
+        ? at.toLocaleTimeString([], hm)
+        : at.toLocaleString([], { month: "short", day: "numeric", ...hm });
+      strs[full] = at.toLocaleString([], { dateStyle: "full", timeStyle: "long" });
+      return 1;
+    },
     is_md: (h) => /\.(md|markdown)$/i.test(strs[h] ?? "") ? 1 : 0,
     page_project: (d) => {
       const m = location.pathname.match(/^\/p\/([^/]+)/);

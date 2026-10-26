@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import calendar
 import json
 import logging
+import re
 import sys
 import time
 from collections import deque
@@ -189,13 +191,31 @@ class LiveWorker:
         return [task for task in (self.relay, self.pump, self.watch, self.logs, self.reattach) if task]
 
 
+# The time a runner log line starts with: UTC, to the millisecond, marked Z
+# (configure_logging in runner/src/runner/server.py).
+RUNNER_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{3})Z ")
+
+
+def local_line(line: str) -> str:
+    """A runner log line with its UTC time in the control plane's local time."""
+    m = RUNNER_STAMP.match(line)
+    if m is None:
+        return line
+    ts = calendar.timegm(time.strptime(m[1], "%Y-%m-%dT%H:%M:%S"))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + m[2] + " " + line[m.end():]
+
+
+def local_log(text: str) -> str:
+    return "\n".join(local_line(line) for line in text.split("\n"))
+
+
 def print_worker_line(worker_id: str, line: str) -> None:
-    sys.stdout.write(f"{worker_id} | {line}\n")
+    sys.stdout.write(f"{worker_id} | {local_line(line)}\n")
     sys.stdout.flush()
 
 
 def when(ts: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+    return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(ts))
 
 
 class Orchestrator:
@@ -1012,13 +1032,13 @@ class Orchestrator:
                 if not kept:
                     return head + f"No log was read from {w['id']} before it was lost.\n"
                 return (head + f"\nThe end of {w['id']}'s runner log when it was lost "
-                        f"({when(w['lost_at'])}):\n" + "\n".join(kept) + "\n")
+                        f"({when(w['lost_at'])}):\n" + local_log("\n".join(kept)) + "\n")
             worker = stored_worker(w)
         try:
             text = await self.provider.logs(worker, lines)
         except Exception as e:
             return head + f"\nCould not read {worker.id}'s runner log: {describe(e)}\n"
-        return head + "\n" + text
+        return head + "\n" + local_log(text)
 
     async def list_files(self, thread_id: str, path: str) -> dict:
         """A directory of the thread's worktree, read from the worker that holds

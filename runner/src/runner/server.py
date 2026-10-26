@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import subprocess
+import time
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -53,7 +54,14 @@ class QuietPolls(logging.Filter):
 def configure_logging() -> None:
     """prime-agent's own log lines (runner.harness), thread failures, and one
     access line per request worth reading."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(name)s: %(message)s")
+    # Times in UTC, marked so: the control plane shows them in its own local
+    # time (local_line in orchestrator/control/service.py).
+    handler = logging.StreamHandler()
+    stamp = logging.Formatter("%(asctime)s.%(msecs)03dZ %(levelname)s: %(name)s: %(message)s",
+                              datefmt="%Y-%m-%dT%H:%M:%S")
+    stamp.converter = time.gmtime
+    handler.setFormatter(stamp)
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     # Web calls log what they did themselves (runner.web); model calls are prime-agent's.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").addFilter(QuietPolls())
