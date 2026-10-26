@@ -25,7 +25,7 @@ from starlette.staticfiles import StaticFiles
 from . import paths
 from .providers import WorkerProvider, default_provider
 from .gitio import GitError
-from .hub import is_folder, remote_url
+from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
 from .runner_client import FileError
 from .service import (ENDS_STREAM, ArchivedError, EditError, Orchestrator, describe, editable, image_title,
@@ -319,6 +319,14 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         except GitError as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p), 201)
+
+    async def list_folders(req: Request):
+        """The folders in a folder on this machine (?path=, the home folder by
+        default), for the folder picker: hub.folders."""
+        try:
+            return JSONResponse(await asyncio.to_thread(folders, req.query_params.get("path", "")))
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 400)
 
     async def project_settings(req: Request):
         """Change any of a project's name, model and remote (`repo_url`, "" to
@@ -632,6 +640,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/health", health),
         Route("/api/projects", list_projects, methods=["GET"]),
         Route("/api/projects", create_project, methods=["POST"]),
+        Route("/api/folders", list_folders, methods=["GET"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),

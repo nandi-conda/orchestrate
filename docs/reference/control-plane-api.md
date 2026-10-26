@@ -16,6 +16,7 @@ provider call failed).
 | --- | --- | --- | --- |
 | GET | `/api/projects` | `?archived=1` for archived ones | list of projects; each has `repo_path` (its hub) and `repo_url` (its remote, `""` for none) |
 | POST | `/api/projects` | `{name, model?}`, or `{folder, name?, model?}` to open a folder on disk (its full path; named after it unless `name` is given) | 201 + the project; a folder that cannot be opened is a 400 with the reason, and nothing is made |
+| GET | `/api/folders` | `?path=` a full path (`~` works), the home folder by default | `{path, parent, entries: [{name, path, git}]}`: the folders in it (hidden ones left out), for the folder picker; `parent` is `""` at the top. A path that is not a readable folder is a 400 |
 | GET | `/api/projects/{id}` | | the project |
 | POST | `/api/projects/{id}/settings` | any of `{name, model, repo_url}`; `repo_url: ""` removes the remote | the project; a remote the hub cannot join is a 400 with git's reason, and nothing changes |
 | POST | `/api/projects/{id}/archive` | | the project: running threads stopped, workers destroyed |

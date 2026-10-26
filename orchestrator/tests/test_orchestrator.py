@@ -856,6 +856,32 @@ async def test_a_project_opens_from_a_folder_named_after_it(tmp_path):
             assert r.status_code == 201 and r.json()["name"] == "named"
 
 
+async def test_the_folder_picker_lists_folders_from_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for d in ("b-app", "A-notes", ".hidden"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "file.txt").write_text("x")
+    subprocess.run(["git", "init", "-q", str(tmp_path / "b-app")], check=True)
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True), HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            home = (await c.get("/api/folders")).json()
+            assert home["path"] == str(tmp_path.resolve()) and home["parent"] == str(tmp_path.resolve().parent)
+            assert [(e["name"], e["git"]) for e in home["entries"] if e["name"] in ("A-notes", "b-app")] == [
+                ("A-notes", False), ("b-app", True)]
+            assert all(not e["name"].startswith(".") for e in home["entries"])
+            inner = (await c.get("/api/folders", params={"path": "~/b-app"})).json()
+            assert (inner["path"], inner["entries"]) == (str((tmp_path / "b-app").resolve()), [])
+            assert (await c.get("/api/folders", params={"path": "/"})).json()["parent"] == ""
+            r = await c.get("/api/folders", params={"path": "relative"})
+            assert r.status_code == 400 and "full path" in r.json()["error"]
+            r = await c.get("/api/folders", params={"path": str(tmp_path / "nope")})
+            assert r.status_code == 400 and "no folder" in r.json()["error"]
+
+
 async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypatch):
     """An image's bytes live in the store: events and the transcript carry only
     its id, /api/images/<id> serves the bytes, and the runner gets them base64

@@ -92,6 +92,11 @@ RESPAWN: Const[i32] = 66
 RESPAWNED: Const[i32] = 67
 THREADS_REFRESH: Const[i32] = 68
 FOLDER_IN: Const[i32] = 69
+PICK_SHOW: Const[i32] = 70     # arg: the field picked for (PICK_NEW, PICK_REMOTE)
+PICK_HIDE: Const[i32] = 71
+GOT_FOLDERS: Const[i32] = 72
+PICK_OPEN: Const[i32] = 73     # arg: a folder of the listing; -1 its parent; -2 the home folder
+PICK_USE: Const[i32] = 74
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -99,6 +104,10 @@ TOOLS: Const[i32] = 1
 WLOG: Const[i32] = 2
 FILES: Const[i32] = 3
 THINKING: Const[i32] = 4
+
+# the fields the folder picker fills
+PICK_NEW: Const[i32] = 1       # the Open folder dialog's folder
+PICK_REMOTE: Const[i32] = 2    # the settings' remote
 
 # routing modes
 AUTO: Const[i32] = 0
@@ -138,6 +147,9 @@ transcript: i32 = 0      # JSON handle: selected thread's events
 plog: i32 = 0            # JSON handle: project orchestrator
 loading: i32 = 0
 show_new: i32 = 0        # 1 the New project dialog is up, 2 the Open folder one
+picking: i32 = 0         # the field the folder picker is open for (PICK_NEW, PICK_REMOTE), 0 when closed
+folders: i32 = 0         # JSON handle: the folder the picker shows ({path, parent, entries})
+folders_loading: i32 = 0
 creating: i32 = 0
 sending: i32 = 0
 mode: i32 = 0
@@ -170,6 +182,8 @@ h_set_model: i32 = 0     # the settings' model ("" = the default)
 h_set_err: i32 = 0       # why the settings could not be saved
 h_folder: i32 = 0        # the Open folder dialog's folder
 h_new_err: i32 = 0       # why the project could not be created
+h_pick: i32 = 0          # the folder the picker shows, or is asked for
+h_pick_err: i32 = 0      # why the picker's folder could not be listed
 h_req: i32 = 0
 h_last: i32 = 0          # the request being sent, put back if the send fails
 h_err: i32 = 0
@@ -240,7 +254,7 @@ def init() -> None:
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
-    global h_set_name, h_set_model, h_set_err, h_folder, h_new_err
+    global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
     global h_img, h_when, h_when_full
     h_pid = s_new()
     h_sel = s_new()
@@ -251,6 +265,8 @@ def init() -> None:
     h_set_err = s_new()
     h_folder = s_new()
     h_new_err = s_new()
+    h_pick = s_new()
+    h_pick_err = s_new()
     h_req = s_new()
     h_last = s_new()
     h_err = s_new()
@@ -486,6 +502,15 @@ def fetch_wlog() -> None:
     get_text(h_url, GOT_WLOG)
 
 
+def fetch_folders() -> None:
+    """The folders in h_pick ("" = the home folder), for the folder picker."""
+    global folders_loading
+    folders_loading = 1
+    s_set(h_url, "/api/folders?path=")
+    s_add_enc(h_url, h_pick)
+    get(h_url, GOT_FOLDERS)
+
+
 def fetch_files() -> None:
     """The directory h_fpath of the selected thread's worktree, from its worker."""
     global files_loading
@@ -578,6 +603,7 @@ def update(msg: i32, arg: i32) -> None:
     global projects, project, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
+    global picking, folders, folders_loading
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -614,13 +640,56 @@ def update(msg: i32, arg: i32) -> None:
         if creating == 0:
             s_clear(h_new_err)
             show_new = arg + 1
+            picking = 0
     elif msg == NEW_HIDE:
         if creating == 0:
             show_new = 0
+            picking = 0
     elif msg == NAME_IN:
         s_copy(h_name, arg)
     elif msg == FOLDER_IN:
         s_copy(h_folder, arg)
+    elif msg == PICK_SHOW:
+        # The picker starts at the folder the field names, the home folder
+        # when it names none.
+        picking = arg
+        s_clear(h_pick_err)
+        if arg == PICK_NEW:
+            s_copy(h_pick, h_folder)
+        else:
+            s_copy(h_pick, h_repo)
+        fetch_folders()
+    elif msg == PICK_HIDE:
+        picking = 0
+    elif msg == PICK_OPEN:
+        if arg == -2:
+            s_clear(h_pick)
+        elif arg == -1:
+            jstr(folders, "parent", h_pick)
+        else:
+            o = j_at(folders, "entries")
+            e = j_idx(o, arg)
+            jstr(e, "path", h_pick)
+            j_free(e)
+            j_free(o)
+        fetch_folders()
+    elif msg == GOT_FOLDERS:
+        # A folder that cannot be listed keeps the last listing under its reason.
+        folders_loading = 0
+        if j_ok(arg) == 1:
+            s_clear(h_pick_err)
+            folders = take_none(folders)
+            folders = arg
+        else:
+            j_err(arg, h_pick_err)
+            j_free(arg)
+    elif msg == PICK_USE:
+        if folders != 0:
+            if picking == PICK_NEW:
+                jstr(folders, "path", h_folder)
+            else:
+                jstr(folders, "path", h_repo)
+        picking = 0
     elif msg == CREATE:
         # A folder is joined to the project's repository before the reply comes
         # back, so opening one can take as long as copying its history.
@@ -975,9 +1044,11 @@ def update(msg: i32, arg: i32) -> None:
             jstr(project, "repo_url", h_repo)
             s_clear(h_set_err)
             show_settings = 1
+            picking = 0
     elif msg == SETTINGS_HIDE:
         if saving_settings == 0:
             show_settings = 0
+            picking = 0
     elif msg == SET_NAME_IN:
         s_copy(h_set_name, arg)
     elif msg == SET_MODEL_IN:
@@ -1221,10 +1292,15 @@ def open_folder_dialog() -> None:
     el("div")
     cls("form")
     label("Folder")
+    div("field-row")
     input_open("/home/you/my-app", h_folder, FOLDER_IN)
     autofocus()
     on_enter(CREATE, 0)
     end()
+    btn("Browse…", "outline", PICK_SHOW, PICK_NEW)
+    end()
+    if picking == PICK_NEW:
+        folder_picker()
     el("p")
     cls("help")
     text("A git repository's folder, or any folder: one that is not a repository becomes one, "
@@ -1239,6 +1315,82 @@ def open_folder_dialog() -> None:
     new_project_error()
     end()
     create_footer()
+
+
+def folder_picker() -> None:
+    """Folders on the control plane's machine, one at a time, to fill the
+    field the picker was opened for: open a folder to go into it, then use the
+    one shown. Git repositories are marked."""
+    i: i32
+    n: i32 = 0
+    e: i32
+    ents: i32
+    div("picker")
+    div("wlog-bar")
+    span("mono picker-path")
+    if folders != 0:
+        jstr(folders, "path", h_t1)
+        text_ref(h_t1)
+    end()
+    div("pane-actions")
+    btn_open("ghost", PICK_OPEN, -2)
+    cls("sm")
+    text("Home")
+    end()
+    if folders != 0:
+        jstr(folders, "parent", h_t1)
+        if s_len(h_t1) > 0:
+            btn_open("ghost", PICK_OPEN, -1)
+            cls("sm")
+            text("Up")
+            end()
+    end()
+    end()
+    if s_len(h_pick_err) > 0:
+        el("div")
+        cls("alert")
+        cls("destructive")
+        attr("role", "alert")
+        text_ref(h_pick_err)
+        end()
+    if folders != 0:
+        ents = j_at(folders, "entries")
+        n = j_len(ents, "")
+        div("files picker-list")
+        if n == 0:
+            el("p")
+            cls("muted")
+            cls("file")
+            if folders_loading == 1:
+                text("Loading…")
+            else:
+                text("No folders in here.")
+            end()
+        for i in range(n):
+            e = j_idx(ents, i)
+            jstr(e, "name", h_t1)
+            el("button")
+            cls("file")
+            key(i + 1)
+            on_click(PICK_OPEN, i)
+            span("file-name")
+            text_ref(h_t1)
+            text("/")
+            end()
+            if j_int(e, "git") == 1:
+                badge("git", "secondary")
+            end()
+            j_free(e)
+        end()
+        j_free(ents)
+    div("picker-actions")
+    btn("Cancel", "ghost", PICK_HIDE, 0)
+    btn_open("", PICK_USE, 0)
+    cls("sm")
+    text("Use this folder")
+    end()
+    end()
+    end()
 
 
 def new_project_error() -> None:
@@ -2579,9 +2731,14 @@ def settings_dialog() -> None:
     on_enter(SETTINGS_SAVE, 0)
     end()
     label("Remote (optional)")
+    div("field-row")
     input_open("https://github.com/you/repo or /home/you/my-app", h_repo, REPO_IN)
     on_enter(SETTINGS_SAVE, 0)
     end()
+    btn("Browse…", "outline", PICK_SHOW, PICK_REMOTE)
+    end()
+    if picking == PICK_REMOTE:
+        folder_picker()
     el("p")
     cls("help")
     text("With a remote, the project's main branch follows its default branch and finished threads "
