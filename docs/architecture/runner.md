@@ -111,13 +111,19 @@ per-thread wrapper (`PRIME_AGENT_KERNEL_PYTHON`) that execs
 | the thread's home | writable: its venv and prime-agent's agent dir |
 | `/tmp` | the thread's own temp directory |
 | the kernel's pixi environment | read-only |
+| the pixi the runner runs under | read-only, on `PATH`; its cache and global tools go in the thread's home |
 | the orchestrate checkout, the runner's environment, the worker user's home, other threads | empty |
 | `/proc` | its own pid namespace |
 
 The kernel's environment is built fresh: `PATH`, `HOME`, `TMPDIR`, locale and
 terminal variables, the team socket and prime-agent's own variables. No token,
 key, `RUNNER_*` or pixi variable reaches it. `uv pip install` installs into the
-thread's venv.
+thread's venv, which is for the agent's scratch work: the project's own
+dependencies, environments and tasks are pixi's (every project is a pixi
+project, see [Project repos](git.md#every-project-is-a-pixi-project)), and the
+system prompt tells the agent so. Snapshots leave pixi's environments out
+(everything in a `.pixi/` directory's subdirectories); `pixi install` or
+`pixi run` makes them again from `pixi.lock`.
 
 bubblewrap needs unprivileged user namespaces and a fully visible `/proc`.
 Container runtimes mask parts of `/proc` (crun on Sprites masks `kcore`,

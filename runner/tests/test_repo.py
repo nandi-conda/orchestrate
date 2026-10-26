@@ -16,9 +16,10 @@ def git(cwd, *args):
 
 
 def source(tmp_path):
-    """A repository whose default branch `main` holds notes.txt."""
+    """A pixi project whose default branch `main` holds notes.txt."""
     src = tmp_path / "source"
     git(tmp_path, "init", "-q", "-b", "main", str(src))
+    (src / "pixi.toml").write_text('[workspace]\nchannels = ["conda-forge"]\nplatforms = ["linux-64"]\n')
     (src / "notes.txt").write_text("one\ntwo\nthree\n")
     git(src, "add", "-A")
     git(src, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "init")
@@ -141,7 +142,7 @@ async def test_every_turn_lands_concurrent_threads_linearly(tmp_path):
     await stop_all(h)
     assert "landed" in types(a) and "landed" in types(b)
     repo = h.repo.path
-    assert set(git(repo, "ls-tree", "--name-only", "origin/main").split()) == {"notes.txt", "a.txt", "b.txt"}
+    assert set(git(repo, "ls-tree", "--name-only", "origin/main").split()) == {"notes.txt", "pixi.toml", "a.txt", "b.txt"}
     assert git(repo, "rev-list", "--merges", "--count", "origin/main") == "0"
     assert "add b" in git(repo, "log", "--format=%s", "origin/main")
     assert "Thread: " in git(repo, "log", "--format=%B", "origin/main")
@@ -231,7 +232,7 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     finally:
         o.cancel()
     assert "landed" in types(t) and "error" not in types(t), t.events
-    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"notes.txt", "y.txt", "x.txt", ".gitignore"}
+    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"notes.txt", "pixi.toml", "y.txt", "x.txt", ".gitignore"}
     assert git(hub, "show", f"refs/snapshots/{t.id}:out/o") == "o"
     assert git(hub, "rev-parse", "--verify", f"refs/sessions/{t.id}")
     wt = tmp_path / "threads" / t.id
@@ -324,7 +325,7 @@ async def test_worktree_left_behind_by_a_thread_that_moved_on_is_made_again(tmp_
     await ws2.snapshot()
     await move(other, old, "T")
     back = await old.worktree(tmp_path / "w1" / "T", "T")
-    assert sorted(p.name for p in back.path.iterdir() if p.name != ".git") == ["a.txt", "b.txt", "notes.txt"]
+    assert sorted(p.name for p in back.path.iterdir() if p.name != ".git") == ["a.txt", "b.txt", "notes.txt", "pixi.toml"]
 
 
 async def test_worktree_that_holds_what_the_hub_has_keeps_its_ignored_files(tmp_path):
@@ -339,6 +340,32 @@ async def test_worktree_that_holds_what_the_hub_has_keeps_its_ignored_files(tmp_
     (ws.path / "build" / "app").write_text("binary\n")
     again = await repo.worktree(tmp_path / "w1" / "T", "T")
     assert (again.path / "build" / "app").read_text() == "binary\n"
+
+
+async def test_a_snapshot_leaves_out_pixis_environments(tmp_path):
+    """pixi.lock makes a project's environments again; they are big, and stay on the worker."""
+    source(tmp_path)
+    repo = await seeded(tmp_path, "w1")
+    ws = await repo.worktree(tmp_path / "w1" / "T", "T")
+    for path in (".pixi/envs/default/bin/python", ".pixi/config.toml", "sub/.pixi/envs/x/lib", "keep.txt"):
+        (ws.path / path).parent.mkdir(parents=True, exist_ok=True)
+        (ws.path / path).write_text("x\n")
+    snap = await ws.snapshot()
+    files = git(repo.path, "ls-tree", "-r", "--name-only", snap).split()
+    assert sorted(files) == [".pixi/config.toml", "keep.txt", "notes.txt", "pixi.toml"]
+
+
+async def test_a_source_that_is_not_a_pixi_project_is_refused(tmp_path):
+    """Every project is a pixi project, the CLI's too."""
+    src = source(tmp_path)
+    git(src, "rm", "-q", "pixi.toml")
+    git(src, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "no pixi")
+    with pytest.raises(GitError, match="not a pixi project"):
+        await seeded(tmp_path)
+    (src / "pyproject.toml").write_text('[project]\nname = "p"\n\n[tool.pixi.workspace]\nchannels = []\n')
+    git(src, "add", "-A")
+    git(src, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "pixi in pyproject")
+    assert (await seeded(tmp_path, "again")).base == "main"
 
 
 async def test_bundles_leave_out_what_the_other_side_has(tmp_path):

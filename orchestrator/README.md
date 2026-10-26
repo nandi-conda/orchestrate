@@ -223,8 +223,10 @@ credentials, so this repository must be publicly readable.
 
 Every project has its own git repository on the control plane's machine, a
 bare repository at `.orchestrator/repos/<project id>.git` (the hub; its path is
-under **Settings** in the project window). It starts from an empty commit,
-"Start the project". Each thread works in its own worktree on `thread/<id>` on
+under **Settings** in the project window). It starts from a commit that makes
+the project a pixi project, "Start the project": every project is one, and a
+main branch that is not (an older hub, an attached remote's history) gets a
+commit that makes it one. Each thread works in its own worktree on `thread/<id>` on
 its worker; every turn ends with the thread's branch and a snapshot of its
 whole worktree (ignored files too) taken into the hub and the branch landed
 on the hub's main branch (a turn a model call failed in is only taken) (rebase, fast-forward;

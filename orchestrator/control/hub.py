@@ -1,8 +1,12 @@
 """One local git repository per project: the hub its workers' commits go to.
 
 A project's hub is a bare repository, `<repos>/<project id>.git`, on the
-machine the control plane runs on. Every project starts with one, from an
-empty commit ("Start the project"). It holds:
+machine the control plane runs on. Every project starts with one, from a
+commit that makes it a pixi project ("Start the project": pixi.toml, and
+pixi's lines in .gitignore and .gitattributes). Every project is a pixi
+project: a base that is not one (a hub from before this was so, or a remote's
+history the base adopts) gets a commit that makes it one, "Make the project a
+pixi project", landed like a thread's work. It holds:
 
 - `refs/heads/<base>`: the project's main branch.
 - `refs/heads/thread/<id>`: each thread's branch, as of its last turn.
@@ -33,16 +37,65 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import shutil
 import tempfile
+import tomllib
 from pathlib import Path
 
 from . import gitio
 from .gitio import AUTHOR, GitError, git
 
 LAND_ATTEMPTS = 5  # pushes rejected because the remote moved before giving up
-EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+START, MAKE_PIXI = "Start the project", "Make the project a pixi project"  # the hub's own commits
+# A new project's pixi workspace: on conda-forge, for the platforms workers run on.
+PLATFORMS = ("linux-64", "linux-aarch64")
+# What `pixi init` puts in .gitignore and .gitattributes: environments stay out
+# of git, and pixi.lock is never merged line by line.
+GITIGNORE = ("# pixi environments", ".pixi/*", "!.pixi/config.toml")
+GITATTRIBUTES = ("# SCM syntax highlighting & preventing 3-way merges",
+                 "pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff")
+
+
+def manifest(name: str) -> str:
+    """A new project's pixi.toml."""
+    return (f"[workspace]\nname = {json.dumps(name)}\nchannels = [\"conda-forge\"]\n"
+            f"platforms = {json.dumps(list(PLATFORMS))}\n\n[tasks]\n\n[dependencies]\n")
+
+
+async def is_pixi(repo: str | os.PathLike, commit: str) -> bool:
+    """Whether `commit` is a pixi project: pixi.toml at its root, or a
+    pyproject.toml with a [tool.pixi] table."""
+    if (await git(repo, "cat-file", "-e", f"{commit}:pixi.toml", check=False)).code == 0:
+        return True
+    pyproject = await git(repo, "show", f"{commit}:pyproject.toml", check=False)
+    if pyproject.code:
+        return False
+    try:
+        return "pixi" in tomllib.loads(pyproject.out).get("tool", {})
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+async def pixi_tree(repo: str | os.PathLike, commit: str | None, name: str) -> str:
+    """The tree of `commit` (None: an empty one) made a pixi project, as
+    `pixi init` makes one: a pixi.toml named `name`, and pixi's lines added to
+    .gitignore and .gitattributes where they are missing."""
+    with tempfile.TemporaryDirectory() as d:
+        env = {"GIT_INDEX_FILE": os.path.join(d, "index")}
+        await git(repo, "read-tree", *([commit] if commit else ["--empty"]), env=env)
+        files = {"pixi.toml": manifest(name)}
+        for path, lines in ((".gitignore", GITIGNORE), (".gitattributes", GITATTRIBUTES)):
+            old = (await git(repo, "show", f"{commit}:{path}", check=False)).out if commit else ""
+            have = old.splitlines()
+            files[path] = "\n".join(have + [line for line in lines if line not in have]) + "\n"
+        for path, text in files.items():
+            src = Path(d) / "blob"
+            src.write_text(text)
+            blob = (await git(repo, "hash-object", "-w", str(src))).out
+            await git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
+        return (await git(repo, "write-tree", env=env)).out
 
 
 def worker_ref(ref: str, base: str) -> str:
@@ -62,8 +115,9 @@ def thread_refs(tid: str) -> list[str]:
 
 
 class Hub:
-    def __init__(self, path: str | os.PathLike, token: str | None = None) -> None:
+    def __init__(self, path: str | os.PathLike, name: str, token: str | None = None) -> None:
         self.path = Path(path).resolve()  # git runs in other directories
+        self.name = name  # the project's, for the pixi.toml the hub writes
         self.token = token  # GITHUB_TOKEN, sent to http(s) remotes
         self.url = ""
         self.env: dict = {}
@@ -83,12 +137,15 @@ class Hub:
                 "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}"}
 
     async def open(self) -> None:
-        """Make the hub on first use, from an empty first commit; else learn
-        its base and the remote it is connected to."""
+        """Make the hub on first use, from a first commit that makes the
+        project a pixi project; else learn its base and the remote it is
+        connected to, and make the base a pixi project if it is not one."""
         if (self.path / "HEAD").exists():
             self.base = (await self.git("config", "--get", "orchestrate.base")).out
             self.url = (await self.git("config", "--get", "orchestrate.remote", check=False)).out
             self.env = self.auth(self.url)
+            async with self.lock:
+                await self._make_pixi()
             return
         new = self.path.with_name(self.path.name + ".new")
         if new.exists():
@@ -98,11 +155,8 @@ class Hub:
         for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("gc.auto", "0")):
             await git(new, "config", key, value)
         base = "main"
-        with tempfile.TemporaryDirectory() as d:
-            empty = Path(d) / "empty"
-            empty.write_bytes(b"")
-            tree = (await git(new, "hash-object", "-t", "tree", "-w", str(empty))).out
-        commit = (await git(new, "commit-tree", tree, "-m", "Start the project")).out
+        tree = await pixi_tree(new, None, self.name)
+        commit = (await git(new, "commit-tree", tree, "-m", START)).out
         await git(new, "update-ref", f"refs/heads/{base}", commit)
         await git(new, "symbolic-ref", "HEAD", f"refs/heads/{base}")
         await git(new, "config", "orchestrate.base", base)
@@ -114,13 +168,15 @@ class Hub:
 
         The base and the remote's default branch become one line of history:
         - a remote without commits gets the base, under the base's name;
-        - a remote ahead of the base (or a base that is still only "Start the
-          project") gives the base its commits;
+        - a remote ahead of the base (or a base with nothing landed on it yet)
+          gives the base its commits;
         - a base ahead of the remote is pushed there, as a landing would be;
         - histories that have each gone their own way are refused, and the
           project keeps the remote it had.
-        The base takes the name of the remote's default branch. Removing the
-        remote keeps everything here; landings stay on this machine from then on."""
+        The base takes the name of the remote's default branch, and is made a
+        pixi project if it is not one (pushed there, as a landing would be).
+        Removing the remote keeps everything here; landings stay on this
+        machine from then on."""
         async with self.lock:
             if url:
                 env = self.auth(url)
@@ -130,6 +186,29 @@ class Hub:
                 env = {}
                 await self.git("config", "--unset-all", "orchestrate.remote", check=False)
             self.url, self.env = url, env
+            await self._make_pixi()
+
+    async def _make_pixi(self) -> None:
+        """Make the base a pixi project, if it is not one, with a commit landed
+        as a thread's work is: on the remote first when there is one."""
+        base = f"refs/heads/{self.base}"
+        for _ in range(LAND_ATTEMPTS):
+            if self.url:
+                await self.git("fetch", "-q", self.url, f"+{base}:{base}")
+            tip = (await self.git("rev-parse", base)).out
+            if await is_pixi(self.path, tip):
+                return
+            tree = await pixi_tree(self.path, tip, self.name)
+            new = (await self.git("commit-tree", tree, "-p", tip, "-m", MAKE_PIXI)).out
+            if self.url:
+                push = await self.git("push", "-q", self.url, f"{new}:{base}", check=False)
+                if push.code:
+                    if any(s in push.err for s in ("fetch first", "non-fast-forward")):
+                        continue  # the repository moved since the fetch
+                    raise GitError(f"pushing to {self.base} of {self.url} failed: {push.err or push.out}")
+            await self.git("update-ref", base, new)
+            return
+        raise GitError(f"{self.base} of {self.url} kept moving; {LAND_ATTEMPTS} pushes were rejected")
 
     async def _join(self, url: str, env: dict) -> None:
         ours = (await self.git("rev-parse", f"refs/heads/{self.base}")).out
@@ -145,7 +224,7 @@ class Hub:
                 tip = ours
                 if ours != theirs:
                     await git(self.path, "push", "-q", url, f"{ours}:refs/heads/{name}", env=env)
-            elif await self._ancestor(ours, theirs) or await self._fresh(ours):
+            elif await self._ancestor(ours, theirs) or not await self._landed(ours):
                 tip = theirs
             else:
                 raise GitError(f"{name} of {url} and this project's {self.base} have each gone their "
@@ -163,10 +242,24 @@ class Hub:
     async def _ancestor(self, a: str, b: str) -> bool:
         return (await self.git("merge-base", "--is-ancestor", a, b, check=False)).code == 0
 
-    async def _fresh(self, commit: str) -> bool:
-        """Whether `commit` is the hub's first, empty commit: nothing landed yet."""
-        info = (await self.git("log", "-1", "--format=%T %P", commit)).out.split()
-        return info == [EMPTY_TREE]
+    async def _own(self, commit: str) -> list[str]:
+        """The hub's own commits `commit`'s history starts with ("Start the
+        project", then "Make the project a pixi project" in a hub from before
+        every project began as one), oldest first."""
+        own = []
+        for line in (await self.git("log", "--reverse", "--format=%H %s", commit)).out.splitlines():
+            sha, subject = line.split(" ", 1)
+            if subject != (START, MAKE_PIXI)[len(own)]:
+                break
+            own.append(sha)
+            if len(own) == 2:
+                break
+        return own
+
+    async def _landed(self, commit: str) -> bool:
+        """Whether anything landed on the base `commit`: it is more than the hub's own commits."""
+        own = await self._own(commit)
+        return not own or own[-1] != commit
 
     async def remote_base(self, url: str, env: dict) -> str | None:
         """The default branch of `url`, or None when it has no commits yet."""
@@ -233,10 +326,14 @@ class Hub:
                     shutil.rmtree(wt)
                 wt.parent.mkdir(parents=True, exist_ok=True)
                 await self.git("worktree", "add", "-q", "--detach", str(wt), branch)
+                # A branch begun before a remote was connected shares no history with
+                # the base: it goes on top without the hub's own commits it starts from,
+                # which have no place on the remote's history.
+                onto = [f"refs/heads/{base}"]
+                if (await self.git("merge-base", f"refs/heads/{base}", branch, check=False)).code:
+                    onto = ["--onto", onto[0], (await self._own(branch))[-1]]
                 try:
-                    # --no-keep-empty: a branch begun before a remote was connected starts
-                    # at "Start the project", which has no place on the remote's history.
-                    rebase = await git(wt, "rebase", "-q", "--no-keep-empty", f"refs/heads/{base}", check=False)
+                    rebase = await git(wt, "rebase", "-q", *onto, check=False)
                     if rebase.code:
                         files = (await git(wt, "diff", "--name-only", "--diff-filter=U")).out.split()
                         await git(wt, "rebase", "--abort")

@@ -9,7 +9,7 @@ import pytest
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
 from runner import ThreadHost, View
-from runner.sandbox import SandboxError, runner_checkout
+from runner.sandbox import SandboxError, pixi, runner_checkout, worker_private
 from runner.server import create_app
 
 
@@ -55,6 +55,27 @@ def test_readonly_paths_come_back_inside_hidden_ones(tmp_path):
     r = in_view(v, f"ls -A {tmp_path / 'state'}; cat {tmp_path / 'state/env/bin/tool'}; "
                    f"touch {tmp_path / 'state/env/x'} 2>/dev/null || echo read-only")
     assert r.stdout.split() == ["env", "tool", "read-only"], r.stderr
+
+
+def test_commands_get_pixi_read_only_with_its_cache_in_the_thread_home(tmp_path):
+    """Every project is a pixi project: a thread's commands run the pixi the
+    runner runs under, from wherever the worker has it (its home, hidden), and
+    keep what pixi makes in the thread's own home."""
+    v = view(tmp_path, hidden=worker_private(tmp_path / "threads"), tools=(pixi(),))
+    r = in_view(v, "command -v pixi; ls -A \"$(dirname \"$(command -v pixi)\")\"; "
+                   "pixi info --json | python3 -c 'import json, sys; print(json.load(sys.stdin)[\"cache_dir\"])'; "
+                   "touch \"$(command -v pixi)\" 2>/dev/null || echo read-only")
+    assert r.stdout.split() == [pixi(), "pixi", f"{tmp_path / 'home'}/.cache/rattler/cache", "read-only"], r.stderr
+
+
+async def test_a_thread_runs_pixi_in_its_workspace(tmp_path):
+    host = host_with([sh("pixi init . 2>/dev/null && pixi task add hello 'echo hello from pixi' 2>/dev/null && "
+                         "pixi task list --machine-readable"), "done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="make it a pixi project")
+    await host.wait_idle(t.id)
+    assert results(t)[0].split() == ["0", "hello"], results(t)
+    assert (tmp_path / "threads" / t.id / "pixi.toml").exists()
+    await host.stop(t.id)
 
 
 async def test_a_workdir_too_deep_for_a_thread_socket_is_refused(tmp_path):

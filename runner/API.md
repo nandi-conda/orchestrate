@@ -168,12 +168,13 @@ this view:
 | `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, `models.json`, skills, the session) |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept for the thread |
 | `runner/.pixi/envs/kernel`, prime-agent's bundled skills | read-only: the kernel's Python and packages |
+| `$PIXI_EXE` | read-only, at its own path and on `PATH`: the pixi the runner runs under (every project is a pixi project); it keeps its cache and global tools in the thread's `HOME` |
 | `$RUNNER_WORKDIR/.team/<id>.sock` | the thread's team socket |
 | the rest of the orchestrate checkout and the runner's pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
 | `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |
 
 The kernel's environment is made afresh: `PATH` (the thread's venv, the kernel
-environment, the system's), `VIRTUAL_ENV`, `HOME`, `TMPDIR=/tmp`, `USER`,
+environment, pixi's directory, the system's), `VIRTUAL_ENV`, `HOME`, `TMPDIR=/tmp`, `USER`,
 `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `ORCHESTRATE_TEAM_SOCKET`,
 and prime-agent's own variables for its kernel (`RLM_*`, `PRIME_AGENT_*`). No
 token, key, `RUNNER_*` or pixi variable reaches it. The venv is the thread's

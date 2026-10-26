@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,9 @@ AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
 # The refs the orchestrator may set on a worker.
 SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots|origin-sessions)/[\w./-]+$")
 THREAD_ID = re.compile(r"^[\w-]+$")
+# What a snapshot leaves out: pixi's environments, in the subdirectories of any
+# `.pixi/` (its config.toml, beside them, stays).
+PIXI_ENVIRONMENTS = ":(exclude,glob)**/.pixi/*/**"
 
 
 class GitError(RuntimeError):
@@ -174,15 +178,32 @@ class Repo:
 
     async def seed(self, source: str) -> None:
         """Start from another repository's branches, with no orchestrator (the
-        CLI): its branches become `origin/*` and its HEAD the base."""
+        CLI): its branches become `origin/*` and its HEAD the base, which is a
+        pixi project as every project is."""
         await self.open()
         head = (await self.git("ls-remote", "--symref", source, "HEAD")).out.splitlines()
         base = next((line.split()[1].removeprefix("refs/heads/") for line in head if line.startswith("ref:")), "")
         if not base:
             raise GitError(f"{source} has no default branch")
         await self.git("fetch", "-q", source, "+refs/heads/*:refs/remotes/origin/*")
+        if not await self.is_pixi(f"refs/remotes/origin/{base}"):
+            raise GitError(f"{base} of {source} is not a pixi project (no pixi.toml, nor a pyproject.toml "
+                           "with [tool.pixi]); every project is one: make it one with `pixi init`")
         await self.git("config", "orchestrate.base", base)
         self.base = base
+
+    async def is_pixi(self, commit: str) -> bool:
+        """Whether `commit` is a pixi project: pixi.toml at its root, or a
+        pyproject.toml with a [tool.pixi] table (the orchestrator's hub.py asks the same)."""
+        if (await self.git("cat-file", "-e", f"{commit}:pixi.toml", check=False)).code == 0:
+            return True
+        pyproject = await self.git("show", f"{commit}:pyproject.toml", check=False)
+        if pyproject.code:
+            return False
+        try:
+            return "pixi" in tomllib.loads(pyproject.out).get("tool", {})
+        except tomllib.TOMLDecodeError:
+            return False
 
     def _session_env(self, tid: str, directory: Path) -> dict:
         index = self.path / ".git" / "sessions" / f"{tid}.index"
@@ -291,10 +312,12 @@ class Workspace:
 
     async def snapshot(self) -> str:
         """Commit the whole worktree, ignored files included, as a child of the
-        branch tip at `refs/snapshots/<id>`. Its index lives on with the
-        worktree, so only changed files are hashed again."""
+        branch tip at `refs/snapshots/<id>`, but for pixi's environments (what
+        is in a `.pixi/` directory's subdirectories), which pixi.lock makes
+        again. Its index lives on with the worktree, so only changed files are
+        hashed again."""
         env = await self.index("snapshot.index")
-        await self.git("add", "-A", "-f", env=env)
+        await self.git("add", "-A", "-f", "--", ".", PIXI_ENVIRONMENTS, env=env)
         tree = (await self.git("write-tree", env=env)).out
         commit = (await self.git("commit-tree", tree, "-p", "HEAD", "-m", f"Snapshot of {self.branch}")).out
         await self.git("update-ref", snapshot_ref(self.tid), commit)

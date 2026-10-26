@@ -3,8 +3,32 @@
 Every project has its own git repository on the control plane's machine: a
 bare repository at `.orchestrator/repos/<project id>.git`, the project's
 **hub** (its path is under **Settings** in the project window). It starts from
-an empty commit, "Start the project". It is the only place commits live beyond
-a worker.
+a commit that makes the project a pixi project, "Start the project". It is the
+only place commits live beyond a worker.
+
+## Every project is a pixi project
+
+A project's dependencies, environments and tasks are [pixi](https://pixi.sh)'s,
+so a thread on any worker, and you in a clone, get the same environment from
+`pixi.lock`. The hub keeps that true of the project's main branch:
+
+- A new project's first commit, "Start the project", holds what `pixi init`
+  makes: `pixi.toml` (named after the project, on conda-forge, for
+  `linux-64` and `linux-aarch64`, the platforms workers run on), and pixi's
+  lines in `.gitignore` (environments stay out of git) and `.gitattributes`
+  (`pixi.lock` is never merged line by line).
+- A main branch that is not a pixi project gets a commit that makes it one,
+  "Make the project a pixi project", with the same files (`.gitignore` and
+  `.gitattributes` keep what they had, with pixi's lines added). That happens
+  when a hub from before this opens, and when an attached remote's history
+  becomes the main branch. With a remote, the commit lands there first, as a
+  thread's work does.
+
+A project is a pixi project when it has `pixi.toml` at its root, or a
+`pyproject.toml` with a `[tool.pixi]` table; either is left as it is. Threads
+run pixi in their sandbox and are told to use it for everything the project
+needs ([The sandbox](runner.md#the-sandbox)). The runner's CLI refuses a
+`--repo` that is not a pixi project.
 
 ## What the hub holds
 
@@ -99,7 +123,9 @@ Attaching a remote joins the two histories (`Hub.connect`):
 | is behind the project | it gets the commits it is missing (fast-forward push) |
 | has a different history | refused with git's reason; the project keeps the remote it had |
 
-Landing rebases with `--no-keep-empty`, so branches begun before a remote was
-attached drop the empty "Start the project" commit. Removing the remote keeps
+A branch begun before a remote was attached shares no history with the
+remote's: it lands on top without the hub's own commits it starts from
+("Start the project", and "Make the project a pixi project" in a hub from
+before every project began as one). Removing the remote keeps
 everything in the hub; landings stay local from then on, and attaching it
 again pushes what it missed.

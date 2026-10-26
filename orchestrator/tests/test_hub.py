@@ -5,6 +5,7 @@ files from it. Against the echo runner, which keeps the real runner's git flow."
 
 import asyncio
 import subprocess
+import tomllib
 
 import pytest
 
@@ -91,14 +92,41 @@ def remote(tmp_path):
     return bare, seed
 
 
-async def test_a_project_without_a_repository_starts_from_an_empty_commit(tmp_path):
-    hub = Hub(tmp_path / "p.git")
+async def test_a_project_starts_as_a_pixi_project(tmp_path):
+    hub = Hub(tmp_path / "p.git", 'my "p"')
     await hub.open()
     assert hub.base == "main"
     assert git(hub.path, "log", "--format=%s", "main") == "Start the project"
-    assert git(hub.path, "ls-tree", "main") == ""
-    await Hub(tmp_path / "p.git").open()  # a second open finds it
+    assert git(hub.path, "ls-tree", "--name-only", "main").split() == [".gitattributes", ".gitignore", "pixi.toml"]
+    manifest = tomllib.loads(git(hub.path, "show", "main:pixi.toml"))
+    assert manifest["workspace"] == {"name": 'my "p"', "channels": ["conda-forge"],
+                                     "platforms": ["linux-64", "linux-aarch64"]}
+    assert ".pixi/*" in git(hub.path, "show", "main:.gitignore").splitlines()
+    assert "pixi.lock merge=binary" in git(hub.path, "show", "main:.gitattributes")
+    await Hub(tmp_path / "p.git", "p").open()  # a second open finds it
     assert git(hub.path, "rev-list", "--count", "main") == "1"
+
+
+def legacy_hub(path):
+    """A hub from before every project was a pixi project: an empty first commit."""
+    git(path.parent, "init", "-q", "--bare", "-b", "main", str(path))
+    empty = git(path, "hash-object", "-t", "tree", "-w", "/dev/null")
+    start = git(path, "-c", "user.email=a@b", "-c", "user.name=a", "commit-tree", empty, "-m", "Start the project")
+    git(path, "update-ref", "refs/heads/main", start)
+    git(path, "config", "orchestrate.base", "main")
+    return start
+
+
+async def test_a_hub_from_before_pixi_becomes_a_pixi_project_when_it_opens(tmp_path):
+    start = legacy_hub(tmp_path / "p.git")
+    hub = Hub(tmp_path / "p.git", "p")
+    await hub.open()
+    assert git(hub.path, "log", "--format=%s", "main").splitlines() == ["Make the project a pixi project",
+                                                                       "Start the project"]
+    assert git(hub.path, "rev-parse", "main^") == start
+    assert "pixi.toml" in git(hub.path, "ls-tree", "--name-only", "main").split()
+    await Hub(tmp_path / "p.git", "p").open()  # once
+    assert git(hub.path, "rev-list", "--count", "main") == "2"
 
 
 async def test_every_turn_lands_on_the_hub(tmp_path):
@@ -106,15 +134,15 @@ async def test_every_turn_lands_on_the_hub(tmp_path):
     t = await orch.spawn(p["id"], "T", "write a.txt: one")
     landed = await event(s, p, t["id"], "landed")
     hub = orch.hub_path(p["id"])
+    pixi = {".gitattributes", ".gitignore", "pixi.toml"}
     assert git(hub, "rev-parse", f"thread/{t['id']}") == landed["commit"] == git(hub, "rev-parse", "main")
     assert git(hub, "show", "main:a.txt") == "one"
     await wait_for(lambda: idle(s, t["id"]))
 
     await orch.send(t["id"], "write b.txt: two")
     landed = await landing(s, p, t["id"], 2)
-    assert git(hub, "ls-tree", "--name-only", "main").split() == ["a.txt", "b.txt"]
     assert landed["base"] == "main" and git(hub, "rev-parse", "main") == landed["commit"]
-    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "b.txt"}
+    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "b.txt", *pixi}
     assert git(hub, "rev-list", "--merges", "--count", "main") == "0"
     await orch.close()
     await orch.provider.close()
@@ -131,7 +159,8 @@ async def test_landing_rebases_onto_what_landed_before_and_conflicts_go_back(tmp
     b = await orch.spawn(p["id"], "B", "write same.txt: b")
     await event(s, p, b["id"], "landed")
     hub = orch.hub_path(p["id"])
-    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "same.txt"}
+    assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {
+        "a.txt", "same.txt", ".gitattributes", ".gitignore", "pixi.toml"}
 
     await orch.send(c["id"], "write same.txt: c")
     conflict = await event(s, p, c["id"], "land_conflict")
@@ -161,7 +190,8 @@ async def test_a_project_repository_gets_the_landing_first_and_nothing_else(tmp_
     await orch.send(t["id"], "write b.txt: two")
     landed = await landing(s, p, t["id"], 2)
     assert git(bare, "rev-parse", "trunk") == landed["commit"] == git(hub, "rev-parse", "trunk")
-    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {"notes.txt", "theirs.txt", "a.txt", "b.txt"}
+    assert set(git(bare, "ls-tree", "--name-only", "trunk").split()) == {
+        "notes.txt", "theirs.txt", "a.txt", "b.txt", "pixi.toml", ".gitignore", ".gitattributes"}
     assert git(bare, "for-each-ref", "--format=%(refname)") == "refs/heads/trunk"  # no thread branches
     await orch.close()
     await orch.provider.close()
@@ -193,7 +223,7 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
 
 
 async def test_a_worker_may_only_set_its_threads_refs(tmp_path):
-    hub = Hub(tmp_path / "p.git")
+    hub = Hub(tmp_path / "p.git", "p")
     await hub.open()
     with pytest.raises(Exception, match="may not set"):
         await hub.receive("t_1", b"", {"refs/heads/main": git(hub.path, "rev-parse", "main")})
@@ -202,7 +232,7 @@ async def test_a_worker_may_only_set_its_threads_refs(tmp_path):
 async def test_a_hub_at_a_relative_path_is_made_where_it_says(tmp_path, monkeypatch):
     """The control plane's default is `.orchestrator/repos`, relative to where it runs."""
     monkeypatch.chdir(tmp_path)
-    hub = Hub(".orchestrator/repos/p.git")
+    hub = Hub(".orchestrator/repos/p.git", "p")
     await hub.open()
     assert (tmp_path / ".orchestrator" / "repos" / "p.git" / "HEAD").exists()
     assert git(tmp_path / ".orchestrator" / "repos" / "p.git", "log", "--format=%s", "main") == "Start the project"
@@ -234,7 +264,7 @@ async def test_a_remote_with_another_history_is_refused(tmp_path):
     hub = orch.hub_path(p["id"])
     assert git(hub, "rev-parse", "main") == landed["commit"]
     assert git(hub, "for-each-ref", "--format=%(refname)", "refs/orchestrate") == ""
-    assert git(bare, "log", "--format=%s", "trunk") == "init"
+    assert git(bare, "log", "--format=%s", "trunk") == "init"  # not made a pixi project either
     await orch.close()
     await orch.provider.close()
     await s.close()
@@ -271,13 +301,57 @@ async def test_a_remote_ahead_or_behind_follows_and_removing_it_keeps_the_hub(tm
 
 async def test_a_hub_remembers_its_remote(tmp_path):
     bare, seed = remote(tmp_path)
-    hub = Hub(tmp_path / "p.git")
+    hub = Hub(tmp_path / "p.git", "p")
     await hub.open()
     await hub.connect(str(bare))
-    again = Hub(tmp_path / "p.git")
+    again = Hub(tmp_path / "p.git", "p")
     await again.open()
     assert (again.url, again.base) == (str(bare), "trunk")
+    assert git(bare, "log", "--format=%s", "trunk").splitlines() == ["Make the project a pixi project", "init"]
     await again.connect("")
-    last = Hub(tmp_path / "p.git")
+    last = Hub(tmp_path / "p.git", "p")
     await last.open()
     assert last.url == ""
+
+
+async def test_a_remote_that_is_a_pixi_project_is_left_as_it_is(tmp_path):
+    bare, seed = remote(tmp_path)
+    (seed / ".gitignore").write_text("build/\n")
+    commit(seed, "pyproject.toml", '[project]\nname = "r"\n\n[tool.pixi.workspace]\nchannels = []\n', "pixi")
+    tip = git(bare, "rev-parse", "trunk")
+    hub = Hub(tmp_path / "p.git", "p")
+    await hub.open()
+    await hub.connect(str(bare))
+    assert git(bare, "rev-parse", "trunk") == tip == git(hub.path, "rev-parse", "trunk")
+
+
+async def test_a_remote_that_is_not_a_pixi_project_gets_pixis_files_beside_its_own(tmp_path):
+    bare, seed = remote(tmp_path)
+    commit(seed, ".gitignore", "build/\n", "ignore build")
+    hub = Hub(tmp_path / "p.git", "p")
+    await hub.open()
+    await hub.connect(str(bare))
+    assert git(bare, "rev-parse", "trunk") == git(hub.path, "rev-parse", "trunk")
+    assert git(bare, "log", "-1", "--format=%s", "trunk") == "Make the project a pixi project"
+    assert git(bare, "show", "trunk:.gitignore").splitlines() == ["build/", "# pixi environments", ".pixi/*",
+                                                                  "!.pixi/config.toml"]
+
+
+async def test_a_thread_begun_before_the_remote_lands_on_it_without_the_hubs_start(tmp_path):
+    s, p, orch = await setup(tmp_path)
+    t = await orch.spawn(p["id"], "T", "hold on")
+    await event(s, p, t["id"], "landed")
+    await wait_for(lambda: idle(s, t["id"]))
+    bare, seed = remote(tmp_path)
+    commit(seed, ".gitignore", "build/\n", "ignore build")  # not the .gitignore the hub started with
+    await orch.update_project(p["id"], repo_url=str(bare))  # nothing landed here: the base follows the remote
+
+    await orch.send(t["id"], "write a.txt: one")
+    landed = await landing(s, p, t["id"], 2)
+    assert git(bare, "rev-parse", "trunk") == landed["commit"]
+    assert git(bare, "log", "--format=%s", "trunk").splitlines()[1:] == ["Make the project a pixi project",
+                                                                         "ignore build", "init"]
+    assert git(bare, "show", "trunk:a.txt") == "one"
+    await orch.close()
+    await orch.provider.close()
+    await s.close()

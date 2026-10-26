@@ -698,7 +698,7 @@ class Orchestrator:
         async with self._hubs_lock:
             hub = self.hubs.get(project["id"])
             if hub is None:
-                hub = Hub(self.hub_path(project["id"]), get_secret("GITHUB_TOKEN"))
+                hub = Hub(self.hub_path(project["id"]), project["name"], get_secret("GITHUB_TOKEN"))
                 await hub.open()
                 if hub.url != project["repo_url"]:
                     await hub.connect(project["repo_url"])

@@ -21,7 +21,7 @@ from typing import Any, Callable
 from .harness import HARNESS, KERNEL, SESSION, Harness, HarnessError, Place, PrimeAgent
 from .peers import LocalPeers, PeerError, Peers
 from .repo import GitError, Repo, Workspace
-from .sandbox import SandboxError, View, worker_private
+from .sandbox import SandboxError, View, pixi, worker_private
 from .team import TeamServer
 from .web import DeepSeekWeb
 
@@ -42,6 +42,15 @@ How the team works, through the `team` skill (read its SKILL.md):
   messages that start with [from <thread id>] or [from router]; the user's own come as they are.
 - Keep your directory entry current with `team.set_summary` when your focus changes.
 - `team.web_search` and `team.web_fetch` search and read the web.
+
+The project is a pixi project (https://pixi.sh): pixi.toml at the root of your workspace says
+its dependencies, environments and tasks, and pixi.lock pins them. Use pixi for all of it:
+- `pixi add <package>` (conda-forge) or `pixi add --pypi <package>` for a dependency the project
+  needs, never pip, uv or another installer; `pixi run <task or command>` to run in the project's
+  environment; `pixi task add <name> <command>` for how the project is built, tested and run.
+- Commit pixi.toml and pixi.lock with the work that changes them. Environments live in .pixi/,
+  which git ignores and the runner does not save: `pixi run` and `pixi install` make them again.
+- Your kernel's own venv (`uv pip install`) is for your scratch work only, never for the project.
 
 Commits: commit your work on {branch} with clear messages; there is no remote to push to.
 At the end of every turn the runner commits anything left over and your branch lands on the
@@ -365,7 +374,7 @@ class ThreadHost:
         """Where the thread lives on this worker: its worktree, and the view
         its kernel gets of the worker: that, the repository's git dir, the
         thread's own home and /tmp under `.home/` and `.tmp/`, its team socket,
-        and the kernel's Python environment and prime-agent's skills read-only."""
+        the kernel's Python environment and prime-agent's skills read-only, and pixi."""
         work = self.workdir.resolve()
         socket = str(work / ".team" / f"{tid}.sock")
         if len(os.fsencode(socket)) >= SOCKET_ADDRESS_MAX:
@@ -374,7 +383,8 @@ class ThreadHost:
                                f"{str(work)!r}")
         view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
                     writable=((str(self.repo.path.resolve() / ".git"),) if self.repo else ()) + (socket,),
-                    hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")))
+                    hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")),
+                    tools=(pixi(),))
         return Place(view=view, socket=socket, kernel=str(work / ".team" / f"{tid}.kernel"))
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,

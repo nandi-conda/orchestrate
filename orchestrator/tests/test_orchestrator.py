@@ -766,8 +766,10 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
             await wait_for(idle)
 
             top = (await c.get(f"/api/threads/{tid}/files")).json()
-            assert top == {"path": "", "entries": [{"name": "out", "dir": True, "size": 0},
-                                                   {"name": "README.md", "dir": False, "size": 3}]}
+            assert top["path"] == "" and top["entries"][0] == {"name": "out", "dir": True, "size": 0}
+            assert [e["name"] for e in top["entries"]] == ["out", ".gitattributes", ".gitignore", "README.md",
+                                                           "pixi.toml"]  # every project is a pixi project
+            assert top["entries"][3] == {"name": "README.md", "dir": False, "size": 3}
             sub = (await c.get(f"/api/threads/{tid}/files", params={"path": "out/x/.."})).json()
             assert sub["path"] == "out" and [e["name"] for e in sub["entries"]] == ["hello world"]
 
