@@ -26,8 +26,8 @@ threads. Default port 8080. Every route except `/health` needs
 
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
 - `request`, `id` or `images` is required. An `id` with no `request` brings a thread back: see [Resuming a thread](#resuming-a-thread).
-- `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads, so they need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
-- `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model` (its built-in providers; the runner gives it `DEEPSEEK_API_KEY` only). Omitted: `deepseek` with `$DEEPSEEK_MODEL`.
+- `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads; on a thread whose model takes text only (`deepseek-v4-pro`), prime-agent sends that turn to its `imageModel`, `deepseek/deepseek-flash` (`IMAGE_MODEL` in `src/runner/harness.py`). They need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
+- `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model` (the runner gives it `DEEPSEEK_API_KEY` only; it runs `--offline`, so the models it knows are the ones `runner/models.json` declares). Omitted: `deepseek` with `$DEEPSEEK_MODEL`.
 - A message (or `request`) starting with `/` is a prime-agent slash command.
 - `files` paths are relative to the thread's worktree. A path that leaves it (`..`, a symlink out) or names `.git` is 400, as is a file listed as a directory or the reverse; a missing one is 404. `.git` is never listed.
 - `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`. A message posted while a turn runs steers it: the model reads it before its next call.
@@ -165,7 +165,7 @@ this view:
 | `/` | the machine's system, read-only (its git, compilers, shells) |
 | `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; the kernel starts here |
 | `$RUNNER_WORKDIR/.repo/.git` | the worker repository's git dir, writable, so the thread can commit |
-| `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, skills, the session) |
+| `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, `models.json`, skills, the session) |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept for the thread |
 | `runner/.pixi/envs/kernel`, prime-agent's bundled skills | read-only: the kernel's Python and packages |
 | `$RUNNER_WORKDIR/.team/<id>.sock` | the thread's team socket |

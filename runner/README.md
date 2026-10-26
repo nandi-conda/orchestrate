@@ -36,6 +36,7 @@ and environment variables are in [API.md](API.md).
 | `src/runner/sandbox.py` | `View` (what a thread's kernel sees), bubblewrap arguments, the kernel's environment |
 | `src/runner/team.py` | the runner's side of the team skill: a thread's socket for peer and web calls |
 | `skills/team/` | the team skill: its SKILL.md and the `team` module in the kernel |
+| `models.json` | the models prime-agent knows (it runs `--offline`): `deepseek-v4-pro`, and `deepseek-flash`, which takes image turns |
 | `src/runner/web.py` | `DeepSeekWeb`: DeepSeek Search & Fetch API, same `DEEPSEEK_API_KEY` as the model |
 | `src/runner/thread.py` | `AgentThread` (prime-agent events to runner events, turns) and `ThreadHost` (workspaces, capacity) |
 | `src/runner/repo.py` | the worker's repository, per-thread worktrees, snapshots, sessions, bundles to and from the orchestrator |

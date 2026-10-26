@@ -45,6 +45,11 @@ RUNNER = Path(__file__).resolve().parents[2]
 HARNESS = RUNNER / ".harness" / f"prime-agent-{VERSION}"  # deploy/install-harness.sh
 KERNEL = RUNNER / ".pixi" / "envs" / "kernel"  # pixi.toml, feature `kernel`
 TEAM_SKILL = RUNNER / "skills" / "team"
+# The models threads run on, as prime-agent's models.json: the binary runs
+# --offline, so it has no catalog to look them up in. IMAGE_MODEL takes a
+# turn that attaches images when the thread's model accepts text only.
+MODELS = RUNNER / "models.json"
+IMAGE_MODEL = "deepseek/deepseek-flash"
 # prime-agent's bundled skills threads do without: they need its daemon
 # (messaging and observing sessions, factories, heartbeats), a Serper key
 # (websearch), or accounts a worker has none of (MCP connections, Prime
@@ -106,12 +111,13 @@ class PrimeAgent:
                                "run `pixi install -e kernel`")
 
     def prepare(self, place: Place) -> None:
-        """The thread's agent dir (settings, the team skill), its venv and its
+        """The thread's agent dir (settings, models, the team skill), its venv and its
         kernel wrapper."""
         for d in (place.view.root, place.view.home, place.view.tmp, place.sessions):
             Path(d).mkdir(parents=True, exist_ok=True)
-        settings = {"skills": [f"-{name}/SKILL.md" for name in DROPPED_SKILLS]}
+        settings = {"skills": [f"-{name}/SKILL.md" for name in DROPPED_SKILLS], "imageModel": IMAGE_MODEL}
         (place.agent_dir / "settings.json").write_text(json.dumps(settings, indent=1))
+        shutil.copyfile(MODELS, place.agent_dir / "models.json")
         skill = place.agent_dir / "skills" / "team"
         shutil.rmtree(skill, ignore_errors=True)
         shutil.copytree(TEAM_SKILL, skill)

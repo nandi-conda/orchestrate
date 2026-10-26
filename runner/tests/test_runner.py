@@ -421,3 +421,21 @@ def test_sandbox_starts_for_a_user_with_ambient_capabilities():
                         sys.executable, "-c", code], capture_output=True, text=True,
                        env={**os.environ, "PYTHONPATH": str(runner_checkout() / "runner" / "src")})
     assert r.returncode == 0, r.stderr
+
+
+def test_image_turns_go_to_a_model_that_takes_images(tmp_path):
+    """The binary runs --offline, so it knows the models the agent dir
+    declares: the thread's default takes text only, and the settings send an
+    image turn to deepseek-flash, which takes images."""
+    from runner.harness import HARNESS, IMAGE_MODEL, Place, PrimeAgent
+
+    place = Place(view=view(tmp_path), socket=str(tmp_path / "team.sock"), kernel=str(tmp_path / "kernel"))
+    PrimeAgent().prepare(place)
+    out = subprocess.run([str(HARNESS / "prime-agent"), "--offline", "model", "list", "deepseek"],
+                         env={"PATH": os.environ["PATH"], "HOME": place.view.home, "DEEPSEEK_API_KEY": "unused",
+                              "PRIME_AGENT_CODING_AGENT_DIR": str(place.agent_dir)},
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout
+    images = {row.split()[1]: row.split()[-1] for row in out.splitlines()[1:]}
+    assert IMAGE_MODEL == "deepseek/deepseek-flash"
+    assert images["deepseek-flash"] == "yes" and images["deepseek-v4-pro"] == "no"
+    assert '"imageModel": "deepseek/deepseek-flash"' in (place.agent_dir / "settings.json").read_text()
