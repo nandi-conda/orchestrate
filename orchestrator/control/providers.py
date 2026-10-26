@@ -463,11 +463,10 @@ class SpritesProvider:
         # it ends every turn under way there, so it is left running when it
         # is exactly the runner this would start: the same commit, model key,
         # token and settings, as the fingerprint it reports says. Otherwise
-        # it is restarted from the definition put below (`start` does not
-        # replace a running process), so the runner serving the worker is
-        # always this checkout's, with this control plane's key and token;
-        # the turns that cuts short resume when their threads are posted
-        # again (runner/API.md, "Interrupted turns").
+        # the service is removed and put again (see below), so the runner
+        # serving the worker is always this checkout's, with this control
+        # plane's key and token; the turns that cuts short resume when their
+        # threads are posted again (runner/API.md, "Interrupted turns").
         async with steps.step("looking for its runner service"):
             defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
         if defined:
@@ -477,17 +476,31 @@ class SpritesProvider:
             if serving:
                 steps.note("it is: left running")
                 return worker
-            steps.note("it is not (another commit, key, token or settings, or no answer): it is restarted")
+            steps.note("it is not (another commit, key, token or settings, or no answer): its service is "
+                       "removed and put again")
 
         async with steps.step(f"installing orchestrate {commit[:12]} on it (git fetch, pixi install, prime-agent)"):
-            out = await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
+            out = await self.exec(name, BOOTSTRAP,
+                                  env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         for line in out.strip().splitlines()[-10:]:
             steps.note(f"  install | {line}")
-        async with steps.step("defining its runner service"):
+        if defined:
+            # A definition is removed, not replaced: the API answers a PUT whose
+            # command is the one it already has with "Service already running
+            # with that command, use .../restart" and keeps the definition it
+            # has, whether that service runs or not. The env travels in the
+            # definition (this control plane's token, model key, commit and
+            # fingerprint), so a redefined service kept the old ones for good:
+            # the runner reported no fingerprint, and every attach restarted a
+            # worker a matching one would have been left running. Removing the
+            # service stops the runner it ran; the PUT below makes it, on this
+            # definition, and starts it.
+            async with steps.step("removing its runner service (a PUT cannot replace a definition)"):
+                gone = await self.http.delete(f"/sprites/{name}/services/runner")
+                if gone.status_code != 404:  # already gone
+                    gone.raise_for_status()
+        async with steps.step("defining its runner service, which starts it"):
             (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        action = "restart" if defined else "start"
-        async with steps.step(f"{action}ing its runner service"):
-            await self.service_action(name, action)
         async with steps.step("waiting up to 300s for its runner to answer"):
             health = await self.wait_ready(worker)
         if health.get("commit") != commit:
@@ -511,27 +524,6 @@ class SpritesProvider:
         except TimeoutError:
             return False
         return health.get("spec") == want
-
-    async def service_action(self, name: str, action: str, timeout: float = 300.0) -> None:
-        """Run `start`/`restart`/`stop` on the runner service to completion.
-
-        The response is a stream of the action's log, which ends with a
-        `complete` event. Bound it: a runtime that is confused about the
-        service must not hang worker creation forever.
-        """
-
-        async def run() -> None:
-            async with self.http.stream("POST", f"/sprites/{name}/services/runner/{action}") as s:
-                s.raise_for_status()
-                async for _ in s.aiter_lines():
-                    pass
-
-        what = {"start": "starting", "restart": "restarting", "stop": "stopping"}.get(action, action)
-        try:
-            await asyncio.wait_for(run(), timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"the runner service on sprite {name} did not finish {what} "
-                               f"within {timeout:.0f}s") from None
 
     async def wait_ready(self, worker: Worker, timeout: float = 300.0) -> dict:
         try:

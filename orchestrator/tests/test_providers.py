@@ -240,12 +240,21 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
 
 class FakeSprites:
     """The Sprites API surface `SpritesProvider.create` uses, for a sprite that
-    already exists, with or without a runner service defined."""
+    already exists, with or without a runner service defined.
+
+    The service keeps the definition it was given, as the API does: a PUT
+    whose command is the one it already has is answered "Service already
+    running with that command" and changes nothing, running or not. Only a
+    DELETE forgets it, and a PUT after that makes it again."""
+
+    # The command every definition carries: what main() starts the runner with.
+    COMMAND = {"cmd": "bash", "args": ["/opt/orchestrate/runner/deploy/start.sh"]}
 
     def __init__(self, defined: bool) -> None:
         self.defined = defined
-        self.actions: list[str] = []
-        self.service: dict = {}
+        self.deleted = 0
+        self.service: dict = ({**self.COMMAND, "env": {"RUNNER_TOKEN": "old"}, "http_port": 8080}
+                              if defined else {})
 
     async def post(self, url, **kw):
         assert url == "/sprites"
@@ -260,31 +269,26 @@ class FakeSprites:
 
     async def put(self, url, **kw):
         if url.endswith("/services/runner"):
-            self.service = kw["json"]
+            if self.defined and all(self.service.get(k) == kw["json"].get(k) for k in ("cmd", "args")):
+                return httpx.Response(200, json={"message": "Service already running with that command, use "
+                                                            "POST /v1/services/runner/restart if you want to "
+                                                            "restart it", "name": "runner"},
+                                      request=httpx.Request("PUT", url))
+            self.service, self.defined = kw["json"], True  # it makes the service, and starts it
         else:
             self.labels = kw["json"]["labels"]
         return httpx.Response(200, request=httpx.Request("PUT", url))
 
-    def stream(self, method, url, **kw):
-        self.actions.append(url.rsplit("/", 1)[-1])
-        return FakeStream()
+    async def delete(self, url, **kw):
+        assert url.endswith("/services/runner")
+        if not self.defined:
+            return httpx.Response(404, request=httpx.Request("DELETE", url))
+        self.deleted += 1
+        self.service, self.defined = {}, False
+        return httpx.Response(204, request=httpx.Request("DELETE", url))
 
     async def aclose(self):
         pass
-
-
-class FakeStream:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def raise_for_status(self):
-        pass
-
-    async def aiter_lines(self):
-        yield '{"type": "complete"}'
 
 
 async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str = "", fake=None):
@@ -321,12 +325,17 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
         await fake.aclose()
 
 
-async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started(env):
-    """`start` leaves a running runner as it was: its old code and its old
-    model key. A service already defined is restarted from the new definition."""
+async def test_sprites_create_replaces_a_service_an_earlier_control_plane_defined(env):
+    """A defined service cannot be redefined: a PUT whose command is the one it
+    already has is answered "Service already running with that command" and
+    keeps the definition it has. The env is part of that definition (this
+    control plane's token, model key, commit and fingerprint), so a service
+    left by an earlier control plane is removed and put again: otherwise the
+    runner kept the old token and key, reported no fingerprint, and every
+    attach restarted a worker it would otherwise leave running."""
     worker, fake = await _sprites_create(env, defined=True)
     assert worker.id == "orch-w1" and fake.labels == ["orchestrator"]  # the slot's sprite, labeled
-    assert fake.actions == ["restart"]
+    assert fake.deleted == 1
     assert worker.token == "stored" and fake.service["env"]["RUNNER_TOKEN"] == "stored"
     assert fake.service["env"]["DEEPSEEK_API_KEY"] == "key"
 
@@ -340,21 +349,24 @@ async def test_sprites_create_leaves_running_a_runner_it_would_start_the_same_wa
     assert want == providers.service_spec({**fake.service, "env": {
         k: v for k, v in fake.service["env"].items() if k != "RUNNER_SPEC"}})
     assert fake.service["env"]["ORCHESTRATE_COMMIT"] == "c0ffee"
+    left, deleted = dict(fake.service), fake.deleted
     worker, fake = await _sprites_create(env, defined=True, spec=want, fake=fake)
-    assert fake.actions == ["restart"] and fake.bootstrap is None  # nothing more: no bootstrap, no restart
+    assert (fake.service, fake.deleted) == (left, deleted) and fake.bootstrap is None  # nothing more
     assert worker.token == "stored"
 
 
-async def test_sprites_create_restarts_a_runner_started_otherwise(env):
+async def test_sprites_create_replaces_a_runner_started_otherwise(env):
     """Another fingerprint (another commit, key or token) is another runner:
-    the service is restarted from this control plane's definition."""
+    the service is removed and put again from this control plane's definition."""
     _, fake = await _sprites_create(env, defined=True, spec="not-this-one")
-    assert fake.actions == ["restart"] and fake.bootstrap is not None
+    assert fake.deleted == 1 and fake.bootstrap is not None
+    assert fake.service["env"]["RUNNER_TOKEN"] == "stored"
 
 
-async def test_sprites_create_starts_a_new_service(env):
+async def test_sprites_create_makes_a_new_service(env):
+    """A sprite with no runner service gets one: the PUT makes it, and starts it."""
     _, fake = await _sprites_create(env, defined=False)
-    assert fake.actions == ["start"]
+    assert fake.deleted == 0
     assert fake.bootstrap == {"ORCHESTRATE_REPO": "https://example.com/fork.git", "ORCHESTRATE_COMMIT": "c0ffee"}
 
 
