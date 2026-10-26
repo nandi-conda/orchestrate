@@ -44,6 +44,12 @@ HEALTH_EVERY = 10.0
 HEALTH_TIMEOUT = 5.0
 READY_TIMEOUT = 300.0
 CAPACITY = 16  # running threads per worker before another one starts
+# Workers are a pool shared by every project, of at most POOL workers. A slot
+# (1..POOL) always names the same worker, so the pool never holds more, and
+# what a provider has beyond the slots is destroyed when the control plane
+# starts (Orchestrator.start). A thread that finds every worker full, or not
+# ready, waits for room; no worker is made for it.
+POOL = 3
 # A worker's runner log goes to this process's stdout as it is written, each
 # line tagged with the worker; following starts LOG_BACKLOG lines back, and the
 # last LOG_KEPT lines are kept with the worker when it is lost.
@@ -59,20 +65,20 @@ ENDED = {"done", "failed", "stopped"}
 ENDS_STREAM = {"reasoning", "assistant", "tool_call", "turn_done", "state", "error"}
 
 
-def worker_spec(project: dict, index: int) -> WorkerSpec:
-    return WorkerSpec(project_id=project["id"], index=index, capacity=CAPACITY)
+def worker_spec(index: int) -> WorkerSpec:
+    return WorkerSpec(index=index, capacity=CAPACITY)
 
 
-def attachable(w: dict) -> bool:
-    """A stored worker that a control plane can attach to again by its index.
-    Workers start at index 1; 0 marks a row stored before workers kept their
-    index, whose spec cannot be made again."""
-    return w["idx"] >= 1
+def pooled(w: dict) -> bool:
+    """A stored worker of the pool, which a control plane attaches to again
+    by its slot. The rest are from before workers were a pool shared by every
+    project (each project had its own, named for it)."""
+    return w["project_id"] == "" and w["idx"] >= 1
 
 
 def stored_worker(w: dict) -> Worker:
     """A worker as the store keeps it, for the provider."""
-    return Worker(id=w["id"], project_id=w["project_id"], provider=w["provider"], handle=w["handle"],
+    return Worker(id=w["id"], provider=w["provider"], handle=w["handle"],
                   url=w["url"], token=w["token"], capacity=w["capacity"], index=w["idx"])
 
 
@@ -221,7 +227,7 @@ def when(ts: float) -> str:
 
 class Orchestrator:
     def __init__(self, store: Store, provider: WorkerProvider, router: Router, repos: str | Path,
-                 max_running: int = 64) -> None:
+                 max_running: int = 64, pool: int = POOL) -> None:
         self.store = store
         # One git repository per project, the hub its threads' work goes to (hub.py).
         self.repos = Path(repos).resolve()
@@ -230,14 +236,16 @@ class Orchestrator:
         self.provider = provider
         self.router = router
         self.max_running = max_running
-        self.workers: dict[str, list[LiveWorker]] = {}
-        # Per project, the indexes of the workers it ever made (from the
-        # store, on first use) and of those lost. A worker outlives the
-        # control plane: its disk holds the threads' worktrees, so a later
-        # control plane attaches to it again by its index. A new worker takes
-        # an index never used, so it never takes a lost worker's name.
-        self.made: dict[str, set[int]] = {}
-        self.lost: dict[str, set[int]] = {}
+        # The pool's workers this control plane has attached, each in its slot
+        # (lw.worker.index, 1..pool), shared by every project. A worker
+        # outlives the control plane: its disk holds the threads' worktrees,
+        # so a later control plane attaches to it again by its slot. A lost
+        # worker's slot is filled again with a new worker of the same name.
+        self.pool = pool
+        self.workers: list[LiveWorker] = []
+        # Notified whenever a worker may have room again (a thread's state
+        # changed, a worker's did, a start was posted); _pick_worker waits on it.
+        self.room = asyncio.Condition()
         self.by_thread: dict[str, LiveWorker] = {}
         # Per thread, the messages the control plane logged when it took them
         # (a spawned thread's request as "created", the rest as "message_in")
@@ -281,34 +289,68 @@ class Orchestrator:
         left on them (files never committed, ignored build output) is there
         for the next control plane, which attaches to them again."""
         tasks = list(self.background)
-        for lws in self.workers.values():
-            for lw in lws:
-                tasks += lw.tasks()
+        for lw in self.workers:
+            tasks += lw.tasks()
         for task in tasks:
             task.cancel()
         # Wait for them to end, so none touches the store after it closes.
         await asyncio.gather(*tasks, return_exceptions=True)
-        for lws in self.workers.values():
-            for lw in lws:
-                await lw.client.close()
+        for lw in self.workers:
+            await lw.client.close()
+
+    async def start(self) -> None:
+        """Make the provider hold the pool's workers and nothing else: every
+        worker of ours it has outside the slots is destroyed (workers each
+        project had before the pool, a pool that was bigger, workers of a
+        control plane whose store is gone), and the store says so of those it
+        knew. Called once, before the control plane takes work."""
+        destroyed = await self.provider.sweep(self.pool)
+        if destroyed:
+            log.warning("destroyed %d worker(s) outside the pool's %d slots: %s",
+                        len(destroyed), self.pool, ", ".join(destroyed))
+        for w in await self.store.list_workers():
+            if w["lost_at"] is None and not (pooled(w) and w["idx"] <= self.pool):
+                await self.store.lose_worker(w["id"], f"workers are a pool of {self.pool} shared by every "
+                                                      "project; this one was outside it and was destroyed", "")
 
     # ---------------------------------------------------------------- workers
 
-    async def _pick_worker(self, project: dict, start: bool = False) -> LiveWorker:
-        """The least loaded worker with room, made when none has. With `start`
-        the caller is about to start a thread there and holds a place for it
-        (`starting`) until it has, so concurrent starts spread out."""
-        async with self._lock:
-            lw = await self._least_loaded(project)
-            if start:
-                lw.starting += 1
-            return lw
+    async def _pick_worker(self, project: dict, start: bool = False, tid: str | None = None) -> LiveWorker:
+        """The least loaded worker of the pool with room, attached to (made, if
+        its provider has none) when a slot is empty. With every slot filled
+        and no worker with room, it waits for room; thread `tid`, which waits
+        for it, says so. With `start` the caller is about to start a thread
+        there and holds a place for it (`starting`) until it has, so
+        concurrent starts spread out."""
+        said = False
+        while True:
+            async with self._lock:
+                lw = await self._least_loaded(project)
+                if lw is not None:
+                    if start:
+                        lw.starting += 1
+                    return lw
+            if tid is not None and not said:
+                said = True
+                await self.store.update_thread(tid, activity=f"waiting for room: all {self.pool} workers "
+                                                             "are full or not ready")
+            # Room is looked for again when a worker may have some, or after a
+            # health check's while, since a worker's load is its runner's to say.
+            async with self.room:
+                try:
+                    await asyncio.wait_for(self.room.wait(), HEALTH_EVERY)
+                except asyncio.TimeoutError:
+                    pass
 
-    async def _least_loaded(self, project: dict) -> LiveWorker:
-        """Callers hold self._lock."""
-        lws = self.workers.setdefault(project["id"], [])
+    async def _made_room(self) -> None:
+        async with self.room:
+            self.room.notify_all()
+
+    async def _least_loaded(self, project: dict) -> LiveWorker | None:
+        """The ready worker with the most room, else the pool's first empty
+        slot attached, else None. Callers hold self._lock."""
         best, best_load = None, None
-        for lw in list(lws):
+        for lw in list(self.workers):
             if lw.state != "ready":  # it has no room to offer until it is back
                 continue
             h = await self._probe(lw)
@@ -319,52 +361,55 @@ class Orchestrator:
                 best, best_load = lw, running
         if best is not None:
             return best
-        made = await self._made(project["id"])
-        live = {lw.worker.index for lw in lws}
-        idle = sorted(made - live - self.lost[project["id"]])  # left by an earlier control plane
-        return await self._attach(project, idle[0] if idle else max(made, default=0) + 1)
-
-    async def _made(self, project_id: str) -> set[int]:
-        if project_id not in self.made:
-            workers = [w for w in await self.store.list_workers(project_id) if attachable(w)]
-            self.made[project_id] = {w["idx"] for w in workers}
-            self.lost[project_id] = {w["idx"] for w in workers if w["lost_at"] is not None}
-        return self.made[project_id]
+        filled = {lw.worker.index for lw in self.workers}
+        empty = [i for i in range(1, self.pool + 1) if i not in filled]
+        return await self._attach(project, empty[0]) if empty else None
 
     async def _attach(self, project: dict, index: int) -> LiveWorker:
-        """The project's worker `index`, started: made new, or the one an
-        earlier control plane made, with its disk. Callers hold self._lock."""
-        for lw in self.workers.get(project["id"], []):
+        """The pool's worker in slot `index`, started: made new, or the one an
+        earlier control plane made, with its disk. It is attached for a thread
+        of `project`, whose log says so. Callers hold self._lock."""
+        for lw in self.workers:
             if lw.worker.index == index:
                 return lw
-        spec = worker_spec(project, index)
-        spec.token = next((w["token"] for w in await self.store.list_workers(project["id"])
-                           if w["idx"] == index and attachable(w)), "")
+        spec = worker_spec(index)
+        spec.token = next((w["token"] for w in await self.store.list_workers()
+                           if w["idx"] == index and pooled(w) and w["lost_at"] is None), "")
         worker = await self.provider.create(spec)
         await self.store.upsert_worker(worker.record())
-        (await self._made(project["id"])).add(index)
         lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
         lw.boot = (await lw.client.health(timeout=HEALTH_TIMEOUT)).get("boot")
+        await self._prune(lw)
         lw.logs = asyncio.create_task(self._follow_logs(lw))
-        lw.relay = asyncio.create_task(self._relay(project["id"], lw))
+        lw.relay = asyncio.create_task(self._relay(lw))
         lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
         lw.watch = asyncio.create_task(self._watch(lw))
-        self.workers.setdefault(project["id"], []).append(lw)
+        self.workers.append(lw)
         await self.store.append_event(project["id"], None, "worker",
                                       {"id": worker.id, "provider": worker.provider, "url": worker.url})
         return lw
 
+    async def _prune(self, lw: LiveWorker) -> None:
+        """Take every project that is gone from this control plane's list
+        (archived) off the worker: its threads there and their worktrees.
+        Everything of theirs is in the projects' hubs."""
+        keep = [p["id"] for p in await self.store.list_projects()]
+        removed = await lw.client.prune(keep)
+        if removed:
+            log.info("worker %s: took archived project(s) %s off it", lw.worker.id, ", ".join(removed))
+
     async def _home(self, project: dict, worker_id: str | None) -> LiveWorker | None:
         """The worker a thread ran on, attached again if an earlier control
-        plane left it; None when it has none or that worker was lost."""
+        plane left it; None when it has none or that worker was lost (or was
+        from before the pool)."""
         if worker_id is None:
             return None
         async with self._lock:
-            for lw in self.workers.get(project["id"], []):
+            for lw in self.workers:
                 if lw.worker.id == worker_id:
                     return lw
-            for w in await self.store.list_workers(project["id"]):
-                if w["id"] == worker_id and w["lost_at"] is None and attachable(w):
+            for w in await self.store.list_workers():
+                if w["id"] == worker_id and w["lost_at"] is None and pooled(w) and w["idx"] <= self.pool:
                     return await self._attach(project, w["idx"])
         return None
 
@@ -383,10 +428,15 @@ class Orchestrator:
             lw.unreachable_since = asyncio.get_running_loop().time()
         (log.info if to == "ready" else log.warning)("worker %s: %s -> %s: %s", wid, frm, to, reason)
         await self.store.set_worker_state(wid, to, reason)
-        await self.store.append_event(lw.worker.project_id, None, "worker_state",
-                                      {"worker": wid, "from": frm, "to": to, "reason": reason})
+        # The worker is every project's: each project with a thread on it, or
+        # last on it, logs it.
+        for project_id in await self.store.projects_on_worker(wid):
+            await self.store.append_event(project_id, None, "worker_state",
+                                          {"worker": wid, "from": frm, "to": to, "reason": reason})
         async with lw.changed:
             lw.changed.notify_all()
+        await self._made_room()
+
 
     async def _bind_to(self, tid: str, to: str, reason: str, worker: str | None = None, **fields) -> dict:
         """Move a thread's binding to `to` (states.BINDING), or raise
@@ -445,6 +495,7 @@ class Orchestrator:
             return None
         await self._restarted(lw, h)
         if lw.state == "unreachable":
+            await self._prune(lw)  # a project may have been archived while it was away
             await self._worker_to(lw, "ready", "its runner answers again")
         return h
 
@@ -461,13 +512,13 @@ class Orchestrator:
         if lw.state != "unreachable":
             return
         await self._worker_to(lw, "reattaching", why)
-        project = await self.store.get_project(lw.worker.project_id)
-        spec = worker_spec(project, lw.worker.index)
+        spec = worker_spec(lw.worker.index)
         spec.token = lw.worker.token
         try:
             worker = await self.provider.create(spec)
             client = RunnerClient(worker.url, worker.token)
             h = await client.health(timeout=HEALTH_TIMEOUT)
+            await client.prune([p["id"] for p in await self.store.list_projects()])
         except Exception as e:
             lw.failures += 1
             failed = describe(e)
@@ -536,20 +587,17 @@ class Orchestrator:
         message (live_worker). It is destroyed too, so it can never run a
         thread a second time. Why, and the end of its log as it was followed,
         stay with it in the store: destroying it takes its log too."""
-        lws = self.workers.get(lw.worker.project_id, [])
-        if lw not in lws:
+        if lw not in self.workers:
             return
-        lws.remove(lw)
+        self.workers.remove(lw)  # its slot is empty: a new worker of the same name fills it
         me = asyncio.current_task()
         for task in lw.tasks():
             if task is not me:
                 task.cancel()
-        project_id, wid = lw.worker.project_id, lw.worker.id
+        wid = lw.worker.id
         await self._worker_to(lw, "lost", why)
-        await self._unbind_all(lw, f"worker {wid} is lost ({why}); it comes back on another worker with its "
-                                   "next message, or with Respawn")
-        await self._made(project_id)
-        self.lost[project_id].add(lw.worker.index)
+        await self._unbind_all(lw, f"worker {wid} is lost ({why}); it comes back on a worker of the pool "
+                                   "with its next message, or with Respawn")
         await self.store.lose_worker(wid, why, "\n".join(lw.log_tail))
         try:
             await self.provider.destroy(lw.worker)
@@ -570,7 +618,7 @@ class Orchestrator:
         except Exception as e:
             log.warning("cannot follow the log of worker %s: %s", wid, describe(e))
 
-    async def _relay(self, project_id: str, lw: LiveWorker) -> None:
+    async def _relay(self, lw: LiveWorker) -> None:
         """Copy a worker's event stream into the store; reconnect on drops.
         Each connection starts with a look at which runner serves the worker,
         so one that restarted is streamed from its first event."""
@@ -579,7 +627,7 @@ class Orchestrator:
                 await self._restarted(lw, await lw.client.health(timeout=HEALTH_TIMEOUT))
                 async for ev in lw.client.events(after=lw.last_seq):
                     lw.last_seq = max(lw.last_seq, ev.get("seq", 0))
-                    await self._ingest(project_id, ev)
+                    await self._ingest(ev)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -592,6 +640,8 @@ class Orchestrator:
     # connection. Each worker queues its threads' peer calls (list, read,
     # message, spawn, summary) and this pump long-polls them off it, runs each
     # one concurrently and posts the answer back (runner/API.md, "Peer calls").
+    # A worker holds threads of every project: each call is answered as the
+    # thread that made it, within that thread's project.
 
     async def _pump_peer_calls(self, lw: LiveWorker) -> None:
         running: set[asyncio.Task] = set()
@@ -619,7 +669,8 @@ class Orchestrator:
         try:
             if handler is None:
                 raise PeerCallError(f"unknown op {op!r}")
-            reply = {"ok": True, "result": await handler(self, lw, **args)}
+            caller = await self._caller(lw, call.get("thread"))
+            reply = {"ok": True, "result": await handler(self, lw, caller, **args)}
         except PeerCallError as e:
             reply = {"ok": False, "error": str(e)}
         except TypeError as e:  # wrong or missing args
@@ -632,42 +683,57 @@ class Orchestrator:
         except Exception as e:  # the worker hands the call out again after its lease
             log.warning("answering peer call %s on %s: %s", call.get("id"), lw.worker.id, e)
 
+    async def _caller(self, lw: LiveWorker, thread_id) -> dict:
+        """The thread making a peer call: one that is on this worker."""
+        t = await self.store.get_thread(thread_id) if isinstance(thread_id, str) else None
+        if t is None or t["worker_id"] != lw.worker.id:
+            raise PeerCallError(f"thread {thread_id} is not on worker {lw.worker.id}")
+        return t
+
     async def _own_thread(self, project_id: str, thread_id: str | None) -> dict:
-        """A thread of the calling worker's project; nothing else is visible to it."""
+        """A thread of the caller's project; nothing else is visible to it."""
         t = await self.store.get_thread(thread_id) if thread_id else None
         if t is None or t["project_id"] != project_id:
             raise PeerCallError(f"no thread {thread_id}")
         return t
 
-    async def peer_list_threads(self, lw: LiveWorker, project: str, query: str | None = None) -> list[dict]:
-        project_id = lw.worker.project_id
+    @staticmethod
+    def _as_caller(caller: dict, thread_id) -> None:
+        """A call made for a thread is made by that thread only."""
+        if thread_id != caller["id"]:
+            raise PeerCallError(f"thread {caller['id']} cannot act as {thread_id}")
+
+    async def peer_list_threads(self, lw: LiveWorker, caller: dict, project: str,
+                                query: str | None = None) -> list[dict]:
+        project_id = caller["project_id"]
         if project != project_id:
             raise PeerCallError("threads of another project are not visible")
         threads = [peer_entry(t) for t in await self.store.list_threads(project_id)]
         q = (query or "").lower()
         return [t for t in threads if q in (t["title"] + " " + t["summary"]).lower()] if q else threads
 
-    async def peer_read_thread(self, lw: LiveWorker, thread_id: str, last_n: int = 20) -> dict:
-        project_id = lw.worker.project_id
+    async def peer_read_thread(self, lw: LiveWorker, caller: dict, thread_id: str, last_n: int = 20) -> dict:
+        project_id = caller["project_id"]
         t = await self._own_thread(project_id, thread_id)
         events = await self.store.list_events(project_id, t["id"], 0, limit=5000)
         recent = [{"seq": e["seq"], "thread": e["thread_id"], "type": e["type"], "ts": e["created_at"],
                    "data": e["payload"]} for e in events[-int(last_n):]]
         return {**peer_entry(t), "events": recent}
 
-    async def peer_send_message(self, lw: LiveWorker, sender: str, to: str, body: str,
+    async def peer_send_message(self, lw: LiveWorker, caller: dict, sender: str, to: str, body: str,
                                 reply_to: str | None = None, hops: int = 0) -> dict:
-        project_id = lw.worker.project_id
-        t = await self._own_thread(project_id, to)
+        self._as_caller(caller, sender)
+        t = await self._own_thread(caller["project_id"], to)
         try:
-            await self.send(t["id"], str(body), sender or "unknown", int(hops or 0) + 1, reply_to)
+            await self.send(t["id"], str(body), sender, int(hops or 0) + 1, reply_to)
         except ArchivedError as e:
             raise PeerCallError(str(e)) from None
         return {"ok": True}
 
-    async def peer_spawn_thread(self, lw: LiveWorker, parent: str | None, project: str, title: str,
+    async def peer_spawn_thread(self, lw: LiveWorker, caller: dict, parent: str | None, project: str, title: str,
                                 request: str) -> dict:
-        project_id = lw.worker.project_id
+        self._as_caller(caller, parent)
+        project_id = caller["project_id"]
         if project != project_id:
             raise PeerCallError("cannot spawn threads in another project")
         request = str(request or "").strip()
@@ -680,23 +746,25 @@ class Orchestrator:
             raise PeerCallError(str(e)) from None
         return {"id": t["id"], "title": t["title"]}
 
-    async def peer_set_summary(self, lw: LiveWorker, thread_id: str, summary: str,
+    async def peer_set_summary(self, lw: LiveWorker, caller: dict, thread_id: str, summary: str,
                                files: list | None = None) -> dict:
-        t = await self._own_thread(lw.worker.project_id, thread_id)
+        self._as_caller(caller, thread_id)
+        t = caller
         fields = {"summary": str(summary or "")}
         if isinstance(files, list):
             fields["files"] = [str(f) for f in files]
         await self.store.update_thread(t["id"], **fields)
         return {"ok": True}
 
-    async def peer_save(self, lw: LiveWorker, thread_id: str, land: bool = False) -> dict:
+    async def peer_save(self, lw: LiveWorker, caller: dict, thread_id: str, land: bool = False) -> dict:
         """A thread's turn ended: take its branch, snapshot and session into the hub;
         with `land`, land the branch there and send the worker the new base
         and branch (runner/API.md, "Repository")."""
-        t = await self._own_thread(lw.worker.project_id, thread_id)
+        self._as_caller(caller, thread_id)
+        t = caller
         project = await self.store.get_project(t["project_id"])
         hub = await self.hub(project)
-        data, refs = await lw.client.pull_thread(t["id"], await hub.have(t["id"]))
+        data, refs = await lw.client.pull_thread(project["id"], t["id"], await hub.have(t["id"]))
         await hub.receive(t["id"], data, refs)
         if not land:
             return {"landed": False, "base": hub.base}
@@ -743,13 +811,15 @@ class Orchestrator:
         repository, when there is one), and a thread's branch, snapshot and session."""
         hub = await self.hub(project)
         await hub.sync()
-        data, refs = await hub.pack(tid, list((await lw.client.repo_refs()).values()))
-        await lw.client.push_repo(data, hub.base, refs)
+        data, refs = await hub.pack(tid, list((await lw.client.repo_refs(project["id"])).values()))
+        await lw.client.push_repo(project["id"], data, hub.base, refs)
 
-    async def _ingest(self, project_id: str, ev: dict) -> None:
+    async def _ingest(self, ev: dict) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}
-        if not tid or await self.store.get_thread(tid) is None:
+        t = await self.store.get_thread(tid) if tid else None
+        if t is None:
             return
+        project_id = t["project_id"]
         if typ == "created":
             return  # the control plane already logged the thread
         if typ == "message_in" and self._echoed(tid, data.get("body")):
@@ -765,6 +835,8 @@ class Orchestrator:
         if fields:
             await self.store.update_thread(tid, **fields)
         await self.store.append_event(project_id, tid, typ, data)
+        if "state" in fields:  # a thread that ends a turn makes room on its worker
+            await self._made_room()
         if typ in ENDS_STREAM:
             await self.store.delete_events(project_id, tid, "delta")
 
@@ -827,7 +899,7 @@ class Orchestrator:
             if lw is not None and lw.state != "ready":
                 lw = None
             if lw is None:
-                lw, picked = await self._pick_worker(project, start=True), True
+                lw, picked = await self._pick_worker(project, start=True, tid=tid), True
             if lw is not old:
                 there = await lw.client.get_thread(tid)
                 if there is not None and there.get("state") not in ENDED:
@@ -843,6 +915,7 @@ class Orchestrator:
         finally:
             if picked:
                 lw.starting -= 1
+                await self._made_room()
         lw.threads.add(tid)
         self.by_thread[tid] = lw
         wid = lw.worker.id
@@ -1036,7 +1109,7 @@ class Orchestrator:
             head += f"worker {lw.worker.id} is {lw.state}: {lw.reason or 'its runner answers'}\n"
             worker = lw.worker
         else:
-            w = {w["id"]: w for w in await self.store.list_workers(t["project_id"])}.get(t["worker_id"])
+            w = {w["id"]: w for w in await self.store.list_workers()}.get(t["worker_id"])
             if w is None:
                 return head + "It has not been on a worker, so there is no worker log.\n"
             head += f"worker {w['id']} is {w['state']}: {w['state_reason'] or 'nothing recorded'}\n"
@@ -1104,11 +1177,12 @@ class Orchestrator:
     #
     # An archived project leaves the project list and takes no work: no
     # requests, messages, edits, spawns or file reads, from the person or from
-    # a peer. Archiving it stops every thread still on a runner and destroys
-    # the project's workers, so it holds no compute. Its threads keep their
-    # own state and archived flags, its log and its hub (every turn's work is
-    # in the hub already). Unarchived, it is as it was: each thread comes back
-    # on a new worker, from its branch, snapshot and session in the hub, with its next
+    # a peer. Archiving it stops every thread still on a runner and takes the
+    # project off the pool's workers (its repository and worktrees there), so
+    # it holds no compute or disk. Its threads keep their own state and
+    # archived flags, its log and its hub (every turn's work is in the hub
+    # already). Unarchived, it is as it was: each thread comes back on a
+    # worker, from its branch, snapshot and session in the hub, with its next
     # message.
 
     async def open_project(self, project_id: str) -> dict:
@@ -1146,9 +1220,9 @@ class Orchestrator:
     async def archive_project(self, project_id: str) -> dict:
         """Archive a project: it is marked first, so nothing new starts (requests
         still queued for routing fail, and say so in its log), then its running
-        threads are stopped and its workers destroyed. Archiving an
-        archived project finishes that (a worker whose destroy failed is
-        destroyed again) without logging it twice."""
+        threads are stopped, unbound, and taken off the pool's workers. A
+        worker not ready now has it taken off when it is ready again.
+        Archiving an archived project finishes that without logging it twice."""
         p = await self.store.get_project(project_id)
         if p is None:
             raise KeyError(project_id)
@@ -1158,25 +1232,16 @@ class Orchestrator:
         for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
             if t["state"] not in ENDED:
                 await self.stop(t["id"])
-        await self._destroy_workers(project_id)
+        for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
+            lw = self.by_thread.pop(t["id"], None)
+            if lw is not None:
+                lw.threads.discard(t["id"])
+            if t["binding"] != "unbound":
+                await self._bind_to(t["id"], "unbound", "its project was archived")
+        for lw in list(self.workers):
+            if lw.state == "ready":
+                await self._prune(lw)
         return p
-
-    async def _destroy_workers(self, project_id: str) -> None:
-        """Let go of every worker the project has and destroy it. Each is marked
-        lost, so its index (and its sprite's name) is never used again."""
-        async with self._lock:
-            for lw in self.workers.pop(project_id, []):
-                for task in lw.tasks():
-                    task.cancel()
-                await self._worker_to(lw, "lost", "its project was archived")
-                await self._unbind_all(lw, "its project was archived")
-                await lw.client.close()
-            await self._made(project_id)
-            for w in await self.store.list_workers(project_id):
-                if w["lost_at"] is None and attachable(w):
-                    await self.provider.destroy(stored_worker(w))
-                    self.lost[project_id].add(w["idx"])
-                    await self.store.lose_worker(w["id"], "its project was archived", "")
 
     async def unarchive_project(self, project_id: str) -> dict:
         p = await self.store.get_project(project_id)

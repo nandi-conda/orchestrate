@@ -20,7 +20,7 @@ from starlette.routing import Route
 from . import files, sandbox
 from .harness import RUNNER, PrimeAgent
 from .peers import OrchestratorPeers
-from .repo import THREAD_ID, GitError, Repo, refs_header
+from .repo import THREAD_ID, GitError, Repos, refs_header
 from .secrets import get_secret, require
 from .thread import ThreadHost, dumps
 from .web import deepseek_web
@@ -154,6 +154,8 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             images = images_of(b)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+        if not isinstance(b.get("project"), str) or not b["project"]:
+            return JSONResponse({"error": "project is required"}, status_code=400)
         if b.get("request") is None and not b.get("id") and not images:
             return JSONResponse({"error": "request, or the id of a thread to bring back, is required"},
                                 status_code=400)
@@ -161,7 +163,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if request is None and images:
             request = ""  # images only: the thread still gets a turn
         try:
-            t = await host.start(project=b.get("project", "default"),
+            t = await host.start(project=b["project"],
                                  title=b.get("title") or (b.get("request") or b.get("id") or "thread")[:60],
                                  request=request, parent=b.get("parent"),
                                  model=b.get("model"), id=b.get("id"),
@@ -250,15 +252,20 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         return sse(None, after_of(req), backlog)
 
     async def get_repo(req: Request):
-        return JSONResponse({"base": host.repo.base, "refs": await host.repo.refs()})
+        try:
+            repo = host.repos.get(req.path_params["project"])
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"base": repo.base, "refs": await repo.refs()})
 
     async def post_repo(req: Request):
         try:
+            repo = host.repos.get(req.path_params["project"])
             refs = json.loads(req.headers.get("x-git-refs") or "{}")
             base = req.headers.get("x-git-base") or ""
             if not base or not isinstance(refs, dict):
                 raise ValueError("x-git-base and x-git-refs (a JSON object) are required")
-            await host.repo.receive(await req.body(), base, refs)
+            await repo.receive(await req.body(), base, refs)
         except (ValueError, GitError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         return JSONResponse({"ok": True})
@@ -269,10 +276,21 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             return JSONResponse({"error": "bad thread id"}, status_code=400)
         have = [h for h in req.query_params.get("have", "").split(",") if h]
         try:
-            data, refs = await host.repo.send(tid, have)
+            repo = host.repos.get(req.path_params["project"])
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        try:
+            data, refs = await repo.send(tid, have)
         except GitError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
         return Response(data, media_type="application/octet-stream", headers={"x-git-refs": refs_header(refs)})
+
+    async def prune(req: Request):
+        b = await req.json()
+        keep = b.get("keep") if isinstance(b, dict) else None
+        if not isinstance(keep, list) or not all(isinstance(p, str) for p in keep):
+            return JSONResponse({"error": "keep (a list of project ids) is required"}, status_code=400)
+        return JSONResponse({"removed": await host.prune(set(keep))})
 
     outbox = host.peers.outbox if isinstance(host.peers, OrchestratorPeers) else None
 
@@ -299,9 +317,10 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         Route("/threads/{id}/stop", guard(stop), methods=["POST"]),
         Route("/threads/{id}/files", guard(list_files)),
         Route("/threads/{id}/files/raw", guard(raw_file)),
-        Route("/repo", guard(get_repo), methods=["GET"]),
-        Route("/repo", guard(post_repo), methods=["POST"]),
-        Route("/threads/{id}/repo", guard(thread_repo)),
+        Route("/projects/prune", guard(prune), methods=["POST"]),
+        Route("/projects/{project}/repo", guard(get_repo), methods=["GET"]),
+        Route("/projects/{project}/repo", guard(post_repo), methods=["POST"]),
+        Route("/projects/{project}/threads/{id}/repo", guard(thread_repo)),
         Route("/peer/calls", guard(peer_calls), methods=["GET"]),
         Route("/peer/calls/{id}", guard(peer_answer), methods=["POST"]),
     ])
@@ -313,8 +332,8 @@ def host_from_env() -> ThreadHost:
         agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
         web=deepseek_web(),
         peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
-        # The orchestrator brings the project's commits (POST /repo).
-        repo=Repo(os.path.join(workdir, ".repo")),
+        # The orchestrator brings each project's commits (POST /projects/{project}/repo).
+        repos=Repos(os.path.join(workdir, ".repos")),
         workdir=workdir,
         capacity=int(os.environ.get("RUNNER_CAPACITY", "16")),
     )

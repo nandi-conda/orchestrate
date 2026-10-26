@@ -30,12 +30,12 @@ class TeamError(RuntimeError):
 
 
 async def _list_threads(t: "AgentThread", query: str | None = None) -> list[dict]:
-    rows = await t.peers.list_threads(t.project, query)
+    rows = await t.peers.list_threads(t.id, t.project, query)
     return [r for r in rows if r.get("id") != t.id]
 
 
 async def _read_thread(t: "AgentThread", id: str, last_n: int = 20) -> dict:
-    return await t.peers.read_thread(id, int(last_n))
+    return await t.peers.read_thread(t.id, id, int(last_n))
 
 
 async def _send_message(t: "AgentThread", to: str, body: str, reply_to: str | None = None) -> dict:

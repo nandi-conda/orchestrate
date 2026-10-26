@@ -72,8 +72,8 @@ thread, titled for the image. Images show in the transcript and open enlarged
 on a click.
 
 With `DEEPSEEK_API_KEY` stored (keyring, service `orchestrate`), the
-orchestrator starts the real runner from `../runner` as a local subprocess,
-one worker per project, and the router uses `deepseek-flash`. Without the key it
+orchestrator starts the real runner from `../runner` as local subprocesses,
+a pool of up to 3 workers shared by every project, and the router uses `deepseek-flash`. Without the key it
 falls back to an echo runner (`control.devrunner`) and a rule-based router. That
 way you can click through the whole UI with no credentials.
 
@@ -178,7 +178,8 @@ also carries the workers' peer calls:
    call on its worker.
 2. The control plane holds a long poll on each worker's `GET /peer/calls`,
    which returns the moment a call is queued.
-3. It runs every call concurrently, scoped to the worker's project
+3. It runs every call concurrently, as the thread that made it and scoped to
+   that thread's project, since a worker holds threads of every project
    (`Orchestrator.PEER_OPS` in `control/service.py`), and posts the answer to
    `POST /peer/calls/{id}`.
 
@@ -199,9 +200,13 @@ Runners never touch the database, and never connect to the control plane.
 
 ### Sprites
 
-When `SPRITES_TOKEN` is stored, each worker is a sprite named
-`orch-<project>-w<n>`, even when the browser reached the control plane on
-localhost. The provider clones this repo to `/opt/orchestrate`, runs
+When `SPRITES_TOKEN` is stored, the workers are a pool of 3 sprites shared by
+every project, named for their slot (`orch-w1`..`orch-w3`) and labeled
+`orchestrator`, even when the browser reached the control plane on localhost.
+A thread that finds every worker full waits for room; no fourth is made. At
+startup the control plane destroys every other sprite of ours (labeled, or
+named `orch-p-<id>-w<n>` as each project's own workers were before the pool).
+See `docs/worker-lifecycle.md`, "The worker pool". The provider clones this repo to `/opt/orchestrate`, runs
 `runner/deploy/bootstrap.sh`, and registers `runner/deploy/start.sh` as the
 sprite service on port 8080. Sprites keep their default open outbound
 network; the orchestrator sets no network policy.
@@ -271,7 +276,7 @@ lost worker is retired, and its threads take the path back on another worker.
 | `ready` | its runner answers `/health` | |
 | `unreachable` | `/health` fails, its provider still has it (a sprite waking, this machine's network down) | it answers again; reattached after 300 s without an answer, or at once by Respawn |
 | `reattaching` | the provider is starting its runner again, same disk and token | ready when it answers; unreachable if it fails |
-| `lost` | its provider says it is gone; destroyed | retired: its threads are unbound and come back on another worker |
+| `lost` | its provider says it is gone; destroyed | retired: its threads are unbound and come back on the pool; its slot is filled by a new worker of the same name |
 
 | Binding | Means | Way back to bound |
 | --- | --- | --- |
@@ -333,7 +338,7 @@ To read a live sprite's log without the UI:
 
 ```sh
 curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \
-  "https://api.sprites.dev/v1/sprites/orch-<project>-w<n>/fs/read?path=/.sprite/logs/services/runner.log&workingDir=/" | tail -n 300
+  "https://api.sprites.dev/v1/sprites/orch-w<n>/fs/read?path=/.sprite/logs/services/runner.log&workingDir=/" | tail -n 300
 ```
 
 The spawn path has been exercised against the live API: create, bootstrap,

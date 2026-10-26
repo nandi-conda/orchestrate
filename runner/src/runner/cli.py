@@ -9,7 +9,7 @@ import tempfile
 
 from . import sandbox
 from .harness import PrimeAgent
-from .repo import Repo
+from .repo import Repos
 from .secrets import get_secret, require
 from .thread import ThreadHost
 from .web import deepseek_web
@@ -30,12 +30,13 @@ def _print(ev: dict):
 
 async def amain(args):
     workdir = args.workdir or tempfile.mkdtemp(prefix="runner-")
-    repo = None
+    repos, repo = None, None
     if args.repo:
-        repo = Repo(f"{workdir}/.repo")
+        repos = Repos(f"{workdir}/.repos")
+        repo = repos.get(args.project)
         await repo.seed(args.repo)
     host = ThreadHost(agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
-                      web=deepseek_web(), repo=repo, workdir=workdir)
+                      web=deepseek_web(), repos=repos, workdir=workdir)
     q = host.subscribe(None)
     spec = {"provider": "deepseek", "model": args.model} if args.model else None
     t = await host.start(project=args.project, title=args.request[:60], request=args.request, model=spec)

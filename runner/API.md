@@ -1,7 +1,8 @@
 # Runner HTTP API
 
 One runner process per worker (a Sprite, a container, a laptop). It hosts many
-threads. Default port 8080. Every route except `/health` needs
+threads, of any number of projects: workers are a pool the orchestrator shares
+between all its projects. Default port 8080. Every route except `/health` needs
 `Authorization: Bearer $RUNNER_TOKEN` when `RUNNER_TOKEN` is set.
 
 ## Routes
@@ -10,16 +11,17 @@ threads. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit", "boot"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout); `boot` is random per runner process, so a control plane can tell the runner restarted (its threads are gone from memory, its event `seq` starts again at 1) |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"request"?, "images"?, "title"?, "project"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry; 409 if `id` is running here |
+| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry; 400 without `project`; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
 | POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
 | GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream` |
-| GET | `/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>`, its snapshot and its session; header `x-git-refs` (below) |
-| GET | `/repo` | | `{"base", "refs": {"<refname>": "<sha>"}}`: the worker repository's refs |
-| POST | `/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/`, `refs/remotes/origin-snapshots/` and `refs/remotes/origin-sessions/` |
+| GET | `/projects/{project}/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>`, its snapshot and its session; header `x-git-refs` (below) |
+| GET | `/projects/{project}/repo` | | `{"base", "refs": {"<refname>": "<sha>"}}`: the project's repository's refs on this worker |
+| POST | `/projects/{project}/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/`, `refs/remotes/origin-snapshots/` and `refs/remotes/origin-sessions/` |
+| POST | `/projects/prune` | `{"keep": ["<project>", ...]}` | `{"removed": [...]}`: every other project is taken off this worker (below) |
 | GET | `/events` | | SSE stream for every thread on this worker |
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
@@ -78,7 +80,7 @@ harness state, kept in the thread's home and committed by the runner as
 `refs/sessions/<id>` (a commit of those directories, whose parent is the
 previous turn's). To bring a thread back on any worker (its old one was
 deleted, the orchestrator restarted, or the thread stopped or failed), the
-orchestrator sends its refs (`POST /repo`), then posts `/threads` with the
+orchestrator sends its refs (`POST /projects/{project}/repo`), then posts `/threads` with the
 thread's `id`, `title`, `parent` and `summary`, and usually no `request`:
 
 - The worktree is the worker's own for that thread when it still has one
@@ -99,12 +101,15 @@ laptop behind NAT, and it opens every connection. The team skill's calls
 still reach it, by queuing on this runner for the orchestrator to collect:
 
 1. `GET /peer/calls?wait=25` (max 55) long-polls. It returns as soon as a call
-   is queued, with every call due: `[{"id", "op", "args"}]`, or `[]` after
+   is queued, with every call due: `[{"id", "thread", "op", "args"}]`
+   (`thread` is the thread making the call, as the runner knows it from the
+   socket the call came on), or `[]` after
    `wait` seconds with none, or when the connection asking is closed (an
    orchestrator that went away; a poll outliving it would hold the worker open
    while it stops).
-2. The orchestrator runs each call (concurrently) as this worker, limited to
-   the worker's project.
+2. The orchestrator runs each call (concurrently) as the calling thread,
+   limited to that thread's project: a worker holds threads of many projects,
+   and none sees another project's.
 3. `POST /peer/calls/{id}` with `{"ok": true, "result": ...}` or
    `{"ok": false, "error": "..."}` wakes the waiting tool; an error becomes the
    tool's result. 404 if the call is unknown or already answered.
@@ -122,7 +127,7 @@ runner itself.
 
 | `op` (the tool) | `args` | `result` |
 | --- | --- | --- |
-| `list_threads` | `{"project", "query"}` (`query` may be null) | list of directory entries (the thread itself is left out of what it sees) |
+| `list_threads` | `{"project", "query"}` (`query` may be null; `project` is the caller's) | list of directory entries (the thread itself is left out of what it sees) |
 | `read_thread` | `{"thread_id", "last_n"}` | directory entry + `"events"`: recent event list |
 | `send_message` | `{"sender", "to", "body", "reply_to"}` | `{"ok": true}` |
 | `spawn_thread` | `{"parent", "project", "title", "request"}` | `{"id", "title"}` |
@@ -132,7 +137,7 @@ runner itself.
 A thread also calls `set_summary` after each turn, and when it has a `parent`, sends
 `Finished: <summary>` to the parent through `send_message`. The orchestrator routes
 `send_message` to whichever worker holds `to` (`POST /threads/{to}/messages` with
-`hops + 1`), and `spawn_thread` to the least loaded worker.
+`hops + 1`), and `spawn_thread` to the least loaded worker of its pool.
 
 ## Environment
 
@@ -145,7 +150,7 @@ Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`) are read from the environment first
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | for web search and fetch |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
-| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repo/` |
+| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repos/<project>/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 
 ## Sandbox
@@ -164,13 +169,13 @@ this view:
 | --- | --- |
 | `/` | the machine's system, read-only (its git, compilers, shells) |
 | `$RUNNER_WORKDIR/<id>` | the thread's worktree, writable; the kernel starts here |
-| `$RUNNER_WORKDIR/.repo/.git` | the worker repository's git dir, writable, so the thread can commit |
+| `$RUNNER_WORKDIR/.repos/<project>/.git` | its project's repository's git dir, writable, so the thread can commit |
 | `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, `models.json`, skills, the session) |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept for the thread |
 | `runner/.pixi/envs/kernel`, prime-agent's bundled skills | read-only: the kernel's Python and packages |
 | `$PIXI_EXE` | read-only, at its own path and on `PATH`: the pixi the runner runs under (every project is a pixi project); it keeps its cache and global tools in the thread's `HOME` |
 | `$RUNNER_WORKDIR/.team/<id>.sock` | the thread's team socket |
-| the rest of the orchestrate checkout and the runner's pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads, the keyring and caches are not there |
+| the rest of the orchestrate checkout and the runner's pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads and projects, the keyring and caches are not there |
 | `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |
 
 The kernel's environment is made afresh: `PATH` (the thread's venv, the kernel
@@ -200,26 +205,27 @@ non-root service may hold before starting bubblewrap, which refuses them
 
 The orchestrator keeps one git repository per project (its hub); it is the
 only place commits live beyond a worker. The worker has a repository of its
-own, `$RUNNER_WORKDIR/.repo`, with no remote: the worker reaches nothing, and
+own per project, `$RUNNER_WORKDIR/.repos/<project>`, made when the orchestrator
+first sends that project's commits, with no remote: the worker reaches nothing, and
 the orchestrator moves commits both ways as git bundles over this API. A
 bundle carries objects only; ref tips travel as JSON in `x-git-refs`
 (`{"<refname>": "<sha>"}`), since a bundle leaves out a ref whose tip the
 other side already has.
 
-- `POST /repo` brings the hub's commits: the default branch as
+- `POST /projects/{project}/repo` brings the hub's commits: the default branch as
   `refs/remotes/origin/<base>` (`x-git-base` names it), a thread's branch as
   `refs/remotes/origin/thread/<id>` and its snapshot as
   `refs/remotes/origin-snapshots/<id>`, its session as
   `refs/remotes/origin-sessions/<id>`. The orchestrator sends the base
   before it starts a thread, and the thread's branch, snapshot and session before it
-  brings one back. It leaves out of the bundle what `GET /repo` says the
-  worker has.
-- `GET /threads/{id}/repo?have=...` gives the thread's `refs/heads/thread/<id>`,
+  brings one back. It leaves out of the bundle what `GET /projects/{project}/repo` says
+  the worker has.
+- `GET /projects/{project}/threads/{id}/repo?have=...` gives the thread's `refs/heads/thread/<id>`,
   `refs/snapshots/<id>` and `refs/sessions/<id>`, without the commits `have` lists (the hub's tips;
   ones the worker does not know are ignored). The body is empty when the hub
   has everything.
 
-Threads on one worker share the repository's objects and refs; each has its
+Threads of a project on one worker share its repository's objects and refs; each has its
 own worktree, index and branch. A turn's work leaves the worker on one path:
 
 1. A thread commits on `thread/<id>` as it likes; there is no remote to push to.
@@ -228,7 +234,7 @@ own worktree, index and branch. A turn's work leaves the worker on one path:
    files included, whose parent is the branch tip (`refs/snapshots/<id>`), and
    commits the session (`refs/sessions/<id>`). It then asks the orchestrator
    to `save` (a peer call), which takes all three with
-   `GET /threads/{id}/repo`.
+   `GET /projects/{project}/threads/{id}/repo`.
 3. `save` has `land: true` unless a model call failed in the turn (the work
    is then only taken, and the runner logs `saved`): the orchestrator rebases the branch onto the default branch in its hub (and,
    when the project has a GitHub repository, pushes the new tip there first),
@@ -243,3 +249,10 @@ own worktree, index and branch. A turn's work leaves the worker on one path:
 The CLI (`pixi run run --repo <path or URL>`) has no orchestrator: `--repo`
 seeds the worker repository (its branches become `origin/*`, its HEAD the
 base) and landing moves `origin/<base>` there.
+
+A project leaves a worker with `POST /projects/prune`: the orchestrator sends
+the projects it still has (not archived) whenever it attaches to a worker and
+after it archives one, and the runner stops and forgets the threads of every
+other project, and deletes its repository and their worktrees, homes, `/tmp`
+and team sockets. Nothing is lost: the hub has every turn's branch, snapshot
+and session, so an unarchived project's threads come back from it.

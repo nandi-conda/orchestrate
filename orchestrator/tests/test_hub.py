@@ -167,7 +167,7 @@ async def test_landing_rebases_onto_what_landed_before_and_conflicts_go_back(tmp
     assert conflict["files"] == ["same.txt"] and conflict["base"] == "main"
     assert git(hub, "show", "main:same.txt") == "b"
     # The worker has the base the thread has to rebase onto.
-    wt = tmp_path / "w" / f"{p['id']}-w1" / c["id"]
+    wt = tmp_path / "w" / "w1" / c["id"]
     assert git(wt, "rev-parse", "origin/main") == git(hub, "rev-parse", "main")
     await orch.close()
     await orch.provider.close()

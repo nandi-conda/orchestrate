@@ -1,5 +1,42 @@
 # Worker and thread lifecycle
 
+## The worker pool
+
+Workers are a **pool of 3, shared by every project** (`POOL` in
+`orchestrator/control/service.py`). Each worker sits in a numbered slot, and a
+slot always names the same worker: `orch-w1`, `orch-w2`, `orch-w3` on Sprites
+(labeled `orchestrator`), `w1`..`w3` locally. That is the whole lifecycle
+policy:
+
+- **Made only to fill an empty slot.** A thread goes on the least loaded
+  ready worker with room (16 running threads each). When none has room, the
+  first empty slot is filled. When every slot is filled and none has room,
+  or the ones with room are not ready (a sprite waking, a network blip), the
+  thread **waits** ("waiting for room" on its Now line) and starts as soon as
+  a turn ends somewhere. No fourth worker is ever made.
+- **Kept, not destroyed.** Workers outlive the control plane, and a sprite
+  pauses on its own while nothing is connected to it, so an idle pool costs
+  little. A lost worker's slot is filled again by a new worker of the same
+  name.
+- **Swept at startup.** Before it takes work, the control plane lists the
+  provider's workers and destroys every one of ours that is not a slot: each
+  project's own workers from before the pool (`orch-p-<id>-w<n>`), slots
+  beyond the pool's size, and the pool of a control plane whose store is
+  gone. The store marks the ones it knew as lost, with why. Sprites not named
+  `orch-` with the label or the old per-project names are never touched.
+- **Projects share workers, not repositories.** A worker keeps one
+  repository per project (`.repos/<project>`), a thread sees only its own
+  project's, and each peer call is answered within the calling thread's
+  project. Archiving a project takes it off every worker (its repository,
+  worktrees, homes); its hub keeps everything, so unarchiving brings its
+  threads back on the pool.
+
+One control plane uses a Sprites organization's pool at a time: a second one
+pointed at the same token attaches to the same slots and restarts their
+runners under its own token.
+
+## Worker states and thread binding
+
 The control plane tracks two things for every running piece of work:
 
 - **the worker**: a machine (a sprite, or a local process) running the runner
@@ -17,7 +54,7 @@ worker, a bound thread). The one exception is a lost worker, which is gone for
 good; its threads take the path back on another worker instead. `states.py`
 checks this when it loads, so a state with no way back cannot be added.
 
-## Worker states
+### Worker states
 
 ```mermaid
 stateDiagram-v2
@@ -39,7 +76,7 @@ stateDiagram-v2
 | `ready` | its runner answers `/health` | | |
 | `unreachable` | `/health` fails but its provider still has it: a sprite waking from a pause, or this machine's network down | a failed health check (every 10 s, before every delivery, when picking a worker) | it answers again; or reattached |
 | `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable, or Respawn / a thread being put back on it | ready once it answers; unreachable again if it fails, and another try 300 s later |
-| `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its index never reused. Its threads are unbound and come back on another worker |
+| `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its slot filled again by a new worker of the same name. Its threads are unbound and come back on the pool |
 
 `ready → ready` is a runner restart: `/health` returns a new `boot` id (the
 runner crashed, a sprite woke cold, or it was reattached). The new runner runs
@@ -49,7 +86,7 @@ theirs: they come back on it, in their worktree, with their next message.
 A worker is never lost just for not answering. Only its provider saying it is
 gone loses it.
 
-## Thread binding
+### Thread binding
 
 ```mermaid
 stateDiagram-v2
@@ -64,7 +101,7 @@ stateDiagram-v2
 | Binding | Means | Way back to bound |
 | --- | --- | --- |
 | `bound` | a live worker's runner has the thread | |
-| `binding` | being put on a worker: one picked or made, the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
+| `binding` | being put on a worker: one picked (a slot filled, or waiting for room), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
 | `unbound` | on no worker | its next message, opening its files, or Respawn |
 
 Each move is stored with its reason (`threads.binding_reason`) and logged as a
@@ -82,8 +119,9 @@ Each move is stored with its reason (`threads.binding_reason`) and logged as a
 **Where a thread goes when it is bound.** On the worker it was last on, while
 that worker is not lost, so it continues in the same worktree (uncommitted
 and ignored files included); an unreachable one is reattached first.
-Otherwise on the least loaded ready worker (a new one when all are full),
-from its branch, snapshot and session in the hub. If its runner still runs it
+Otherwise on the least loaded ready worker of the pool (an empty slot filled
+when none has room; waiting for room when every slot is filled), from its
+branch, snapshot and session in the hub. If its runner still runs it
 (only the control plane lost track), it is bound as it is: "found again on
 worker …". A thread with no saved turn yet gets its original request again;
 the rest come back idle and wait for their next message.
@@ -124,13 +162,13 @@ as a thread's state.
   and reason, and that Respawn brings it back.
 - **Now:** while binding, the activity line says `starting on a worker`.
 - **The project log** shows `worker_state` events (`worker unreachable`,
-  `worker ready`, ...) with their reasons; a thread's log shows its `unbound`
-  moves.
+  `worker ready`, ...) with their reasons, in every project with a thread on
+  that worker or last on it; a thread's log shows its `unbound` moves.
 - **The Worker log tab** opens with two lines, then the worker's runner log:
 
   ```text
-  thread t_ab12 is bound: on worker orch-p_cd34-w1, idle until its next message
-  worker orch-p_cd34-w1 is ready: its runner answers again
+  thread t_ab12 is bound: on worker orch-w1, idle until its next message
+  worker orch-w1 is ready: its runner answers again
   ```
 
   For a thread whose worker was lost, it shows the end of that worker's log
@@ -147,7 +185,7 @@ returns at once; the thread's `binding` events show how it went.
 | `binding` (stuck starting, e.g. a sprite that never comes up) | calls the start off (`binding → unbound`) and starts again; messages sent meanwhile wait for the new start and are delivered |
 | `bound`, worker `ready` | stops it on its runner and posts it again (`bound → binding → bound`); a turn under way is cut short |
 | `bound`, worker `unreachable` or `reattaching` | reattaches the worker first (its runner is started again), then binds the thread on it |
-| worker `lost` | its threads are already unbound; Respawn binds them on another worker |
+| worker `lost` | its threads are already unbound; Respawn binds them on the pool |
 
 ## Messages to a thread in each state
 

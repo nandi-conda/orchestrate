@@ -17,7 +17,8 @@ where the control plane is.
 | Event relay | `GET /events` (SSE, resumable by `seq`) | every thread's events, stored in the project log and streamed to the UI |
 | Thread control | `POST /threads`, `POST /threads/{id}/messages`, `POST /threads/{id}/stop` | start, resume, message and stop threads |
 | Peer calls | `GET /peer/calls?wait=25`, `POST /peer/calls/{id}` | the threads' calls to each other and to the project, below |
-| Git | `GET /repo`, `POST /repo`, `GET /threads/{id}/repo` | moving commits between the hub and the worker as bundles ([details](git.md)) |
+| Git | `GET /projects/{p}/repo`, `POST /projects/{p}/repo`, `GET /projects/{p}/threads/{id}/repo` | moving commits between a project's hub and the worker as bundles ([details](git.md)) |
+| Pruning | `POST /projects/prune` | taking archived projects off the worker, when it is attached and after an archive |
 | Files | `GET /threads/{id}/files`, `/files/raw` | the UI's Files tab |
 | Logs | provider APIs (Sprites log stream, local log file) | worker logs on the control plane's stdout and in the Worker log tab |
 
@@ -49,9 +50,10 @@ sequenceDiagram
    runner queues the call.
 2. The control plane holds a long poll on every worker's `GET /peer/calls`. It
    returns the moment a call is queued.
-3. The control plane runs each call concurrently, scoped to the worker's
-   project (`Orchestrator.PEER_OPS` in `control/service.py`), and posts the
-   answer to `POST /peer/calls/{id}`.
+3. The control plane runs each call concurrently, as the thread that made it
+   (the runner names it in the call) and scoped to that thread's project, since
+   a worker holds threads of every project (`Orchestrator.PEER_OPS` in
+   `control/service.py`), and posts the answer to `POST /peer/calls/{id}`.
 
 So threads on different workers, local or on Sprites, list, read, message and
 spawn each other in one round trip through the control plane. A call handed

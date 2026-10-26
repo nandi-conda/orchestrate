@@ -23,10 +23,11 @@ project starts with its own local git repository and no remote (cards say
   machine, read-only.
 
 Hover a project card for its **Archive** button. Archiving stops every running
-thread and destroys the project's workers, so it holds no compute; its log and
-repository stay. **Archived** in the top bar lists archived projects, which
-open read-only; **Unarchive** brings one back, and its threads return on a new
-worker with their next message.
+thread and takes the project off the shared workers (its repository and
+worktrees there), so it holds no compute or disk; its log and hub repository
+stay. **Archived** in the top bar lists archived projects, which open
+read-only; **Unarchive** brings one back, and its threads return on the pool
+with their next message.
 
 ## The project window
 

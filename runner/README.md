@@ -17,7 +17,7 @@ DEEPSEEK_API_KEY=... RUNNER_TOKEN=... pixi run serve   # HTTP service on :8080
 
 `--repo` seeds the run: threads start from its default branch, and finished
 work lands on `origin/<default>` in the workdir's own repository
-(`<workdir>/.repo`); nothing is pushed back to the source. Under an
+(`<workdir>/.repos/<project>`, `--project` defaults to `local`); nothing is pushed back to the source. Under an
 orchestrator the worker has no remote at all: the orchestrator moves commits
 to and from its per-project repository ([API.md](API.md#repository)).
 

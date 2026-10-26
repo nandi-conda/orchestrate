@@ -54,24 +54,27 @@ sequenceDiagram
     participant Hub as Hub (control plane)
     participant W as Worker runner
     Note over Hub,W: Starting or bringing back a thread
-    Hub->>W: GET /repo (what it has)
-    Hub->>W: POST /repo bundle: origin/<base>, origin/thread/<id>,<br/>origin-snapshots/<id>, origin-sessions/<id>
+    Hub->>W: GET /projects/<p>/repo (what it has)
+    Hub->>W: POST /projects/<p>/repo bundle: origin/<base>, origin/thread/<id>,<br/>origin-snapshots/<id>, origin-sessions/<id>
     Hub->>W: POST /threads {id, ...}
     Note over Hub,W: End of every turn
     W->>W: commit leftovers, snapshot worktree, commit session
     W->>Hub: peer call save {thread_id, land}
-    Hub->>W: GET /threads/<id>/repo?have=<hub tips>
+    Hub->>W: GET /projects/<p>/threads/<id>/repo?have=<hub tips>
     Hub->>Hub: rebase thread/<id> onto <base> (push to remote first, if any)
-    Hub->>W: POST /repo new origin/<base>, origin/thread/<id>
+    Hub->>W: POST /projects/<p>/repo new origin/<base>, origin/thread/<id>
     Hub-->>W: {landed: true, base, commit}
     W->>W: git reset --keep origin/thread/<id>, event "landed"
 ```
 
 On the worker, the hub's refs appear as remote-tracking refs of a repository
-with no remote (`$RUNNER_WORKDIR/.repo`): `refs/remotes/origin/<base>`,
+with no remote, one per project (`$RUNNER_WORKDIR/.repos/<project>`, since
+the pool's workers are shared by every project): `refs/remotes/origin/<base>`,
 `refs/remotes/origin/thread/<id>`, `refs/remotes/origin-snapshots/<id>` and
-`refs/remotes/origin-sessions/<id>`. Threads on one worker share that
-repository's objects; each has its own worktree, index and branch.
+`refs/remotes/origin-sessions/<id>`. A project's threads on one worker share
+that repository's objects; each has its own worktree, index and branch.
+Archiving a project removes its repository and worktrees from every worker
+(`POST /projects/prune`).
 
 ## Every turn lands
 

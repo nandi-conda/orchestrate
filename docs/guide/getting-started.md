@@ -63,16 +63,19 @@ Then create a project, type a request, and press Enter. The
 
 | Stored | Workers | Router |
 | --- | --- | --- |
-| nothing | local echo runner (`control.devrunner`), one per project | rule-based (`HeuristicRouter`) |
+| nothing | local echo runner (`control.devrunner`), a pool of 3 shared by every project | rule-based (`HeuristicRouter`) |
 | `DEEPSEEK_API_KEY` | the real runner as a local subprocess (Linux) | `deepseek-flash` (`ModelRouter`) |
-| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, `orch-<project>-w<n>` | `deepseek-flash` |
+| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, a pool of 3: `orch-w1`..`orch-w3` | `deepseek-flash` |
 
 !!! warning "Sprites cost money"
-    With `SPRITES_TOKEN` stored, the first thread a project spawns creates a
-    billable sprite, even when the control plane runs on your laptop. That is
-    the point of storing the token. Workers are **not** destroyed when the
-    control plane stops (the next control plane attaches to them again);
-    archiving a project destroys its workers.
+    With `SPRITES_TOKEN` stored, the first thread creates a billable sprite,
+    even when the control plane runs on your laptop. That is the point of
+    storing the token. There are never more than 3 (the pool, shared by every
+    project); they pause while idle and are **not** destroyed when the control
+    plane stops (the next one attaches to them again). At startup the control
+    plane destroys every other `orch-` sprite of ours, such as each project's
+    own workers from before the pool. See
+    [The worker pool](../worker-lifecycle.md#the-worker-pool).
 
 !!! note "Sprites run pushed code"
     A sprite clones this checkout's `origin` remote at its current branch, not

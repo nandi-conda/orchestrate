@@ -1,18 +1,19 @@
-"""The project's git repository on a worker, and how threads' work leaves it.
+"""The projects' git repositories on a worker, and how threads' work leaves them.
 
-The orchestrator keeps one git repository per project, its hub, and the
-worker's repository (`<workdir>/.repo`) is a copy of the parts its threads
-need. The worker never reaches the hub, or any remote: the orchestrator opens
-every connection and moves commits both ways as git bundles (runner/API.md,
-"Repository"):
+A worker is shared by every project: it holds one repository per project whose
+threads it has run (`<workdir>/.repos/<project>`, `Repos`). The orchestrator
+keeps one git repository per project, its hub, and the worker's repository is
+a copy of the parts its threads need. The worker never reaches the hub, or any
+remote: the orchestrator opens every connection and moves commits both ways as
+git bundles (runner/API.md, "Repository"):
 
-- `POST /repo` brings the hub's refs to the worker, as remote-tracking refs:
-  the project's default branch as `origin/<base>`, a thread's branch as
-  `origin/thread/<id>`, its snapshot as `origin-snapshots/<id>` and its
-  session as `origin-sessions/<id>`.
-- `GET /threads/{id}/repo` hands the orchestrator a thread's branch
-  `thread/<id>`, its snapshot `refs/snapshots/<id>` and its session
-  `refs/sessions/<id>`.
+- `POST /projects/{project}/repo` brings the hub's refs to the worker, as
+  remote-tracking refs: the project's default branch as `origin/<base>`, a
+  thread's branch as `origin/thread/<id>`, its snapshot as
+  `origin-snapshots/<id>` and its session as `origin-sessions/<id>`.
+- `GET /projects/{project}/threads/{id}/repo` hands the orchestrator a
+  thread's branch `thread/<id>`, its snapshot `refs/snapshots/<id>` and its
+  session `refs/sessions/<id>`.
 
 Every thread gets a worktree on its own branch `thread/<id>`. A new thread's
 branch starts from `origin/<base>`. A thread brought back on a worker keeps
@@ -53,6 +54,7 @@ AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
 # The refs the orchestrator may set on a worker.
 SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots|origin-sessions)/[\w./-]+$")
 THREAD_ID = re.compile(r"^[\w-]+$")
+PROJECT_ID = re.compile(r"^[\w-]+$")
 # What a snapshot leaves out: pixi's environments, in the subdirectories of any
 # `.pixi/` (its config.toml, beside them, stays).
 PIXI_ENVIRONMENTS = ":(exclude,glob)**/.pixi/*/**"
@@ -351,6 +353,43 @@ class Workspace:
             await self.git("update-ref", f"refs/remotes/origin/{base}", head)
             await self.git("update-ref", f"refs/remotes/origin/{self.branch}", head)
         return {"landed": True, "base": base, "commit": head}
+
+
+class Repos:
+    """The worker's repositories, one per project, made on first use."""
+
+    def __init__(self, root: str | os.PathLike):
+        self.root = Path(root)
+        self.repos: dict[str, Repo] = {}
+
+    def get(self, project: str) -> Repo:
+        if not PROJECT_ID.match(project or ""):
+            raise GitError(f"bad project id {project!r}")
+        repo = self.repos.get(project)
+        if repo is None:
+            repo = self.repos[project] = Repo(self.root / project)
+        return repo
+
+    def projects(self) -> list[str]:
+        """Every project this worker has a repository for, made by this
+        runner process or an earlier one."""
+        on_disk = {p.name for p in self.root.iterdir() if (p / ".git").exists()} if self.root.exists() else set()
+        return sorted(on_disk | set(self.repos))
+
+    async def worktrees(self, project: str) -> list[Path]:
+        """The thread worktrees a project's repository has."""
+        repo = self.get(project)
+        if not (repo.path / ".git").exists():
+            return []
+        out = (await repo.git("worktree", "list", "--porcelain")).out
+        main = repo.path.resolve()
+        return [Path(line.removeprefix("worktree ")) for line in out.splitlines()
+                if line.startswith("worktree ") and Path(line.removeprefix("worktree ")) != main]
+
+    def remove(self, project: str) -> None:
+        """Delete a project's repository from this worker."""
+        repo = self.repos.pop(project, None)
+        shutil.rmtree(repo.path if repo else self.root / project, ignore_errors=True)
 
 
 def refs_header(refs: dict[str, str]) -> str:

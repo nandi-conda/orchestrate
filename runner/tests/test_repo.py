@@ -8,7 +8,7 @@ from conftest import Scripted, Web, in_view, py, sh, started, types, until
 
 from runner import ThreadHost
 from runner.peers import OrchestratorPeers, PeerOutbox
-from runner.repo import GitError, Repo
+from runner.repo import GitError, Repo, Repos
 
 
 def git(cwd, *args):
@@ -26,15 +26,20 @@ def source(tmp_path):
     return src
 
 
+async def seeded_repos(tmp_path, name="threads", project="p"):
+    """A worker's repositories, with project `project`'s seeded from the source."""
+    repos = Repos(tmp_path / name / ".repos")
+    await repos.get(project).seed(str(tmp_path / "source"))
+    return repos
+
+
 async def seeded(tmp_path, name="threads"):
-    repo = Repo(tmp_path / name / ".repo")
-    await repo.seed(str(tmp_path / "source"))
-    return repo
+    return (await seeded_repos(tmp_path, name)).get("p")
 
 
 async def host(tmp_path, *scripts, name="threads", **kw):
     return ThreadHost(agent=Scripted(*scripts), web=Web(), workdir=str(tmp_path / name),
-                      repo=await seeded(tmp_path, name), **kw)
+                      repos=await seeded_repos(tmp_path, name), **kw)
 
 
 async def run(t, command):
@@ -85,7 +90,7 @@ async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
     b = await h.start(project="p", title="b", request="y")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
     threads = tmp_path / "threads"
-    r = (await run(a, f"ls -A {threads}; echo ---; ls -A {threads / '.repo'}; echo ---; "
+    r = (await run(a, f"ls -A {threads}; echo ---; ls -A {threads / '.repos' / 'p'}; echo ---; "
                "echo hi > mine.txt && git add mine.txt && git commit -qm mine && git log --format=%s -1"))
     listed, clone, log = r.stdout.split("---\n")
     assert b.id not in listed.split() and a.id in listed.split()
@@ -103,7 +108,7 @@ async def test_turn_end_commits_leftovers_snapshots_the_worktree_and_lands(tmp_p
     await h.stop(t.id)
     assert "landed" in types(t) and "saved" not in types(t) and "error" not in types(t), t.events
     assert sorted(t.files) == [".gitignore", "new.txt"]
-    repo = h.repo.path
+    repo = h.repos.get('p').path
     assert git(repo, "show", f"{t.branch}:new.txt") == "draft"
     assert "build" not in git(repo, "ls-tree", "--name-only", t.branch).split()
     snap = f"refs/snapshots/{t.id}"
@@ -126,8 +131,8 @@ async def test_a_turn_a_model_call_failed_in_is_saved_not_landed(tmp_path):
     await h.wait_idle(t.id)
     await h.stop(t.id)
     assert "saved" in types(t) and "landed" not in types(t), t.events
-    assert git(h.repo.path, "show", f"{t.branch}:half.txt") == "half"
-    assert "half.txt" not in git(h.repo.path, "ls-tree", "--name-only", "origin/main")
+    assert git(h.repos.get('p').path, "show", f"{t.branch}:half.txt") == "half"
+    assert "half.txt" not in git(h.repos.get('p').path, "ls-tree", "--name-only", "origin/main")
 
 
 async def test_every_turn_lands_concurrent_threads_linearly(tmp_path):
@@ -141,7 +146,7 @@ async def test_every_turn_lands_concurrent_threads_linearly(tmp_path):
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
     await stop_all(h)
     assert "landed" in types(a) and "landed" in types(b)
-    repo = h.repo.path
+    repo = h.repos.get('p').path
     assert set(git(repo, "ls-tree", "--name-only", "origin/main").split()) == {"notes.txt", "pixi.toml", "a.txt", "b.txt"}
     assert git(repo, "rev-list", "--merges", "--count", "origin/main") == "0"
     assert "add b" in git(repo, "log", "--format=%s", "origin/main")
@@ -167,7 +172,7 @@ async def test_conflict_goes_back_to_the_thread(tmp_path):
     assert conflict["files"] == ["notes.txt"] and conflict["base"] == "main"
     assert any(e["type"] == "message_in" and e["data"]["from"] == "runner" for e in b.events)
     assert "landed" in types(b)
-    repo = h.repo.path
+    repo = h.repos.get('p').path
     assert git(repo, "show", "origin/main:notes.txt").splitlines()[1] == "TWO-b"
     assert git(repo, "rev-list", "--merges", "--count", "origin/main") == "0"
 
@@ -180,10 +185,11 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     hub = tmp_path / "hub.git"
     git(tmp_path, "clone", "-q", "--bare", str(src), str(hub))
     outbox = PeerOutbox()
-    repo = Repo(tmp_path / "threads" / ".repo")
+    repos = Repos(tmp_path / "threads" / ".repos")
+    repo = repos.get("p")
     h = ThreadHost(agent=Scripted([sh("echo x > x.txt; printf 'out/\\n' > .gitignore; mkdir out; echo o > out/o"),
                                    py("await team.set_summary('added x')"), "done"]),
-                   web=Web(), peers=OrchestratorPeers(outbox), workdir=str(tmp_path / "threads"), repo=repo)
+                   web=Web(), peers=OrchestratorPeers(outbox), workdir=str(tmp_path / "threads"), repos=repos)
 
     async def ship():
         tip = git(hub, "rev-parse", "main")
@@ -250,7 +256,7 @@ async def test_resumed_thread_continues_on_a_new_worker_with_its_files_and_sessi
     await first.stop(t.id)
     # The first worker is gone; another one picks the thread up from what the hub has.
     second = await host(tmp_path, ["still here"], name="w2")
-    await move(first.repo, second.repo, "t_resume")
+    await move(first.repos.get("p"), second.repos.get("p"), "t_resume")
     r = await second.start(project="p", title="t", id="t_resume")
     assert r.state == "idle" and (await run(r, "cat draft.txt")).stdout == "v1\n"
     assert (await run(r, "cat build/app")).stdout == "bin\n"  # ignored, from the snapshot
@@ -395,3 +401,43 @@ async def test_the_orchestrator_may_set_remote_tracking_refs_only(tmp_path):
         await repo.receive(b"", "main", {"refs/heads/main": tip})
     await repo.receive(b"", "main", {"refs/remotes/origin/thread/x": tip})
     assert git(repo.path, "rev-parse", "origin/thread/x") == tip
+
+
+async def test_threads_of_two_projects_share_a_worker_but_not_a_repository(tmp_path):
+    """A worker is shared by every project: each project has its own repository
+    there, and a thread sees only its own project's."""
+    source(tmp_path)
+    repos = await seeded_repos(tmp_path)
+    await repos.get("q").seed(str(tmp_path / "source"))
+    h = ThreadHost(agent=Scripted(["ok"], ["ok"]), web=Web(), workdir=str(tmp_path / "threads"), repos=repos)
+    a = await h.start(project="p", title="a", request="x")
+    b = await h.start(project="q", title="b", request="y")
+    await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
+    assert git(repos.get("p").path, "for-each-ref", "--format=%(refname:short)", "refs/heads/thread").split() == [f"thread/{a.id}"]
+    assert git(repos.get("q").path, "for-each-ref", "--format=%(refname:short)", "refs/heads/thread").split() == [f"thread/{b.id}"]
+    r = await run(a, f"ls -A {tmp_path / 'threads' / '.repos'}")
+    assert r.stdout.split() == ["p"], r.stderr  # q's repository is not in p's thread's view
+    await stop_all(h)
+
+
+async def test_pruning_takes_other_projects_off_the_worker(tmp_path):
+    """The orchestrator sends the projects it still has; every other one's
+    threads stop, and its repository and their workspaces are deleted."""
+    source(tmp_path)
+    repos = await seeded_repos(tmp_path)
+    await repos.get("q").seed(str(tmp_path / "source"))
+    h = ThreadHost(agent=Scripted(["ok"], [sh("sleep 30")]), web=Web(), workdir=str(tmp_path / "threads"),
+                   repos=repos)
+    a = await h.start(project="p", title="a", request="x")
+    b = await h.start(project="q", title="b", request="y")
+    await h.wait_idle(a.id)
+    await started(b)
+    threads = tmp_path / "threads"
+    assert (threads / b.id).exists() and (threads / ".home" / b.id).exists()
+    assert await h.prune({"p"}) == ["q"]
+    assert b.id not in h.threads and b.task.done()
+    assert not (threads / b.id).exists() and not (threads / ".home" / b.id).exists()
+    assert not (threads / ".repos" / "q").exists() and repos.projects() == ["p"]
+    assert (threads / a.id).exists() and a.id in h.threads
+    assert await h.prune({"p"}) == []
+    await stop_all(h)

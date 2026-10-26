@@ -9,14 +9,17 @@ connects out to the control plane.
 ## Workers on Fly Sprites
 
 With `SPRITES_TOKEN` stored, each worker is a [Fly Sprite](https://sprites.dev)
-named `orch-<project>-w<n>`. Workers are not per thread: a project gets one,
-and another only when every worker it has is at capacity. New threads go to
-the least loaded worker.
+named for its slot in the pool, `orch-w1` to `orch-w3`, and labeled
+`orchestrator`. Workers are not per thread or per project: the pool of 3 is
+shared by every project, each worker holding one repository per project. New
+threads go to the least loaded worker, and wait when all are full. See
+[The worker pool](../worker-lifecycle.md#the-worker-pool).
 
 Making a worker (`SpritesProvider.create`):
 
-1. `POST /v1/sprites` creates the sprite (URL auth `public` at the proxy; the
-   runner itself requires its `RUNNER_TOKEN`).
+1. `POST /v1/sprites` creates the sprite with the label `orchestrator` (URL
+   auth `public` at the proxy; the runner itself requires its `RUNNER_TOKEN`).
+   A slot's sprite that is already there is given the label (`PUT`).
 2. The commit to run is resolved with `git ls-remote` on this checkout's
    `origin` at its current branch.
 3. A bootstrap script, run through exec, checks that commit out at
@@ -138,7 +141,7 @@ The exact paths are in the [runner API reference](../reference/runner-api.md#san
 ## Logs
 
 Every worker's runner log streams to the control plane's stdout, each line
-prefixed with its worker (`orch-p_ab12-w0 | INFO: runner.harness: ...`);
+prefixed with its worker (`orch-w1 | INFO: runner.harness: ...`);
 attaching a worker prints its last 50 lines first. For a sprite the control
 plane follows `GET /v1/sprites/<name>/services/runner/logs` (NDJSON); for a
 local worker, its `runner.log`. Tracebacks, prime-agent's stderr, failed model
@@ -151,5 +154,5 @@ To read a live sprite's log without the UI:
 
 ```sh
 curl -sS -H "Authorization: Bearer $SPRITES_TOKEN" \
-  "https://api.sprites.dev/v1/sprites/orch-<project>-w<n>/fs/read?path=/.sprite/logs/services/runner.log&workingDir=/" | tail -n 300
+  "https://api.sprites.dev/v1/sprites/orch-w<n>/fs/read?path=/.sprite/logs/services/runner.log&workingDir=/" | tail -n 300
 ```

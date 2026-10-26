@@ -115,9 +115,13 @@ class Store(Protocol):
         then (the worker, and its log with it, is gone afterwards)."""
     async def set_worker_state(self, worker_id: str, state: str, reason: str) -> None:
         """A worker's state (states.WORKER) and why it is in it."""
-    async def list_workers(self, project_id: str) -> list[dict]:
-        """Every worker made for the project; `idx` is the number its worker
-        spec was made with, `lost_at` is set once it was lost."""
+    async def projects_on_worker(self, worker_id: str) -> list[str]:
+        """The projects with a thread on the worker, or last on it (threads.worker_id)."""
+    async def list_workers(self) -> list[dict]:
+        """Every worker ever made; `idx` is the pool slot it was made for,
+        `lost_at` is set once it was lost. `project_id` is "" for the pool's
+        workers, and names the project of a worker from before workers were
+        a pool shared by every project (each project had its own)."""
 
 
 class Notifier:
@@ -412,7 +416,7 @@ class _SqlStore:
 
     # workers
     async def upsert_worker(self, worker: dict) -> None:
-        w = {"id": worker["id"], "project_id": worker["project_id"], "provider": worker["provider"],
+        w = {"id": worker["id"], "project_id": "", "provider": worker["provider"],
              "handle": worker["handle"], "url": worker["url"], "token": worker.get("token", ""),
              "capacity": worker.get("capacity", 16), "idx": worker.get("index", 0),
              "created_at": worker.get("created_at", now())}
@@ -431,9 +435,13 @@ class _SqlStore:
         await self._exec(self._q("UPDATE workers SET state = ?, state_reason = ? WHERE id = ?"),
                          state, reason, worker_id)
 
-    async def list_workers(self, project_id: str) -> list[dict]:
-        return await self._fetch(self._q("SELECT * FROM workers WHERE project_id = ? ORDER BY created_at"),
-                                 project_id)
+    async def list_workers(self) -> list[dict]:
+        return await self._fetch(self._q("SELECT * FROM workers ORDER BY created_at"))
+
+    async def projects_on_worker(self, worker_id: str) -> list[str]:
+        rows = await self._fetch(self._q("SELECT DISTINCT project_id FROM threads WHERE worker_id = ? "
+                                         "ORDER BY project_id"), worker_id)
+        return [r["project_id"] for r in rows]
 
 
 class SqliteStore(_SqlStore):

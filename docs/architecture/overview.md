@@ -52,8 +52,10 @@ Sprite per worker), `LocalProvider` (a subprocess on this machine) and
 `AutoProvider`, which picks Sprites whenever `SPRITES_TOKEN` is stored.
 
 **Workers** run the runner (`runner/`), one process hosting many threads
-(capacity 16 by default). A project gets workers as it needs them: not one
-per thread, since threads are cheap. Each thread is a prime-agent process
+(capacity 16 by default), of any project. They are a fixed pool of 3 shared
+by every project, not one per thread or per project: threads are cheap, and
+a thread that finds the pool full waits for room. See
+[The worker pool](../worker-lifecycle.md#the-worker-pool). Each thread is a prime-agent process
 whose Python kernel runs sandboxed in its own git worktree. See
 [The runner and prime-agent](runner.md).
 

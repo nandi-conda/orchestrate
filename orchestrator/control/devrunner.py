@@ -8,8 +8,10 @@ It has no model. Each turn it says what it got, and:
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
-Its git flow is the real runner's (runner/API.md, "Repository"): a worktree
-per thread in a repository the control plane fills (`POST /repo`), and at the
+Like the real runner it hosts threads of any number of projects. Its git flow
+is the real runner's (runner/API.md, "Repository"): a worktree per thread in
+its project's repository, which the control plane fills
+(`POST /projects/{project}/repo`), and at the
 end of every turn a commit, a snapshot and a session that the control plane
 takes, landing the branch (peer call `save`). Its session is the messages a thread received, one
 per line, so a thread brought back on another worker says how many it had.
@@ -30,6 +32,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import tempfile
 import threading
@@ -78,9 +81,9 @@ class Host:
         self.capacity = capacity
         self.delay = delay
         self.workdir = Path(workdir).resolve()
-        self.repo = Checkout(self.workdir / ".repo")
-        self.opened = False
-        self.opening = asyncio.Lock()  # requests come in at once; one makes the repository
+        self.repos: dict[str, Checkout] = {}  # one per project
+        self.opened: set[str] = set()
+        self.opening = asyncio.Lock()  # requests come in at once; one makes a repository
         self.threads: dict[str, dict] = {}
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
@@ -88,23 +91,45 @@ class Host:
         self.waiting: dict[str, asyncio.Future] = {}
         self.calls_cond = asyncio.Condition()
 
-    async def open(self) -> None:
+    async def repo(self, project: str) -> Checkout:
+        """The project's repository on this worker, made on first use."""
+        if not THREAD_ID.match(project or ""):
+            raise GitError(f"bad project id {project!r}")
         async with self.opening:
-            if not self.opened:
-                await self.repo.open()
-                self.opened = True
+            if project not in self.repos:
+                self.repos[project] = Checkout(self.workdir / ".repos" / project)
+            if project not in self.opened:
+                await self.repos[project].open()
+                self.opened.add(project)
+        return self.repos[project]
 
-    async def peer_call(self, op: str, **args) -> str:
-        """A peer call whose answer is a tool result."""
-        reply = await self.peer(op, **args)
+    async def prune(self, keep: set[str]) -> list[str]:
+        """Take every project not in `keep` off this worker (runner/API.md)."""
+        root = self.workdir / ".repos"
+        on_disk = {d.name for d in root.iterdir()} if root.exists() else set()
+        gone = sorted(p for p in on_disk | set(self.repos) if p not in keep)
+        for project in gone:
+            for tid in [tid for tid, t in self.threads.items() if t["project"] == project]:
+                t = self.threads.pop(tid)
+                t["state"] = "stopped"
+                for path in (self.workdir / tid, self.session_dir(t)):
+                    shutil.rmtree(path, ignore_errors=True)
+            self.repos.pop(project, None)
+            self.opened.discard(project)
+            shutil.rmtree(root / project, ignore_errors=True)
+        return gone
+
+    async def peer_call(self, op: str, thread: str, **args) -> str:
+        """Thread `thread`'s peer call, whose answer is a tool result."""
+        reply = await self.peer(op, thread, **args)
         return json.dumps(reply.get("result") if reply.get("ok") else {"error": reply.get("error")})
 
-    async def peer(self, op: str, **args) -> dict:
+    async def peer(self, op: str, thread: str, **args) -> dict:
         cid = f"pc_{secrets.token_hex(5)}"
         fut = asyncio.get_running_loop().create_future()
         self.waiting[cid] = fut
         async with self.calls_cond:
-            self.calls[cid] = {"id": cid, "op": op, "args": args}
+            self.calls[cid] = {"id": cid, "thread": thread, "op": op, "args": args}
             self.calls_cond.notify_all()
         try:
             return await asyncio.wait_for(fut, 60)
@@ -152,7 +177,7 @@ class Host:
         for task in SPAWN.findall(text):
             await self.emit(t["id"], "tool_call", {"id": "c1", "name": "spawn_thread",
                                                    "arguments": {"request": task}})
-            r = await self.peer_call("spawn_thread", parent=t["id"], project=t["project"], title=task[:40],
+            r = await self.peer_call("spawn_thread", t["id"], parent=t["id"], project=t["project"], title=task[:40],
                                      request=task)
             await self.emit(t["id"], "tool_result", {"id": "c1", "name": "spawn_thread", "result": r})
         for path, body in WRITE.findall(text):
@@ -160,20 +185,21 @@ class Host:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(body + "\n")
         for to, body in TELL.findall(text):
-            await self.peer_call("send_message", sender=t["id"], to=to, body=body)
+            await self.peer_call("send_message", t["id"], sender=t["id"], to=to, body=body)
         for query in LIST.findall(text):
-            r = await self.peer_call("list_threads", project=t["project"], query=query.strip() or None)
+            r = await self.peer_call("list_threads", t["id"], project=t["project"], query=query.strip() or None)
             await self.emit(t["id"], "tool_result", {"id": "c2", "name": "list_threads", "result": r})
         for tid in READ.findall(text):
-            r = await self.peer_call("read_thread", thread_id=tid, last_n=5)
+            r = await self.peer_call("read_thread", t["id"], thread_id=tid, last_n=5)
             await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
         summary = f"echoed {len(text)} chars"
         t["summary"] = summary
         await self.save(t)
         await self.emit(t["id"], "turn_done", {"summary": summary, "final": f"Echo: {text}"})
-        await self.peer_call("set_summary", thread_id=t["id"], summary=summary, files=[])
+        await self.peer_call("set_summary", t["id"], thread_id=t["id"], summary=summary, files=[])
         if t.get("parent") and not text.startswith("Finished:"):
-            await self.peer_call("send_message", sender=t["id"], to=t["parent"], body=f"Finished: {summary}")
+            await self.peer_call("send_message", t["id"], sender=t["id"], to=t["parent"],
+                                 body=f"Finished: {summary}")
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
 
@@ -182,14 +208,15 @@ class Host:
         lands the branch."""
         tid, branch = t["id"], f"thread/{t['id']}"
         try:
-            commit = await self.repo.save(self.workdir / tid, tid, f"{t['title']}\n\nThread: {tid}")
-            await self.repo.save_session(tid, self.session_dir(t))
-            reply = await self.peer("save", thread_id=tid, land=True)
+            repo = await self.repo(t["project"])
+            commit = await repo.save(self.workdir / tid, tid, f"{t['title']}\n\nThread: {tid}")
+            await repo.save_session(tid, self.session_dir(t))
+            reply = await self.peer("save", tid, thread_id=tid, land=True)
             if not reply.get("ok"):
                 raise GitError(reply.get("error") or "save failed")
             result = reply["result"]
             if result.get("landed"):
-                await self.repo.follow(self.workdir / tid, tid)
+                await repo.follow(self.workdir / tid, tid)
         except (GitError, asyncio.TimeoutError) as e:
             await self.emit(tid, "error", {"error": f"saving the work failed: {e or type(e).__name__}"})
             return
@@ -243,18 +270,20 @@ def create_app(host: Host, token: str) -> Starlette:
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
         b = await req.json()
+        if not isinstance(b.get("project"), str) or not b["project"]:
+            return JSONResponse({"error": "project is required"}, 400)
         if not b.get("request") and not b.get("id") and not b.get("images"):
             return JSONResponse({"error": "request, or the id of a thread to bring back, is required"}, 400)
         tid = b.get("id") or f"t_{secrets.token_hex(5)}"
         if tid in host.threads and host.threads[tid]["state"] not in ("stopped", "failed"):
             return JSONResponse({"error": "exists"}, 409)
-        t = {"id": tid, "project": b.get("project", ""), "title": b.get("title") or (b.get("request") or tid)[:40],
+        t = {"id": tid, "project": b["project"], "title": b.get("title") or (b.get("request") or tid)[:40],
              "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
              "resumed": not (b.get("request") or b.get("images"))}
         try:
-            await host.open()
-            await host.repo.worktree(host.workdir / tid, tid)
-            await host.repo.session(tid, host.session_dir(t))
+            repo = await host.repo(t["project"])
+            await repo.worktree(host.workdir / tid, tid)
+            await repo.session(tid, host.session_dir(t))
             host.session_dir(t).mkdir(parents=True, exist_ok=True)
         except GitError as e:
             return JSONResponse({"error": str(e)}, 500)
@@ -358,19 +387,22 @@ def create_app(host: Host, token: str) -> Starlette:
     async def get_repo(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
-        await host.open()
-        return JSONResponse({"base": host.repo.base, "refs": await host.repo.refs()})
+        try:
+            repo = await host.repo(req.path_params["project"])
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return JSONResponse({"base": repo.base, "refs": await repo.refs()})
 
     async def post_repo(req: Request):
         if not authed(req):
             return JSONResponse({"error": "unauthorized"}, 401)
-        await host.open()
         try:
+            repo = await host.repo(req.path_params["project"])
             refs = json.loads(req.headers.get("x-git-refs") or "{}")
             base = req.headers.get("x-git-base") or ""
             if not base or not isinstance(refs, dict):
                 raise ValueError("x-git-base and x-git-refs (a JSON object) are required")
-            await host.repo.receive(await req.body(), base, refs)
+            await repo.receive(await req.body(), base, refs)
         except (ValueError, GitError) as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse({"ok": True})
@@ -381,12 +413,23 @@ def create_app(host: Host, token: str) -> Starlette:
         tid = req.path_params["tid"]
         if not THREAD_ID.match(tid):
             return JSONResponse({"error": "bad thread id"}, 400)
-        await host.open()
         try:
-            data, refs = await host.repo.send(tid, [h for h in req.query_params.get("have", "").split(",") if h])
+            repo = await host.repo(req.path_params["project"])
+        except GitError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        try:
+            data, refs = await repo.send(tid, [h for h in req.query_params.get("have", "").split(",") if h])
         except GitError as e:
             return JSONResponse({"error": str(e)}, 404)
         return Response(data, media_type="application/octet-stream", headers={"x-git-refs": refs_header(refs)})
+
+    async def prune(req: Request):
+        if not authed(req):
+            return JSONResponse({"error": "unauthorized"}, 401)
+        keep = (await req.json()).get("keep")
+        if not isinstance(keep, list):
+            return JSONResponse({"error": "keep (a list of project ids) is required"}, 400)
+        return JSONResponse({"removed": await host.prune(set(keep))})
 
     async def peer_calls(req: Request):
         if not authed(req):
@@ -415,9 +458,10 @@ def create_app(host: Host, token: str) -> Starlette:
         Route("/threads/{tid}/events", thread_events),
         Route("/threads/{tid}/files", list_files),
         Route("/threads/{tid}/files/raw", raw_file),
-        Route("/threads/{tid}/repo", thread_repo),
-        Route("/repo", get_repo, methods=["GET"]),
-        Route("/repo", post_repo, methods=["POST"]),
+        Route("/projects/prune", prune, methods=["POST"]),
+        Route("/projects/{project}/threads/{tid}/repo", thread_repo),
+        Route("/projects/{project}/repo", get_repo, methods=["GET"]),
+        Route("/projects/{project}/repo", post_repo, methods=["POST"]),
         Route("/events", all_events),
     ])
 

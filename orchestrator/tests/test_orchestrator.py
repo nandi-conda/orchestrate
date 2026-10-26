@@ -230,7 +230,7 @@ async def test_ingest_tracks_what_a_thread_is_doing(tmp_path):
     orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
 
     async def doing(typ, data):
-        await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
+        await orch._ingest({"thread": t["id"], "type": typ, "data": data})
         return (await s.get_thread(t["id"]))["activity"]
 
     assert await doing("state", {"state": "working"}) == "thinking"
@@ -250,7 +250,7 @@ async def test_streamed_reply_shows_live_then_folds_into_its_events(tmp_path):
     orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True), HeuristicRouter(), tmp_path / "repos")
 
     async def ingest(typ, data):
-        await orch._ingest(p["id"], {"thread": t["id"], "type": typ, "data": data})
+        await orch._ingest({"thread": t["id"], "type": typ, "data": data})
 
     async def shown():
         return app_mod.fold(await s.list_events(p["id"], t["id"], 0, limit=2000))
@@ -676,9 +676,10 @@ async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
             provider.gate.set()
 
 
-async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tmp_path, monkeypatch):
-    """An archived project leaves the list, holds no workers and takes no work;
-    unarchived, its threads come back on a new worker with their next message."""
+async def test_archiving_a_project_stops_its_threads_and_takes_it_off_the_workers(tmp_path, monkeypatch):
+    """An archived project leaves the list, takes no work and has nothing left
+    on the pool's workers, which stay for the other projects; unarchived, its
+    threads come back on the pool with their next message."""
     monkeypatch.setenv("DEVRUNNER_DELAY", "1.5")  # a turn is long enough to archive during it
     provider = LocalProvider(workdir=str(tmp_path / "workers"), use_devrunner=True)
     destroyed = []
@@ -697,9 +698,11 @@ async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tm
             other = (await c.post("/api/projects", json={"name": "other"})).json()["id"]
             done = (await c.post(f"/api/projects/{pid}/requests",
                                  json={"text": "build hello", "mode": "new"})).json()["spawned"][0]["id"]
+            theirs = (await c.post(f"/api/projects/{other}/requests",
+                                   json={"text": "build theirs", "mode": "new"})).json()["spawned"][0]["id"]
 
             async def idle():
-                return (await c.get(f"/api/threads/{done}")).json()["state"] == "idle"
+                return {(await c.get(f"/api/threads/{t}")).json()["state"] for t in (done, theirs)} == {"idle"}
             await wait_for(idle)
             busy = (await c.post(f"/api/projects/{pid}/requests",
                                  json={"text": "sleep 30", "mode": "new"})).json()["spawned"][0]["id"]
@@ -707,17 +710,18 @@ async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tm
             async def working():
                 return (await c.get(f"/api/threads/{busy}")).json()["state"] == "working"
             await wait_for(working)
-            workers = [w["id"] for w in await app.state.orch.store.list_workers(pid)]
-            assert workers
+            w1 = tmp_path / "workers" / "w1"
+            assert (w1 / ".repos" / pid).exists() and (w1 / done).exists() and (w1 / theirs).exists()
 
             r = await c.post(f"/api/projects/{pid}/archive")
             assert r.status_code == 200 and r.json()["archived_at"] is not None
             assert [p["id"] for p in (await c.get("/api/projects")).json()] == [other]
             assert [p["id"] for p in (await c.get("/api/projects?archived=1")).json()] == [pid]
             assert {(await c.get(f"/api/threads/{t}")).json()["state"] for t in (done, busy)} == {"stopped"}
-            assert sorted(destroyed) == sorted(workers)
-            assert all(w["lost_at"] is not None for w in await app.state.orch.store.list_workers(pid))
-            assert app.state.orch.workers.get(pid) is None
+            # The worker stays, shared; only the project is gone from it.
+            assert destroyed == [] and [lw.worker.id for lw in app.state.orch.workers] == ["w1"]
+            assert not (w1 / ".repos" / pid).exists() and not (w1 / done).exists() and not (w1 / busy).exists()
+            assert (w1 / ".repos" / other).exists() and (w1 / theirs).exists()
             log = (await c.get(f"/api/projects/{pid}/log")).json()
             assert [e["type"] for e in log if e["type"].startswith("project_")] == ["project_archived"]
 
@@ -729,7 +733,6 @@ async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tm
                 assert r.status_code == 409 and "archived" in r.json()["error"]
             # Archiving it again changes nothing.
             assert (await c.post(f"/api/projects/{pid}/archive")).status_code == 200
-            assert len(destroyed) == len(workers)
             log = (await c.get(f"/api/projects/{pid}/log")).json()
             assert [e["type"] for e in log if e["type"].startswith("project_")] == ["project_archived"]
 
@@ -741,8 +744,13 @@ async def test_archiving_a_project_stops_its_threads_and_destroys_its_workers(tm
             async def revived():
                 return (await binds(app.state.orch.store, pid, done))[1:] or None
             back = (await wait_for(revived))[0]
-            assert back["worker"] not in workers  # a new worker: the old ones are gone
+            assert back["worker"] == "w1"  # back on the pool, from the hub
             assert (await unbinds(app.state.orch.store, pid, done))[0] == "its project was archived"
+
+            async def answered():
+                return (await c.get(f"/api/threads/{done}")).json()["state"] == "idle" or None
+            await wait_for(answered)
+            assert (w1 / done).exists()  # its worktree, made again from the hub
             assert (await c.post("/api/projects/p_nope/archive")).status_code == 404
             assert (await c.post("/api/projects/p_nope/unarchive")).status_code == 404
 
@@ -1022,7 +1030,7 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     await wait_for(lost)
     assert (await s.get_thread(busy["id"]))["state"] == "failed"
     assert (await s.get_thread(idle_one["id"]))["state"] == "idle"
-    assert orch.workers[p["id"]] == [] and busy["id"] not in orch.by_thread
+    assert orch.workers == [] and busy["id"] not in orch.by_thread
 
     for t in (idle_one, busy):
         await orch.send(t["id"], f"still there, {t['title']}?")
@@ -1033,7 +1041,8 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     for t in (idle_one, busy):
         await wait_for(lambda: answered(t))
     new = orch.by_thread[busy["id"]]
-    assert new is orch.by_thread[idle_one["id"]] and new.worker.id != old.worker.id
+    # A new worker, in the lost one's slot: the pool never grows.
+    assert new is orch.by_thread[idle_one["id"]] and new is not old and new.worker.id == old.worker.id
     await orch.close()
     await provider.close()
     await s.close()
@@ -1103,7 +1112,7 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     states = [(e["payload"]["from"], e["payload"]["to"]) for e in await s.list_events(p["id"])
               if e["type"] == "worker_state"]
     assert ("ready", "unreachable") in states and states[-1] == ("unreachable", "ready")
-    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     await orch.close()
     await provider.close()
     await s.close()
@@ -1155,7 +1164,7 @@ async def test_a_restarted_runner_lets_its_threads_go_and_they_come_back_on_it(t
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [w.id, w.id]
-    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     listing = await orch.list_files(t["id"], "")
     assert "notes.txt" in [e["name"] for e in listing["entries"]]
     await orch.close()
@@ -1200,7 +1209,7 @@ async def test_a_worker_unreachable_for_too_long_is_reattached_and_its_thread_co
         return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
                    for e in await s.list_events(p["id"], t["id"])) or None
     await wait_for(answered)
-    assert orch.by_thread[t["id"]] is lw and orch.workers[p["id"]] == [lw]
+    assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [lw.worker.id] * 2
     assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
     await orch.close()
@@ -1482,23 +1491,32 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     await s.close()
 
 
-async def test_threads_on_a_worker_stored_without_its_index_share_one_new_worker(tmp_path, monkeypatch):
+async def test_threads_on_a_projects_own_worker_from_before_the_pool_come_back_on_the_pool(tmp_path, monkeypatch):
+    """Each project had its own workers before they were a pool: starting
+    destroys what the provider still has of them, the store says they are
+    lost, and their threads come back on the pool's first worker."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    # A row from before workers kept their index (idx 0), and two threads on it.
-    await s.upsert_worker({"id": f"{p['id']}-w1", "project_id": p["id"], "provider": "local",
-                           "handle": "1", "url": "http://127.0.0.1:1", "token": "x"})
+    old = f"{p['id']}-w1"
+    await s.upsert_worker({"id": old, "provider": "local", "handle": "1", "url": "http://127.0.0.1:1",
+                           "token": "x", "index": 1})
+    await s._exec(s._q("UPDATE workers SET project_id = ? WHERE id = ?"), p["id"], old)
+    (tmp_path / "w" / old).mkdir(parents=True)  # its disk
     ts = [await s.create_thread(p["id"], title, "") for title in ("A", "B")]
     for t in ts:
-        await s.update_thread(t["id"], worker_id=f"{p['id']}-w1", state="idle")
+        await s.update_thread(t["id"], worker_id=old, state="idle")
     provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
     orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    await orch.start()
+    assert not (tmp_path / "w" / old).exists()
+    row = {w["id"]: w for w in await s.list_workers()}[old]
+    assert row["lost_at"] is not None and "pool of 3" in row["lost_reason"]
     lws = [await orch.live_worker(t["id"]) for t in ts]
-    assert lws[0] is lws[1] and len(orch.workers[p["id"]]) == 1 and lws[0].worker.index == 1
+    assert lws[0] is lws[1] and orch.workers == [lws[0]] and lws[0].worker.id == "w1"
     await orch.close()
     await provider.close()
     await s.close()
@@ -1936,4 +1954,78 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
     await wait_for(idle, timeout=30)
     await orch.close()
     await orch.provider.close()
+    await s.close()
+
+
+async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp_path, monkeypatch):
+    """The pool never holds more than its slots: with every worker full, a new
+    thread waits, says so, and starts once a turn ends and makes room."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "1.0")
+    monkeypatch.setattr(service, "CAPACITY", 1)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    made = []
+    create = provider.create
+
+    async def recording_create(spec):
+        made.append(spec.index)
+        return await create(spec)
+    provider.create = recording_create
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos", pool=1)
+    first = await orch.spawn(p["id"], "First", "one")
+
+    async def working():
+        return (await s.get_thread(first["id"]))["state"] == "working" or None
+    await wait_for(working)
+    second = await orch.spawn(p["id"], "Second", "two")
+
+    async def waiting():
+        t = await s.get_thread(second["id"])
+        return t["binding"] == "binding" and t["activity"].startswith("waiting for room") or None
+    await wait_for(waiting)
+    await wait_for(lambda: idle_of(s, second["id"]))
+    assert made == [1] and [lw.worker.id for lw in orch.workers] == ["w1"]
+    assert (await s.get_thread(second["id"]))["worker_id"] == "w1"
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_projects_share_a_worker_and_see_only_their_own_threads(tmp_path, monkeypatch):
+    """Two projects' threads on one worker: each thread's peer calls are
+    answered within its own project, and a call made as another thread is refused."""
+    from control.service import Orchestrator, PeerCallError
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    a, b = await s.create_project("a"), await s.create_project("b")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), use_devrunner=True)
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    ta = await orch.spawn(a["id"], "Mine", "first")
+    tb = await orch.spawn(b["id"], "Theirs", "second")
+    await wait_for(lambda: idle_of(s, ta["id"]))
+    await wait_for(lambda: idle_of(s, tb["id"]))
+    assert orch.by_thread[ta["id"]] is orch.by_thread[tb["id"]] and len(orch.workers) == 1
+    await orch.send(ta["id"], f"list: \nread {tb['id']}")
+
+    async def results():
+        got = {e["payload"]["name"]: e["payload"]["result"] for e in await s.list_events(a["id"], ta["id"])
+               if e["type"] == "tool_result"}
+        return got if {"list_threads", "read_thread"} <= set(got) else None
+    got = await wait_for(results)
+    assert [t["id"] for t in json.loads(got["list_threads"])] == [ta["id"]]  # its own project's only
+    assert json.loads(got["read_thread"]) == {"error": f"no thread {tb['id']}"}
+    lw = orch.by_thread[ta["id"]]
+    caller = await orch._caller(lw, ta["id"])
+    with pytest.raises(PeerCallError, match="cannot act as"):
+        await orch.peer_set_summary(lw, caller, tb["id"], "not mine")
+    with pytest.raises(PeerCallError, match="is not on worker"):
+        await orch._caller(lw, "t_nope")
+    await orch.close()
+    await provider.close()
     await s.close()

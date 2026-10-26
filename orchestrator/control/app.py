@@ -269,6 +269,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         holder["orch"] = orch
         app.state.orch = orch
         try:
+            await orch.start()
             yield
         finally:
             await orch.close()
@@ -331,7 +332,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
         except Exception as e:
-            return JSONResponse({"error": f"could not destroy the project's workers: {describe(e)}"}, 502)
+            return JSONResponse({"error": f"could not take the project off the workers: {describe(e)}"}, 502)
         return JSONResponse(project_view(p))
 
     async def project_unarchive(req: Request):

@@ -4,11 +4,13 @@ No network and no keyring: `control.secrets.get_secret` is patched, so these
 run anywhere.
 """
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import httpx
@@ -89,11 +91,13 @@ class Recording:
 
     async def create(self, spec):
         self.created.append(spec)
-        return providers.Worker(id=f"{self.name}-w", project_id=spec.project_id, provider=self.name,
-                                handle="", url="http://example.invalid")
+        return providers.Worker(id=f"{self.name}-w", provider=self.name, handle="", url="http://example.invalid")
 
     async def destroy(self, worker) -> None:
         self.destroyed.append(worker)
+
+    async def sweep(self, slots):
+        return [f"{self.name}-swept-beyond-{slots}"]
 
     async def close(self) -> None:
         pass
@@ -103,14 +107,14 @@ async def test_a_token_means_sprites(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     local, sprites = Recording("local"), Recording("sprites")
     p = providers.AutoProvider(local=local, sprites=sprites)
-    worker = await p.create(worker_spec({"id": "p_1"}, 1))
+    worker = await p.create(worker_spec(1))
     assert worker.provider == "sprites" and sprites.created and not local.created
 
 
 async def test_no_token_means_local_workers(env, capsys):
     local = Recording("local")
     p = providers.AutoProvider(local=local)
-    await p.create(worker_spec({"id": "p_1"}, 1))
+    await p.create(worker_spec(1))
     assert local.created
     assert "SPRITES_TOKEN is not stored" in capsys.readouterr().err
 
@@ -118,7 +122,7 @@ async def test_no_token_means_local_workers(env, capsys):
 async def test_destroy_goes_to_the_provider_that_made_the_worker(env):
     local, sprites = Recording("local"), Recording("sprites")
     p = providers.AutoProvider(local=local, sprites=sprites)
-    worker = providers.Worker(id="x", project_id="p_1", provider="sprites", handle="x", url="u")
+    worker = providers.Worker(id="x", provider="sprites", handle="x", url="u")
     await p.destroy(worker)
     assert sprites.destroyed == [worker] and not local.destroyed
 
@@ -136,7 +140,7 @@ def test_passthrough_env_never_includes_the_sprites_token(env):
 
 
 def test_worker_spec_carries_no_control_plane_address():
-    spec = worker_spec({"id": "p_1", "repo_url": "https://example.com/r.git"}, 2)
+    spec = worker_spec(2)
     assert spec.index == 2 and not hasattr(spec, "repo_url")  # the hub syncs the worker
     assert not hasattr(spec, "orchestrator_url")
 
@@ -188,7 +192,7 @@ async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
     try:
         assert (p.source, p.ref) == ("https://example.com/fork.git", "dev")
-        assert p.sprite_name(providers.WorkerSpec(project_id="p_ab12cd34", index=1)) == "orch-p-ab12cd34-w1"
+        assert p.sprite_name(1) == "orch-w1"
     finally:
         await p.close()
 
@@ -198,7 +202,7 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
     try:
         with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
-            await p.create(providers.WorkerSpec(project_id="p_1", index=1))
+            await p.create(providers.WorkerSpec(index=1))
     finally:
         await p.close()
 
@@ -224,7 +228,10 @@ class FakeSprites:
                               request=httpx.Request("GET", url))
 
     async def put(self, url, **kw):
-        self.service = kw["json"]
+        if url.endswith("/services/runner"):
+            self.service = kw["json"]
+        else:
+            self.labels = kw["json"]["labels"]
         return httpx.Response(200, request=httpx.Request("PUT", url))
 
     def stream(self, method, url, **kw):
@@ -277,7 +284,7 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee"):
     env.setattr(providers, "wait_healthy", healthy)
     env.setattr(p, "accepts_token", accepts)
     try:
-        return await p.create(providers.WorkerSpec(project_id="p_1", index=1, token="stored")), fake
+        return await p.create(providers.WorkerSpec(index=1, token="stored")), fake
     finally:
         await fake.aclose()
 
@@ -286,6 +293,7 @@ async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started
     """`start` leaves a running runner as it was: its old code and its old
     model key. A service already defined is restarted from the new definition."""
     worker, fake = await _sprites_create(env, defined=True)
+    assert worker.id == "orch-w1" and fake.labels == ["orchestrator"]  # the slot's sprite, labeled
     assert fake.actions == ["restart"]
     assert worker.token == "stored" and fake.service["env"]["RUNNER_TOKEN"] == "stored"
     assert fake.service["env"]["DEEPSEEK_API_KEY"] == "key"
@@ -311,12 +319,12 @@ async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypat
     monkeypatch.setattr(p, "command", lambda: [sys.executable, "-c",
                                                "print('bubblewrap cannot make a sandbox here'); raise SystemExit(1)"])
     with pytest.raises(RuntimeError, match="exited with code 1.*\n.*bubblewrap cannot make a sandbox here"):
-        await p.create(providers.WorkerSpec(project_id="p_1", index=1))
+        await p.create(providers.WorkerSpec(index=1))
 
 
 async def test_local_follow_yields_the_backlog_then_each_new_line(tmp_path):
     p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
-    w = providers.Worker(id="p-w0", project_id="p", provider="local", handle="", url="")
+    w = providers.Worker(id="p-w0", provider="local", handle="", url="")
     (tmp_path / "p-w0").mkdir()
     path = p.log_path("p-w0")
     path.write_bytes(b"one\ntwo\nthree\npart")
@@ -351,7 +359,7 @@ async def test_sprites_follow_reopens_the_log_stream_without_repeating_lines(env
     p = providers.SpritesProvider(token="tok", source="https://example.com/r.git", ref="main")
     await p.http.aclose()
     p.http = httpx.AsyncClient(base_url=p.API, transport=httpx.MockTransport(handler))
-    w = providers.Worker(id="orch-p-w0", project_id="p", provider="sprites", handle="orch-p-w0", url="")
+    w = providers.Worker(id="orch-p-w0", provider="sprites", handle="orch-p-w0", url="")
     lines = p.follow(w, 50)
     got = [await lines.__anext__() for _ in range(5)]
     await lines.aclose()
@@ -381,7 +389,7 @@ async def test_a_sprite_exists_until_the_api_no_longer_has_it(env, status, there
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
     await p.http.aclose()
     p.http = SpriteLookup(status)
-    w = providers.Worker(id="orch-p-1-w1", project_id="p_1", provider="sprites", handle="orch-p-1-w1",
+    w = providers.Worker(id="orch-p-1-w1", provider="sprites", handle="orch-p-1-w1",
                          url="https://worker.invalid")
     assert await p.exists(w) is there
 
@@ -390,6 +398,62 @@ async def test_a_sprite_lookup_that_fails_is_not_an_answer(env):
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
     await p.http.aclose()
     p.http = SpriteLookup(503)
-    w = providers.Worker(id="w", project_id="p_1", provider="sprites", handle="w", url="https://worker.invalid")
+    w = providers.Worker(id="w", provider="sprites", handle="w", url="https://worker.invalid")
     with pytest.raises(httpx.HTTPStatusError):
         await p.exists(w)
+
+
+async def test_a_new_sprite_is_made_with_the_label(env):
+    env.setattr(secrets, "get_secret", lambda name: "key")
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    made = []
+
+    async def post(url, **kw):
+        made.append(kw["json"])
+        raise RuntimeError("stop after the create request")
+
+    p.http = types.SimpleNamespace(post=post, aclose=lambda: asyncio.sleep(0))
+    with pytest.raises(RuntimeError, match="stop after"):
+        await p.create(providers.WorkerSpec(index=2))
+    assert made == [{"name": "orch-w2", "url_settings": {"auth": "public"}, "labels": ["orchestrator"]}]
+
+
+async def test_sprites_sweep_destroys_ours_outside_the_slots_only(env):
+    """Labeled sprites beyond the pool, and each project's own workers from
+    before the pool, go; the slots and sprites that are not ours stay."""
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    pages = {None: {"sprites": [{"name": "orch-w1", "labels": ["orchestrator"]},
+                                {"name": "orch-w4", "labels": ["orchestrator"]},
+                                {"name": "orch-p-ab12cd34-w1", "labels": []}],
+                    "has_more": True, "next_continuation_token": "next"},
+             "next": {"sprites": [{"name": "orch-w3", "labels": ["orchestrator"]},
+                                  {"name": "orch-notes", "labels": []}],
+                      "has_more": False}}
+    asked, deleted = [], []
+
+    async def get(url, params=None, **kw):
+        asked.append(params)
+        return httpx.Response(200, json=pages[params.get("continuation_token")], request=httpx.Request("GET", url))
+
+    async def delete(url, **kw):
+        deleted.append(url)
+        return httpx.Response(204, request=httpx.Request("DELETE", url))
+
+    p.http = types.SimpleNamespace(get=get, delete=delete)
+    assert await p.sweep(3) == ["orch-p-ab12cd34-w1", "orch-w4"]
+    assert sorted(deleted) == ["/sprites/orch-p-ab12cd34-w1", "/sprites/orch-w4"]
+    assert all(a["prefix"] == "orch-" for a in asked) and len(asked) == 2
+
+
+async def test_local_sweep_deletes_worker_directories_outside_the_slots(tmp_path):
+    for d in ("w1", "w2", "w3", "p_1-w1"):
+        (tmp_path / d).mkdir()
+    p = providers.LocalProvider(workdir=str(tmp_path), use_devrunner=True)
+    assert await p.sweep(2) == ["p_1-w1", "w3"]
+    assert sorted(d.name for d in tmp_path.iterdir()) == ["w1", "w2"]
+
+
+async def test_auto_sweeps_the_provider_the_pool_is_on(env):
+    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
+    p = providers.AutoProvider(local=Recording("local"), sprites=Recording("sprites"))
+    assert await p.sweep(3) == ["sprites-swept-beyond-3"]

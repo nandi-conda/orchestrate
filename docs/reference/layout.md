@@ -33,7 +33,7 @@
 | `src/runner/sandbox.py` | `View` (what a thread's kernel sees), bubblewrap arguments, the kernel's environment |
 | `src/runner/team.py` | the runner's side of the team skill: each thread's socket for peer and web calls |
 | `src/runner/peers.py` | `OrchestratorPeers` (queued for the control plane to collect) and `LocalPeers` (same process, for the CLI) |
-| `src/runner/repo.py` | the worker repository, worktrees, snapshots, sessions, bundles |
+| `src/runner/repo.py` | the worker's repositories (one per project, `Repos`), worktrees, snapshots, sessions, bundles |
 | `src/runner/files.py` | the Files API, confined to the worktree |
 | `src/runner/web.py` | DeepSeek Search and Fetch |
 | `src/runner/cli.py` | a one-shot local run |

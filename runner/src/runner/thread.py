@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from typing import Any, Callable
 
 from .harness import HARNESS, KERNEL, SESSION, Harness, HarnessError, Place, PrimeAgent
 from .peers import LocalPeers, PeerError, Peers
-from .repo import GitError, Repo, Workspace
+from .repo import GitError, Repos, Workspace
 from .sandbox import SandboxError, View, pixi, worker_private
 from .team import TeamServer
 from .web import DeepSeekWeb
@@ -335,13 +336,14 @@ class ThreadHost:
     """Runs many AgentThreads in one process. One host per worker."""
 
     def __init__(self, *, agent: PrimeAgent, web: DeepSeekWeb, peers: Peers | None = None,
-                 repo: Repo | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
+                 repos: Repos | None = None, workdir: str = "/work/threads", limits: Limits | None = None,
                  capacity: int = 16):
         self.agent, self.web = agent, web
         self.peers = peers or LocalPeers()
         if isinstance(self.peers, LocalPeers):
             self.peers.host = self
-        self.repo = repo
+        # One repository per project: the worker is shared by every project.
+        self.repos = repos
         self.workdir = Path(workdir)
         self.limits = limits or Limits()
         self.capacity = capacity
@@ -370,9 +372,9 @@ class ThreadHost:
     def running(self) -> int:
         return sum(1 for t in self.threads.values() if t.state in ("queued", "working"))
 
-    def _place(self, tid: str) -> Place:
+    def _place(self, tid: str, project: str) -> Place:
         """Where the thread lives on this worker: its worktree, and the view
-        its kernel gets of the worker: that, the repository's git dir, the
+        its kernel gets of the worker: that, its project's repository's git dir, the
         thread's own home and /tmp under `.home/` and `.tmp/`, its team socket,
         the kernel's Python environment and prime-agent's skills read-only, and pixi."""
         work = self.workdir.resolve()
@@ -382,7 +384,8 @@ class ThreadHost:
                                f"address ({SOCKET_ADDRESS_MAX - 1} bytes): use a shorter workdir than "
                                f"{str(work)!r}")
         view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
-                    writable=((str(self.repo.path.resolve() / ".git"),) if self.repo else ()) + (socket,),
+                    writable=((str(self.repos.get(project).path.resolve() / ".git"),) if self.repos else ())
+                    + (socket,),
                     hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")),
                     tools=(pixi(),))
         return Place(view=view, socket=socket, kernel=str(work / ".team" / f"{tid}.kernel"))
@@ -398,12 +401,13 @@ class ThreadHost:
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
-        place = self._place(tid)
+        place = self._place(tid, project)
         workspace = None
-        if self.repo:
+        if self.repos:
+            repo = self.repos.get(project)
             Path(place.view.root).parent.mkdir(parents=True, exist_ok=True)
-            workspace = await self.repo.worktree(place.view.root, tid)
-            await self.repo.session(tid, place.agent_dir, SESSION)
+            workspace = await repo.worktree(place.view.root, tid)
+            await repo.session(tid, place.agent_dir, SESSION)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
                         peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=workspace,
                         emit=self._emit, summary=summary)
@@ -417,6 +421,27 @@ class ThreadHost:
             t.set_state("idle")
         t.task = asyncio.create_task(t.run(), name=tid)
         return t
+
+    async def prune(self, keep: set[str]) -> list[str]:
+        """Take every project not in `keep` off this worker: its threads here
+        are stopped and forgotten, and its repository and their worktrees,
+        homes, /tmp and team sockets deleted. The orchestrator keeps all of
+        it in its hub, so the project comes back from there if it is ever
+        used again. Returns the projects removed."""
+        gone = [p for p in self.repos.projects() if p not in keep] if self.repos else []
+        for project in gone:
+            for tid in [t.id for t in self.threads.values() if t.project == project]:
+                await self.stop(tid)
+                del self.threads[tid]
+            for tree in await self.repos.worktrees(project):
+                tid = tree.name
+                for path in (tree, self.workdir / ".home" / tid, self.workdir / ".tmp" / tid):
+                    shutil.rmtree(path, ignore_errors=True)
+                for leftover in (self.workdir / ".team").glob(f"{tid}.*"):
+                    leftover.unlink(missing_ok=True)
+            self.repos.remove(project)
+            log.info("project %s is no longer on this worker", project)
+        return gone
 
     def deliver(self, thread_id: str, body: str, sender: str = "user", hops: int = 0,
                 images: list[dict] | None = None):
