@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QFile, QIODevice, QObject, QStandardPaths, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage, QWebEnginePermission,
@@ -25,6 +25,8 @@ from .server import DOWN, UP, ControlPlane
 
 # The status page's Retry link; the page never loads it, the window acts on it.
 RETRY = QUrl("http://retry.orchestrate.invalid/")
+# The app icon, the same file the UI serves as its favicon.
+ICON = Path(__file__).resolve().parents[1] / "ui" / "icon.svg"
 
 
 def prepare_qt() -> None:
@@ -183,6 +185,7 @@ class MainWindow(QMainWindow):
         self.control = control
         self.download_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation))
         self.setWindowTitle("Orchestrator")
+        self.setWindowIcon(QIcon(str(ICON)))
         self.resize(1280, 820)
         self.view = QWebEngineView(self)
         self.view.setPage(Page(self.view, control))

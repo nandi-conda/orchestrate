@@ -319,3 +319,9 @@ def test_browse_shows_the_os_folder_dialog_and_fills_the_field(qtbot, up, tmp_pa
     d.accept()
     field = "document.querySelector('input[placeholder=\"/home/you/my-app\"]').value"
     qtbot.waitUntil(lambda: js(qtbot, w, field) == str(target), timeout=WAIT)
+
+
+def test_the_window_has_the_app_icon(qtbot, tmp_path):
+    w = window(qtbot, tmp_path)
+    assert not w.windowIcon().pixmap(64, 64).isNull()
+    w.close()

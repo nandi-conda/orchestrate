@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <!-- The app icon: a project (the ring) whose hub sends threads out to its
+       workers, one of them busy. The Android launcher icon draws the same
+       shapes (android/app/src/main/res/drawable/ic_launcher_*.xml). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#312E81"/>
+    </linearGradient>
+  </defs>
+  <rect width="108" height="108" rx="24" fill="url(#bg)"/>
+  <g transform="translate(54 54) scale(1.2) translate(-54 -54)">
+  <circle cx="54" cy="54" r="23" fill="none" stroke="#FFFFFF" stroke-opacity="0.3" stroke-width="3"/>
+  <path d="M54,54 Q44.81,44.81 54,31 M54,54 Q66.56,50.64 73.92,65.5 M54,54 Q50.64,66.56 34.08,65.5"
+        fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="54" cy="54" r="8" fill="#FFFFFF"/>
+  <circle cx="54" cy="31" r="6.5" fill="#FBBF24"/>
+  <circle cx="73.92" cy="65.5" r="6.5" fill="#FFFFFF"/>
+  <circle cx="34.08" cy="65.5" r="6.5" fill="#FFFFFF"/>
+  </g>
+</svg>
