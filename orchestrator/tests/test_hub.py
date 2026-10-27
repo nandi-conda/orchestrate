@@ -9,11 +9,13 @@ import tomllib
 
 import pytest
 
+from control import gitio
 from control.gitio import GitError
 from control.hub import Hub
 from control.providers import LocalProvider
 from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
 from control.service import Orchestrator
+from control.steps import Steps
 from control.store import SqliteStore
 
 pytestmark = pytest.mark.anyio
@@ -550,3 +552,37 @@ async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
     await orch.close()
     await orch.places.close()
     await s.close()
+
+
+async def test_talking_to_a_remote_shows_its_steps_and_gits_progress(tmp_path):
+    bare, seed = remote(tmp_path)
+    shown = []
+
+    async def show(what):
+        shown.append(what)
+
+    hub = Hub(tmp_path / "p.git", "p")
+    await hub.open()
+    await hub.connect(f"file://{bare}", Steps("connecting", show))
+    assert f"fetching trunk of file://{bare}" in shown
+    assert any(s.startswith(f"pushing trunk to file://{bare}: ") and "objects" in s for s in shown)
+
+
+async def test_a_remote_that_stops_answering_fails_and_frees_the_hub(tmp_path, monkeypatch):
+    """A remote that takes the connection and then sends nothing (a stalled
+    network, a server that hangs) fails the push with git's reason instead of
+    holding the hub's lock: the next landing or sync is not stuck behind it."""
+    monkeypatch.setattr(gitio, "LIMITS", ("-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=2"))
+    held = []
+
+    async def silent(reader, writer):
+        held.append(writer)  # never answers, never hangs up
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/r.git"
+    hub = Hub(tmp_path / "p.git", "p")
+    await hub.open()
+    with pytest.raises(GitError, match="too slow"):
+        await asyncio.wait_for(hub.connect(url), 30)
+    assert not hub.lock.locked() and hub.url == ""
+    server.close()

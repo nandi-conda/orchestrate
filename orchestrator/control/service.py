@@ -22,7 +22,7 @@ import re
 import shutil
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -271,7 +271,9 @@ class Orchestrator:
         # One git repository per project, the hub its threads' work goes to (hub.py).
         self.repos = Path(repos).resolve()
         self.hubs: dict[str, Hub] = {}
-        self._hubs_lock = asyncio.Lock()
+        # A hub is opened (and connected to its remote) once, by whoever asks
+        # first; projects' hubs open independently of each other.
+        self._hub_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         # Where workers run: each project's `workers` names a place of these.
         self.places = places
         self.router = router
@@ -981,7 +983,15 @@ class Orchestrator:
         hub = await self.hub(project)
         data, refs = await lw.client.pull_thread(project["id"], t["id"], await hub.have(t["id"]))
         await hub.receive(t["id"], data, refs)
-        result = await hub.land(t["id"]) if land else {"landed": False, "base": hub.base}
+        if land:
+            async def show(what: str) -> None:
+                await self.store.update_thread(t["id"], activity=what)
+
+            # Landing talks to the project's remote: its steps and git's progress
+            # are logged, and are the thread's activity while it runs.
+            result = await hub.land(t["id"], Steps(f"thread {t['id']} landing", show))
+        else:
+            result = {"landed": False, "base": hub.base}
         self._push_hub(project["id"])
         # Every turn saves: its steps go to stdout only when it is slow or fails.
         await self._ship(lw, project, t["id"], Steps(f"thread {t['id']} saving", level=logging.DEBUG))
@@ -1005,7 +1015,7 @@ class Orchestrator:
         its hub only, and the work reaches the folder once the computer it is
         on drives the project again (its hub lands the base there)."""
         opened = False
-        async with self._hubs_lock:
+        async with self._hub_locks[project["id"]]:
             hub = self.hubs.get(project["id"])
             if hub is None:
                 hub = Hub(self.hub_path(project["id"]), project["name"], get_secret("GITHUB_TOKEN"))
@@ -1013,7 +1023,7 @@ class Orchestrator:
                 url = project["repo_url"]
                 elsewhere = is_folder(url) and not Path(url).is_dir() and not isinstance(self.sync, Solo)
                 if hub.url != url and not elsewhere:
-                    await hub.connect(url)
+                    await hub.connect(url, Steps(f"project {project['id']} connecting to {url}"))
                 self.hubs[project["id"]] = hub
                 opened = True
         if opened:
@@ -1041,13 +1051,12 @@ class Orchestrator:
         hub = Hub(self.hub_path(pid), name, get_secret("GITHUB_TOKEN"))
         try:
             await hub.open()
-            await hub.connect(repo_url)
+            await hub.connect(repo_url, Steps(f"project {pid} connecting to {repo_url}"))
         except BaseException:
             shutil.rmtree(hub.path, ignore_errors=True)
             raise
         project = await self.store.create_project(name, model, repo_url, pid)
-        async with self._hubs_lock:
-            self.hubs[pid] = hub
+        self.hubs[pid] = hub
         return project
 
     async def update_project(self, project_id: str, **fields) -> dict:
@@ -1067,7 +1076,8 @@ class Orchestrator:
             check_key(fields["model"])  # here: this computer starts the project's workers
         if "repo_url" in fields and fields["repo_url"] != project["repo_url"]:
             hub = await self.hub(project)
-            await hub.connect(fields["repo_url"])
+            url = fields["repo_url"]
+            await hub.connect(url, Steps(f"project {project_id} connecting to {url or 'no remote'}"))
             self._push_hub(project_id)
         return await self.store.update_project(project_id, **fields)
 
@@ -1108,9 +1118,7 @@ class Orchestrator:
         wid, pid = lw.worker.id, project["id"]
         async with steps.step(f"opening project {pid}'s hub"):
             hub = await self.hub(project)
-        if hub.url:
-            async with steps.step(f"fetching {hub.base} of {hub.url} into the hub"):
-                await hub.sync()
+        await hub.sync(steps)  # a step of its own when there is a remote
         async with steps.step(f"asking worker {wid} which commits of project {pid} it has"):
             have = list((await lw.client.repo_refs(pid)).values())
         async with steps.step("bundling what it lacks"):

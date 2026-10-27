@@ -49,13 +49,16 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
 from . import gitio
 from .gitio import AUTHOR, GitError, git
+from .steps import Steps
 
 LAND_ATTEMPTS = 5  # pushes rejected because the remote moved before giving up
+PROGRESS_EVERY = 5.0  # seconds between the progress lines a fetch or push logs
 START, MAKE_PIXI = "Start the project", "Make the project a pixi project"  # the hub's own commits
 IMPORT = "Add the folder's files"  # what a folder opened as a project had not committed
 # A new project's pixi workspace: on conda-forge, for the platforms workers run on.
@@ -226,11 +229,30 @@ class Hub:
         self.url = ""
         self.env: dict = {}
         self.base = ""
+        # What the hub does with its remote, when no caller's steps name it.
+        self.steps = Steps(f"project {self.path.stem}'s hub")
         # Ref changes take turns: a landing, a sync, a turn's work coming in.
         self.lock = asyncio.Lock()
 
     async def git(self, *args: str, check: bool = True) -> gitio.Git:
         return await git(self.path, *args, check=check, env=self.env)
+
+    async def _net(self, steps: Steps, what: str, *args: str, env: dict | None = None,
+                   check: bool = True) -> gitio.Git:
+        """Run git talking to a remote as step `what` of `steps`: logged when it
+        starts and ends, every STILL_EVERY seconds while it runs, and with git's
+        progress (a fetch's or push's --progress) every PROGRESS_EVERY seconds.
+        A remote that stops answering fails it (gitio.STALL)."""
+        shown = 0.0
+
+        async def show(line: str) -> None:
+            nonlocal shown
+            if time.monotonic() - shown >= PROGRESS_EVERY or line.endswith("done."):
+                shown = time.monotonic()
+                await steps.progress(f"{what}: {line}")
+
+        async with steps.step(what):
+            return await git(self.path, *args, check=check, env=self.env if env is None else env, progress=show)
 
     def auth(self, url: str) -> dict:
         """git's environment for talking to `url`: the token as a header, for http(s)."""
@@ -249,7 +271,7 @@ class Hub:
             self.url = (await self.git("config", "--get", "orchestrate.remote", check=False)).out
             self.env = self.auth(self.url)
             async with self.lock:
-                await self._make_pixi()
+                await self._make_pixi(self.steps)
             return
         new = self.path.with_name(self.path.name + ".new")
         if new.exists():
@@ -264,7 +286,7 @@ class Hub:
         new.rename(self.path)
         self.base = base
 
-    async def connect(self, url: str) -> None:
+    async def connect(self, url: str, steps: Steps | None = None) -> None:
         """Make `url` the project's remote, or leave it without one ("").
 
         The base and the remote's default branch become one line of history:
@@ -280,32 +302,35 @@ class Hub:
         A folder (is_folder; as remote_url writes it) is made a remote the hub
         can land in first (`folder`). Removing the remote keeps everything
         here; landings stay on this machine from then on."""
+        steps = steps or self.steps
         async with self.lock:
             if url:
                 branch = await folder(url) if is_folder(url) else None
                 env = self.auth(url)
-                await self._join(url, env, branch)
+                await self._join(url, env, branch, steps)
                 await self.git("config", "orchestrate.remote", url)
             else:
                 env = {}
                 await self.git("config", "--unset-all", "orchestrate.remote", check=False)
             self.url, self.env = url, env
-            await self._make_pixi()
+            await self._make_pixi(steps)
 
-    async def _make_pixi(self) -> None:
+    async def _make_pixi(self, steps: Steps) -> None:
         """Make the base a pixi project, if it is not one, with a commit landed
         as a thread's work is: on the remote first when there is one."""
         base = f"refs/heads/{self.base}"
         for _ in range(LAND_ATTEMPTS):
             if self.url:
-                await self.git("fetch", "-q", self.url, f"+{base}:{base}")
+                await self._net(steps, f"fetching {self.base} of {self.url}",
+                                "fetch", "--progress", self.url, f"+{base}:{base}")
             tip = (await self.git("rev-parse", base)).out
             if await is_pixi(self.path, tip):
                 return
             tree = await pixi_tree(self.path, tip, self.name)
             new = (await self.git("commit-tree", tree, "-p", tip, "-m", MAKE_PIXI)).out
             if self.url:
-                push = await self.git("push", "-q", self.url, f"{new}:{base}", check=False)
+                push = await self._net(steps, f"pushing {self.base} to {self.url}",
+                                       "push", "--progress", self.url, f"{new}:{base}", check=False)
                 if push.code:
                     if any(s in push.err for s in ("fetch first", "non-fast-forward")):
                         continue  # the repository moved since the fetch
@@ -314,22 +339,25 @@ class Hub:
             return
         raise GitError(f"{self.base} of {self.url} kept moving; {LAND_ATTEMPTS} pushes were rejected")
 
-    async def _join(self, url: str, env: dict, branch: str | None) -> None:
+    async def _join(self, url: str, env: dict, branch: str | None, steps: Steps) -> None:
         ours = (await self.git("rev-parse", f"refs/heads/{self.base}")).out
-        name = await self.remote_base(url, env)
+        name = await self.remote_base(url, env, steps)
         if name is None:
             name = branch or self.base
-            await git(self.path, "push", "-q", url, f"{ours}:refs/heads/{name}", env=env)
+            await self._net(steps, f"pushing {self.base} to {url} as {name}",
+                            "push", "--progress", url, f"{ours}:refs/heads/{name}", env=env)
             await self._rename(name, ours)
             return
         incoming = "refs/orchestrate/connecting"
-        await git(self.path, "fetch", "-q", url, f"+refs/heads/{name}:{incoming}", env=env)
+        await self._net(steps, f"fetching {name} of {url}",
+                        "fetch", "--progress", url, f"+refs/heads/{name}:{incoming}", env=env)
         try:
             theirs = (await self.git("rev-parse", incoming)).out
             if ours == theirs or await self._ancestor(theirs, ours):
                 tip = ours
                 if ours != theirs:
-                    await git(self.path, "push", "-q", url, f"{ours}:refs/heads/{name}", env=env)
+                    await self._net(steps, f"pushing {self.base} to {name} of {url}",
+                                    "push", "--progress", url, f"{ours}:refs/heads/{name}", env=env)
             elif await self._ancestor(ours, theirs) or not await self._landed(ours):
                 tip = theirs
             else:
@@ -371,23 +399,25 @@ class Hub:
         own = await self._own(commit)
         return not own or own[-1] != commit
 
-    async def remote_base(self, url: str, env: dict) -> str | None:
+    async def remote_base(self, url: str, env: dict, steps: Steps) -> str | None:
         """The default branch of `url`, or None when it has no commits yet."""
-        head = (await git(self.path, "ls-remote", "--symref", url, "HEAD", env=env)).out.splitlines()
+        head = (await self._net(steps, f"asking {url} for its default branch",
+                                "ls-remote", "--symref", url, "HEAD", env=env)).out.splitlines()
         for line in head:
             if line.startswith("ref: refs/heads/"):
                 return line.split()[1].removeprefix("refs/heads/")
-        if (await git(self.path, "ls-remote", "--heads", url, env=env)).out:
+        if (await self._net(steps, f"asking {url} for its branches", "ls-remote", "--heads", url, env=env)).out:
             raise GitError(f"{url} has branches but no default branch")
         return None
 
-    async def sync(self) -> None:
+    async def sync(self, steps: Steps | None = None) -> None:
         """Bring the base up to the project's repository, which may have moved
         on without the hub (someone pushed)."""
         if not self.url:
             return
         async with self.lock:
-            await self.git("fetch", "-q", self.url, f"+refs/heads/{self.base}:refs/heads/{self.base}")
+            await self._net(steps or self.steps, f"fetching {self.base} of {self.url}",
+                            "fetch", "--progress", self.url, f"+refs/heads/{self.base}:refs/heads/{self.base}")
 
     async def have(self, tid: str) -> list[str]:
         """The hub's tips a worker can leave out of a thread's bundle."""
@@ -421,16 +451,18 @@ class Hub:
             data = await gitio.bundle(self.path, list(refs), have)
         return data, {worker_ref(r, self.base): sha for r, sha in refs.items()}
 
-    async def land(self, tid: str) -> dict:
+    async def land(self, tid: str, steps: Steps | None = None) -> dict:
         """Rebase the thread's branch onto the base and make it the base: on
         the project's repository first when there is one, then here. Answers
         as the runner's `save` peer call does."""
         base, branch = self.base, f"refs/heads/thread/{tid}"
         wt = self.path.with_name(self.path.stem + ".landing") / tid
+        steps = steps or self.steps
         async with self.lock:
             for _ in range(LAND_ATTEMPTS):
                 if self.url:
-                    await self.git("fetch", "-q", self.url, f"+refs/heads/{base}:refs/heads/{base}")
+                    await self._net(steps, f"fetching {base} of {self.url}",
+                                    "fetch", "--progress", self.url, f"+refs/heads/{base}:refs/heads/{base}")
                 await self.git("worktree", "prune")
                 if wt.exists():
                     shutil.rmtree(wt)
@@ -453,7 +485,8 @@ class Hub:
                 finally:
                     await self.git("worktree", "remove", "--force", str(wt))
                 if self.url:
-                    push = await self.git("push", "-q", self.url, f"{new}:refs/heads/{base}", check=False)
+                    push = await self._net(steps, f"pushing {base} to {self.url}",
+                                           "push", "--progress", self.url, f"{new}:refs/heads/{base}", check=False)
                     if push.code:
                         if any(s in push.err for s in ("fetch first", "non-fast-forward")):
                             continue  # the repository moved since the fetch; rebase onto its new tip

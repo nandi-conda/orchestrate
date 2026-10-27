@@ -13,6 +13,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Awaitable, Callable
 
 AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
 
@@ -28,15 +29,61 @@ class Git:
     err: str
 
 
-async def git(cwd: str | os.PathLike, *args: str, check: bool = True, env: dict | None = None) -> Git:
+# A remote that sends nothing for STALL seconds fails the git command talking
+# to it, with git's reason, instead of holding it (and the hub's lock) forever:
+# http(s) through curl's low-speed limit, ssh through its keepalives. ssh never
+# asks for a passphrase or a host key on the terminal the app was started from.
+STALL = 60
+LIMITS = ("-c", "http.lowSpeedLimit=1000", "-c", f"http.lowSpeedTime={STALL}")
+SSH = (f"ssh -o BatchMode=yes -o ConnectTimeout={STALL} -o ServerAliveInterval=15 "
+       f"-o ServerAliveCountMax={STALL // 15}")
+
+
+async def git(cwd: str | os.PathLike, *args: str, check: bool = True, env: dict | None = None,
+              progress: Callable[[str], Awaitable[None]] | None = None) -> Git:
+    """Run git in `cwd`. With `progress`, each line git writes to stderr is
+    given to it as it comes (a fetch's or push's --progress: "Writing objects:
+    45% (900/2000)"); the error text keeps only the lines git ended."""
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd), env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})},
+        "git", *LIMITS, *args, cwd=str(cwd),
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": SSH, **(env or {})},
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
+    try:
+        if progress is None:
+            out, err = await proc.communicate()
+        else:
+            out, err = await asyncio.gather(proc.stdout.read(), _stderr(proc.stderr, progress))
+            await proc.wait()
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
     r = Git(proc.returncode or 0, out.decode(errors="replace").strip(), err.decode(errors="replace").strip())
     if check and r.code:
         raise GitError(f"git {' '.join(args)} failed: {r.err or r.out}")
     return r
+
+
+async def _stderr(stream: asyncio.StreamReader, progress: Callable[[str], Awaitable[None]]) -> bytes:
+    """Give `progress` each line of git's stderr, those it rewrites in place
+    (ended by \\r) too; the lines it ends with \\n, for the error text."""
+    kept, line = bytearray(), bytearray()
+    while chunk := await stream.read(4096):
+        for b in chunk:
+            if b not in b"\r\n":
+                line.append(b)
+                continue
+            text = line.decode(errors="replace").strip()
+            if text:
+                await progress(text)
+                if b == ord("\n"):
+                    kept += line + b"\n"
+            line.clear()
+    if line.strip():
+        await progress(line.decode(errors="replace").strip())
+        kept += line
+    return bytes(kept)
 
 
 async def has_commit(repo: str | os.PathLike, sha: str) -> bool:

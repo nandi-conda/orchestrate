@@ -78,6 +78,12 @@ class Steps:
             self.note(f"still {what} ({took:.0f}s so far)", max(self.level, logging.INFO))
             await self._tell(f"{what} ({took:.0f}s)")
 
+    async def progress(self, text: str) -> None:
+        """How the step under way is getting on ("pushing main: Writing
+        objects: 45%"): logged and shown as the step."""
+        self.note(text)
+        await self._tell(text)
+
     @asynccontextmanager
     async def step(self, what: str) -> AsyncIterator[None]:
         """Run the body as step `what` ("shipping the hub to worker w1")."""

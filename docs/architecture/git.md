@@ -117,6 +117,16 @@ token with **Contents: Read and write**, sent by git as the header
 `Authorization: Basic base64("x-access-token:<token>")`
 (`http.<repo url>.extraHeader`).
 
+Every fetch and push to a remote is a logged step (on the control plane's
+stdout) with git's progress every few seconds ("pushing main to …: Writing
+objects: 45%"); while a thread's work lands, that line is also the thread's
+activity in the UI. A remote that sends nothing for 60 seconds fails the git
+command with git's reason (curl's low-speed limit for http(s), keepalives for
+ssh, which never asks for a passphrase or host key), so a stalled network
+shows up as an error on the Settings dialog or the thread instead of a save
+that never finishes. Each project's hub opens on its own: one project's slow
+remote does not hold up another's.
+
 Attaching a remote joins the two histories (`Hub.connect`):
 
 | The remote | What happens |
