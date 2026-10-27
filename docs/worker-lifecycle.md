@@ -358,6 +358,10 @@ runner keeps its disk from filling up:
   from the hub's branch, snapshot and session the next time it starts there,
   as it would on another worker. A thread whose turn was cut short there, or
   whose save failed, keeps everything; so does every thread it runs.
+- On a computer the worker shares with everything else, a short disk is
+  mostly not the worker's doing: when it has nothing more it can take off,
+  the runner says so once, and again only after the disk has recovered and
+  run short again.
 
 ## Respawn, from each state
 

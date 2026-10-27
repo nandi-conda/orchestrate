@@ -439,6 +439,7 @@ class ThreadHost:
         self.stopping = ""  # why the runner is stopping, once it is (shut_down)
         self.making_room = asyncio.Lock()
         self.room: asyncio.Task | None = None  # a make_room a turn's end started
+        self.short_of_disk = False  # make_room said so, and the disk has not recovered since
 
     # events -----------------------------------------------------------------
     def _emit(self, t: AgentThread, type: str, data: Any):
@@ -578,9 +579,8 @@ class ThreadHost:
             return
         async with self.making_room:
             if self.free() >= ROOM_LOW:
+                self.short_of_disk = False
                 return
-            log.warning("only %.0f%% of the disk is free: taking threads this runner does not run off it",
-                        self.free() * 100)
             idle = []
             for project in self.repos.projects():
                 repo = self.repos.get(project)
@@ -591,6 +591,9 @@ class ThreadHost:
                     when = await repo.in_hub(tid)
                     if when is not None:
                         idle.append((when, project, tid, tree))
+            if idle:
+                log.warning("only %.0f%% of the disk is free: taking %d thread(s) this runner does not run "
+                            "off it, the longest untouched first", self.free() * 100, len(idle))
             for _, project, tid, tree in sorted(idle):
                 if self.free() >= ROOM_HIGH:
                     break
@@ -603,10 +606,13 @@ class ThreadHost:
                         await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
                 log.info("thread %s (project %s) is off this worker until it is started here again: "
                          "the hub has its work; %.0f%% of the disk is free now", tid, project, self.free() * 100)
-            if self.free() < ROOM_LOW:
-                log.warning("only %.0f%% of the disk is free after taking off every thread that could go: "
-                            "the threads this runner runs, or work not yet in the hub, hold the rest",
-                            self.free() * 100)
+            # Said once while the disk stays short: on a computer the worker shares
+            # with everything else, what fills it is mostly not the worker's.
+            if self.free() < ROOM_LOW and not self.short_of_disk:
+                log.warning("only %.0f%% of the disk %s is on is free, and this worker has nothing more it can "
+                            "take off (the threads it runs, and work not yet in the hub, stay)",
+                            self.free() * 100, self.workdir)
+            self.short_of_disk = self.free() < ROOM_LOW
 
     async def prune(self, keep: set[str]) -> list[str]:
         """Take every project not in `keep` off this worker: its threads here

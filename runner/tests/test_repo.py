@@ -129,8 +129,8 @@ async def test_a_worker_short_of_disk_takes_off_threads_whose_work_the_hub_has(t
     await saved("t_cut", at=0)
     (work / ".team").mkdir(exist_ok=True)
     (work / ".team" / "t_cut.turn").write_text("{}")
-    room = iter([0.10, 0.10, 0.20, 0.40, 0.40, 0.40])  # each look at the disk; a drop frees some
-    monkeypatch.setattr(h, "free", lambda: next(room))
+    # The disk is short until t_old's worktree is gone.
+    monkeypatch.setattr(h, "free", lambda: 0.10 if (work / "t_old").exists() else 0.40)
     await h.make_room()
     assert not (work / "t_old").exists() and not (work / ".home" / "t_old").exists()
     for kept in ("t_new", "t_unsaved", "t_cut"):  # t_new: ROOM_HIGH was free once t_old went
@@ -139,6 +139,24 @@ async def test_a_worker_short_of_disk_takes_off_threads_whose_work_the_hub_has(t
     ws = await repo.worktree(work / "t_old", "t_old")
     assert (work / "t_old" / "build.out").read_text() == "t_old"  # its snapshot's files
     assert ws.branch == "thread/t_old"
+
+
+async def test_a_disk_full_of_other_things_is_said_once(tmp_path, monkeypatch, caplog):
+    """On a computer the worker shares, a short disk with nothing of the
+    worker's to take off is one warning, not one per turn, until it recovers."""
+    source(tmp_path)
+    h = await host(tmp_path)
+    free = [0.10]
+    monkeypatch.setattr(h, "free", lambda: free[0])
+    for _ in range(3):
+        await h.make_room()
+    free[0] = 0.50
+    await h.make_room()
+    free[0] = 0.10
+    await h.make_room()
+    said = [r for r in caplog.records if "nothing more it can take off" in r.getMessage()]
+    assert len(said) == 2
+    assert not [r for r in caplog.records if "taking" in r.getMessage()]
 
 
 async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
