@@ -90,19 +90,25 @@ class Limits:
 class DeltaBuffer:
     """Gathers a streaming reply into `delta` events: one per kind (and tool) at
     a time, sent every `every` seconds or `size` characters, so the UI follows
-    the model without an event per token."""
+    the model without an event per token. Reply and reasoning text start at
+    their first non-blank character: the blank lines a model writes before a
+    tool call are no reply, so they make no row."""
 
     def __init__(self, emit: Callable[[str, Any], None], every: float = 0.25, size: int = 400):
         self._emit, self.every, self.size = emit, every, size
         self.kind, self.name, self.parts = "", "", []
+        self.started = False  # the part has had a non-blank character
         self.sent = time.monotonic()
 
     def __call__(self, kind: str, text: str, name: str = "") -> None:
         if (kind, name) != (self.kind, self.name):
             self.flush()
-            self.kind, self.name = kind, name
+            self.kind, self.name, self.started = kind, name, kind == "tool"
             if kind == "tool":  # a tool call starts: say which, before its arguments arrive
                 self._emit("delta", {"kind": kind, "name": name, "text": ""})
+        if not self.started:
+            text = text.lstrip()
+            self.started = bool(text)
         if text:
             self.parts.append(text)
         if sum(map(len, self.parts)) >= self.size or time.monotonic() - self.sent >= self.every:
@@ -314,7 +320,9 @@ class AgentThread:
 class Turn:
     """One turn's prime-agent events, as the runner's: `delta`s while the model
     streams, then per model call its `reasoning`, `assistant`, `tool_call`s and
-    `usage`, and a `tool_result` per call it ran."""
+    `usage`, and a `tool_result` per call it ran. Text that is only blank
+    (DeepSeek writes "\\n\\n" before a tool call) is no reply or reasoning, so
+    it is not an event."""
 
     def __init__(self, t: AgentThread):
         self.t = t
@@ -359,9 +367,9 @@ class Turn:
         blocks = m.get("content") or []
         reasoning = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        if reasoning:
+        if reasoning.strip():
             self.t.emit("reasoning", {"content": reasoning})
-        if text:
+        if text.strip():
             self.final = text
             self.t.emit("assistant", {"content": text})
         for b in blocks:

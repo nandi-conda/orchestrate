@@ -167,6 +167,20 @@ async def test_thread_streams_deltas_before_the_final_events(tmp_path):
     await host.stop(t.id)
 
 
+async def test_blank_text_before_a_tool_call_is_no_reply(tmp_path):
+    """DeepSeek writes "\\n\\n" as text before a tool call: that is no reply,
+    so there is no `assistant` event and no content delta for it (each made
+    an empty Agent row)."""
+    host = host_with([py("print(1 + 1)", text="\n\n"), "all done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="add")
+    await host.wait_idle(t.id)
+    replies = [e["data"]["content"] for e in t.events if e["type"] == "assistant"]
+    assert replies == ["all done"]
+    content = "".join(e["data"]["text"] for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content")
+    assert content == "all done"
+    await host.stop(t.id)
+
+
 async def test_a_message_during_a_turn_steers_it(tmp_path):
     host = host_with([{**py("import asyncio\nawait asyncio.sleep(2)"), "delayMs": 0}, "noted", "done"],
                      tmp_path=tmp_path)

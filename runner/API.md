@@ -60,9 +60,9 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `prepared` | `{"resumed", "idle"}`: its worktree and session are made; `resumed` when it resumes a turn cut short here (below), `idle` when it waits for its next message; else it works on its request. Messages posted before this steer the first turn from its start (the control plane sends a thread on a job only steering). A failure is an `error` and state `failed` instead |
 | `state` | `{"state"}` |
 | `message_in` | `{"from", "body"}` |
-| `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool, `python_repl`; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
-| `reasoning` | `{"content"}`: the model's whole reasoning for one step, once it is done |
-| `assistant` | `{"content"}` |
+| `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool, `python_repl`; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. A `reasoning` or `content` part starts at its first non-blank character. |
+| `reasoning` | `{"content"}`: the model's whole reasoning for one step, once it is done; none when it is blank |
+| `assistant` | `{"content"}`: the model's reply text for one step; none when it is blank (DeepSeek writes `"\n\n"` before a tool call) |
 | `tool_call` | `{"id", "name", "arguments", "step"}`: the model's one tool is `python_repl` (`{"code"}`); `step` numbers the model call within its turn |
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | prime-agent's token counts for one model call |
