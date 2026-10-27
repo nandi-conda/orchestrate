@@ -4,10 +4,10 @@
 #   https://github.com/nandi-conda/orchestrate/releases/download/rolling/orchestrator.apk
 # is always the newest build.
 #
-# The app carries the control plane (orchestrator/control), its ultra UI and
-# git, so a change to any of them is a new APK. It is signed with the release
-# key from the repository secrets (android/README.md): Android installs an
-# update only over an app signed with the same key.
+# The app carries the control plane (orchestrator/control), its ultra UI,
+# git and Automerge (for sync), so a change to any of them is a new APK. It is
+# signed with the release key from the repository secrets (android/README.md):
+# Android installs an update only over an app signed with the same key.
 name: Android
 
 on:
@@ -71,6 +71,20 @@ jobs:
       - name: Build git for Android
         if: steps.git-cache.outputs.cache-hit != 'true'
         run: android/git/build.sh android/git/out/arm64-v8a
+
+      - name: Cache automerge for Android
+        id: automerge-cache
+        uses: actions/cache@v6
+        with:
+          path: android/automerge/out
+          key: android-automerge-${{ hashFiles('android/automerge/**', '!android/automerge/out/**') }}
+
+      - name: Build automerge for Android
+        if: steps.automerge-cache.outputs.cache-hit != 'true'
+        run: |
+          # maturin prepares the cross build with a host Python of the app's version (3.12).
+          export PATH="$GITHUB_WORKSPACE/orchestrator/.pixi/envs/default/bin:$PATH"
+          android/automerge/build.sh android/automerge/out
 
       - uses: actions/setup-java@v6
         with:

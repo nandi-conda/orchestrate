@@ -92,9 +92,9 @@ def log_doc(project_id: str, thread_id: str | None) -> str:
 
 
 def automerge():
-    """Automerge's Python package (automerge.core): only a control plane that
-    syncs needs it, so one built without it (the Android app, the conda
-    package, for now) runs as long as it does not sync."""
+    """Automerge's Python package (automerge.core), imported once a control
+    plane syncs. The Android app carries one built for it
+    (android/automerge/build.sh)."""
     import automerge.core
 
     return automerge.core
