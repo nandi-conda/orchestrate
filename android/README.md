@@ -8,6 +8,7 @@ as the desktop window runs it. Using it: [docs/guide/android.md](../docs/guide/a
 | --- | --- |
 | `app/src/main/java/.../MainActivity.java` | the window: Keys screen, then the WebView |
 | `app/src/main/java/.../ControlPlane.java` | starts and stops the control plane on its own thread |
+| `app/src/main/java/.../ControlPlaneService.java` | foreground service (notification + wake lock) so Android does not freeze the control plane off screen |
 | `app/src/main/java/.../Keys.java` | the keys, encrypted with an Android Keystore key |
 | `app/src/main/python/orchestrate_android.py` | the control plane's entry point on the phone: git on PATH, the session cookie, sprites |
 | `app/requirements.txt` | the control plane's Python packages, pinned as `orchestrator/pixi.lock` has them |

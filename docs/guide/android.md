@@ -2,9 +2,16 @@
 
 The app is the orchestrator on a phone, the way the desktop window is on a
 computer: the ultra UI in a WebView, with the control plane running inside
-the app's own process. There is nothing else to run or connect to. Closing
-the app (Back out of it, or swipe it away) stops the control plane, as
-closing the desktop window does.
+the app's own process. There is nothing else to run or connect to.
+
+While the control plane runs, the app shows a notification, **The control
+plane is running**. That is what keeps Android from freezing the app when
+it is off screen: binding a worker installs the runner on a sprite for
+minutes, and turns run as long as they take, over connections the control
+plane holds, so it keeps running (and keeps the CPU awake) until you stop
+it: leaving the app (Back out of it, or swipe it away) or **Stop** in the
+notification stops it, as closing the desktop window does. Switching to
+another app or turning the screen off does not.
 
 ## Install
 

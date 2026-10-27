@@ -1,9 +1,11 @@
 package dev.orchestrate.app;
 
 import android.app.Activity;
+import android.Manifest;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Bundle;
@@ -63,6 +65,7 @@ public class MainActivity extends Activity {
             ControlPlane cp = ControlPlane.get();
             String why = cp.stopped();
             if (why != null) {
+                ControlPlaneService.stop(MainActivity.this);
                 showStatus(getString(R.string.stopped, why.isEmpty() ? getString(R.string.no_reason) : why), true);
             } else if (cp.started()) {
                 showWeb();
@@ -107,6 +110,11 @@ public class MainActivity extends Activity {
 
     private void start() {
         showStatus(getString(R.string.starting), false);
+        // Its notification keeps the control plane running off screen (ControlPlaneService).
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 0);
+        }
+        ControlPlaneService.start(this);
         ControlPlane.get().start(this, keys);
         main.removeCallbacks(watch);
         main.post(watch);
@@ -316,6 +324,16 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // Stop in the notification may have ended it while the app was away.
+        if (web != null) {
+            main.removeCallbacks(watch);
+            main.post(watch);
+        }
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         CookieManager.getInstance().flush();
@@ -328,6 +346,7 @@ public class MainActivity extends Activity {
         // Leaving the app ends the control plane, as closing the desktop window does.
         if (isFinishing()) {
             ControlPlane.get().stop();
+            ControlPlaneService.stop(this);
         }
         super.onDestroy();
     }

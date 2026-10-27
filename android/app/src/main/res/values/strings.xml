@@ -14,5 +14,8 @@
     <string name="key_deepseek">DeepSeek API key, for the router and every worker. Sent as Authorization: Bearer &lt;key&gt; to api.deepseek.com.</string>
     <string name="key_sprites">Fly Sprites org token. Workers run on Sprites; sent as Authorization: Bearer &lt;token&gt; to api.sprites.dev.</string>
     <string name="key_github">GitHub fine-grained token with Contents: Read and write on the project repos, for projects with a GitHub remote. Workers never get it.</string>
+    <string name="channel_name">Control plane</string>
+    <string name="running">The control plane is running.</string>
+    <string name="stop">Stop</string>
     <string name="downloading">Downloading %1$s</string>
 </resources>
