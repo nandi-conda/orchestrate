@@ -259,6 +259,13 @@ INFO:orchestrator:worker orch-w1: installing orchestrate 1a2b3c4d5e6f on it (git
 INFO:orchestrator:worker orch-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
 ```
 
+A step the runner refuses fails with the runner's own words, not just its
+status, so the line says what to fix:
+
+```text
+WARNING:orchestrator:thread t_ab12: sending worker orch-w1 the bundle (1 KiB): failed after 0.2s: RunnerError: the worker answered 400 to POST /projects/p_1/repo: refs the orchestrator may not set: refs/heads/x
+```
+
 A worker being made holds up no thread while another worker of the place
 answers: threads bind on the least loaded ready one meanwhile, and only a
 thread with no worker answering at all waits for it. A sprite is reinstalled and its runner

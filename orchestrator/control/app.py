@@ -27,7 +27,7 @@ from .providers import PLACES, Places, default_places
 from .gitio import GitError
 from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
-from .runner_client import FileError
+from .runner_client import RunnerError
 from .service import (ENDS_STREAM, ArchivedError, EditError, NotOnWorker, Orchestrator, describe, editable,
                       image_title, prepared_text, tool_arg)
 from .store import Store, store_from_url
@@ -580,8 +580,8 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": "no such thread"}, 404)
         if isinstance(e, (ArchivedError, NotOnWorker, NotDriving)):
             return JSONResponse({"error": str(e)}, 409)
-        if isinstance(e, FileError):
-            return JSONResponse({"error": str(e)}, e.status)
+        if isinstance(e, RunnerError) and e.status < 500:
+            return JSONResponse({"error": e.error}, e.status)
         return JSONResponse({"error": f"could not read the thread's files: {describe(e)}"}, 502)
 
     async def thread_files(req: Request):
