@@ -49,6 +49,11 @@ For each problem:
    fallbacks, retries, degraded modes or `try`/`except` that hides the error,
    and never silence a warning or lower a log level to make a line go away.
    When something cannot work, it fails saying why.
+   Write optimised software: a fix must not make the code do more work, move
+   more bytes or hold more memory than the job needs. Ask what a path costs
+   at the size it really runs at (a repository of hundreds of megabytes, not
+   a fixture), and leave out of what is stored, sent or recomputed whatever
+   can be made again from what is already there.
 3. Add or change a test that would have caught it, in the suite of the
    subproject you touched, and run that suite (`cd orchestrator && pixi run -e
    test test`, `cd orchestrator && pixi run test-desktop`, `cd runner && pixi

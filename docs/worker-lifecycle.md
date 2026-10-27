@@ -297,7 +297,7 @@ worker being made calls that attach off too, and it starts again.
 `POST /threads` answers at once: the runner registers the thread `queued`
 and makes its worktree and session afterwards, in the thread's own task. That
 can take minutes (a worktree made again from the hub writes every file of its
-snapshot, ignored build output included), and a request held open that long
+snapshot: ignored files too, but for pixi's environments and cargo's `target/`, which are made again), and a request held open that long
 is cut off (the control plane's 30 s read timeout, and Fly's proxy). The
 thread is bound as soon as the runner answers. Each step of making it
 arrives as a `preparing` event (the thread's activity: "making its worktree",

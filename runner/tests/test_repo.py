@@ -1,6 +1,7 @@
 """Threads' commits: worktrees off the base branch, snapshots, bundles to and from the hub, landing."""
 
 import asyncio
+import os
 import subprocess
 
 import pytest
@@ -454,17 +455,29 @@ async def test_worktree_that_holds_what_the_hub_has_keeps_its_ignored_files(tmp_
     assert (again.path / "build" / "app").read_text() == "binary\n"
 
 
-async def test_a_snapshot_leaves_out_pixis_environments(tmp_path):
-    """pixi.lock makes a project's environments again; they are big, and stay on the worker."""
+async def test_a_snapshot_leaves_out_what_is_made_again(tmp_path):
+    """pixi's environments and cargo's target/ are big and made again from the project's files; they stay on the worker."""
     source(tmp_path)
     repo = await seeded(tmp_path, "w1")
     ws = await repo.worktree(tmp_path / "w1" / "T", "T")
-    for path in (".pixi/envs/default/bin/python", ".pixi/config.toml", "sub/.pixi/envs/x/lib", "keep.txt"):
+    for path in (".pixi/envs/default/bin/python", ".pixi/config.toml", "sub/.pixi/envs/x/lib", "target/debug/deps/lib.rlib", "keep.txt"):
         (ws.path / path).parent.mkdir(parents=True, exist_ok=True)
         (ws.path / path).write_text("x\n")
     snap = await ws.snapshot()
     files = git(repo.path, "ls-tree", "-r", "--name-only", snap).split()
     assert sorted(files) == [".pixi/config.toml", "keep.txt", "notes.txt", "pixi.toml"]
+
+
+async def test_a_snapshot_drops_what_an_earlier_one_took_of_what_is_made_again(tmp_path):
+    """The snapshot index lives on: build output an older snapshot took (before it was left out) goes at the next."""
+    source(tmp_path)
+    repo = await seeded(tmp_path, "w1")
+    ws = await repo.worktree(tmp_path / "w1" / "T", "T")
+    (ws.path / "target").mkdir()
+    (ws.path / "target" / "app").write_text("x\n")
+    subprocess.run(["git", "add", "-f", "target/app"], cwd=ws.path, check=True, env={**os.environ, **await ws.index("snapshot.index")})
+    files = git(repo.path, "ls-tree", "-r", "--name-only", await ws.snapshot()).split()
+    assert "target/app" not in files
 
 
 async def test_a_source_that_is_not_a_pixi_project_is_refused(tmp_path):

@@ -55,9 +55,10 @@ AUTHOR = ("orchestrate", "threads@orchestrate.invalid")
 SHIPPED = re.compile(r"^refs/remotes/(origin|origin-snapshots|origin-sessions)/[\w./-]+$")
 THREAD_ID = re.compile(r"^[\w-]+$")
 PROJECT_ID = re.compile(r"^[\w-]+$")
-# What a snapshot leaves out: pixi's environments, in the subdirectories of any
-# `.pixi/` (its config.toml, beside them, stays).
-PIXI_ENVIRONMENTS = ":(exclude,glob)**/.pixi/*/**"
+# What a snapshot leaves out, being big and made again from the project's own
+# files: pixi's environments (the subdirectories of any `.pixi/`; its
+# config.toml, beside them, stays) and cargo's `target/` build output.
+REBUILDABLE = ("**/.pixi/*/**", "**/target/**")
 
 
 class GitError(RuntimeError):
@@ -354,12 +355,12 @@ class Workspace:
 
     async def snapshot(self) -> str:
         """Commit the whole worktree, ignored files included, as a child of the
-        branch tip at `refs/snapshots/<id>`, but for pixi's environments (what
-        is in a `.pixi/` directory's subdirectories), which pixi.lock makes
-        again. Its index lives on with the worktree, so only changed files are
-        hashed again."""
+        branch tip at `refs/snapshots/<id>`, but for REBUILDABLE. Its index
+        lives on with the worktree, so only changed files are hashed again;
+        what it holds of REBUILDABLE from an earlier snapshot goes out of it."""
         env = await self.index("snapshot.index")
-        await self.git("add", "-A", "-f", "--", ".", PIXI_ENVIRONMENTS, env=env)
+        await self.git("add", "-A", "-f", "--", ".", *(f":(exclude,glob){g}" for g in REBUILDABLE), env=env)
+        await self.git("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *(f":(glob){g}" for g in REBUILDABLE), env=env)
         tree = (await self.git("write-tree", env=env)).out
         commit = (await self.git("commit-tree", tree, "-p", "HEAD", "-m", f"Snapshot of {self.branch}")).out
         await self.git("update-ref", snapshot_ref(self.tid), commit)
