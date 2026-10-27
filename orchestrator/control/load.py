@@ -20,7 +20,8 @@ and comes to one level:
     backed_up  BACKLOG or more messages it has not got to: what it is sent now
                waits behind them.
     stalled    its worker is not answering (unreachable, or being reattached):
-               anything sent to it waits for the worker to come back.
+               a message to it moves it to a ready worker, cutting short the
+               turn it had under way there.
 
 The router gives new work only to idle threads whose work it continues; busy
 threads get only what concerns their current turn, and backed-up or stalled
@@ -36,7 +37,8 @@ BACKLOG = 2
 
 LEVELS = ("idle", "busy", "backed_up", "stalled")
 
-# Worker states (states.WORKER) in which nothing sent to its threads gets through.
+# Worker states (states.WORKER) in which nothing sent to its threads gets through
+# (a message moves its thread to a ready worker instead).
 WORKER_AWAY = {"unreachable", "reattaching"}
 
 

@@ -118,7 +118,12 @@ goes on this computer, and on a phone every thread goes on Sprites.
   `POST /api/projects/{id}/threads`, or one the plan left without) is placed
   by `Router.place` from its request when it is first put on a worker; its
   Worker log says "asking the router where its workers run".
-- A thread a peer spawns runs where its parent runs.
+- A thread a peer spawns runs where its parent runs, so a local thread that
+  needs help gets local helpers.
+- A thread the router spawns to carry on or help with an existing thread's
+  work (that thread busy, backed up or stalled) runs where that thread runs,
+  unless the request asks for the other place. The router sees each thread's
+  `workers` in the directory.
 - A `send` entry with `workers` moves that thread (`Orchestrator.move`): it
   is stopped and unbound where it runs, and comes back on the new place with
   the message, from its work in the hub. Its log shows a `moved` event.

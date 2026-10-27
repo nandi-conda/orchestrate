@@ -20,11 +20,13 @@ numbered slot of its place's pool, and a slot always names the same worker:
 place. That is the whole lifecycle policy:
 
 - **Made only to fill an empty slot.** A thread goes on the least loaded
-  ready worker with room (16 running threads each). When none has room, the
-  first empty slot is filled. When every slot is filled and none has room,
-  or the ones with room are not ready (a sprite waking, a network blip), the
-  thread **waits** ("waiting for room" on its Now line) and starts as soon as
-  a turn ends somewhere. No fourth worker is ever made.
+  ready worker with room (16 running threads each). When none has room, it
+  **does not wait**: it goes on the least loaded ready worker anyway (16 only
+  spreads threads; the runner sets no limit), and the first empty slot, if
+  any, is filled in the background for the threads after it. Only when no
+  worker of its place answers at all does a thread wait: for the slot being
+  filled, or, with every slot filled, for the first worker that answers ("no
+  … worker answers" on its Now line). No fourth worker is ever made.
 - **Kept, not destroyed.** Workers outlive the control plane, and a sprite
   pauses on its own while nothing is connected to it, so an idle pool costs
   little. A lost worker's slot is filled again by a new worker of the same
@@ -86,7 +88,17 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `ready` | its runner answers `/health` | | |
 | `unreachable` | `/health` fails but its provider still has it: a sprite waking from a pause, or this machine's network down | a failed health check (every 10 s, before every delivery, when picking a worker) | it answers again; or reattached |
-| `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable, or Respawn / a thread being put back on it | ready once it answers; unreachable again if it fails, and another try 300 s later |
+| `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable | ready once it answers; unreachable again if it fails, and another try 300 s later |
+
+**Work never waits for a worker to answer.** A message to a thread whose
+worker is unreachable or reattaching moves the thread to a ready worker of
+the pool at once, from its branch, snapshot and session in the hub, and is
+delivered there. A turn it had under way on the old worker is cut short: it
+goes on from its last saved turn. The old worker keeps the thread on a
+"moved off" list: once it answers again the thread is stopped there, and
+until then nothing it sends for that thread is taken (its peer calls for it
+are refused, since the thread is no longer on it). A thread no work comes
+for while its worker is away stays on it and carries on when it answers.
 | `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its slot filled again by a new worker of the same name. Its threads are unbound and come back on the pool |
 
 `ready → ready` is a runner restart: `/health` returns a new `boot` id (the
@@ -145,7 +157,7 @@ stateDiagram-v2
 | Binding | Means | Way back to bound |
 | --- | --- | --- |
 | `bound` | a live worker's runner has the thread | |
-| `binding` | being put on a worker: one picked (a slot filled, or waiting for room), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
+| `binding` | being put on a worker: one picked (a slot filled, or the first worker to answer when none does), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
 | `unbound` | on no worker | its next message, or Respawn |
 
 Each move is stored with its reason (`threads.binding_reason`) and logged as a
@@ -162,11 +174,11 @@ Each move is stored with its reason (`threads.binding_reason`) and logged as a
   `stopped before it was on a worker`.
 
 **Where a thread goes when it is bound.** On the worker it was last on, while
-that worker is not lost, so it continues in the same worktree (uncommitted
-and ignored files included); an unreachable one is reattached first.
-Otherwise on the least loaded ready worker of the pool (an empty slot filled
-when none has room; waiting for room when every slot is filled), from its
-branch, snapshot and session in the hub. If its runner still runs it
+that worker is ready, so it continues in the same worktree (uncommitted and
+ignored files included). One that does not answer is not waited for.
+Otherwise on the least loaded ready worker of the pool, over 16 if need be
+(an empty slot is filled in the background), from its branch, snapshot and
+session in the hub. If its runner still runs it
 (only the control plane lost track), it is bound as it is: "found again on
 worker …". A thread with no saved turn yet gets its original request again;
 the rest come back idle and wait for their next message.
@@ -247,8 +259,9 @@ INFO:orchestrator:worker orch-w1: installing orchestrate 1a2b3c4d5e6f on it (git
 INFO:orchestrator:worker orch-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
 ```
 
-A worker being made holds up only the threads waiting for it: other threads
-bind on a worker with room meanwhile. A sprite is reinstalled and its runner
+A worker being made holds up no thread while another worker of the place
+answers: threads bind on the least loaded ready one meanwhile, and only a
+thread with no worker answering at all waits for it. A sprite is reinstalled and its runner
 restarted whenever the commit, model key, token or settings it would run
 with changed since it was started (a new commit on the branch the control
 plane's checkout follows is the usual one); otherwise its runner is left

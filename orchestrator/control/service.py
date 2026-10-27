@@ -46,13 +46,14 @@ MAX_HOPS = 6
 HEALTH_EVERY = 10.0
 HEALTH_TIMEOUT = 5.0
 READY_TIMEOUT = 300.0
-CAPACITY = 16  # running threads per worker before another one starts
+CAPACITY = 16  # running threads per worker before an empty slot is filled
 # Each place workers run in (providers.PLACES) has a pool of at most POOL
 # workers, shared by every project that runs there. A slot (a place and
 # 1..POOL) always names the same worker, so the pool never holds more, and
 # what a provider has beyond the slots is destroyed when the control plane
 # starts (Orchestrator.start). A thread that finds every worker of its
-# project's place full, or not ready, waits for room; no worker is made for it.
+# place full goes on the least loaded ready one: CAPACITY spreads threads, it
+# never holds one back. No worker beyond the slots is made for it.
 POOL = 3
 # A worker's runner log goes to this process's stdout as it is written, each
 # line tagged with the worker; following starts LOG_BACKLOG lines back, and the
@@ -188,6 +189,10 @@ class LiveWorker:
     watch: asyncio.Task | None = None
     logs: asyncio.Task | None = None
     threads: set[str] = field(default_factory=set)
+    # Threads moved off it while it did not answer (_bind): its runner may
+    # still run them, so they are stopped there once it answers again
+    # (_stop_moved), and whatever it sends for them is dropped.
+    moved_off: set[str] = field(default_factory=set)
     starting: int = 0  # threads picked for it and not yet posted: they count as running
     # Picks of it that ended (posted or not). A /health looked at before one
     # ended may not count it, so a pick counts those that ended since its look.
@@ -346,38 +351,47 @@ class Orchestrator:
     # ---------------------------------------------------------------- workers
 
     async def _pick_worker(self, project: dict, place: str, steps: Steps) -> LiveWorker:
-        """The least loaded ready worker of the pool with room, with a place
-        held for the thread the caller is about to start there (`starting`,
-        given back by the caller), so concurrent starts spread out. With no
-        worker with room, the pool's first empty slot is filled (_attached);
-        with every slot filled, it waits for room. Workers are looked at
-        concurrently and never under a lock, and one being made holds no
-        lock: a worker that is slow to come up only keeps the threads
-        waiting for it waiting. Only the pool of `place`, where the thread's
-        workers run, is looked at: PlaceRefused when this control plane runs
-        no workers there."""
+        """The least loaded ready worker of the pool, with a place held for
+        the thread the caller is about to start there (`starting`, given back
+        by the caller), so concurrent starts spread out. A thread never waits
+        for room: CAPACITY only spreads threads. With no ready worker under
+        it, the pool's first empty slot is filled in the background, for the
+        threads after this one, and this one goes on the least loaded ready
+        worker now; only with no ready worker at all does it wait, for the
+        slot being filled (_attached) or, with every slot filled, for the
+        first worker to answer. Workers are looked at concurrently and never
+        under a lock, and one being made holds no lock. Only the pool of
+        `place`, where the thread's workers run, is looked at: PlaceRefused
+        when this control plane runs no workers there."""
         self.places.provider(place)
         async with contextlib.AsyncExitStack() as waiting:
             said = False
             while True:
                 seen = await self._look(place)
                 lw = self._roomiest(seen)
+                filled = {w.worker.index for w in self.workers if w.worker.provider == place}
+                empty = [i for i in range(1, self.pool + 1) if i not in filled]
+                if lw is None:
+                    lw = self._roomiest(seen, full=True)
+                    if empty and lw is None:
+                        await self._attached(project, (place, empty[0]), steps)
+                        continue
+                    if empty:
+                        self._attach_task(project, (place, empty[0]))
+                    if lw is not None:
+                        steps.note(f"no {place} worker is under {lw.worker.capacity} running threads "
+                                   f"({self._pool_state(place, seen)}); it goes on the least loaded one"
+                                   + (f" while slot {empty[0]} is filled" if empty else ""))
                 if lw is not None:
                     lw.starting += 1
                     return lw
-                filled = {lw.worker.index for lw in self.workers if lw.worker.provider == place}
-                empty = [i for i in range(1, self.pool + 1) if i not in filled]
-                if empty:
-                    await self._attached(project, (place, empty[0]), steps)
-                    continue
                 if not said:
                     said = True
                     await waiting.enter_async_context(steps.step(
-                        f"waiting for room: all {self.pool} {place} workers are full or not ready "
-                        f"({self._pool_state(place, seen)})"))
-                # Room is looked for again when a worker may have some, or
-                # after a health check's while, since a worker's load is its
-                # runner's to say.
+                        f"no {place} worker answers ({self._pool_state(place, seen)}); "
+                        "it goes on the first that does"))
+                # Looked for again when a worker's state changes, or after a
+                # health check's while.
                 async with self.room:
                     try:
                         await asyncio.wait_for(self.room.wait(), HEALTH_EVERY)
@@ -403,16 +417,18 @@ class Orchestrator:
         for it since: being started there, or started after the look."""
         return h.get("running", 0) + lw.starting + lw.picked - h["picked"]
 
-    def _roomiest(self, seen: dict[str, tuple[LiveWorker, dict]]) -> LiveWorker | None:
+    def _roomiest(self, seen: dict[str, tuple[LiveWorker, dict]], full: bool = False) -> LiveWorker | None:
         """Of the workers looked at, the one still ready with the most room;
-        None when none has any. Nothing is awaited, so no other start can
-        take the room it counts between the look and the place held."""
+        None when none has any (with `full`, when none is ready: a full one
+        counts too). Nothing is awaited, so no other start can take the room
+        it counts between the look and the place held."""
         best, best_load = None, None
         for lw, h in seen.values():
             if lw.state != "ready" or lw not in self.workers:
                 continue
             running = self._running(lw, h)
-            if running < h.get("capacity", lw.worker.capacity) and (best_load is None or running < best_load):
+            if ((full or running < h.get("capacity", lw.worker.capacity))
+                    and (best_load is None or running < best_load)):
                 best, best_load = lw, running
         return best
 
@@ -440,16 +456,7 @@ class Orchestrator:
             for lw in self.workers:
                 if slot_of(lw.worker) == slot:
                     return lw
-            task = self.attaching.get(slot)
-            if task is None or task.done():  # one that ended goes from attaching as its callbacks run
-                made = Steps(f"{place} worker slot {index}")
-                task = asyncio.create_task(self._attach(project, slot, made))
-                self.attaching[slot], self.attach_steps[slot] = task, made
-                self.background.add(task)
-                task.add_done_callback(self.background.discard)
-                task.add_done_callback(lambda t: self.attaching.pop(slot) if self.attaching.get(slot) is t
-                                       else None)
-                task.add_done_callback(lambda t: t.cancelled() or t.exception())  # its waiters report it
+            task = self._attach_task(project, slot)
             made = self.attach_steps[slot]
             try:
                 async with steps.step(f"waiting for {place} worker slot {index} to come up"):
@@ -462,6 +469,20 @@ class Orchestrator:
                 if task.cancelled() and not asyncio.current_task().cancelling():
                     continue  # Respawn called the attach off (respawn): attach the slot afresh
                 raise
+
+    def _attach_task(self, project: dict, slot: Slot) -> asyncio.Task:
+        """The attach of `slot` under way, started now (for a thread of
+        `project`) when there is none. Nothing waits for it here."""
+        task = self.attaching.get(slot)
+        if task is None or task.done():  # one that ended goes from attaching as its callbacks run
+            made = Steps(f"{slot[0]} worker slot {slot[1]}")
+            task = asyncio.create_task(self._attach(project, slot, made))
+            self.attaching[slot], self.attach_steps[slot] = task, made
+            self.background.add(task)
+            task.add_done_callback(self.background.discard)
+            task.add_done_callback(lambda t: self.attaching.pop(slot) if self.attaching.get(slot) is t else None)
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())  # its waiters report it
+        return task
 
     async def _attach(self, project: dict, slot: Slot, steps: Steps) -> LiveWorker:
         """Start the worker in `slot`: made new, or the one an earlier control
@@ -603,8 +624,16 @@ class Orchestrator:
         await self._restarted(lw, h)
         if lw.state == "unreachable":
             await self._prune(lw)  # a project may have been archived while it was away
+            await self._stop_moved(lw)
             await self._worker_to(lw, "ready", "its runner answers again")
         return h
+
+    async def _stop_moved(self, lw: LiveWorker) -> None:
+        """Stop, on a worker that answers again, the threads moved off it
+        while it did not (_bind): each runs on another worker now."""
+        for tid in sorted(lw.moved_off):
+            if self.by_thread.get(tid) is not lw:
+                await lw.client.stop_if_there(tid)
 
     async def _reattach(self, lw: LiveWorker, why: str, waiter: Steps | None = None) -> None:
         """Have the provider start an unreachable worker's runner again, on the
@@ -641,6 +670,11 @@ class Orchestrator:
                 h = await client.health(timeout=HEALTH_TIMEOUT)
             async with steps.step("taking archived projects off it"):
                 await client.prune([p["id"] for p in await self.store.list_projects()])
+            if lw.moved_off:
+                async with steps.step("stopping the threads moved off it while it did not answer"):
+                    for tid in sorted(lw.moved_off):
+                        if self.by_thread.get(tid) is not lw:
+                            await client.stop_if_there(tid)
         except Exception as e:
             lw.failures += 1
             failed = describe(e)
@@ -661,22 +695,6 @@ class Orchestrator:
         await self._restarted(lw, h)
         steps.note(f"ready again at {worker.url}")
         await self._worker_to(lw, "ready", f"reattached: its {worker.provider} provider started its runner again")
-
-    async def _settled(self, lw: LiveWorker) -> None:
-        """Wait for a thread's worker to be ready, looking at it first: returns
-        once it is ready or lost (and its threads unbound), raises when it
-        is unreachable and a reattach fails meanwhile."""
-        if lw.state == "ready":
-            await self._probe(lw)
-        failures = lw.failures
-        if lw.state not in ("ready", "lost"):
-            left = READY_TIMEOUT - (asyncio.get_running_loop().time() - lw.unreachable_since)
-            log.warning("worker %s is %s (%s); work for its threads waits for it to answer again, or to be "
-                        "reattached in %.0fs", lw.worker.id, lw.state, lw.reason, max(left, 0))
-        async with lw.changed:
-            await lw.changed.wait_for(lambda: lw.state in ("ready", "lost") or lw.failures > failures)
-        if lw.state not in ("ready", "lost"):
-            raise RuntimeError(f"worker {lw.worker.id} is {lw.state}: {lw.reason}")
 
     async def _restarted(self, lw: LiveWorker, h: dict) -> None:
         """Take note of the runner process serving the worker. One started
@@ -763,7 +781,7 @@ class Orchestrator:
                 await self._restarted(lw, await lw.client.health(timeout=HEALTH_TIMEOUT))
                 async for ev in lw.client.events(after=lw.last_seq):
                     lw.last_seq = max(lw.last_seq, ev.get("seq", 0))
-                    await self._ingest(ev)
+                    await self._ingest(ev, lw)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -991,6 +1009,8 @@ class Orchestrator:
         lw.threads.discard(thread_id)
         if lw.state == "ready":
             await lw.client.stop_if_there(thread_id)
+        elif lw.state != "lost":
+            lw.moved_off.add(thread_id)
         await self._bind_to(thread_id, "unbound", why, worker=lw.worker.id)
 
     async def _ship(self, lw: LiveWorker, project: dict, tid: str | None, steps: Steps) -> None:
@@ -1009,8 +1029,10 @@ class Orchestrator:
         async with steps.step(f"sending worker {wid} the bundle ({len(data) / 1024:.0f} KiB)"):
             await lw.client.push_repo(pid, data, hub.base, refs)
 
-    async def _ingest(self, ev: dict) -> None:
+    async def _ingest(self, ev: dict, lw: LiveWorker | None = None) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}
+        if lw is not None and tid in lw.moved_off:
+            return  # the thread runs elsewhere now: this worker's copy of it is stopped
         t = await self.store.get_thread(tid) if tid else None
         if t is None:
             return
@@ -1078,9 +1100,12 @@ class Orchestrator:
     async def _bind(self, tid: str, why: str, entered: bool = False) -> LiveWorker:
         """Put a thread on a worker: unbound or bound -> binding -> bound, or
         back to unbound with why it failed. It goes on the worker it was on
-        while that one is not lost (reattached first when it is unreachable),
-        so the worktree there is the one it continues in; else on a picked
-        worker, from its branch, snapshot and session in the hub. A thread
+        while that one is ready, so the worktree there is the one it continues
+        in; else on a picked worker, from its branch, snapshot and session in
+        the hub. It never waits for a worker that does not answer
+        (unreachable, or being reattached): it moves off it, and a turn under
+        way there is cut short and stopped there once it answers again
+        (_stop_moved); the thread goes on from its last saved turn. A thread
         none of whose turns was saved (new, or its worker went before its
         first turn ended) is given its request; the rest wait idle for their
         next message. One the worker's runner still runs (only this control
@@ -1114,10 +1139,11 @@ class Orchestrator:
             if lw is None and t["worker_id"] is not None:
                 async with steps.step(f"finding worker {t['worker_id']}, which it was on"):
                     lw = await self._home(project, t["workers"], t["worker_id"], steps)
-            if lw is not None and lw.state in ("unreachable", "reattaching"):
-                await self._reattach(lw, f"thread {tid} is being put back on it", steps)
             if lw is not None and lw.state != "ready":
-                steps.note(f"worker {lw.worker.id} is {lw.state} ({lw.reason}); picking another")
+                if lw.state != "lost":
+                    lw.moved_off.add(tid)
+                steps.note(f"worker {lw.worker.id} is {lw.state} ({lw.reason}); moving it to a ready worker "
+                           "(a turn under way there is cut short and stopped once that worker answers again)")
                 lw = None
             if lw is None:
                 async with steps.step("picking a worker of the pool"):
@@ -1142,6 +1168,7 @@ class Orchestrator:
                 lw.picked += 1
                 await self._made_room()
         lw.threads.add(tid)
+        lw.moved_off.discard(tid)
         self.by_thread[tid] = lw
         wid = lw.worker.id
         if found is not None:
@@ -1276,17 +1303,22 @@ class Orchestrator:
                     raise
             lw = self.by_thread.get(thread_id)
             if lw is not None:
-                await self._settled(lw)
+                await self._probe(lw)  # one that answers again takes it at once
                 t = await self.store.get_thread(thread_id)
-                if self.by_thread.get(thread_id) is lw and t["state"] not in ENDED:
+                if self.by_thread.get(thread_id) is lw and lw.state == "ready" and t["state"] not in ENDED:
                     return lw
+                if self.by_thread.get(thread_id) is lw and lw.state != "ready" and thread_id not in self.binding:
+                    # Work for it does not wait for its worker to answer: it moves (_bind).
+                    self._begin_binding(thread_id, f"its worker {lw.worker.id} is {lw.state} ({lw.reason}); "
+                                                   "moving it to a ready worker for a message to it")
+                    continue
             if thread_id not in self.binding:
                 self._begin_binding(thread_id, "brought back on a worker for a message to it or its files")
 
     async def respawn(self, thread_id: str) -> None:
         """Put a thread on a worker afresh, from whatever binding it is in
         (states.py): one being put on a worker is called off and started
-        over; one on an unreachable worker has that worker reattached; one
+        over; one on a worker that does not answer moves to a ready one; one
         bound is stopped on its runner and posted again. Returns at once; the
         thread's binding events say how it went."""
         t = await self.store.get_thread(thread_id)

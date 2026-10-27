@@ -357,7 +357,7 @@ def free_port() -> int:
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
-    # One running thread per worker, so peer calls have to cross workers.
+    # One running thread per worker: the second thread fills a second slot.
     monkeypatch.setattr(service, "CAPACITY", 1)
     port = free_port()
     url = f"http://127.0.0.1:{port}"
@@ -438,9 +438,9 @@ async def test_end_to_end_with_echo_runner(server):
         # Workers never call the control plane, so it serves no peer API.
         assert (await c.get(f"/api/peer/projects/{pid}/threads")).status_code == 404
 
-        # Across workers: list, read and message threads on another worker.
+        # Peers: list, read and message another thread, wherever it runs.
         on = {t["id"]: t["worker_id"] for t in (await c.get(f"/api/projects/{pid}/threads")).json()}
-        assert on[ids[0]] and on[ids[1]] and on[ids[0]] != on[ids[1]]
+        assert on[ids[0]] and on[ids[1]]
         await c.post(f"/api/projects/{pid}/requests", json={
             "text": f"list: export\nread {ids[0]}\ntell {ids[0]}: hello from the export thread",
             "mode": "thread", "target": ids[1]})
@@ -1176,8 +1176,8 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
 
 async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monkeypatch):
     """A worker whose runner stops answering (a sprite waking, this machine's
-    network down) is not lost while its provider still has it: its threads
-    stay on it and carry on once it answers again."""
+    network down) is not lost while its provider still has it: a thread no
+    work came for meanwhile stays on it and carries on once it answers again."""
     import signal
 
     from control.service import Orchestrator
@@ -1198,6 +1198,10 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     proc.send_signal(signal.SIGSTOP)
     await asyncio.sleep(1.5)  # several watches that get no answer
     proc.send_signal(signal.SIGCONT)
+
+    async def back():
+        return lw.state == "ready" or None
+    await wait_for(back)
     await orch.send(t["id"], "again")
 
     async def answered():
@@ -1391,6 +1395,61 @@ async def test_a_worker_unreachable_for_too_long_is_reattached_and_its_thread_co
     assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [lw.worker.id] * 2
     assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_message_to_a_thread_whose_worker_does_not_answer_moves_it_to_a_ready_worker(tmp_path, monkeypatch):
+    """Work never waits for a worker to answer again: a message to a thread
+    on an unreachable worker moves the thread to another worker of the pool
+    (from its last saved turn in the hub) and is delivered there. Once the
+    first worker answers again, the thread is stopped there, and nothing it
+    sends for that thread is taken."""
+    import signal
+
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.1)
+    monkeypatch.setattr(service, "HEALTH_TIMEOUT", 0.2)
+    monkeypatch.setattr(service, "READY_TIMEOUT", 60)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos", pool=2)
+    t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    first = orch.by_thread[t["id"]]
+    proc = provider.procs[first.worker.id]
+    proc.send_signal(signal.SIGSTOP)
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    now = orch.by_thread[t["id"]]
+    assert now is not first and now.state == "ready" and first.state == "unreachable"
+    assert t["id"] in first.moved_off
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [first.worker.id, now.worker.id]
+    assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
+    stopped = []
+    stop_if_there = first.client.stop_if_there
+
+    async def recording_stop(tid):
+        stopped.append(tid)
+        await stop_if_there(tid)
+    first.client.stop_if_there = recording_stop
+    proc.send_signal(signal.SIGCONT)
+    async def back():
+        return first.state == "ready" or None
+    await wait_for(back)
+    assert stopped == [t["id"]] and orch.by_thread[t["id"]] is now
+    await wait_for(lambda: idle_of(s, t["id"]))
+    await orch._ingest({"thread": t["id"], "type": "state", "data": {"state": "stopped"}}, first)
+    assert (await s.get_thread(t["id"]))["state"] == "idle"  # w1's copy of it does not count
     await orch.close()
     await provider.close()
     await s.close()
@@ -2147,9 +2206,10 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
     await s.close()
 
 
-async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp_path, monkeypatch):
-    """The pool never holds more than its slots: with every worker full, a new
-    thread waits, says so, and starts once a turn ends and makes room."""
+async def test_a_full_pool_puts_a_new_thread_on_the_least_loaded_worker_at_once(tmp_path, monkeypatch):
+    """The pool never holds more than its slots, and a thread never waits for
+    room: with every worker full, a new thread goes on the least loaded one
+    at once (CAPACITY only spreads threads) and says so in its Worker log."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "1.0")
@@ -2173,13 +2233,13 @@ async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp
     await wait_for(working)
     second = await orch.spawn(p["id"], "Second", "two")
 
-    async def waiting():
-        t = await s.get_thread(second["id"])
-        return t["binding"] == "binding" and t["activity"].startswith("waiting for room") or None
-    await wait_for(waiting)
-    await wait_for(lambda: idle_of(s, second["id"]))
+    async def bound():
+        return (await s.get_thread(second["id"]))["binding"] == "bound" or None
+    await wait_for(bound)
+    assert (await s.get_thread(first["id"]))["state"] == "working"  # it went on beside it, not after it
     assert made == [1] and [lw.worker.id for lw in orch.workers] == ["w1"]
     assert (await s.get_thread(second["id"]))["worker_id"] == "w1"
+    assert "it goes on the least loaded one" in await orch.worker_logs(second["id"])
     await orch.close()
     await provider.close()
     await s.close()
@@ -2221,11 +2281,11 @@ async def test_projects_share_a_worker_and_see_only_their_own_threads(tmp_path, 
     await s.close()
 
 
-async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it(tmp_path, monkeypatch):
-    """Making a worker (a sprite installing) takes no lock: while the second
-    slot's worker is being made for one thread, another thread binds on the
-    first worker, which has room. The waiting thread's Worker log says what
-    it waits on, step by step, the worker's own steps with it."""
+async def test_a_worker_slow_to_come_up_holds_up_no_thread(tmp_path, monkeypatch):
+    """Making a worker (a sprite installing) takes no lock and keeps no
+    thread waiting while a worker is ready: with the first worker full, a
+    new thread goes on it at once and the second slot's worker is made in
+    the background, its steps in the Worker log, for the threads after it."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.3")
@@ -2250,24 +2310,18 @@ async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it
         return (await s.get_thread(a["id"]))["state"] == "working" or None
     await wait_for(working)
     b = await orch.spawn(p["id"], "B", "two")
-
-    async def b_waits():
-        return "waiting for local worker slot 2" in (await s.get_thread(b["id"]))["activity"] or None
-    await wait_for(b_waits)
-    await wait_for(lambda: idle_of(s, a["id"]))
-    c = await orch.spawn(p["id"], "C", "three")
-    await wait_for(lambda: idle_of(s, c["id"]))
-    assert (await s.get_thread(c["id"]))["worker_id"] == "w1"
-    assert (await s.get_thread(b["id"]))["binding"] == "binding"
+    await wait_for(lambda: idle_of(s, b["id"]))
+    assert (await s.get_thread(b["id"]))["worker_id"] == "w1"
     text = await orch.worker_logs(b["id"])
-    assert "picking a worker of the pool ..." in text and "waiting for local worker slot 2 to come up ..." in text
-    assert "worker slot 2, which it waits on:" in text and "making or finding its worker" in text
+    assert "it goes on the least loaded one while slot 2 is filled" in text
+    assert ("local", 2) in orch.attaching and [lw.worker.id for lw in orch.workers] == ["w1"]
 
     provider.gate.set()
-    await wait_for(lambda: idle_of(s, b["id"]))
-    assert [lw.worker.id for lw in orch.workers] == ["w1", "w2"]
-    text = await orch.worker_logs(b["id"])
-    assert "waiting for local worker slot 2 to come up: done in" in text and "bound: on worker w" in text
+
+    async def filled():
+        return [lw.worker.id for lw in orch.workers] == ["w1", "w2"] or None
+    await wait_for(filled)
+    assert "attached at http://" in orch.attach_steps[("local", 2)].text()
     await orch.close()
     await provider.close()
     await s.close()

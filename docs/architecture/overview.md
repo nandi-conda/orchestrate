@@ -57,9 +57,10 @@ thread on a refused place fails with that reason; nothing picks another
 place for it.
 
 **Workers** run the runner (`runner/`), one process hosting many threads
-(capacity 16 by default), of any project. They are a fixed pool of 3 shared
-by every project, not one per thread or per project: threads are cheap, and
-a thread that finds the pool full waits for room. See
+(16 by default spreads them), of any project. They are a fixed pool of 3
+shared by every project, not one per thread or per project: threads are
+cheap, and a thread that finds the pool full goes on the least loaded worker
+that answers instead of waiting. See
 [The worker pool](../worker-lifecycle.md#the-worker-pool). Each thread is a prime-agent process
 whose Python kernel runs sandboxed in its own git worktree. See
 [The runner and prime-agent](runner.md).

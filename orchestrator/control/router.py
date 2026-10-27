@@ -8,7 +8,9 @@ A plan spawns new threads, sends messages to existing ones, or both:
 
 The router also decides where each thread's workers run (providers.PLACES):
 on Sprites unless the request asks to run on the person's own computer
-("run it locally"). `workers` on a send moves that thread there. A thread
+("run it locally"); a thread spawned to carry on or help with an existing
+thread's work runs where that thread runs. `workers` on a send moves that
+thread there. A thread
 spawned without one (a new thread typed straight in, or one the plan left
 it off) is asked about with `place` when it is first put on a worker.
 
@@ -39,16 +41,20 @@ import httpx
 LOAD = """Each thread has a `load` (how much it already has on its plate):
 `level` is "idle" (between turns, nothing waiting: it takes work at once),
 "busy" (in a turn), "backed_up" (`backlog` messages it has not got to are
-waiting on it) or "stalled" (its worker is not answering, so anything sent
-waits); `busy_for` is seconds into its current turn.
+waiting on it) or "stalled" (its worker is not answering: a message moves it
+to another worker and cuts its turn short); `busy_for` is seconds into its
+current turn.
 """
 
 PLACES = """Each thread's work runs on workers in one of `places`: "sprites" (cloud
 machines) unless the person asks for their own computer ("run locally", "on my
 machine", "on this computer", "don't use sprites"), then "local". A place with a
 non-empty `why` is unavailable: never pick it; pick the other one. Each thread
-has its `workers` in the directory. Give every spawned thread "workers". A send's
-"workers" is "" unless the request asks to move that thread to the other place.
+has its `workers` in the directory. Give every spawned thread "workers". A thread
+spawned to continue, follow on from or help with an existing thread's work (that
+thread busy, backed_up or stalled, say) runs where that thread runs: its
+`workers`, unless the request asks for the other place. A send's "workers" is ""
+unless the request asks to move that thread to the other place.
 """
 
 REPLY_FORMAT = """Answer by calling `route` once: `spawn` lists the new threads (each with a
