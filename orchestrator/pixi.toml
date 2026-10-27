@@ -15,10 +15,9 @@ aiosqlite = ">=0.21"
 asyncpg = ">=0.30"
 keyring = ">=25"
 ultra = ">=0.1.20,<0.2"
-
-# Projects shared through the sync server (control/sync.py). Automerge's
-# Python package is on PyPI only, and still a pre-release: pinned exactly.
-[pypi-dependencies]
+# Projects shared through the sync server (control/sync.py). conda-forge has no
+# automerge; recipe/automerge builds it into nandi-testing. Still a pre-release:
+# pinned exactly.
 automerge = "==0.2.0.dev4"
 
 [feature.test.dependencies]
