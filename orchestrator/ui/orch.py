@@ -173,6 +173,12 @@ def on_paste(msg: i32) -> None:
     pass
 
 @jscall
+def newline_keys() -> None:
+    """In the request box (#req, a textarea), Shift+Enter adds a line and plain
+    Enter sends without one, so pasted and typed text keeps its lines."""
+    pass
+
+@jscall
 def img_count() -> i32:
     """How many images are attached to the request being composed."""
     pass

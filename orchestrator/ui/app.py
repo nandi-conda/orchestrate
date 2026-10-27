@@ -20,7 +20,7 @@ from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_o
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
-                  img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row,
+                  img_drop, img_stash, img_restore, img_clear, on_zoom, newline_keys, j_put_row,
                   host_folders, host_pick_folder)
 
 # ---- Msg
@@ -364,6 +364,7 @@ def init() -> None:
     on_nav(NAV)
     on_select(h_seltext, h_selpos, h_selsrc, SELECTED)
     on_paste(PASTED)
+    newline_keys()
     on_zoom()
     show_address()
 
@@ -3113,10 +3114,12 @@ def request_box() -> None:
     end()
     end()
     div("composer-row")
-    el("input")
+    el("textarea")
     cls("input")
     cls("grow")
+    cls("composer-box")
     attr("id", "req")
+    attr("rows", "1")
     if s_len(h_quote) > 0:
         attr("placeholder", "Reply to the quote…")
     elif img_count() > 0:
@@ -3138,7 +3141,8 @@ def request_box() -> None:
 
 
 def from_input() -> None:
-    # value + events for the request input
+    # value + events for the request box; Enter sends, Shift+Enter adds a line
+    # (newline_keys)
     value_ref(h_req)
     on_input(REQ_IN)
     on_enter(SEND, 0)

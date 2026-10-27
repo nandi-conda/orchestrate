@@ -67,7 +67,8 @@ saying what it is doing.
 
 ### Sending a request
 
-Type in the request box and press Enter. The toggles above it decide where it
+Type in the request box and press Enter. Shift+Enter starts a new line, and
+pasted text keeps its lines (a log, a list); the box grows with them. The toggles above it decide where it
 goes:
 
 | Toggle | What happens |

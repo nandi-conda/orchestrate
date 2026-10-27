@@ -168,6 +168,11 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .composer { border-top: 1px solid var(--border); padding: 10px 16px 14px; display: grid; gap: 8px; }
 .composer-row { display: flex; gap: 8px; align-items: center; }
 .grow { flex: 1; }
+/* The request box grows with its lines (pastes keep theirs) up to a cap, then scrolls. */
+.composer-row:has(.composer-box) { align-items: flex-end; }
+.composer-box { display: block; height: auto; min-height: 2.25rem; max-height: 40vh; field-sizing: content;
+                resize: none; overflow-y: auto; font: inherit; font-size: .875rem; line-height: 1.25rem;
+                padding: .45rem .75rem; }
 
 /* Images pasted into the request box, before they are sent. */
 .attachments { display: flex; flex-wrap: wrap; gap: 8px; }

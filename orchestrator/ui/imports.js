@@ -263,6 +263,16 @@ export function imports({ str, strs, vals, dispatch }) {
         })();
       }, true);
     },
+    // The request box is a textarea: Shift+Enter is kept from ultra's Enter
+    // handler (on the root, below document) so the browser adds the line,
+    // and plain Enter, which sends, adds none.
+    newline_keys: () => {
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.isComposing || e.target.id !== "req") return;
+        if (e.shiftKey) e.stopPropagation();
+        else e.preventDefault();
+      }, true);
+    },
     img_count: () => images.length,
     img_url: (i, d) => { strs[d] = images[i] ?? ""; },
     img_drop: (i) => { images.splice(i, 1); },
