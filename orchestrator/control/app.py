@@ -449,7 +449,8 @@ def create_app(store: Store | None = None, places: Places | None = None,
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
         except Exception as e:
-            return JSONResponse({"error": f"could not take the project off the workers: {describe(e)}"}, 502)
+            log.exception("archiving project %s", req.path_params["pid"])
+            return JSONResponse({"error": f"could not archive the project: {describe(e)}"}, 502)
         return JSONResponse(project_view(p))
 
     async def project_drive(req: Request):
@@ -465,6 +466,9 @@ def create_app(store: Store | None = None, places: Places | None = None,
             p = await orch().unarchive_project(req.path_params["pid"])
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
+        except Exception as e:
+            log.exception("unarchiving project %s", req.path_params["pid"])
+            return JSONResponse({"error": f"could not unarchive the project: {describe(e)}"}, 502)
         return JSONResponse(project_view(p))
 
     async def post_request(req: Request):

@@ -388,3 +388,48 @@ async def test_logs_kept_as_documents_before_are_dropped_from_the_replica(tmp_pa
         await s.replica.close()
         await s.client.close()
         await store.close()
+
+
+
+async def test_archiving_on_a_computer_that_does_not_drive_the_project_takes_it_over(tmp_path, sync_server, fast):
+    """Archive and Unarchive are done where they are clicked: that computer
+    takes the project's lease, so the person sees it done (or why not) at
+    once, not handed to the driver's inbox."""
+    a = await Computer(tmp_path / "a", sync_server, "desktop").start()
+    b = await Computer(tmp_path / "b", sync_server, "phone").start()
+    try:
+        pid = (await a.orch.create_project("shared"))["id"]
+        await a.orch.submit(pid, "write notes.txt: hello")
+
+        async def idle_on(c):
+            ts = await c.store.list_threads(pid)
+            return ts if ts and all(t["state"] == "idle" for t in ts) else None
+        await wait_for(lambda: idle_on(a))
+        await wait_for(lambda: idle_on(b))
+        assert not await b.orch.sync.claim(pid)
+
+        p = await b.orch.archive_project(pid)
+        assert p["archived_at"] is not None
+        assert (await b.store.get_project(pid))["archived_at"] is not None
+        assert b.orch.sync.driver(pid) == {"name": "phone", "me": True}
+        assert [e for e in await b.events(pid) if e["type"] == "project_archived"]
+
+        async def archived_on_a():
+            return (await a.store.get_project(pid))["archived_at"] is not None
+        await wait_for(archived_on_a)
+        await wait_for(lambda: wait_for_driver(a, pid, "phone"))
+
+        p = await a.orch.unarchive_project(pid)
+        assert p["archived_at"] is None
+        assert a.orch.sync.driver(pid) == {"name": "desktop", "me": True}
+
+        async def live_on_b():
+            return (await b.store.get_project(pid))["archived_at"] is None
+        await wait_for(live_on_b)
+    finally:
+        await b.close()
+        await a.close()
+
+
+async def wait_for_driver(c, pid, name):
+    return (c.orch.sync.driver(pid) or {}).get("name") == name

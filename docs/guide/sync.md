@@ -51,9 +51,13 @@ requests, runs its threads on its own workers, and keeps its git hub. The
 project's header on every other computer says **Driven by** that computer.
 
 - What you do on a computer that does not drive the project (send a request,
-  message a thread, edit a message, stop, archive, change settings) is handed to
-  the computer that does, which does it as if you had done it there. Its result
-  shows on every computer a moment later.
+  message a thread, edit a message, stop or archive a thread, change settings)
+  is handed to the computer that does, which does it as if you had done it
+  there. Its result shows on every computer a moment later.
+- Archiving or unarchiving a **project** is done where you click it: that
+  computer takes the project over first (as **Take over** does), so the
+  project is archived when the button's "Archiving…" ends, or the list says why
+  it could not be.
 - A computer drives a project when you open or use it there and no computer
   drives it: nobody did, or the one that did stopped (it quit, or has not
   renewed its claim for half a minute).

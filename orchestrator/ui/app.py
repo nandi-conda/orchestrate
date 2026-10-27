@@ -190,6 +190,7 @@ fview_req: i32 = 0       # the handle its read will land in, 0 when none is pend
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 threads_open: i32 = 1    # the thread list is unfolded on a phone (a desktop shows it always)
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
+proj_busy: i32 = 0       # 1 + the card being archived or unarchived, 0 when none is
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 jump_seq: i32 = 0        # or at this event instead, the one a clicked quote came from (0 = none)
 md_quote: i32 = 0        # seq of the message whose first block quote md() links to its source (0 = none)
@@ -778,6 +779,7 @@ def update(msg: i32, arg: i32) -> None:
     global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, code_copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
+    global proj_busy
     global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
     global switching, switch_list
     e: i32 = 0
@@ -857,16 +859,26 @@ def update(msg: i32, arg: i32) -> None:
             open_project(h_t1)
     elif msg == PROJ_SHOW_ARCHIVED:
         proj_archived = arg
+        proj_busy = 0
         loading = 1
         projects = take_none(projects)
         s_clear(h_err)
         fetch_projects()
     elif msg == PROJ_ARCHIVE:
-        post_project(arg, "archive")
+        # Archiving stops the project's threads and takes it off the workers,
+        # so the reply can take a while: the card says so until it comes.
+        if proj_busy == 0:
+            proj_busy = arg + 1
+            s_clear(h_err)
+            post_project(arg, "archive")
     elif msg == PROJ_UNARCHIVE:
-        post_project(arg, "unarchive")
+        if proj_busy == 0:
+            proj_busy = arg + 1
+            s_clear(h_err)
+            post_project(arg, "unarchive")
     elif msg == PROJ_ARCHIVED:
         # Either way the project leaves the list on screen.
+        proj_busy = 0
         if j_ok(arg) == 1:
             s_clear(h_err)
             if screen == 0:
@@ -1522,7 +1534,14 @@ def project_list() -> None:
         end()
         el("button")
         cls("project-archive")
-        if proj_archived == 1:
+        if proj_busy == i + 1:
+            cls("busy")
+            attr("aria-busy", "true")
+            if proj_archived == 1:
+                text("Unarchiving…")
+            else:
+                text("Archiving…")
+        elif proj_archived == 1:
             on_click(PROJ_UNARCHIVE, i)
             attr("title", "Unarchive")
             attr("aria-label", "Unarchive")

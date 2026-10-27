@@ -1682,12 +1682,17 @@ class Orchestrator:
         still queued for routing fail, and say so in its log), then its running
         threads are stopped, unbound, and taken off the pool's workers. A
         worker not ready now has it taken off when it is ready again.
-        Archiving an archived project finishes that without logging it twice."""
+        Archiving an archived project finishes that without logging it twice.
+
+        This computer takes the project's lease first (Take over), whichever
+        drives it: archiving stops all of its threads anyway, and so it is
+        done here, now, and what goes wrong is said to the person who asked,
+        rather than handed to the driver's inbox and done (or not) out of
+        their sight."""
         p = await self.store.get_project(project_id)
         if p is None:
             raise KeyError(project_id)
-        if await self._elsewhere(project_id, "archive_project", {}):
-            return p
+        await self.sync.claim(project_id, take=True)
         if p["archived_at"] is None:
             p = await self.store.update_project(project_id, archived_at=now())
             await self.store.append_event(project_id, None, "project_archived", {})
@@ -1706,13 +1711,13 @@ class Orchestrator:
         return p
 
     async def unarchive_project(self, project_id: str) -> dict:
+        """Unarchive a project, taking its lease first as archive_project does."""
         p = await self.store.get_project(project_id)
         if p is None:
             raise KeyError(project_id)
         if p["archived_at"] is None:
             return p
-        if await self._elsewhere(project_id, "unarchive_project", {}):
-            return p
+        await self.sync.claim(project_id, take=True)
         p = await self.store.update_project(project_id, archived_at=None)
         await self.store.append_event(project_id, None, "project_unarchived", {})
         return p
@@ -1760,6 +1765,7 @@ class Orchestrator:
             elif op in ("stop", "respawn", "archive", "unarchive"):
                 await getattr(self, op)(args["thread"])
             elif op in ("archive_project", "unarchive_project"):
+                # Sent by a computer from before archiving took the lease; done all the same.
                 await getattr(self, op)(project_id)
             elif op == "update_project":
                 await self.update_project(project_id, **args["fields"])

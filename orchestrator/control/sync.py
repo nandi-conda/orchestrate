@@ -878,6 +878,14 @@ class Sync:
         log.warning("another computer drives project %s now; letting go of its threads here", project_id)
         if self.orch is not None:
             await self.orch.let_go(project_id)
+        # What the new driver wrote before this computer knew it had lost the
+        # lease was passed over (only a driver's own writes count): the store
+        # is brought up to the documents now.
+        name = project_doc(project_id)
+        async with self.applying:
+            self.seen[INDEX].pop(project_id, None)
+            self.seen.pop(name, None)
+        await self._apply([INDEX, name])
 
     def not_driving(self, project_id: str) -> NotDriving:
         who = self.driver(project_id)

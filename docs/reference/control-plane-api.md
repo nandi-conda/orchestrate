@@ -20,8 +20,8 @@ provider call failed).
 | GET | `/api/projects/{id}` | | the project |
 | POST | `/api/projects/{id}/settings` | any of `{name, model, repo_url}`; `repo_url: ""` removes the remote | the project; a remote the hub cannot join is a 400 with git's reason, and nothing changes |
 | GET | `/api/places` | | where threads' workers can run: `[{id, label, why}]`, `why` empty for a place this control plane runs workers in, else why not (for example no `SPRITES_TOKEN`). The router picks one per thread; each thread has `workers` (`""` until it is placed) |
-| POST | `/api/projects/{id}/archive` | | the project: running threads stopped, workers destroyed |
-| POST | `/api/projects/{id}/unarchive` | | the project |
+| POST | `/api/projects/{id}/archive` | | the project: this computer takes it over (drives it), then its running threads are stopped and it is taken off the workers; 502 with the reason when that fails |
+| POST | `/api/projects/{id}/unarchive` | | the project, driven by this computer |
 | POST | `/api/projects/{id}/drive` | | Take over: this computer drives the project from now on; the project |
 
 ## Requests and messages
