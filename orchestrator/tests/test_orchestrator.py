@@ -339,11 +339,12 @@ async def test_heuristic_router():
     assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
 
-def test_clean_plan_drops_unknown_threads():
+def test_clean_plan_drops_unknown_and_busy_threads():
+    idle, busy = {"level": "idle", "backlog": 0, "busy_for": 0}, {"level": "busy", "backlog": 0, "busy_for": 3}
     plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
-                       "send": [{"thread": "t_nope", "message": "m"},
+                       "send": [{"thread": "t_nope", "message": "m"}, {"thread": "t_2", "message": "m"},
                                 {"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]},
-                      [{"id": "t_1"}], HERE)
+                      [{"id": "t_1", "load": idle}, {"id": "t_2", "load": busy}], HERE)
     # Sprites is not available here: that thread is placed when it is put on a worker.
     assert [(s["workers"], s["where"]) for s in plan["spawn"]] == [("", "")]
     assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]

@@ -52,7 +52,7 @@ image-only request also skips it and spawns one thread.
 
 | Router | When | How it decides |
 | --- | --- | --- |
-| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
+| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. One job per thread: the `route` schema lets it send only to idle threads (`router.idle`; `clean_plan` drops any other send), so anything for a busy, backed-up or stalled thread, even about its current work, goes to a new thread. |
 
 The model answers by calling one function, `route` (`place` when a new thread
 is put on a worker), whose JSON schema is the plan: `tool_choice` names it and
@@ -97,7 +97,10 @@ what the control plane already knows:
 | `idle` | not in a turn, nothing waiting: takes new work at once |
 | `busy` | in a turn, being put on a worker, or one message on its way |
 | `backed_up` | `backlog` is 2 (`load.BACKLOG`) or more: what it is sent now waits behind them |
-| `stalled` | its worker is unreachable or being reattached: whatever it is sent waits for the worker |
+| `stalled` | its worker is unreachable or being reattached: a message to it (typed straight to it) moves it to a ready worker |
+
+The router sends only to `idle` threads; the other levels say why a thread
+is skipped.
 
 The thread list API (`GET /api/projects/{id}/threads`, `GET /api/threads/{id}`)
 returns the same `load`, and the UI shows the backlog as an "N waiting" badge

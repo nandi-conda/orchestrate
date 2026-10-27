@@ -25,8 +25,9 @@ threads about what changed for them. An empty revision is a fine answer.
 
 `ModelRouter` asks a fast OpenAI-compatible model (deepseek-flash by default)
 to call a function whose schema is the plan, with the thread directory as
-context, each thread with its load (load.py), so busy and backed-up threads
-get no new work: it goes to a new thread. It leans toward spawning. A request
+context, each thread with its load (load.py). A thread does one job at a
+time: only idle threads can be sent anything, and work for any other goes to
+a new thread. It leans toward spawning. A request
 it cannot plan (the model unreachable or refusing the call, an answer that is
 not one call of that function, a plan that does nothing) is an error the
 project shows, with what the model said; there is no
@@ -44,9 +45,11 @@ import httpx
 LOAD = """Each thread has a `load` (how much it already has on its plate):
 `level` is "idle" (between turns, nothing waiting: it takes work at once),
 "busy" (in a turn), "backed_up" (`backlog` messages it has not got to are
-waiting on it) or "stalled" (its worker is not answering: a message moves it
-to another worker and cuts its turn short); `busy_for` is seconds into its
-current turn.
+waiting on it) or "stalled" (its worker is not answering); `busy_for` is
+seconds into its current turn. A thread does one job at a time and work never
+waits: only idle threads can be sent anything (`send` names only them), and
+anything for a thread that is not idle, even about its current work, goes to
+a new thread instead.
 """
 
 WHERE = """Each thread's work runs on workers in one of `places`; `reaches` says what
@@ -86,11 +89,7 @@ Threads are cheap: prefer spawning a new thread. Reuse a thread only when the
 request clearly continues that thread's work and the thread is idle. Split a
 request with several independent parts into several new threads. A request can
 also spawn threads and notify existing threads whose work it touches.
-""" + LOAD + """Send a busy thread a message only when it is about the work it is doing now
-(a correction, something it needs); new work, even work that follows on from
-it, goes to a new thread instead. Send a backed_up or stalled thread nothing
-it could do without: its messages wait behind the rest.
-""" + PLACES + """
+""" + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -104,9 +103,7 @@ spawn a thread for each part of the new text that no reached thread covers, and
 send a reached or other thread a message only to say what changed for it (for
 example that a part it had now has its own thread). An empty plan is a fine
 answer when the corrections cover the edit.
-""" + LOAD + """Send a busy thread only what concerns the work it is doing now, and a
-backed_up or stalled thread nothing it could do without.
-""" + PLACES + """
+""" + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -133,11 +130,17 @@ def available(places: list[dict]) -> set[str]:
     return {p["id"] for p in places if not p["why"]}
 
 
+def idle(directory: list[dict]) -> list[str]:
+    """The threads a plan can send to: those whose load (load.py) is idle. A
+    thread does one job at a time, so nothing is queued on a busy one."""
+    return [t["id"] for t in directory if (t.get("load") or {}).get("level") == "idle"]
+
+
 def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
-    """Keep only well-formed entries that point at real threads, each with
-    `workers` an available place, or "" (spawn: asked with `place` when it
-    is first put on a worker; send: not moved), and `where` why there."""
-    known, can = {t["id"] for t in directory}, available(places)
+    """Keep only well-formed entries that point at real, idle threads, each
+    with `workers` an available place, or "" (spawn: asked with `place` when
+    it is first put on a worker; send: not moved), and `where` why there."""
+    known, can = set(idle(directory)), available(places)
 
     def placed(s: dict) -> dict:
         workers = s["workers"] if s.get("workers") in can else ""
@@ -155,8 +158,8 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
     """The `route` function the model must call: its schema is the plan's, so
     the answer has the plan's shape (strict mode). A spawn's `workers` is an
     available place; a send's is one, or "" to leave the thread where it is.
-    `send` is offered only when there are threads to send to, and names one
-    of them. `where` is why a thread runs (or moves) where it does."""
+    `send` is offered only when there are idle threads to send to, and
+    names one of them. `where` is why a thread runs (or moves) where it does."""
     can = sorted(available(places))
     # Nowhere to run: the thread is refused when it is first put on a worker.
     spawn = {"type": "object", "additionalProperties": False,
@@ -167,11 +170,11 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
                             "where": {"type": "string", "description": WHERE_FIELD}}}
     props = {"spawn": {"type": "array", "items": spawn},
              "why": {"type": "string", "description": "one sentence"}}
-    if directory:
+    if idle(directory):
         props["send"] = {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
             "required": ["thread", "message", "workers", "where"],
-            "properties": {"thread": {"type": "string", "enum": [t["id"] for t in directory]},
+            "properties": {"thread": {"type": "string", "enum": idle(directory)},
                            "message": {"type": "string", "description": "what to tell it"},
                            "workers": {"type": "string", "enum": [""] + can,
                                        "description": "\"\" unless its work now needs the other place"},

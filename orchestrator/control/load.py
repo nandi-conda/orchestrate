@@ -23,9 +23,9 @@ and comes to one level:
                a message to it moves it to a ready worker, cutting short the
                turn it had under way there.
 
-The router gives new work only to idle threads whose work it continues; busy
-threads get only what concerns their current turn, and backed-up or stalled
-threads none, so that work goes to a new thread (router.py).
+A thread does one job at a time: the router can send only to idle threads
+(router.idle), and anything for a busy, backed-up or stalled one, even about
+its current work, goes to a new thread (router.py).
 """
 
 from __future__ import annotations

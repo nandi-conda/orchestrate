@@ -258,7 +258,9 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
                                      "send": [{"thread": "t_1", "message": "heads up", "workers": "",
                                                "where": "it stays"}],
                                      "why": "new work"}), seen)
-    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old"}], places)
+    idle, busy = {"level": "idle", "backlog": 0, "busy_for": 0}, {"level": "busy", "backlog": 0, "busy_for": 9}
+    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old", "load": idle},
+                                   {"id": "t_2", "title": "Busy", "load": busy}], places)
     # A send that moves nothing keeps no reason for a move.
     assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
                                "where": "Sprites are not available"}],
@@ -272,10 +274,11 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     props = fn["parameters"]["properties"]
     assert props["spawn"]["items"]["properties"]["workers"]["enum"] == ["local"]
     assert "where" in props["spawn"]["items"]["required"] and "where" in props["send"]["items"]["required"]
+    # One job per thread: only the idle thread can be sent anything.
     assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
     assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
-    # With no threads there is nothing to send to, so the schema has no send.
-    await r.plan("fix it", [], places)
+    # With no idle threads there is nothing to send to, so the schema has no send.
+    await r.plan("fix it", [{"id": "t_2", "title": "Busy", "load": busy}], places)
     assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
 
 
