@@ -8,9 +8,9 @@ project list and projects without reloading.
 
 The start page lists your projects. **New project** asks only for a name; a
 project starts with its own local git repository and no remote (cards say
-"local only"). **Open folder** makes a project from a folder on the machine
+"no remote"). **Open folder** makes a project from a folder on the machine
 the control plane runs on: type its full path (`~/` works), or **Browse…** to
-pick it, and optionally a name (the
+pick it, optionally a name (the
 folder's name otherwise). The folder becomes the project's remote,
 so finished threads land in its checked-out branch and their work shows up in
 its files; see [Opening a folder](../architecture/git.md#opening-a-folder).
@@ -50,7 +50,9 @@ The left side is the thread list: **Project orchestrator** first, then the
 project's threads, each with its state, and an "N waiting" badge when
 messages to it are piling up (red once it is backed up: the router then gives
 new work to a new thread instead; see
-[thread load](../architecture/routing.md#thread-load)). The right side is the pane for what
+[thread load](../architecture/routing.md#thread-load)), and a "This computer"
+badge on a thread whose request said to run locally (the rest run on Sprites;
+see [where threads run](../architecture/routing.md#where-threads-run)). The right side is the pane for what
 you selected, with the request box under it.
 
 **Project orchestrator** shows the router's decisions and every thread's events,

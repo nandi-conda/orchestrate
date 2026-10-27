@@ -48,8 +48,13 @@ spawn and messages to existing threads. See
 [Requests, routing and threads](routing.md).
 
 **Providers** (`control/providers.py`) make workers: `SpritesProvider` (a Fly
-Sprite per worker), `LocalProvider` (a subprocess on this machine) and
-`AutoProvider`, which picks Sprites whenever `SPRITES_TOKEN` is stored.
+Sprite per worker) and `LocalProvider` (a subprocess on this machine). The
+router names each thread's place (`threads.workers`, "sprites" unless the
+request says to run locally, then "local"); `Places` holds the provider of
+each place this control plane runs workers in and why it refuses the others
+(no `SPRITES_TOKEN`; not Linux; a phone), which the router is shown. A
+thread on a refused place fails with that reason; nothing picks another
+place for it.
 
 **Workers** run the runner (`runner/`), one process hosting many threads
 (capacity 16 by default), of any project. They are a fixed pool of 3 shared

@@ -99,6 +99,7 @@ GOT_FOLDERS: Const[i32] = 72
 PICK_OPEN: Const[i32] = 73     # arg: a folder of the listing; -1 its parent; -2 the home folder
 PICK_USE: Const[i32] = 74
 PICKED: Const[i32] = 75       # arg: the field the desktop window's folder dialog picked for
+GOT_PLACES: Const[i32] = 76
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -143,6 +144,7 @@ MD_ALT: Const[i32] = 7
 # ---- Model
 screen: i32 = 0          # 0 project list, 1 a project
 projects: i32 = 0        # JSON handle: list of projects
+places: i32 = 0          # JSON handle: where threads' workers can run ([{id, label, why}], GET /api/places)
 project: i32 = 0         # JSON handle: the open project
 threads: i32 = 0         # JSON handle: thread directory
 transcript: i32 = 0      # JSON handle: selected thread's events
@@ -206,6 +208,9 @@ h_bound: i32 = 0
 h_unbound: i32 = 0
 h_ready: i32 = 0
 h_backed_up: i32 = 0
+h_local: i32 = 0         # "local", the place a thread is badged for
+h_place: i32 = 0         # scratch for a place id while finding its label
+h_plabel: i32 = 0        # a place's label, for a thread's badge
 h_wlog_err: i32 = 0      # why the worker log could not be read
 h_fpath: i32 = 0         # the worktree directory the Files tab shows ("" = its root)
 h_files_err: i32 = 0     # why the files could not be read
@@ -253,7 +258,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_bound, h_unbound, h_ready, h_backed_up
+    global h_bound, h_unbound, h_ready, h_backed_up, h_local, h_place, h_plabel
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
@@ -298,6 +303,10 @@ def init() -> None:
     s_set(h_ready, "ready")
     h_backed_up = s_new()
     s_set(h_backed_up, "backed_up")
+    h_local = s_new()
+    s_set(h_local, "local")
+    h_place = s_new()
+    h_plabel = s_new()
     h_wlog_err = s_new()
     h_fpath = s_new()
     h_files_err = s_new()
@@ -319,6 +328,8 @@ def init() -> None:
     h_edit = s_new()
     h_img = s_new()
     host_picks = host_folders()
+    s_set(h_url, "/api/places")
+    get(h_url, GOT_PLACES)
     on_nav(NAV)
     on_select(h_seltext, h_selpos, SELECTED)
     on_paste(PASTED)
@@ -603,8 +614,23 @@ def land() -> None:
         scroll_follow("pane")
 
 
+def place_label(id: i32, dst: i32) -> None:
+    """The name the UI gives the place `id` ("This computer", "Sprites") in dst."""
+    i: i32
+    e: i32
+    s_copy(dst, id)
+    if places == 0:
+        return
+    for i in range(j_len(places, "")):
+        e = j_idx(places, i)
+        jstr(e, "id", h_place)
+        if s_eq(h_place, id) == 1:
+            jstr(e, "label", dst)
+        j_free(e)
+
+
 def update(msg: i32, arg: i32) -> None:
-    global projects, project, threads, transcript, plog, loading, show_new, creating, sending
+    global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     global picking, folders, folders_loading
@@ -615,6 +641,8 @@ def update(msg: i32, arg: i32) -> None:
         if screen == 0:
             loading = 0
         projects = take(projects, arg)
+    elif msg == GOT_PLACES:
+        places = take(places, arg)
     elif msg == OPEN:
         e = j_idx(projects, arg)
         jstr(e, "id", h_t1)
@@ -1144,6 +1172,15 @@ def thread_badges(t: i32) -> None:
         if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1:
             state_badge(h_t2)
     backlog_badge(t)
+    jstr(t, "workers", h_t2)
+    if s_eq(h_t2, h_local) == 1:
+        place_label(h_t2, h_plabel)
+        el("span")
+        cls("badge")
+        cls("secondary")
+        attr("title", "Its workers run here, as its request asked; the rest run on Sprites")
+        text_ref(h_plabel)
+        end()
 
 
 def backlog_badge(t: i32) -> None:
@@ -1248,7 +1285,7 @@ def project_list() -> None:
         if s_len(h_t2) > 0:
             text_ref(h_t2)
         else:
-            text("local only")
+            text("no remote")
         end()
         end()
         el("div")
@@ -2709,8 +2746,9 @@ def project_window() -> None:
         if s_len(h_t1) > 0:
             text_ref(h_t1)
         else:
-            text("local only")
+            text("no remote")
     end()
+
     span("grow")
     end()
     btn_open("ghost", SETTINGS_SHOW, 0)

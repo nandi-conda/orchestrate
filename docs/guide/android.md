@@ -48,7 +48,8 @@ Change them from the menu, **Keys**; saving restarts the control plane.
   storage (`~/.orchestrate` there). Uninstalling the app deletes them.
 - **git**: built from source for Android (`android/git/build.sh`) with
   curl and OpenSSL, for the hub's worktrees, rebases, bundles and pushes.
-- **Workers**: sprites. A phone runs no local workers.
+- **Workers**: sprites. A phone runs no local workers: the router is told so
+  and puts every thread on Sprites, even when a request says to run locally.
 
 The UI's folder picker browses the app's own storage, since an Android app
 sees only that.

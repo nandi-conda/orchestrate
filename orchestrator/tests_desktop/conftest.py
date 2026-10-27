@@ -37,12 +37,12 @@ def echo_app(tmp_path):
     """The control plane's app on the echo runner, for ControlPlane."""
     from control.app import create_app
     from control.providers import LocalProvider
-    from tests.doubles import ECHO_RUNNER, HeuristicRouter
+    from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
     from control.store import SqliteStore
 
     def make(shutdown):
         return create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                          LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), HeuristicRouter(),
+                          local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                           shutdown_event=shutdown, repos=str(tmp_path / "repos"))
     return make
 

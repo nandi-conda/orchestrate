@@ -20,7 +20,7 @@ SERVICE = "orchestrate"
 KNOWN = {
     "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and every worker",
                          "Authorization: Bearer <key> to https://api.deepseek.com"),
-    "SPRITES_TOKEN": ("Fly Sprites org token; stored, workers always run on Sprites",
+    "SPRITES_TOKEN": ("Fly Sprites org token, for threads the router puts on Sprites",
                       "Authorization: Bearer <token> to https://api.sprites.dev/v1"),
     "GITHUB_TOKEN": ("GitHub fine-grained token, Contents: Read and write on the project repos; "
                      "the control plane fetches their default branch into each project's hub and "

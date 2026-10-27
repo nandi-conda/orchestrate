@@ -21,7 +21,7 @@ collection is unlocked.
 | Name | What it is | Sent as | Without it |
 | --- | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | A DeepSeek API key. The router uses it, and the control plane passes it to every worker, where prime-agent and the web tools use it. | `Authorization: Bearer <key>` to `https://api.deepseek.com` | Required: the control plane does not start, and says how to store it. |
-| `SPRITES_TOKEN` | A Fly Sprites API token for the org your sprites go in. | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` | Workers run on this machine as subprocesses. |
+| `SPRITES_TOKEN` | A Fly Sprites API token for the org your sprites go in. | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` | Sprites is off: the router is told why and puts every thread on this computer. |
 | `GITHUB_TOKEN` | A GitHub **fine-grained** personal access token with **Contents: Read and write** on the repositories you attach to projects. Used by the control plane only; workers never get it. | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` | Projects without a remote work as usual; attaching a private remote, or pushing to any remote, fails with git's error. |
 
 Missing secrets are printed at startup (`pixi run serve` or `pixi run desktop`)
@@ -41,7 +41,7 @@ variable (see [The runner and prime-agent](../architecture/runner.md#the-sandbox
 
 | | How |
 | --- | --- |
-| Where workers run | On Sprites whenever `SPRITES_TOKEN` is stored, even when the browser is on this machine (`AutoProvider`). Locally only when no token is stored. |
+| Where workers run | The router decides per thread: Sprites, unless the request asks to run locally ("run it locally"), then this computer. This computer needs Linux and `../runner`; Sprites needs `SPRITES_TOKEN`; the router never picks a place the control plane cannot run workers in. Each place has its own pool of 3. Threads from before this get the place their worker was in. |
 | What a sprite runs | This checkout's `origin` remote at its current branch, cloned to `/opt/orchestrate` on the sprite. A warning is printed when that is not your exact `HEAD`. |
 | Which router | `ModelRouter` with `deepseek-flash`. A request it cannot plan (the model unreachable, an answer that is no plan) shows as an error in the project. |
 | Which model threads use | prime-agent's `deepseek` provider with `deepseek-flash` by default; a project's model is set in its **Settings**. Image turns on a text-only model go to `deepseek/deepseek-flash`. |

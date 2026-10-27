@@ -21,15 +21,15 @@ drive everything from the repo root:
 ```sh
 pixi run setup                        # install what every project needs
 pixi run set-key DEEPSEEK_API_KEY     # once: store the key in the system keyring
-pixi run set-key SPRITES_TOKEN        # once: run workers on Fly Sprites, even for a local UI
+pixi run set-key SPRITES_TOKEN        # once: run threads on Fly Sprites
 pixi run serve                        # just the control plane + web UI on http://127.0.0.1:8000
 pixi run desktop                      # or: the UI in a desktop window, control plane in the same process
 pixi run test                         # every test suite: runner, orchestrator, desktop window
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```
 
-With `SPRITES_TOKEN` stored, workers are sprites, including when the control
-plane runs on your laptop. The control plane is never reachable from a worker,
+Threads run on Sprites (which needs `SPRITES_TOKEN`); say "run it locally" in a
+request and the router puts its threads on this computer instead. The control plane is never reachable from a worker,
 by design: it opens every connection, and it also collects the workers' peer
 calls (list, read, message and spawn threads across workers), so nothing has to
 be exposed or tunnelled.

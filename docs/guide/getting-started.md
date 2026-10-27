@@ -11,7 +11,8 @@
 - For the real runner on **this** machine: Linux with unprivileged user
   namespaces, since threads are sandboxed with bubblewrap. Workers on Fly
   Sprites are Linux whatever your machine is, so a Mac or Windows control plane
-  with `SPRITES_TOKEN` stored runs real agents fine.
+  with `SPRITES_TOKEN` stored runs real agents fine, for threads the router puts
+  on Sprites (all of them, unless a request says to run locally).
 
 ## Install
 
@@ -89,13 +90,13 @@ Then create a project, type a request, and press Enter. The
 | Stored | Workers | Router |
 | --- | --- | --- |
 | nothing | the control plane does not start: `DEEPSEEK_API_KEY` is required | |
-| `DEEPSEEK_API_KEY` | the real runner as a local subprocess (Linux), a pool of 3 shared by every project | `deepseek-flash` (`ModelRouter`) |
-| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, a pool of 3: `orch-<pool>-w1`..`orch-<pool>-w3` | `deepseek-flash` |
+| `DEEPSEEK_API_KEY` | every thread on this computer: the real runner as a local subprocess (Linux), a pool of 3 shared by every project | `deepseek-flash` (`ModelRouter`) |
+| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | threads on Fly Sprites, a pool of 3: `orch-<pool>-w1`..`orch-<pool>-w3`; a request that says "run locally" puts its threads on this computer instead | `deepseek-flash` |
 
 !!! warning "Sprites cost money"
     With `SPRITES_TOKEN` stored, the first thread creates a billable sprite,
-    even when the control plane runs on your laptop. That is the point of
-    storing the token. There are never more than 3 (the pool, shared by every
+    even when the control plane runs on your laptop, unless its request says
+    to run locally. There are never more than 3 (the pool, shared by every
     project); they pause while idle and are **not** destroyed when the control
     plane stops (the next one attaches to them again). At startup the control
     plane destroys every other `orch-` sprite of ours, such as each project's

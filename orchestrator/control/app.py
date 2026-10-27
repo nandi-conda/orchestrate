@@ -23,7 +23,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from . import paths
-from .providers import WorkerProvider, default_provider
+from .providers import PLACES, Places, default_places
 from .gitio import GitError
 from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
@@ -140,6 +140,9 @@ def display(ev: dict) -> dict:
     elif t in ("project_archived", "project_unarchived"):
         kind, label = K_STATUS, t.removeprefix("project_")
         text = f"project {label}"
+    elif t == "moved":
+        kind, label = K_STATUS, "moved"
+        text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now"
     elif t == "worker_lost":
         kind, label, text = K_ERROR, "worker lost", d.get("error", "")
     elif t == "worker_restarted":
@@ -252,12 +255,12 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
     is bound to (states.py), each with why, and its load (load.py)."""
     view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
                               "binding", "binding_reason", "worker_id", "files", "archived_at", "created_at",
-                              "updated_at", "load")}
+                              "updated_at", "load", "workers")}
     view["worker_state"], view["worker_reason"] = orch.worker_state(t)
     return view
 
 
-def create_app(store: Store | None = None, provider: WorkerProvider | None = None,
+def create_app(store: Store | None = None, places: Places | None = None,
                router: Router | None = None,
                shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS) -> Starlette:
     store = store or store_from_url(None)
@@ -267,7 +270,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
     @asynccontextmanager
     async def lifespan(app):
         await store.open()
-        orch = Orchestrator(store, provider or default_provider(), router or default_router(), repos)
+        orch = Orchestrator(store, places or default_places(), router or default_router(), repos)
         holder["orch"] = orch
         app.state.orch = orch
         try:
@@ -275,9 +278,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
             yield
         finally:
             await orch.close()
-            close = getattr(orch.provider, "close", None)
-            if close:
-                await close()
+            await orch.places.close()
             await store.close()
 
     def orch() -> Orchestrator:
@@ -342,6 +343,12 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         except GitError as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p))
+
+    async def list_places(req: Request):
+        """Where threads' workers can run: [{id, label, why}], `why` saying
+        why this control plane runs none there ("" where it does). The
+        router picks one per thread."""
+        return JSONResponse(orch().places.offered())
 
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
@@ -641,6 +648,7 @@ def create_app(store: Store | None = None, provider: WorkerProvider | None = Non
         Route("/api/projects", list_projects, methods=["GET"]),
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/folders", list_folders, methods=["GET"]),
+        Route("/api/places", list_places, methods=["GET"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),

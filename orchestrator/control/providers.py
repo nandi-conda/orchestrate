@@ -14,8 +14,13 @@ a desktop) on one Sprites org each have their own workers.
 - `SpritesProvider` makes a Fly Sprite per slot, `orch-<pool>-w<n>`, labeled
   `orchestrator-<pool>`, installs the runner on it and runs it as a sprite service
   on port 8080.
-- `AutoProvider` is the default: sprites whenever `SPRITES_TOKEN` is stored,
-  local workers otherwise.
+
+Where a thread's workers run (threads.workers) is the router's decision, per
+thread: "sprites" unless the request asks for "local" (this computer).
+`Places` holds the provider of each place this control plane offers, and why
+it refuses the others; the router is told both, and a thread on a refused
+place fails with that reason instead of running somewhere else. Each place
+has its own pool of slots.
 
 A worker is never told where the control plane is and never connects to it:
 the control plane opens every connection, including the one that collects its
@@ -480,11 +485,10 @@ class SpritesProvider:
         # it ends every turn under way there, so it is left running when it
         # is exactly the runner this would start: the same commit, model key,
         # token and settings, as the fingerprint it reports says. Otherwise
-        # it is restarted from the definition put below (`start` does not
-        # replace a running process), so the runner serving the worker is
-        # always this checkout's, with this control plane's key and token;
-        # the turns that cuts short resume when their threads are posted
-        # again (runner/API.md, "Interrupted turns").
+        # the service is removed and put again (see below), so the runner
+        # serving the worker is always this checkout's, with this control
+        # plane's key and token; the turns that cuts short resume when their
+        # threads are posted again (runner/API.md, "Interrupted turns").
         async with steps.step("looking for its runner service"):
             defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
         if defined:
@@ -494,17 +498,31 @@ class SpritesProvider:
             if serving:
                 steps.note("it is: left running")
                 return worker
-            steps.note("it is not (another commit, key, token or settings, or no answer): it is restarted")
+            steps.note("it is not (another commit, key, token or settings, or no answer): its service is "
+                       "removed and put again")
 
         async with steps.step(f"installing orchestrate {commit[:12]} on it (git fetch, pixi install, prime-agent)"):
-            out = await self.exec(name, BOOTSTRAP, env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
+            out = await self.exec(name, BOOTSTRAP,
+                                  env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
         for line in out.strip().splitlines()[-10:]:
             steps.note(f"  install | {line}")
-        async with steps.step("defining its runner service"):
+        if defined:
+            # A definition is removed, not replaced: the API answers a PUT whose
+            # command is the one it already has with "Service already running
+            # with that command, use .../restart" and keeps the definition it
+            # has, whether that service runs or not. The env travels in the
+            # definition (this control plane's token, model key, commit and
+            # fingerprint), so a redefined service kept the old ones for good:
+            # the runner reported no fingerprint, and every attach restarted a
+            # worker a matching one would have been left running. Removing the
+            # service stops the runner it ran; the PUT below makes it, on this
+            # definition, and starts it.
+            async with steps.step("removing its runner service (a PUT cannot replace a definition)"):
+                gone = await self.http.delete(f"/sprites/{name}/services/runner")
+                if gone.status_code != 404:  # already gone
+                    gone.raise_for_status()
+        async with steps.step("defining its runner service, which starts it"):
             (await self.http.put(f"/sprites/{name}/services/runner", json=service)).raise_for_status()
-        action = "restart" if defined else "start"
-        async with steps.step(f"{action}ing its runner service"):
-            await self.service_action(name, action)
         async with steps.step("waiting up to 300s for its runner to answer"):
             health = await self.wait_ready(worker)
         if health.get("commit") != commit:
@@ -528,27 +546,6 @@ class SpritesProvider:
         except TimeoutError:
             return False
         return health.get("spec") == want
-
-    async def service_action(self, name: str, action: str, timeout: float = 300.0) -> None:
-        """Run `start`/`restart`/`stop` on the runner service to completion.
-
-        The response is a stream of the action's log, which ends with a
-        `complete` event. Bound it: a runtime that is confused about the
-        service must not hang worker creation forever.
-        """
-
-        async def run() -> None:
-            async with self.http.stream("POST", f"/sprites/{name}/services/runner/{action}") as s:
-                s.raise_for_status()
-                async for _ in s.aiter_lines():
-                    pass
-
-        what = {"start": "starting", "restart": "restarting", "stop": "stopping"}.get(action, action)
-        try:
-            await asyncio.wait_for(run(), timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"the runner service on sprite {name} did not finish {what} "
-                               f"within {timeout:.0f}s") from None
 
     async def wait_ready(self, worker: Worker, timeout: float = 300.0) -> dict:
         try:
@@ -671,81 +668,70 @@ def service_log_lines(ev: dict) -> list[str]:
     return []
 
 
-class AutoProvider:
-    """Remote first: workers are sprites whenever a token is stored, local
-    runner processes otherwise. Either way the control plane opens every connection, so
-    where it runs never matters to the worker."""
+# Where a thread's workers can run, by the name its provider goes by
+# (Worker.provider), with how the UI names it.
+PLACES = {"local": "This computer", "sprites": "Sprites"}
 
-    name = "auto"
 
-    def __init__(self, local: LocalProvider | None = None, sprites: SpritesProvider | None = None) -> None:
-        self._local = local
-        self._sprites = sprites
-        self._looked_for_token = sprites is not None
-        self._warned_local = False
+class PlaceRefused(Exception):
+    """A thread was to run where this control plane runs no workers."""
 
-    def local(self) -> LocalProvider:
-        if self._local is None:
-            self._local = LocalProvider()
-        return self._local
 
-    def sprites(self) -> SpritesProvider | None:
-        if not self._looked_for_token:
-            from .secrets import get_secret
+class Places:
+    """The providers of the places this control plane runs workers in, and
+    for each place it does not, why. The router names each thread's place;
+    nothing picks another one for it."""
 
-            self._looked_for_token = True
-            self._sprites = SpritesProvider() if get_secret("SPRITES_TOKEN") else None
-        return self._sprites
+    def __init__(self, providers: dict[str, WorkerProvider], refused: dict[str, str] | None = None) -> None:
+        unknown = (set(providers) | set(refused or {})) - set(PLACES)
+        if unknown:
+            raise ValueError(f"unknown worker place {', '.join(sorted(unknown))}")
+        self.providers = providers
+        self.refused = {p: (refused or {}).get(p, "this control plane does not run workers there")
+                        for p in PLACES if p not in providers}
 
-    async def create(self, spec: WorkerSpec) -> Worker:
-        provider = self.sprites()
-        if provider is None:
-            if not self._warned_local:
-                self._warned_local = True
-                print("AutoProvider: SPRITES_TOKEN is not stored; using local workers. "
-                      "Store it with `pixi run set-key SPRITES_TOKEN` to run workers on Sprites.",
-                      file=sys.stderr)
-            return await self.local().create(spec)
-        return await provider.create(spec)
+    def provider(self, place: str) -> WorkerProvider:
+        """The provider of `place`, or PlaceRefused saying why there is none."""
+        if place in self.providers:
+            return self.providers[place]
+        if place not in PLACES:
+            raise PlaceRefused(f"workers cannot run on {place!r}: it is none of {', '.join(PLACES)}")
+        raise PlaceRefused(f"workers cannot run on {PLACES[place]}: {self.refused[place]}")
 
-    def _of(self, worker: Worker):
-        # A worker an earlier control plane made may be asked about first.
-        return self.sprites() if worker.provider == "sprites" else self.local()
-
-    async def destroy(self, worker: Worker) -> None:
-        provider = self._of(worker)
-        if provider is not None:
-            await provider.destroy(worker)
-
-    async def sweep(self, slots: int, pool: str) -> list[str]:
-        """The pool is sprites when a token is stored, local workers otherwise."""
-        provider = self.sprites()
-        return await (provider or self.local()).sweep(slots, pool)
-
-    async def exists(self, worker: Worker) -> bool:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        return await provider.exists(worker)
-
-    async def logs(self, worker: Worker, lines: int) -> str:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        return await provider.logs(worker, lines)
-
-    async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        async for line in provider.follow(worker, backlog):
-            yield line
+    def offered(self) -> list[dict]:
+        """Every place, in PLACES order, as the UI shows it: `why` is empty
+        for those this control plane runs workers in."""
+        return [{"id": p, "label": label, "why": self.refused.get(p, "")} for p, label in PLACES.items()]
 
     async def close(self) -> None:
-        for provider in (self._local, self._sprites):
-            if provider is not None:
-                await provider.close()
+        for provider in self.providers.values():
+            close = getattr(provider, "close", None)
+            if close is not None:
+                await close()
 
 
-def default_provider() -> WorkerProvider:
-    return AutoProvider()
+SPRITES_MISSING = ("it needs SPRITES_TOKEN, a Fly Sprites organization token (sent as "
+                   "`Authorization: Bearer <token>` to https://api.sprites.dev/v1). Store it with "
+                   "`pixi run set-key SPRITES_TOKEN`, or set it in the environment, and start the app again")
+
+
+def default_places() -> Places:
+    """This computer, when it can run the runner (Linux, with ../runner and
+    DEEPSEEK_API_KEY), and Sprites, when SPRITES_TOKEN is stored."""
+    from .secrets import get_secret
+
+    providers: dict[str, WorkerProvider] = {}
+    refused: dict[str, str] = {}
+    if not sys.platform.startswith("linux"):
+        refused["local"] = ("the runner is Linux-only (it sandboxes threads with bubblewrap), "
+                            f"and this computer runs {sys.platform}")
+    else:
+        try:
+            providers["local"] = LocalProvider()
+        except RuntimeError as e:
+            refused["local"] = str(e)
+    if get_secret("SPRITES_TOKEN"):
+        providers["sprites"] = SpritesProvider()
+    else:
+        refused["sprites"] = SPRITES_MISSING
+    return Places(providers, refused)

@@ -2,13 +2,23 @@
 
 ## The worker pool
 
-Workers are a **pool of 3 per control plane, shared by every project**
-(`POOL` in `orchestrator/control/service.py`). The pool has a name, made once
-and kept in the control plane's store (`Store.pool_id`, eight hex digits).
-Each worker sits in a numbered slot, and a slot always names the same worker:
-`orch-<pool>-w1`, `orch-<pool>-w2`, `orch-<pool>-w3` on Sprites (labeled
-`orchestrator-<pool>`), `w1`..`w3` locally. That is the whole lifecycle
-policy:
+Workers run in one of two places, **Sprites** or **this computer**, and the
+router decides per thread (`threads.workers`): Sprites, unless the request
+asks to run locally ("run it locally", "on my machine"). It is told which
+places this control plane can run workers in and why not the others (no
+`SPRITES_TOKEN`, not Linux, a phone), and never picks one it cannot. A
+thread spawned with no place (a **New thread** typed straight in, an API
+`POST .../threads`) is placed by the router from its request when it is first
+put on a worker; a thread a peer spawns runs where its parent runs. A request
+the router sends to an existing thread can move it ("@t_ab12 run this
+locally"): it is stopped where it runs and comes back on the other place with
+that message. Each place has a **pool of 3, shared by every project**
+(`POOL` in `orchestrator/control/service.py`). The pools are this control
+plane's own, named once in its store (`Store.pool_id`, eight hex digits).
+Each worker sits in a numbered slot of its place's pool, and a slot always
+names the same worker: `orch-<pool>-w1`, `orch-<pool>-w2`, `orch-<pool>-w3`
+on Sprites (labeled `orchestrator-<pool>`), `w1`..`w3` on this computer. A thread only ever goes on a worker of its own
+place. That is the whole lifecycle policy:
 
 - **Made only to fill an empty slot.** A thread goes on the least loaded
   ready worker with room (16 running threads each). When none has room, the
@@ -20,13 +30,13 @@ policy:
   pauses on its own while nothing is connected to it, so an idle pool costs
   little. A lost worker's slot is filled again by a new worker of the same
   name.
-- **Swept at startup.** Before it takes work, the control plane lists the
-  provider's workers and destroys every one of its pool's that is not a
-  slot (slots beyond the pool's size), and those from before pools had
-  names: the one pool every control plane shared (`orch-w<n>`, labeled
+- **Swept at startup.** Before it takes work, the control plane lists each
+  place's workers and destroys every one of its pool's that is not a slot
+  (slots beyond the pool's size), and those from before pools had names:
+  the one pool every control plane shared (`orch-w<n>`, labeled
   `orchestrator`) and each project's own workers (`orch-p-<id>-w<n>`). The
-  store marks the ones it knew as lost, with why. Other pools' sprites, and
-  sprites that are not ours, are never touched.
+  store marks the ones it knew as lost, with why. Other control planes'
+  pools, and sprites that are not ours, are never touched.
 - **Projects share workers, not repositories.** A worker keeps one
   repository per project (`.repos/<project>`), a thread sees only its own
   project's, and each peer call is answered within the calling thread's
