@@ -378,7 +378,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
     async def app_settings(req: Request):
         """This computer's control plane, for the Settings on the project
         list: where its data is, the router's model, the sync server it shares
-        projects through (null when none), and each key it uses, with where
+        projects through and the key of its space (null when none), and each key it uses, with where
         it is found (`source`: "environment", "keyring" or "" for nowhere).
         `keyring` names the keyring backend, "" when there is none."""
         def keys() -> list[dict]:
@@ -388,7 +388,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
         return JSONResponse({
             "data_dir": str(paths.DATA),
             "router_model": getattr(orch().router, "model", ""),
-            "sync": None if sync is None else {"url": sync.client.url, "computer": sync.name},
+            "sync": None if sync is None else {"url": sync.client.url, "computer": sync.name, "space": sync.space},
             "keyring": secrets.keyring_backend() or "",
             "keys": await asyncio.to_thread(keys),
         })

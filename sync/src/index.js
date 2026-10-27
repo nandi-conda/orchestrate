@@ -1,11 +1,13 @@
 // The sync server orchestrate control planes share projects through.
 //
-// Every request carries `Authorization: Bearer <SYNC_TOKEN>`; anything else
-// is answered 401. Control planes open every connection (they are never
-// reached), so all of it is plain HTTP: a sync round, a long-polled change
-// feed, leases, and blobs.
+// A public relay: it keeps no secret and asks for none. Every request names a
+// space with `X-Sync-Space: <64 hex digits>`, a random key the control plane
+// made (or was given, to pair with another computer). Knowing the key is the
+// only way into a space, so it is shared like a secret link. Control planes
+// open every connection (they are never reached), so all of it is plain HTTP:
+// a sync round, a long-polled change feed, leases, and blobs.
 //
-// One Durable Object, SyncHub, holds the whole account:
+// Each space is one Durable Object, SyncHub, and its own prefix in R2:
 //
 // - Automerge documents, by name ("projects", "project:<id>", "log:<id>:main",
 //   "log:<id>:<thread id>"). A control plane syncs one with the Automerge
@@ -33,21 +35,15 @@ const LOADED_MAX = 200; // documents kept loaded
 
 export default {
   async fetch(request, env) {
-    if (!(await authorized(request, env))) {
-      return json({ error: "a valid Authorization: Bearer <sync token> header is required" }, 401);
+    const space = request.headers.get("x-sync-space") || "";
+    if (!SPACE.test(space)) {
+      return json({ error: "an X-Sync-Space header with the space's key (64 hex digits) is required" }, 400);
     }
-    const hub = env.SYNC.get(env.SYNC.idFromName("account"));
-    return hub.fetch(request);
+    return env.SYNC.get(env.SYNC.idFromName(space)).fetch(request);
   },
 };
 
-async function authorized(request, env) {
-  const got = request.headers.get("authorization") || "";
-  const want = `Bearer ${env.SYNC_TOKEN || ""}`;
-  if (!env.SYNC_TOKEN || got.length !== want.length) return false;
-  const enc = new TextEncoder();
-  return crypto.subtle.timingSafeEqual(enc.encode(got), enc.encode(want));
-}
+const SPACE = /^[0-9a-f]{64}$/;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -90,6 +86,7 @@ export class SyncHub {
 
   async fetch(request) {
     const url = new URL(request.url);
+    const r2 = `${request.headers.get("x-sync-space")}/`; // this space's prefix in R2
     const path = url.pathname.split("/").filter(Boolean);
     const route = `${request.method} /${path[0] || ""}${path.length > 1 ? "/*" : ""}${path.length > 2 ? "/*" : ""}`;
     try {
@@ -110,17 +107,17 @@ export class SyncHub {
         case "GET /hubs/*":
           return json(this.bundles(path[1]));
         case "PUT /hubs/*":
-          return await this.addBundle(path[1], request, url);
+          return await this.addBundle(path[1], request, url, r2);
         case "GET /hubs/*/*":
-          return await this.blob(`hubs/${path[1]}/${Number(path[2])}.bundle`);
+          return await this.blob(`${r2}hubs/${path[1]}/${Number(path[2])}.bundle`);
         case "PUT /blobs/*":
-          await this.env.BUCKET.put(`blobs/${path[1]}`, await request.arrayBuffer(), {
+          await this.env.BUCKET.put(`${r2}blobs/${path[1]}`, await request.arrayBuffer(), {
             httpMetadata: { contentType: request.headers.get("content-type") || "application/octet-stream" },
             customMetadata: { meta: request.headers.get("x-meta") || "{}" },
           });
           return json({ ok: true });
         case "GET /blobs/*":
-          return await this.blob(`blobs/${path[1]}`);
+          return await this.blob(`${r2}blobs/${path[1]}`);
       }
       return json({ error: `no route ${request.method} ${url.pathname}` }, 404);
     } catch (e) {
@@ -322,7 +319,7 @@ export class SyncHub {
   // its hub. The body is {base, refs} as JSON (`refs`: every ref of the hub
   // after this bundle), x-meta-length bytes long, then the bundle (empty when
   // only refs moved).
-  async addBundle(project, request, url) {
+  async addBundle(project, request, url, r2) {
     const holder = url.searchParams.get("holder");
     const row = this.leaseRow(project);
     if (!row || row.holder !== holder) {
@@ -337,7 +334,7 @@ export class SyncHub {
     const { base, refs } = JSON.parse(new TextDecoder().decode(body.subarray(0, size)));
     const last = this.sql.exec(`SELECT MAX(n) AS n FROM bundles WHERE project = ?`, project).toArray()[0];
     const n = (last && last.n !== null ? last.n : 0) + 1;
-    await this.env.BUCKET.put(`hubs/${project}/${n}.bundle`, body.subarray(size));
+    await this.env.BUCKET.put(`${r2}hubs/${project}/${n}.bundle`, body.subarray(size));
     this.sql.exec(`INSERT INTO bundles (project, n, base, refs, at) VALUES (?, ?, ?, ?, ?)`,
       project, n, String(base || ""), JSON.stringify(refs || {}), Date.now());
     return json({ n });

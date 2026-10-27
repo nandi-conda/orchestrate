@@ -112,6 +112,7 @@ KEY_EDIT: Const[i32] = 85     # arg: the key's index; -1 closes its field
 KEY_IN: Const[i32] = 86
 KEY_SAVE: Const[i32] = 87
 KEY_SAVED: Const[i32] = 88
+SPACE_COPY: Const[i32] = 89   # copy this computer's sync space key, to pair another computer
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -187,6 +188,7 @@ jump: i32 = 0            # the pane's next content was asked for by navigation: 
 jump_seq: i32 = 0        # or at this event instead, the one a clicked quote came from (0 = none)
 md_quote: i32 = 0        # seq of the message whose first block quote md() links to its source (0 = none)
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
+SPACE_COPIED: Const[i32] = -2  # `copied` while the sync space key is the one just copied
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
@@ -1016,6 +1018,10 @@ def update(msg: i32, arg: i32) -> None:
         # arg is the reply's seq; its raw markdown is what gets copied.
         if find_text(arg, h_clip) == 1:
             clip_copy(h_clip, COPIED, arg, COPY_FAILED)
+    elif msg == SPACE_COPY:
+        if app != 0:
+            jstr(app, "sync.space", h_clip)
+            clip_copy(h_clip, COPIED, SPACE_COPIED, COPY_FAILED)
     elif msg == COPIED:
         copied = arg
         after(1500, COPIED_DONE, arg)
@@ -1550,14 +1556,34 @@ def app_dialog() -> None:
             jstr(app, "sync.url", h_t1)
             text_ref(h_t1)
             end()
-            text(". This computer is ")
+            text(", in this computer's space. This computer is ")
             jstr(app, "sync.computer", h_t1)
             text_ref(h_t1)
             text(".")
         else:
-            text("Off: projects stay on this computer. Set ORCHESTRATE_SYNC_URL and "
-                 "ORCHESTRATE_SYNC_TOKEN below to share them with your other computers.")
+            text("Off: projects stay on this computer.")
         end()
+        if j_has(app, "sync.space") == 1:
+            label("Space key")
+            el("p")
+            cls("help")
+            text("To share these projects with another computer, copy this key and set it there as "
+                 "ORCHESTRATE_SYNC_SPACE (in its Settings). Anyone with the key can see and change them.")
+            end()
+            div("settings-row")
+            span("mono")
+            cls("repo-path")
+            jstr(app, "sync.space", h_t1)
+            text_ref(h_t1)
+            end()
+            btn_open("outline", SPACE_COPY, 0)
+            cls("sm")
+            if copied == SPACE_COPIED:
+                text("Copied")
+            else:
+                text("Copy")
+            end()
+            end()
         label("Workers")
         div("settings-list")
         if places != 0:

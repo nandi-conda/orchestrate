@@ -23,7 +23,7 @@ from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
 pytestmark = pytest.mark.anyio
 
 SYNC_DIR = Path(__file__).resolve().parents[2] / "sync"
-TOKEN = "test-sync-token"
+SPACE = "5" * 64
 
 
 @pytest.fixture
@@ -47,13 +47,13 @@ def sync_server(tmp_path_factory):
     log = open(state / "wrangler.log", "w")
     proc = subprocess.Popen(
         ["npx", "wrangler", "dev", "--local", "--port", str(port), "--ip", "127.0.0.1",
-         "--persist-to", str(state), "--var", f"SYNC_TOKEN:{TOKEN}", "--show-interactive-dev-session=false"],
+         "--persist-to", str(state), "--show-interactive-dev-session=false"],
         cwd=SYNC_DIR, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "CI": "1"})
     url = f"http://127.0.0.1:{port}"
     deadline = time.time() + 90
     while True:
         try:
-            if httpx.get(f"{url}/leases", headers={"authorization": f"Bearer {TOKEN}"}, timeout=2).status_code == 200:
+            if httpx.get(f"{url}/leases", headers={"x-sync-space": SPACE}, timeout=2).status_code == 200:
                 break
         except httpx.HTTPError:
             pass
@@ -87,7 +87,7 @@ class Computer:
     def __init__(self, root: Path, url: str, name: str) -> None:
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
-        self.sync = Sync(url, TOKEN, root / "data", name=name)
+        self.sync = Sync(url, SPACE, root / "data", name=name)
         self.store = SyncedStore(SqliteStore(str(root / "db.sqlite")), self.sync)
         self.provider = LocalProvider(workdir=str(root / "workers"), command=ECHO_RUNNER)
         self.orch = Orchestrator(self.store, local(self.provider), HeuristicRouter(), root / "repos", sync=self.sync)
@@ -260,3 +260,58 @@ async def test_projects_made_before_syncing_are_shared_and_a_restart_picks_up_wh
         assert types.count("request") == 1 and types.count("edited") == 1
     finally:
         await a.close()
+
+
+async def test_a_computer_in_another_space_sees_none_of_its_projects(tmp_path, sync_server, fast):
+    a = await Computer(tmp_path / "a", sync_server, "desktop").start()
+    try:
+        p = await a.orch.create_project("mine")
+        other = Sync(sync_server, "6" * 64, tmp_path / "c" / "data", name="stranger")
+        c = SyncedStore(SqliteStore(str(tmp_path / "c" / "db.sqlite")), other)
+        await c.open()
+        await other.start()
+        try:
+            assert await c.list_projects() == [] and await c.get_project(p["id"]) is None
+            # Its own projects are its own: it drives one with the same id as nobody does in its space.
+            assert await other.claim(p["id"])
+        finally:
+            await other.close()
+            await c.close()
+    finally:
+        await a.close()
+
+
+async def test_a_computer_starts_without_the_server_and_catches_up_once_it_answers(tmp_path, sync_server, fast,
+                                                                                  monkeypatch):
+    monkeypatch.setattr(sync_mod, "CONNECT_WAIT", 0.2)
+    monkeypatch.setattr(sync_mod, "RETRY", 0.2)
+    port = free_port()
+    a = Computer(tmp_path / "a", f"http://127.0.0.1:{port}", "desktop")
+    await a.start()  # nothing listens there: starting goes on without it
+    try:
+        assert not a.sync.caught_up.is_set()
+        a.sync.client.http.base_url = sync_server  # the server answers from now on
+        await wait_for(lambda: asyncio.sleep(0, result=a.sync.caught_up.is_set()))
+        p = await a.orch.create_project("after all")
+        b = await Computer(tmp_path / "b", sync_server, "phone").start()
+        try:
+            assert (await wait_for(lambda: b.store.get_project(p["id"])))["name"] == "after all"
+        finally:
+            await b.close()
+    finally:
+        await a.close()
+
+
+def test_the_space_key_is_made_once_and_kept(tmp_path, monkeypatch):
+    monkeypatch.delenv(sync_mod.SPACE_KEY, raising=False)
+    monkeypatch.setattr(sync_mod, "get_secret", lambda name: None)
+    first = Sync.from_env(tmp_path)
+    assert sync_mod.is_space(first.space) and Sync.from_env(tmp_path).space == first.space
+    assert (tmp_path / "space").stat().st_mode & 0o077 == 0
+    assert first.client.url == sync_mod.DEFAULT_URL
+    # A key from another computer (environment or keyring) names the space instead.
+    monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": "a" * 64}.get(name))
+    assert Sync.from_env(tmp_path).space == "a" * 64
+    monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": "nope"}.get(name))
+    with pytest.raises(RuntimeError, match="ORCHESTRATE_SYNC_SPACE"):
+        Sync.from_env(tmp_path)

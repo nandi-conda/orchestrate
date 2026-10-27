@@ -26,7 +26,7 @@ def main() -> None:
     require(["DEEPSEEK_API_KEY"])  # the router and every worker's model
     warn_optional(["SPRITES_TOKEN", "GITHUB_TOKEN"])
     try:
-        sync = Sync.from_env()  # projects shared with other computers, when both its keys are set
+        sync = Sync.from_env()  # projects shared with other computers in the same space
     except RuntimeError as e:
         raise SystemExit(str(e)) from None
     # EventSource clients hold /events open for as long as their tab is open.

@@ -1,10 +1,15 @@
 """Sharing projects between control planes on several computers, through the
 sync server (sync/ at the top of the repository: a Cloudflare Worker).
 
-With ORCHESTRATE_SYNC_URL and ORCHESTRATE_SYNC_TOKEN set, every project is
-shared: each computer's control plane shows every project, live, and any of
-them can drive it. The control plane opens every connection to the sync
-server, as it does to workers; nothing ever connects to it.
+The sync server is a public relay (DEFAULT_URL, or ORCHESTRATE_SYNC_URL): it
+has no secret, and keeps each *space* apart, named by a random key. Each
+computer makes one the first time (`space` in its data directory), so its
+projects are synced from the start; another computer given the same key as
+ORCHESTRATE_SYNC_SPACE is in the same space, and shares every project: each
+computer's control plane shows every project, live, and any of them can
+drive it. The key is the only way into a space, so it is shared like a secret
+link. The control plane opens every connection to the sync server, as it
+does to workers; nothing ever connects to it.
 
 What is shared is a set of Automerge documents, of which each computer keeps
 a replica (`sync.db` in its data directory) and syncs with the server's
@@ -69,7 +74,10 @@ from .store import Store
 
 log = logging.getLogger("orchestrator.sync")
 
-URL_KEY, TOKEN_KEY = "ORCHESTRATE_SYNC_URL", "ORCHESTRATE_SYNC_TOKEN"
+URL_KEY, SPACE_KEY = "ORCHESTRATE_SYNC_URL", "ORCHESTRATE_SYNC_SPACE"
+DEFAULT_URL = "https://orchestrate-sync.nandithebull.workers.dev"  # ORCHESTRATE_SYNC_URL names another
+SPACE_HEX = 64  # a space's key: 32 random bytes, in hex
+CONNECT_WAIT = 5.0  # how long starting waits to catch up with the server before going on without it
 INDEX = "projects"
 RENEW_EVERY = 10.0
 WAIT = 25.0  # how long a look at the change feed waits for a change
@@ -89,6 +97,24 @@ def project_doc(project_id: str) -> str:
 
 def log_doc(project_id: str, thread_id: str | None) -> str:
     return f"log:{project_id}:{thread_id or 'main'}"
+
+
+def is_space(key: str) -> bool:
+    return len(key) == SPACE_HEX and all(c in "0123456789abcdef" for c in key)
+
+
+def space_key(data: str | Path) -> str:
+    """This computer's own space: its key, made the first time and kept in
+    the data directory (`space`, readable by its owner only)."""
+    path = Path(data) / "space"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(mode=0o600)
+        path.write_text(secrets.token_hex(SPACE_HEX // 2) + "\n")
+    key = path.read_text().strip()
+    if not is_space(key):
+        raise RuntimeError(f"{path} does not hold a space's key ({SPACE_HEX} hex digits); remove it to make a new one")
+    return key
 
 
 def automerge():
@@ -127,12 +153,12 @@ def seq_refs(typ: str, payload: dict) -> list[tuple[dict, str]]:
 
 
 class SyncClient:
-    """The sync server's HTTP API (sync/src/index.js); every request carries
-    `Authorization: Bearer <ORCHESTRATE_SYNC_TOKEN>`."""
+    """The sync server's HTTP API (sync/src/index.js); every request names
+    the space with `X-Sync-Space: <key>`."""
 
-    def __init__(self, url: str, token: str, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(self, url: str, space: str, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.url = url.rstrip("/")
-        self.http = httpx.AsyncClient(base_url=self.url, headers={"authorization": f"Bearer {token}"},
+        self.http = httpx.AsyncClient(base_url=self.url, headers={"x-sync-space": space},
                                       timeout=httpx.Timeout(60.0, connect=10.0), transport=transport)
 
     async def close(self) -> None:
@@ -306,14 +332,20 @@ class Replica:
                               (key, json.dumps(value)))
         await self.db.commit()
 
+    async def forget_space(self) -> None:
+        """Forget where this replica was in its space's change feed and hubs."""
+        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'hub:%'")
+        await self.db.commit()
+
 
 class Sync:
     """This computer's side of the sync server: the replica and its syncing,
     the leases it holds, and its projects' hubs on the server."""
 
-    def __init__(self, url: str, token: str, data: str | Path = paths.DATA, name: str | None = None,
+    def __init__(self, url: str, space: str, data: str | Path = paths.DATA, name: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self.client = SyncClient(url, token, transport)
+        self.space = space
+        self.client = SyncClient(url, space, transport)
         self.data = Path(data)
         self.name = name or socket.gethostname()
         self.holder = ""
@@ -338,18 +370,21 @@ class Sync:
         self.hub_seen: dict[str, dict] = {}  # per project, its hub's last bundle on the server
         self.inbox_running: set[str] = set()
         self.tasks: list[asyncio.Task] = []
+        self.caught_up = asyncio.Event()
 
     @classmethod
-    def from_env(cls, data: str | Path = paths.DATA) -> "Sync | None":
-        """The sync server ORCHESTRATE_SYNC_URL and ORCHESTRATE_SYNC_TOKEN
-        name (environment, then keyring), or None when neither is set."""
-        url, token = get_secret(URL_KEY), get_secret(TOKEN_KEY)
-        if not url and not token:
-            return None
-        if not (url and token):
-            raise RuntimeError(f"set both {URL_KEY} and {TOKEN_KEY} to share projects through the sync server "
-                               f"(only {URL_KEY if url else TOKEN_KEY} is set)")
-        return cls(url, token, data)
+    def from_env(cls, data: str | Path = paths.DATA) -> "Sync":
+        """The sync server at ORCHESTRATE_SYNC_URL (environment, then keyring;
+        DEFAULT_URL when neither has it), in the space ORCHESTRATE_SYNC_SPACE
+        names, or this computer's own (space_key)."""
+        url = get_secret(URL_KEY) or DEFAULT_URL
+        space = get_secret(SPACE_KEY)
+        if space is None:
+            space = space_key(data)
+        elif not is_space(space):
+            raise RuntimeError(f"{SPACE_KEY} must be a space's key, {SPACE_HEX} hex digits "
+                               f"(Settings shows it on the computer that has it)")
+        return cls(url, space, data)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -363,6 +398,11 @@ class Sync:
         self.holder = ident.read_text().strip()
         self.replica = Replica(self.data / "sync.db", bytes.fromhex(self.holder.removeprefix("c_")).ljust(16, b"\0"))
         await self.replica.open()
+        if await self.replica.state("space", self.space) != self.space:
+            # Paired into another space: what this replica has goes to it as
+            # new, and the new space's change feed is followed from its start.
+            await self.replica.forget_space()
+        await self.replica.set_state("space", self.space)
         self.version = await self.replica.state("version", 0)
 
     def bind(self, orch) -> None:
@@ -372,16 +412,34 @@ class Sync:
         """Catch up with the server and start syncing: every document this
         replica has is synced (it may hold changes the server never got), then
         every one changed since the last look; each is applied to the store.
-        Projects only this computer has are then shared, driven by it."""
-        got = await self.client.changes(self.version, 0)
-        names = set(await self.replica.names()) | set(got["docs"])
-        await self._sync(names)
-        await self._apply(names)
-        self.version = got["version"]
-        await self.replica.set_state("version", self.version)
-        await self._share_local_projects()
-        self.tasks = [asyncio.create_task(self._push_loop()), asyncio.create_task(self._pull_loop()),
-                      asyncio.create_task(self._renew_loop())]
+        Projects only this computer has are then shared, driven by it.
+
+        Starting waits CONNECT_WAIT for that, then goes on: a computer that
+        cannot reach the server starts all the same, and catches up once it
+        can. Until then it drives no project (claim raises SyncError)."""
+        self.tasks = [asyncio.create_task(self._catch_up())]
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(self.caught_up.wait()), CONNECT_WAIT)
+
+    async def _catch_up(self) -> None:
+        while True:
+            try:
+                got = await self.client.changes(self.version, 0)
+                names = set(await self.replica.names()) | set(got["docs"])
+                await self._sync(names)
+                await self._apply(names)
+                self.version = got["version"]
+                await self.replica.set_state("version", self.version)
+                await self._share_local_projects()
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("could not catch up with the sync server at %s: %s", self.client.url, e)
+                await asyncio.sleep(RETRY)
+        self.caught_up.set()
+        self.tasks += [asyncio.create_task(self._push_loop()), asyncio.create_task(self._pull_loop()),
+                       asyncio.create_task(self._renew_loop())]
 
     async def close(self) -> None:
         for task in self.tasks:

@@ -41,7 +41,7 @@ final class Keys {
         new Key("OPENGATEWAY_API_TOKEN", false, R.string.key_opengateway),
         new Key("GITHUB_TOKEN", false, R.string.key_github),
         new Key("ORCHESTRATE_SYNC_URL", false, R.string.key_sync_url),
-        new Key("ORCHESTRATE_SYNC_TOKEN", false, R.string.key_sync_token),
+        new Key("ORCHESTRATE_SYNC_SPACE", false, R.string.key_sync_space),
     };
 
     private static final String KEYSTORE = "AndroidKeyStore";

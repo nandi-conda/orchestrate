@@ -1,42 +1,48 @@
 # Projects on several computers
 
 Every computer that runs orchestrate (the desktop window, `pixi run serve`, the
-Android app) can share its projects with your other computers through a **sync
-server** you deploy to your own Cloudflare account. Each computer then shows
-every project, live: its chat, its threads and what they do. Open a project on
-the laptop that you started on the desktop, and go on there.
+Android app) syncs its projects through a **sync server**, a public relay on
+Cloudflare. Computers in the same **space** share every project, live: its
+chat, its threads and what they do. Open a project on the laptop that you
+started on the desktop, and go on there.
 
-## Set it up
+## Spaces
 
-1. Sign in to Cloudflare with wrangler and make the R2 bucket, from a checkout:
+There is nothing to set up for one computer: the first time it starts, it makes
+its own space, a random key kept in its data folder (`~/.orchestrate/space`),
+and its projects are synced from then on.
 
-    ```bash
-    cd sync
-    pixi run install                                 # wrangler into node_modules
-    npx wrangler login                               # opens the browser
-    npx wrangler r2 bucket create orchestrate-sync   # once
-    ```
+To share them with another computer, pair it:
 
-2. Give the Worker its token, then deploy it:
+1. On the first computer, open **Settings** on the project list and **Copy** the
+   space key.
+2. On the other computer, set it as `ORCHESTRATE_SYNC_SPACE`: **Set…** next to it
+   in Settings, `pixi run set-key ORCHESTRATE_SYNC_SPACE`, the environment, or the
+   Android app's Keys screen. Restart orchestrate there.
 
-    ```bash
-    TOKEN=$(openssl rand -hex 32); echo "$TOKEN"     # keep it: this is ORCHESTRATE_SYNC_TOKEN
-    echo "$TOKEN" | npx wrangler secret put SYNC_TOKEN
-    npx wrangler deploy                              # or: pixi run deploy
-    ```
+It is then in the first computer's space, and the projects it had are shared
+there too. The control plane sends the key as `X-Sync-Space: <key>` on every
+request. The relay keeps no secret and checks no account: the key is the only
+way into a space, so share it like a secret link. Anyone with it can see and
+change the space's projects, and whoever runs the relay can read them (they are
+not encrypted end to end).
 
-    `wrangler deploy` prints the Worker's URL,
-    `https://orchestrate-sync.<you>.workers.dev`: this is `ORCHESTRATE_SYNC_URL`.
-    `wrangler.toml` declares the Durable Object and the bucket binding. Deploying
-    again keeps the token; `secret put` again with a new one replaces it, and every
-    computer then needs the new one.
+A computer that cannot reach the relay starts all the same and catches up once
+it can; until then it shows what it had and does not drive projects.
 
-3. Set both on every computer, as environment variables or in the keyring
-   (`pixi run set-key ORCHESTRATE_SYNC_URL`, `pixi run set-key ORCHESTRATE_SYNC_TOKEN`),
-   or on the Android app's Keys screen. The control plane sends the token as
-   `Authorization: Bearer <token>` on every request to the server.
+## The server
 
-The first time a computer syncs, the projects it already has are shared from it.
+orchestrate uses `https://orchestrate-sync.nandithebull.workers.dev`;
+`ORCHESTRATE_SYNC_URL` names another. To run your own on your Cloudflare account,
+one command from a checkout signs in with wrangler (the browser opens the first
+time), makes the R2 bucket and deploys the Worker, and is safe to run again:
+
+```bash
+pixi run deploy-sync
+```
+
+When its URL is not the default, it keeps it in this computer's keyring as
+`ORCHESTRATE_SYNC_URL`; set the same on your other computers.
 
 ## Who drives a project
 
@@ -78,12 +84,11 @@ it is on. Another computer that drives the project lands threads' work in its
 hub, and the work reaches the folder when the folder's computer drives the
 project again.
 
-## The server
+## How the relay works
 
-`sync/` is a Cloudflare Worker with one Durable Object, which holds the
-documents, the change feed, the leases (which computer drives which project)
-and each hub's list of bundles, and an R2 bucket for the bundles and images.
-Control planes reach it over HTTPS and nothing ever connects to them, as with
-workers. `pixi run dev` in `sync/` serves it locally (token in `sync/.dev.vars`,
-`SYNC_TOKEN=...`), and `orchestrator/tests/test_sync.py` runs two control
-planes against it.
+`sync/` is a Cloudflare Worker with a Durable Object per space, which holds the
+space's documents, its change feed, the leases (which computer drives which
+project) and each hub's list of bundles, and an R2 bucket for the bundles and
+images, under the space's prefix. Control planes reach it over HTTPS and nothing
+ever connects to them, as with workers. `pixi run dev` in `sync/` serves it
+locally, and `orchestrator/tests/test_sync.py` runs control planes against it.

@@ -33,11 +33,12 @@ KNOWN = {
                      "the control plane fetches their default branch into each project's hub and "
                      "pushes finished threads' work to it (workers never get it)",
                      'git http.<repo url>.extraHeader "Authorization: Basic base64(x-access-token:<token>)"'),
-    "ORCHESTRATE_SYNC_URL": ("the sync server's URL (`pixi run deploy` in sync/ prints it), to share projects "
-                             "with your other computers; set it and ORCHESTRATE_SYNC_TOKEN, or neither",
+    "ORCHESTRATE_SYNC_URL": ("the sync server, when it is not the public relay "
+                             "https://orchestrate-sync.nandithebull.workers.dev",
                              "the base of every request to the sync server"),
-    "ORCHESTRATE_SYNC_TOKEN": ("the sync server's token, printed with its URL",
-                               "Authorization: Bearer <token> to the sync server"),
+    "ORCHESTRATE_SYNC_SPACE": ("the key of the space to sync projects in, copied from another computer's "
+                               "Settings to share its projects; without it this computer has its own space",
+                               "X-Sync-Space: <key> to the sync server"),
 }
 
 
