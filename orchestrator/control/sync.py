@@ -11,17 +11,23 @@ drive it. The key is the only way into a space, so it is shared like a secret
 link. The control plane opens every connection to the sync server, as it
 does to workers; nothing ever connects to it.
 
-What is shared is a set of Automerge documents, of which each computer keeps
-a replica (`sync.db` in its data directory) and syncs with the server's
+What is shared is a few Automerge documents, of which each computer keeps a
+replica (`sync.db` in its data directory) and syncs with the server's
 (Automerge's sync protocol, over POST /sync):
 
 - "projects": every project, keyed by its id.
 - "project:<id>": its threads ("thread:<id>"), the messages between them
   ("message:<id>"), and its inbox ("inbox:<id>"): what the person did on a
   computer that does not drive the project, for the one that does.
-- "log:<id>:main", "log:<id>:<thread id>": the project's own events and each
-  thread's, keyed by uid. A model call's streaming `delta` events stay on
-  the computer that has them; the call's own events, once it ends, are shared.
+
+and the logs: "log:<id>:main", "log:<id>:<thread id>", the project's own
+events and each thread's. Events are never changed and only a project's
+driver logs them, so a log needs no merging: on the server it is a list of
+entries (uid and row), each added once, which can grow to any size. Each
+computer sends the server every event its store has that the server has not
+(LOG_PUSHED, per project), and fetches the entries of a log it has not got, a
+page at a time. A model call's streaming `delta` events stay on the computer
+that has them; the call's own events, once it ends, are shared.
 
 Each value is a row as JSON, at the document's root. No document has nested
 objects: two computers making the same one at once would each make their
@@ -85,6 +91,8 @@ RETRY = 2.0  # after the sync server could not be reached
 DRIVER_FRESH = 5.0  # a lease another computer holds is asked about again after this
 COMPACT_AFTER = 256  # changes kept per document before it is saved whole
 MAX_ROUNDS = 64
+LOG_BATCH = 2_000_000  # bytes of events per POST /logs
+FORMAT = 2  # of the replica: 2 since logs are entries on the server, no longer documents
 LOCAL_EVENTS = {"delta"}  # a model call's streaming; its own events are shared once it ends
 LOCAL_THREAD_FIELDS = {"token"}
 HUB_REFS = ("refs/heads/", "refs/snapshots/", "refs/sessions/")
@@ -184,6 +192,12 @@ class SyncClient:
         return (await self._call("GET", "/changes", params={"since": since, "wait": wait},
                                  timeout=wait + 30)).json()
 
+    async def append(self, log: str, entries: list[dict]) -> int:
+        return (await self._call("POST", f"/logs/{log}", json={"entries": entries})).json()["n"]
+
+    async def entries(self, log: str, after: int) -> dict:
+        return (await self._call("GET", f"/logs/{log}", params={"after": after})).json()
+
     async def lease(self, project: str, holder: str, name: str, take: bool) -> dict:
         return (await self._call("POST", "/lease", json={"project": project, "holder": holder, "name": name,
                                                          "take": take})).json()
@@ -203,7 +217,8 @@ class SyncClient:
     async def add_bundle(self, project: str, holder: str, base: str, refs: dict, data: bytes) -> int:
         meta = json.dumps({"base": base, "refs": refs}).encode()
         r = await self._call("PUT", f"/hubs/{project}", params={"holder": holder}, content=meta + data,
-                             headers={"x-meta-length": str(len(meta))})
+                             headers={"x-meta-length": str(len(meta))},
+                             timeout=httpx.Timeout(600.0, connect=10.0))  # a whole hub, the first time
         return r.json()["n"]
 
     async def bundle(self, project: str, n: int) -> bytes:
@@ -331,9 +346,16 @@ class Replica:
                               (key, json.dumps(value)))
         await self.db.commit()
 
+    async def forget_logs(self) -> None:
+        """Drop the logs kept as documents (FORMAT 1): they are sent again as entries."""
+        await self.db.execute("DELETE FROM saves WHERE doc LIKE 'log:%'")
+        await self.db.execute("DELETE FROM changes WHERE doc LIKE 'log:%'")
+        await self.db.commit()
+        self.docs = {k: v for k, v in self.docs.items() if not k.startswith("log:")}
+
     async def forget_space(self) -> None:
         """Forget where this replica was in its space's change feed and hubs."""
-        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'hub:%'")
+        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'hub:%' OR k LIKE 'log%'")
         await self.db.commit()
 
 
@@ -368,6 +390,11 @@ class Sync:
         self.hub_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.hub_seen: dict[str, dict] = {}  # per project, its hub's last bundle on the server
         self.inbox_running: set[str] = set()
+        self.logs_dirty: set[str] = set()  # projects with events the server may not have
+        self.log_kick = asyncio.Event()
+        self.log_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Per project, the uids of the events the server has (sent or fetched) this run.
+        self.on_server: dict[str, set[str]] = defaultdict(set)
         self.tasks: list[asyncio.Task] = []
         self.caught_up = asyncio.Event()
         self.problem = ""  # why the last try to catch up with the server failed, "" once it has
@@ -405,6 +432,9 @@ class Sync:
             # new, and the new space's change feed is followed from its start.
             await self.replica.forget_space()
         await self.replica.set_state("space", self.space)
+        if await self.replica.state("format", 1) < FORMAT:
+            await self.replica.forget_logs()
+            await self.replica.set_state("format", FORMAT)
         self.version = await self.replica.state("version", 0)
 
     def bind(self, orch) -> None:
@@ -426,12 +456,17 @@ class Sync:
         while True:
             try:
                 got = await self.client.changes(self.version, 0)
-                names = set(await self.replica.names()) | set(got["docs"])
+                names = set(await self.replica.names()) | {n for n in got["docs"] if not n.startswith("log:")}
                 await self._sync(names)
                 await self._apply(names)
+                await self._pull_logs([n for n in got["docs"] if n.startswith("log:")])
                 self.version = got["version"]
                 await self.replica.set_state("version", self.version)
                 await self._share_local_projects()
+                # Every project's events the server has not got yet go to it.
+                self.logs_dirty |= {p["id"] for p in await self.store.list_projects()
+                                    + await self.store.list_projects(archived=True)}
+                self.log_kick.set()
                 break
             except asyncio.CancelledError:
                 raise
@@ -445,7 +480,7 @@ class Sync:
                  self.client.url, self.space[:8], len(names), projects)
         self.caught_up.set()
         self.tasks += [asyncio.create_task(self._push_loop()), asyncio.create_task(self._pull_loop()),
-                       asyncio.create_task(self._renew_loop())]
+                       asyncio.create_task(self._renew_loop()), asyncio.create_task(self._log_push_loop())]
 
     async def close(self) -> None:
         for task in self.tasks:
@@ -454,6 +489,9 @@ class Sync:
         if self.dirty:
             with contextlib.suppress(Exception):
                 await self._sync(set(self.dirty))
+        for pid in sorted(self.logs_dirty):
+            with contextlib.suppress(Exception):
+                await self._push_logs(pid)
         if self.held:
             with contextlib.suppress(Exception):
                 await self.client.release(self.holder, sorted(self.held))
@@ -523,10 +561,12 @@ class Sync:
         while True:
             try:
                 got = await self.client.changes(self.version, WAIT)
-                if got["docs"]:
-                    changed = await self._sync(got["docs"])
+                docs = [n for n in got["docs"] if not n.startswith("log:")]
+                if docs:
+                    changed = await self._sync(docs)
                     if changed:
                         await self._apply(changed)
+                await self._pull_logs([n for n in got["docs"] if n.startswith("log:")])
                 if got["version"] != self.version:
                     self.version = got["version"]
                     await self.replica.set_state("version", self.version)
@@ -556,8 +596,6 @@ class Sync:
                     await self._apply_projects(fresh)
                 elif name.startswith("project:"):
                     await self._apply_project(name.removeprefix("project:"), fresh)
-                elif name.startswith("log:"):
-                    await self._apply_log(name, fresh)
             await self._apply_deferred()
 
     async def _apply_projects(self, fresh: dict[str, str]) -> None:
@@ -589,18 +627,105 @@ class Sync:
         if inbox and pid in self.held:
             self._run_inbox(pid)
 
-    async def _apply_log(self, name: str, fresh: dict[str, str]) -> None:
-        if name not in self.known:
-            _, pid, tid = name.split(":", 2)
-            self.known[name] = await self.store.event_uids(pid, None if tid == "main" else tid)
-        known = self.known[name]
-        events = []
-        for uid, value in fresh.items():
-            self.seen[name][uid] = value
-            if uid not in known:
-                events.append(json.loads(value))
-        for ev in sorted(events, key=lambda e: (e["created_at"], e["uid"])):
-            self.deferred[ev["uid"]] = ev
+    # ------------------------------------------------------------ logs
+
+    async def _pull_logs(self, names) -> None:
+        """Fetch the entries of logs that changed on the server, and log the
+        events this store has not got."""
+        if not names:
+            return
+        async with self.applying:
+            touched = set()
+            for name in sorted(set(names)):
+                _, pid, tid = name.split(":", 2)
+                if name not in self.known:
+                    self.known[name] = await self.store.event_uids(pid, None if tid == "main" else tid)
+                after = await self.replica.state(f"logpull:{name}", 0)
+                while True:
+                    page = await self.client.entries(name, after)
+                    for e in page["entries"]:
+                        self.on_server[pid].add(e["uid"])
+                        if e["uid"] not in self.known[name]:
+                            self.deferred[e["uid"]] = json.loads(e["row"])
+                        after = e["n"]
+                    await self.replica.set_state(f"logpull:{name}", after)
+                    if not page["more"]:
+                        break
+                touched.add(pid)
+            await self._apply_deferred()
+            for pid in touched:
+                await self._skip_pushed(pid)
+
+    async def _skip_pushed(self, project_id: str) -> int:
+        """Move the project's LOG_PUSHED mark past the events the server has
+        (or that are never sent); the seq it is at."""
+        key = f"logpush:{project_id}"
+        at = start = await self.replica.state(key, 0)
+        done = False
+        while not done:
+            page = await self.store.list_events(project_id, None, at, limit=1000)
+            for ev in page:
+                if ev["type"] not in LOCAL_EVENTS and ev["uid"] not in self.on_server[project_id]:
+                    done = True
+                    break
+                at = ev["seq"]
+            done = done or len(page) < 1000
+        if at != start:
+            await self.replica.set_state(key, at)
+        return at
+
+    async def _push_logs(self, project_id: str) -> None:
+        """Send the server the project's events it has not got, in order,
+        LOG_BATCH bytes at a time, each to its log."""
+        async with self.log_locks[project_id]:
+            at = await self._skip_pushed(project_id)
+            while page := await self.store.list_events(project_id, None, at, limit=1000):
+                batch: dict[str, list[dict]] = defaultdict(list)
+                size = 0
+                for ev in page:
+                    if ev["type"] not in LOCAL_EVENTS and ev["uid"] not in self.on_server[project_id]:
+                        row = await self._event_row(ev)
+                        batch[log_doc(project_id, ev["thread_id"])].append({"uid": ev["uid"], "row": row})
+                        size += len(row)
+                    if size >= LOG_BATCH or ev is page[-1]:
+                        for name, entries in batch.items():
+                            await self.client.append(name, entries)
+                            self.on_server[project_id].update(e["uid"] for e in entries)
+                            self.known.setdefault(name, set()).update(e["uid"] for e in entries)
+                        batch.clear()
+                        size = 0
+                        at = ev["seq"]
+                        await self.replica.set_state(f"logpush:{project_id}", at)
+
+    async def _event_row(self, ev: dict) -> str:
+        """An event as its log's entry has it: seqs it names, as uids."""
+        payload = json.loads(json.dumps(ev["payload"]))
+        refs = seq_refs(ev["type"], payload)
+        uids = await self.store.uids_of([d[k] for d, k in refs if isinstance(d[k], int)])
+        for d, k in refs:
+            if d[k] in uids:
+                d[k] = uids[d[k]]
+        row = {k: ev[k] for k in ("uid", "project_id", "thread_id", "type", "created_at", "peer_id")}
+        return dumps({**row, "payload": payload})
+
+    async def _log_push_loop(self) -> None:
+        while True:
+            await self.log_kick.wait()
+            await asyncio.sleep(PUSH_DELAY)
+            self.log_kick.clear()
+            todo, self.logs_dirty = self.logs_dirty, set()
+            for pid in sorted(todo):
+                try:
+                    await self._push_logs(pid)
+                except asyncio.CancelledError:
+                    self.logs_dirty |= todo
+                    raise
+                except Exception as e:
+                    log.warning("could not send project %s's events to the sync server: %s", pid, e)
+                    self.logs_dirty.add(pid)
+            if self.logs_dirty and not self.log_kick.is_set():
+                await asyncio.sleep(RETRY)
+                self.log_kick.set()
 
     async def _apply_deferred(self) -> None:
         """Log the events waiting to be, oldest first; one that names an event
@@ -642,18 +767,11 @@ class Sync:
             await self._put(project_doc(message["project_id"]), {f"message:{message['id']}": dumps(message)})
 
     async def event_written(self, ev: dict) -> None:
-        if ev["type"] in LOCAL_EVENTS or not self.driving(ev["project_id"]):
+        if ev["type"] in LOCAL_EVENTS:
             return
-        payload = json.loads(json.dumps(ev["payload"]))
-        refs = seq_refs(ev["type"], payload)
-        uids = await self.store.uids_of([d[k] for d, k in refs if isinstance(d[k], int)])
-        for d, k in refs:
-            if d[k] in uids:
-                d[k] = uids[d[k]]
-        name = log_doc(ev["project_id"], ev["thread_id"])
-        self.known.setdefault(name, set()).add(ev["uid"])
-        row = {k: ev[k] for k in ("uid", "project_id", "thread_id", "type", "created_at", "peer_id")}
-        await self._put(name, {ev["uid"]: dumps({**row, "payload": payload})})
+        self.known.setdefault(log_doc(ev["project_id"], ev["thread_id"]), set()).add(ev["uid"])
+        self.logs_dirty.add(ev["project_id"])
+        self.log_kick.set()
 
     async def image_written(self, project_id: str, image: dict, data: bytes) -> None:
         """Every image goes to the server as it is stored: the driver may be another computer."""
@@ -686,11 +804,8 @@ class Sync:
             await self.thread_written(t)
             for m in await self.store.list_messages(t["id"]):
                 await self.message_written(m)
-        after = 0
-        while page := await self.store.list_events(pid, None, after, limit=1000):
-            for ev in page:
-                await self.event_written(ev)
-            after = page[-1]["seq"]
+        self.logs_dirty.add(pid)
+        self.log_kick.set()
         log.info("shared project %s (%s) through the sync server", p["name"], pid)
 
     # ------------------------------------------------------------ driving

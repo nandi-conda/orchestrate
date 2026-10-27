@@ -5,18 +5,23 @@
 // made (or was given, to pair with another computer). Knowing the key is the
 // only way into a space, so it is shared like a secret link. Control planes
 // open every connection (they are never reached), so all of it is plain HTTP:
-// a sync round, a long-polled change feed, leases, and blobs.
+// a sync round, a long-polled change feed, logs, leases, and blobs.
 //
 // Each space is one Durable Object, SyncHub, and its own prefix in R2:
 //
-// - Automerge documents, by name ("projects", "project:<id>", "log:<id>:main",
-//   "log:<id>:<thread id>"). A control plane syncs one with the Automerge
+// - Automerge documents, by name ("projects", "project:<id>"): small, and
+//   changed by any computer. A control plane syncs one with the Automerge
 //   sync protocol: it posts sync messages, the hub applies them and answers
 //   with its own. Each round of a sync names a `session`, so the hub keeps
 //   one sync state per control plane and document while a sync lasts.
-// - A change feed: every document change takes the next `version`, and
-//   GET /changes?since=<version> answers with the documents changed since,
-//   waiting up to `wait` seconds for one.
+// - Logs ("log:<id>:main", "log:<id>:<thread id>"): a project's events, which
+//   only its driver writes and nobody changes, so they need no merging and
+//   can be any size. Each is a list of entries, each a uid and its row (JSON
+//   text, kept in parts), added once (POST /logs/<log>) and read a page at a
+//   time (GET /logs/<log>?after=<n>). Nothing holds a whole log in memory.
+// - A change feed: every change of a document or a log takes the next
+//   `version`, and GET /changes?since=<version> answers with the names of
+//   those changed since, waiting up to `wait` seconds for one.
 // - Leases: each project has one control plane driving it (running its
 //   threads); the others only show it and forward what their user does.
 //   A lease not renewed for LEASE_STALE ms can be taken; `take` takes it at once.
@@ -31,7 +36,10 @@ const MAX_WAIT = 25;
 const PART = 1_000_000; // DO SQLite values stay under 2 MB
 const COMPACT_AFTER = 64; // incremental saves kept before a document is saved whole
 const SESSION_TTL = 10 * 60_000;
-const LOADED_MAX = 200; // documents kept loaded
+const LOADED_MAX = 16; // documents kept loaded (a Worker has 128 MB)
+const PAGE_BYTES = 4_000_000; // of log rows, per GET /logs answer
+const PAGE_ENTRIES = 1000;
+const TEXT_PART = 500_000; // UTF-16 units: at most 1.5 MB of UTF-8, under a DO SQLite value's 2 MB
 
 export default {
   async fetch(request, env) {
@@ -82,6 +90,14 @@ export class SyncHub {
       name TEXT NOT NULL, renewed_at INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS bundles (project TEXT NOT NULL, n INTEGER NOT NULL,
       base TEXT NOT NULL, refs TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (project, n))`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS entries (log TEXT NOT NULL, n INTEGER NOT NULL, uid TEXT NOT NULL,
+      size INTEGER NOT NULL, PRIMARY KEY (log, n), UNIQUE (log, uid))`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS entry_parts (log TEXT NOT NULL, n INTEGER NOT NULL,
+      part INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (log, n, part))`);
+    // Logs were Automerge documents once: those are dropped, and their
+    // computers send the events again, as entries.
+    this.sql.exec(`DELETE FROM chunks WHERE name LIKE 'log:%'`);
+    this.sql.exec(`DELETE FROM docs WHERE name LIKE 'log:%' AND name NOT IN (SELECT DISTINCT log FROM entries)`);
   }
 
   async fetch(request) {
@@ -102,6 +118,10 @@ export class SyncHub {
           if (path[1] === "renew") return json(this.renew(await request.json()));
           if (path[1] === "release") return json(this.release(await request.json()));
           break;
+        case "POST /logs/*":
+          return json(this.append(decodeURIComponent(path[1]), await request.json()));
+        case "GET /logs/*":
+          return json(this.entries(decodeURIComponent(path[1]), Number(url.searchParams.get("after") || 0)));
         case "GET /leases":
           return json(this.leases());
         case "GET /hubs/*":
@@ -249,6 +269,57 @@ export class SyncHub {
     this.waiters.clear();
   }
 
+  // ------------------------------------------------------------ logs
+
+  // POST /logs/<log> {entries: [{uid, row}]} -> {n}: entries not there yet
+  // (by uid) are added, in order; `n` is the log's last.
+  append(log, { entries }) {
+    if (!log.startsWith("log:") || !Array.isArray(entries)) {
+      throw Object.assign(new Error("a log:<project>:<thread> name and entries are required"), { status: 400 });
+    }
+    const last = () => this.sql.exec(`SELECT MAX(n) AS n FROM entries WHERE log = ?`, log).toArray()[0].n || 0;
+    let n = last();
+    let added = 0;
+    for (const { uid, row } of entries) {
+      if (typeof uid !== "string" || typeof row !== "string") continue;
+      if (this.sql.exec(`SELECT 1 FROM entries WHERE log = ? AND uid = ?`, log, uid).toArray().length) continue;
+      n += 1;
+      this.sql.exec(`INSERT INTO entries (log, n, uid, size) VALUES (?, ?, ?, ?)`, log, n, uid, row.length);
+      for (let part = 0; part * TEXT_PART < row.length || part === 0; part++) {
+        this.sql.exec(`INSERT INTO entry_parts (log, n, part, data) VALUES (?, ?, ?, ?)`,
+          log, n, part, row.slice(part * TEXT_PART, (part + 1) * TEXT_PART));
+      }
+      added += 1;
+    }
+    if (added) {
+      this.sql.exec(`INSERT INTO docs (name, version) VALUES (?, ?)
+        ON CONFLICT (name) DO UPDATE SET version = excluded.version`, log, this.bump());
+      this.wake();
+    }
+    return { n };
+  }
+
+  // GET /logs/<log>?after=<n> -> {entries: [{n, uid, row}], more}: the
+  // entries after `n`, at most PAGE_ENTRIES and PAGE_BYTES of them (at least one).
+  entries(log, after) {
+    const out = [];
+    let bytes = 0;
+    const page = this.sql.exec(`SELECT n, uid, size FROM entries WHERE log = ? AND n > ? ORDER BY n LIMIT ?`,
+      log, after, PAGE_ENTRIES + 1).toArray();
+    let more = page.length > PAGE_ENTRIES;
+    for (const e of page.slice(0, PAGE_ENTRIES)) {
+      if (out.length && bytes + e.size > PAGE_BYTES) {
+        more = true;
+        break;
+      }
+      const row = this.sql.exec(`SELECT data FROM entry_parts WHERE log = ? AND n = ? ORDER BY part`, log, e.n)
+        .toArray().map((p) => p.data).join("");
+      out.push({ n: e.n, uid: e.uid, row });
+      bytes += e.size;
+    }
+    return { entries: out, more };
+  }
+
   // ------------------------------------------------------------ leases
 
   leaseRow(project) {
@@ -326,15 +397,40 @@ export class SyncHub {
       return json({ error: `${holder} does not drive project ${project}` +
         (row ? `; ${row.name} does` : "; nobody does") }, 409);
     }
-    const body = new Uint8Array(await request.arrayBuffer());
+    // The body is streamed to R2 past its meta: a bundle can be bigger than a Worker's memory.
     const size = Number(request.headers.get("x-meta-length"));
-    if (!Number.isInteger(size) || size <= 0 || size > body.length) {
-      return json({ error: "x-meta-length must give the length of the {base, refs} JSON the body starts with" }, 400);
+    const total = Number(request.headers.get("content-length"));
+    if (!Number.isInteger(size) || size <= 0 || !Number.isInteger(total) || size > total) {
+      return json({ error: "x-meta-length must give the length of the {base, refs} JSON the body starts with, " +
+        "and content-length the body's" }, 400);
     }
-    const { base, refs } = JSON.parse(new TextDecoder().decode(body.subarray(0, size)));
+    const reader = request.body.getReader();
+    const head = new Uint8Array(size);
+    let have = 0;
+    let rest = null;
+    while (have < size) {
+      const { done, value } = await reader.read();
+      if (done) return json({ error: "the body ended inside its meta" }, 400);
+      const take = Math.min(value.length, size - have);
+      head.set(value.subarray(0, take), have);
+      have += take;
+      if (take < value.length) rest = value.subarray(take);
+    }
+    const { base, refs } = JSON.parse(new TextDecoder().decode(head));
     const last = this.sql.exec(`SELECT MAX(n) AS n FROM bundles WHERE project = ?`, project).toArray()[0];
     const n = (last && last.n !== null ? last.n : 0) + 1;
-    await this.env.BUCKET.put(`${r2}hubs/${project}/${n}.bundle`, body.subarray(size));
+    const bundle = new FixedLengthStream(total - size);
+    const piping = (async () => {
+      const writer = bundle.writable.getWriter();
+      if (rest) await writer.write(rest);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+      }
+      await writer.close();
+    })();
+    await Promise.all([this.env.BUCKET.put(`${r2}hubs/${project}/${n}.bundle`, bundle.readable), piping]);
     this.sql.exec(`INSERT INTO bundles (project, n, base, refs, at) VALUES (?, ?, ?, ?, ?)`,
       project, n, String(base || ""), JSON.stringify(refs || {}), Date.now());
     return json({ n });

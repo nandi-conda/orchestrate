@@ -343,3 +343,48 @@ async def test_pairing_a_computer_that_had_its_own_space(tmp_path, sync_server, 
             await b.close()
     finally:
         await a.close()
+
+
+async def test_a_big_log_crosses_in_pages(tmp_path, sync_server, fast):
+    # More entries than a page holds, more bytes than a page and a POST carry,
+    # and one event bigger than a part of an entry on the server.
+    plain = SqliteStore(str(tmp_path / "a" / "db.sqlite"))
+    await plain.open()
+    p = await plain.create_project("big")
+    for i in range(2500):
+        await plain.append_event(p["id"], None, "request", {"text": f"{i} " + "x" * 3000})
+    await plain.append_event(p["id"], None, "request", {"text": "huge " + "é" * 1_200_000})
+    await plain.close()
+
+    a = await Computer(tmp_path / "a", sync_server, "desktop").start()
+    b = await Computer(tmp_path / "b", sync_server, "phone").start()
+    try:
+        async def all_there():
+            evs = [e for e in await b.events(p["id"]) if e["type"] == "request"]
+            return evs if len(evs) == 2501 else None
+        evs = await wait_for(all_there, timeout=120)
+        assert [e["payload"]["text"].split(" ", 1)[0] for e in evs[:3]] == ["0", "1", "2"]
+        assert evs[-1]["payload"]["text"] == "huge " + "é" * 1_200_000
+    finally:
+        await b.close()
+        await a.close()
+
+
+async def test_logs_kept_as_documents_before_are_dropped_from_the_replica(tmp_path):
+    s = Sync("http://127.0.0.1:1", SPACE, tmp_path / "data")
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    await store.open()
+    await s.open(store)
+    await s.replica.put("log:p_1:main", {"e_1": "{}"})
+    await s.replica.put("projects", {"p_1": "{}"})
+    await s.replica.set_state("format", 1)
+    await s.replica.close()
+    s = Sync("http://127.0.0.1:1", SPACE, tmp_path / "data")
+    await s.open(store)
+    try:
+        assert await s.replica.names() == ["projects"]
+        assert await s.replica.state("format") == sync_mod.FORMAT
+    finally:
+        await s.replica.close()
+        await s.client.close()
+        await store.close()
