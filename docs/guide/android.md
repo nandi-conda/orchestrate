@@ -31,7 +31,7 @@ On first start the app asks for the control plane's keys:
 | `DEEPSEEK_API_KEY` | the router and every worker | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
 | `SPRITES_TOKEN` | workers, which always run on Fly Sprites from the phone | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
 | `GITHUB_TOKEN` (optional) | projects with a GitHub remote: fine-grained, Contents: Read and write | `Authorization: Basic base64(x-access-token:<token>)` to GitHub, by git |
-| `ORCHESTRATE_SYNC_URL`, `ORCHESTRATE_SYNC_TOKEN` (optional, both or neither) | sharing projects with your other computers ([Projects on several computers](sync.md)) | `Authorization: Bearer <token>` to the sync server |
+| `ORCHESTRATE_SYNC_SPACE`, `ORCHESTRATE_SYNC_URL` (optional) | the space to share projects in, copied from another computer, and another sync server than the public relay ([Projects on several computers](sync.md)) | `X-Sync-Space: <key>` to the sync server |
 
 They are encrypted with a key that the Android Keystore holds, kept in the
 app's private storage, and given to the control plane as environment
