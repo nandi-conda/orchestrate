@@ -370,6 +370,7 @@ class Sync:
         self.inbox_running: set[str] = set()
         self.tasks: list[asyncio.Task] = []
         self.caught_up = asyncio.Event()
+        self.problem = ""  # why the last try to catch up with the server failed, "" once it has
 
     @classmethod
     def from_env(cls, data: str | Path = paths.DATA) -> "Sync":
@@ -433,8 +434,13 @@ class Sync:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("could not catch up with the sync server at %s: %s", self.client.url, e)
+                self.problem = str(e) or type(e).__name__
+                log.warning("could not catch up with the sync server at %s: %s", self.client.url, self.problem)
                 await asyncio.sleep(RETRY)
+        self.problem = ""
+        projects = len(await self.store.list_projects())
+        log.info("syncing with %s in space %s…: %d document(s), %d project(s) here",
+                 self.client.url, self.space[:8], len(names), projects)
         self.caught_up.set()
         self.tasks += [asyncio.create_task(self._push_loop()), asyncio.create_task(self._pull_loop()),
                        asyncio.create_task(self._renew_loop())]

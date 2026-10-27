@@ -1563,6 +1563,18 @@ def app_dialog() -> None:
         else:
             text("Off: projects stay on this computer.")
         end()
+        if j_has(app, "sync.url") == 1 and j_int(app, "sync.caught_up") == 0:
+            el("div")
+            cls("alert")
+            cls("destructive")
+            attr("role", "alert")
+            jstr(app, "sync.problem", h_t1)
+            if s_len(h_t1) > 0:
+                text("Not reached yet, so nothing is shared: ")
+                text_ref(h_t1)
+            else:
+                text("Catching up with the sync server…")
+            end()
         if j_has(app, "sync.space") == 1:
             label("Space key")
             el("p")

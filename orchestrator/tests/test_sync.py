@@ -316,3 +316,28 @@ def test_the_space_key_is_made_once_and_kept(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": "nope"}.get(name))
     with pytest.raises(RuntimeError, match="ORCHESTRATE_SYNC_SPACE"):
         Sync.from_env(tmp_path)
+
+
+async def test_pairing_a_computer_that_had_its_own_space(tmp_path, sync_server, fast):
+    a = await Computer(tmp_path / "a", sync_server, "desktop").start()
+    try:
+        pa = await a.orch.create_project("from the desktop")
+        # The laptop ran in its own space first, with a project of its own.
+        lone = Computer(tmp_path / "b", sync_server, "laptop")
+        lone.sync = Sync(sync_server, "7" * 64, tmp_path / "b" / "data", name="laptop")
+        lone.store = SyncedStore(SqliteStore(str(tmp_path / "b" / "db.sqlite")), lone.sync)
+        lone.orch = Orchestrator(lone.store, local(lone.provider), HeuristicRouter(), tmp_path / "b" / "repos",
+                                 sync=lone.sync)
+        await lone.start()
+        pb = await lone.orch.create_project("from the laptop")
+        await lone.close()
+        # Then it is given the desktop's key.
+        b = await Computer(tmp_path / "b", sync_server, "laptop").start()
+        try:
+            for c in (a, b):
+                for p in (pa, pb):
+                    await wait_for(lambda: c.store.get_project(p["id"]))
+        finally:
+            await b.close()
+    finally:
+        await a.close()
