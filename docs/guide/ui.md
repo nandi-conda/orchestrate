@@ -102,7 +102,8 @@ you send goes out as Markdown: the selection quoted, then your text. Click the
 quote in your sent message to go back to the message it came from: the pane
 scrolls to it and flashes it, switching to its thread (or to Project
 orchestrator) when it is elsewhere. A message older than the pane's page says
-so instead. Every reply from an agent has a **Copy** button.
+so instead. Every reply from an agent has a **Copy** button, and so does each
+code block in it; click a piece of inline code to copy just that.
 
 ### Editing your messages
 

@@ -8,6 +8,7 @@ export function imports({ str, strs, vals, dispatch }) {
   let doc = { op: [], s: [] }; // the markdown md_parse last parsed
   const mdCache = new Map(); // markdown source -> its parsed doc
   const MD_CACHE = 4096;
+  const codeIds = new Map(), codeText = [""]; // code_put: place -> id, id -> text
   const follow = new Map(); // element id -> keeps the bottom in view (scroll_follow)
   const placed = new WeakMap(); // element -> the scrollTop toEnd last set
   const toEnd = (sel) => {
@@ -151,6 +152,16 @@ export function imports({ str, strs, vals, dispatch }) {
     },
     md_op: (i) => doc.op[i],
     md_str: (i, d) => { strs[d] = doc.s[i]; },
+    // Code the panes show, for its copy click: an id per place (key), which
+    // keeps it while the text there grows. Ids start at 1 (0 = none).
+    code_put: (k, t) => {
+      const key = strs[k] ?? "";
+      let id = codeIds.get(key);
+      if (id === undefined) { id = codeText.length; codeIds.set(key, id); codeText.push(""); }
+      codeText[id] = strs[t] ?? "";
+      return id;
+    },
+    code_text: (id, d) => { strs[d] = codeText[id] ?? ""; },
     // A pane row by seq: a live row (a reply still streaming) is one seq that
     // grows, and a part that starts is a new row at the end of the list. A row
     // never shrinks: a stream resumed mid-reply after a reconnect starts its

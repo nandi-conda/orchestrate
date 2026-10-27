@@ -131,6 +131,18 @@ def md_str(i: i32, dst: i32) -> None:
     pass
 
 @jscall
+def code_put(key: i32, text: i32) -> i32:
+    """The id of the code shown at key (a place, e.g. "ev-12:0" for a reply's
+    first code span), now holding the string in handle text. A key keeps its
+    id, so a code block still streaming in is one id that grows."""
+    pass
+
+@jscall
+def code_text(id: i32, dst: i32) -> None:
+    """Write the text code_put last gave id to dst."""
+    pass
+
+@jscall
 def clip_copy(h: i32, ok: i32, arg: i32, fail: i32) -> None:
     """Put the string in handle h on the clipboard. update(ok, arg) once it is
     there; if the browser refuses, h holds why and update(fail, h) runs."""

@@ -21,7 +21,7 @@ from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_o
                   clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, newline_keys, j_put_row,
-                  host_folders, host_pick_folder)
+                  host_folders, host_pick_folder, code_put, code_text)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -113,6 +113,9 @@ KEY_IN: Const[i32] = 86
 KEY_SAVE: Const[i32] = 87
 KEY_SAVED: Const[i32] = 88
 SPACE_COPY: Const[i32] = 89   # copy this computer's sync space key, to pair another computer
+COPY_CODE: Const[i32] = 90    # arg: the code's id (code_put)
+CODE_COPIED: Const[i32] = 91
+CODE_COPIED_DONE: Const[i32] = 92
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -189,6 +192,8 @@ jump_seq: i32 = 0        # or at this event instead, the one a clicked quote cam
 md_quote: i32 = 0        # seq of the message whose first block quote md() links to its source (0 = none)
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
 SPACE_COPIED: Const[i32] = -2  # `copied` while the sync space key is the one just copied
+code_copied: i32 = 0     # id of the code span or block just copied (shows a check), 0 when none
+md_codes: i32 = 0        # code spans and blocks md() has drawn so far in the markdown it is on
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
@@ -240,6 +245,9 @@ h_md: i32 = 0            # scratch for markdown text
 h_mdtid: i32 = 0         # thread whose worktree the markdown being drawn names images in ("" = none)
 h_mdbase: i32 = 0        # and the worktree directory its relative image paths start from
 h_mdsrc: i32 = 0         # scratch for an image's worktree path
+h_mdkey: i32 = 0         # where the markdown being drawn is shown, so its code keeps its id
+h_code: i32 = 0          # scratch for a code span's text
+h_ckey: i32 = 0          # and its key: h_mdkey and how many code spans came before it
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
 h_clip: i32 = 0          # the text being copied
@@ -286,7 +294,7 @@ def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_bound, h_unbound, h_ready, h_local, h_place, h_plabel
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
-    global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
+    global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc, h_mdkey, h_code, h_ckey
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_selsrc, h_qsrc, h_lastqsrc, h_evid
     global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
@@ -341,6 +349,9 @@ def init() -> None:
     h_mdtid = s_new()
     h_mdbase = s_new()
     h_mdsrc = s_new()
+    h_mdkey = s_new()
+    h_code = s_new()
+    h_ckey = s_new()
     h_run = s_new()
     h_tid = s_new()
     h_clip = s_new()
@@ -759,7 +770,7 @@ def place_label(id: i32, dst: i32) -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
+    global copied, code_copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
     e: i32 = 0
     k: i32 = 0
@@ -1023,6 +1034,16 @@ def update(msg: i32, arg: i32) -> None:
         if app != 0:
             jstr(app, "sync.space", h_clip)
             clip_copy(h_clip, COPIED, SPACE_COPIED, COPY_FAILED)
+    elif msg == COPY_CODE:
+        # arg is a code span's id; its text is what md() last drew for it.
+        code_text(arg, h_clip)
+        clip_copy(h_clip, CODE_COPIED, arg, COPY_FAILED)
+    elif msg == CODE_COPIED:
+        code_copied = arg
+        after(1500, CODE_COPIED_DONE, arg)
+    elif msg == CODE_COPIED_DONE:
+        if code_copied == arg:
+            code_copied = 0
     elif msg == COPIED:
         copied = arg
         after(1500, COPIED_DONE, arg)
@@ -2199,6 +2220,8 @@ def event_row(e: i32, show_thread: i32) -> None:
         cls("md")
         if k == K_USER and j_has(e, "quote_of") == 1:
             md_quote = j_int(e, "seq")
+        s_set(h_mdkey, "ev-")
+        s_add_num(h_mdkey, j_int(e, "seq"))
         md(h_t1)
         md_quote = 0
         end()
@@ -2309,14 +2332,25 @@ def quote_chip() -> None:
 def md(h: i32) -> None:
     """The markdown in handle h, as elements. A reply still streaming in is
     parsed whole on each render, so it reads right at every step. Images name
-    files in thread h_mdtid's worktree, relative to its directory h_mdbase."""
+    files in thread h_mdtid's worktree, relative to its directory h_mdbase.
+    Code copies in one click: a block by its copy button, a span by clicking
+    it, unless the span is inside something a click already does (a link, or a
+    quote that jumps to its source). h_mdkey says where the markdown is shown."""
+    global md_codes
     n: i32
     i: i32
     op: i32
+    depth: i32 = 0     # elements open
+    clicks: i32 = 0    # depth of the open link or jumping quote, 0 when none
+    block: i32 = 0     # the next code opens inside a code block's pre
+    md_codes = 0
     n = md_parse(h)
     for i in range(n):
         op = md_op(i)
         if op == MD_END:
+            if depth == clicks:
+                clicks = 0
+            depth -= 1
             end()
         elif op == MD_TEXT:
             md_str(i, h_md)
@@ -2345,8 +2379,69 @@ def md(h: i32) -> None:
             cls("center")
         elif op == MD_ALIGN_R:
             cls("right")
+        elif op == 20:
+            depth += 1
+            code_button(code_id(i + 1, n))
+            el("pre")
+            block = 1
+        elif op == 21:
+            depth += 1
+            el("code")
+            if block == 0 and clicks == 0:
+                code_click(code_id(i, n))
+            block = 0
         else:
+            depth += 1
+            if op == 33 or (op == 22 and md_quote != 0):
+                if clicks == 0:
+                    clicks = depth
             md_open(op)
+
+
+def code_id(i: i32, n: i32) -> i32:
+    """The id COPY_CODE copies code op i's text by. It stays the same for the
+    same code in the same place while the markdown grows (code_put), so its
+    check outlasts a render."""
+    global md_codes
+    s_clear(h_code)
+    if i + 1 < n:
+        if md_op(i + 1) == MD_TEXT:
+            md_str(i + 1, h_code)
+    s_copy(h_ckey, h_mdkey)
+    s_add(h_ckey, ":")
+    s_add_num(h_ckey, md_codes)
+    md_codes += 1
+    return code_put(h_ckey, h_code)
+
+
+def code_button(cid: i32) -> None:
+    """A code block's copy icon, a check for a moment after."""
+    btn_open("ghost", COPY_CODE, cid)
+    cls("icon")
+    cls("sm")
+    cls("md-copy")
+    if code_copied == cid:
+        attr("title", "Copied")
+        attr("aria-label", "Copied")
+        span("icon icon-check")
+        end()
+    else:
+        attr("title", "Copy")
+        attr("aria-label", "Copy")
+        span("icon icon-copy")
+        end()
+    end()
+
+
+def code_click(cid: i32) -> None:
+    """A code span copies itself when clicked, and turns green for a moment."""
+    cls("md-copyable")
+    cls_if("copied", code_copied == cid)
+    if code_copied == cid:
+        attr("title", "Copied")
+    else:
+        attr("title", "Click to copy")
+    on_click(COPY_CODE, cid)
 
 
 def md_open(op: i32) -> None:
@@ -2743,6 +2838,8 @@ def thinking_steps(src: i32, n: i32) -> i32:
             jstr(e, "text", h_t1)
             s_copy(h_mdtid, h_sel)
             s_clear(h_mdbase)
+            s_set(h_mdkey, "ev-")
+            s_add_num(h_mdkey, j_int(e, "seq"))
             md(h_t1)
             end()
             end()
@@ -2850,6 +2947,8 @@ def file_view() -> None:
         jstr(fview, "text", h_t1)
         s_copy(h_mdtid, h_sel)
         path_dir(h_mdbase, h_fview)
+        s_set(h_mdkey, "file:")
+        s_add_ref(h_mdkey, h_fview)
         md(h_t1)
         end()
 
