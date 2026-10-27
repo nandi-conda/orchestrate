@@ -31,13 +31,16 @@ def said(workers: str) -> str:
 
 
 class HeuristicRouter:
-    """No model: `@t_xxx` sends that thread work, a bulleted or numbered list
+    """No model: "question: ..." is answered with no thread, `@t_xxx` sends that thread work, a bulleted or numbered list
     fans out one thread per item, anything else spawns one thread. "run
     locally" puts the request's threads on this computer (moves a thread a
     message goes to), "on sprites" on Sprites; `place` picks Sprites when it
     is available, else this computer."""
 
-    async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
+    async def plan(self, request: str, directory: list[dict], places: list[dict], images: int = 0) -> dict:
+        if request.lower().startswith("question:") and not images:
+            return {"spawn": [], "send": [], "answer": f"Answer: {request[9:].strip()}",
+                    "why": "a quick question, answered from the directory"}
         known = {t["id"] for t in directory}
         workers = where(request, places)
         targets = [m for m in MENTION.findall(request) if m in known]

@@ -1,10 +1,19 @@
 """The router: decide where a request typed in a project's main window goes.
 
-A plan spawns new threads, sends messages to existing ones, or both:
+A plan spawns new threads, sends messages to existing ones, answers the
+person itself, or any of these:
 
     {"spawn": [{"title": "...", "request": "...", "workers": "sprites", "where": "..."}],
      "send":  [{"thread": "t_42", "message": "...", "kind": "steer", "workers": "local", "where": "..."}],
+     "answer": "...",
      "why": "..."}
+
+A quick question needs no thread: when what the router is given (the
+threads, their state, summaries, files and load, the places) or what any
+engineer knows answers it, the router answers it in `answer` (markdown, shown
+in the project's chat), and starts no worker for it. A question about the
+project's code or files, or one that needs the internet, a command or any work
+done, goes to a thread like any other request.
 
 The router also decides where each thread's workers run (providers.PLACES),
 from what the thread's work must touch, and says why in `where`: each place
@@ -30,9 +39,10 @@ time: each send is "steer" (about the job the thread is on: a correction,
 guidance, something it needs; a busy thread takes it mid-turn) or "work" (a
 new job: only an idle thread takes it; the control plane gives work for a
 busy one to a new thread). `kind` decides the same for a message sent
-straight to a busy thread, by the person or by another thread. It leans toward spawning. A request
-it cannot plan (the model unreachable or refusing the call, an answer that is
-not one call of that function, a plan that does nothing) is an error the
+straight to a busy thread, by the person or by another thread. It leans toward spawning. The router
+answers a quick question itself (`answer`). A request it cannot plan (the model unreachable or refusing the call, an answer that is
+not one call of that function, a plan that neither answers nor does
+anything) is an error the
 project shows, with what the model said; there is no
 model-less router outside the tests (tests/doubles.py).
 """
@@ -77,9 +87,22 @@ A send's "workers" is "" unless the request means that thread's work now needs
 the other place (its "where" says why; "" when it stays).
 """
 
+ANSWER = """A quick question needs no thread. When the request is a question that what you
+are given here (the threads, their state, summaries, files and load, the
+places) or general engineering knowledge answers in full, answer it yourself in
+"answer", in markdown, short and direct, and spawn nothing for it. Anything you
+would have to look up in the project's code or files, on the internet, by
+running something, or that asks for work done goes to a thread, and "answer" is
+"" unless another part of the request is such a question. Never guess at what a
+thread or the code does beyond what you are given. `images` says how many
+images came with the request: you cannot see them, so a question about them
+goes to a thread.
+"""
+
 REPLY_FORMAT = """Answer by calling `route` once: `spawn` lists the new threads (each with a
 3-6 word title, its task, its workers and where), `send` the messages to existing
-threads, and `why` says in one sentence why."""
+threads, `answer` your own answer to the person ("" when none), and `why` says
+in one sentence why."""
 
 PLACE = """A request in a software project starts an agent thread. Decide where its
 workers run.
@@ -104,7 +127,7 @@ Threads are cheap: prefer spawning a new thread. Reuse a thread only when the
 request clearly continues that thread's work and the thread is idle. Split a
 request with several independent parts into several new threads. A request can
 also spawn threads and notify existing threads whose work it touches.
-""" + LOAD + PLACES + """
+""" + ANSWER + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -118,13 +141,14 @@ spawn a thread for each part of the new text that no reached thread covers, and
 send a reached or other thread a message only to say what changed for it (for
 example that a part it had now has its own thread). An empty plan is a fine
 answer when the corrections cover the edit.
-""" + LOAD + PLACES + """
+""" + ANSWER + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
 class Router(Protocol):
-    async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
-        """Plan a request; `places` is where workers can run (Places.offered)."""
+    async def plan(self, request: str, directory: list[dict], places: list[dict], images: int = 0) -> dict:
+        """Plan a request; `places` is where workers can run (Places.offered),
+        `images` how many images came with it."""
 
     async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict],
                      places: list[dict]) -> dict:
@@ -156,7 +180,8 @@ def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
     """Keep only well-formed entries that point at real threads, each with
     `workers` an available place, or "" (spawn: asked with `place` when it
     is first put on a worker; send: not moved), and `where` why there. A
-    send's `kind` is "steer" or else "work"."""
+    send's `kind` is "steer" or else "work". `answer` is the router's own
+    answer to the person, "" when it gave none."""
     known, can = {t["id"] for t in directory}, available(places)
 
     def placed(s: dict) -> dict:
@@ -169,7 +194,8 @@ def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
              "kind": "steer" if s.get("kind") == "steer" else "work", **placed(s)}
             for s in plan.get("send") or []
             if isinstance(s, dict) and s.get("thread") in known and s.get("message")]
-    return {"spawn": spawn, "send": send, "why": str(plan.get("why", ""))}
+    return {"spawn": spawn, "send": send, "answer": str(plan.get("answer") or "").strip(),
+            "why": str(plan.get("why", ""))}
 
 
 def plan_tool(directory: list[dict], places: list[dict]) -> dict:
@@ -187,6 +213,9 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
                             "workers": {"type": "string", "enum": can or [""]},
                             "where": {"type": "string", "description": WHERE_FIELD}}}
     props = {"spawn": {"type": "array", "items": spawn},
+             "answer": {"type": "string",
+                        "description": "markdown answer to a quick question you can answer from what you are "
+                                       "given; \"\" when a thread must do it"},
              "why": {"type": "string", "description": "one sentence"}}
     if directory:
         props["send"] = {"type": "array", "items": {
@@ -274,9 +303,9 @@ class ModelRouter:
                                plan_tool(directory, places))
         return clean_plan(got, directory, places)
 
-    async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
-        plan = await self._ask(SYSTEM, {"request": request}, directory, places)
-        if not plan["spawn"] and not plan["send"]:
+    async def plan(self, request: str, directory: list[dict], places: list[dict], images: int = 0) -> dict:
+        plan = await self._ask(SYSTEM, {"request": request, "images": images}, directory, places)
+        if not plan["spawn"] and not plan["send"] and not plan["answer"]:
             raise ValueError(f"the router model ({self.model}) planned nothing for the request: {plan['why']!r}")
         return plan
 

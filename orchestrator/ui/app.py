@@ -150,6 +150,7 @@ K_THINKING: Const[i32] = 9
 K_RESULT: Const[i32] = 10
 K_STATE: Const[i32] = 11
 K_REQUEST: Const[i32] = 12
+K_ANSWER: Const[i32] = 13
 
 # markdown render ops (ui/markdown.js); codes from 10 open an element
 MD_END: Const[i32] = 0
@@ -1144,6 +1145,8 @@ def update(msg: i32, arg: i32) -> None:
         k = j_int(arg, "kind")
         if k == K_ROUTE:
             jstr(arg, "text", h_route)
+        elif k == K_ANSWER:
+            s_set(h_route, "answered")
         elif k == K_ERROR and j_has(arg, "thread_id") == 0:
             jstr(arg, "text", h_err)
         # A reply still streaming is one row that grows, so the pane it is in
@@ -2239,7 +2242,8 @@ def event_row(e: i32, show_thread: i32) -> None:
     cls_if("ev-error", k == K_ERROR)
     cls_if("ev-route", k == K_ROUTE)
     cls_if("ev-thinking", k == K_THINKING)
-    cls_if("ev-result", k == K_RESULT)
+    # the router's answer to a quick question looks like a thread's result
+    cls_if("ev-result", k == K_RESULT or k == K_ANSWER)
     cls_if("ev-live", live == 1)
     cls_if("ev-editing", editing != 0 and editing == j_int(e, "seq"))
     div("ev-label")
@@ -2255,7 +2259,7 @@ def event_row(e: i32, show_thread: i32) -> None:
     jstr(e, "text", h_t1)
     if editing != 0 and editing == j_int(e, "seq"):
         edit_box()
-    elif k == K_ASSISTANT or k == K_PEER or k == K_RESULT or k == K_USER:
+    elif k == K_ASSISTANT or k == K_PEER or k == K_RESULT or k == K_ANSWER or k == K_USER:
         # Replies get a copy button and your own messages an edit button; your
         # messages render as markdown too, so a reply to a selection shows its
         # quote as a quote.

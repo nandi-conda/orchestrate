@@ -578,9 +578,9 @@ class GatedRouter(HeuristicRouter):
     def __init__(self) -> None:
         self.gate = asyncio.Event()
 
-    async def plan(self, request, directory, places):
+    async def plan(self, request, directory, places, images=0):
         await self.gate.wait()
-        return await super().plan(request, directory, places)
+        return await super().plan(request, directory, places, images)
 
 
 class GatedProvider(LocalProvider):
@@ -998,7 +998,7 @@ async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypa
 class NoRoutingRouter:
     """A router that must not be asked: an image-only request needs no plan."""
 
-    async def plan(self, request, directory, places):
+    async def plan(self, request, directory, places, images=0):
         raise AssertionError("the router was asked to plan a request with no text")
 
     async def place(self, request, places):
@@ -1893,6 +1893,32 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     await s.close()
 
 
+async def test_a_quick_question_the_router_answers_starts_no_thread(tmp_path):
+    """The router's own answer is the route: no thread is spawned and no
+    worker is put to work, and the answer shows as markdown like a reply."""
+    from control.service import Orchestrator
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
+    got = await orch.handle_request(p["id"], "question: what is running?", "auto")
+    assert got["answer"] == "Answer: what is running?" and got["spawned"] == [] and got["sent"] == []
+    assert got["summary"] == "answered"
+    assert await s.list_threads(p["id"]) == [] and orch.by_thread == {} and orch.binding == {}
+    route = next(e for e in await s.list_events(p["id"]) if e["type"] == "route")
+    shown = app_mod.display(route)
+    assert shown["kind"] == app_mod.K_ANSWER and shown["text"] == "Answer: what is running?"
+    # An answer beside work done says what went to threads under it.
+    both = app_mod.display({"type": "route", "payload": {"answer": "It is idle.", "summary": "answered, started “X”",
+                                                        "spawned": [{"id": "t_1", "title": "X"}], "sent": []}})
+    assert both["text"] == "It is idle.\n\n*answered, started “X”*"
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
 @pytest.fixture
 def postgres(tmp_path):
     import shutil
@@ -2236,9 +2262,9 @@ class RecordingRouter(HeuristicRouter):
     def __init__(self) -> None:
         self.directories: list[list[dict]] = []
 
-    async def plan(self, request, directory, places):
+    async def plan(self, request, directory, places, images=0):
         self.directories.append(directory)
-        return await super().plan(request, directory, places)
+        return await super().plan(request, directory, places, images)
 
 
 async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):

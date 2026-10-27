@@ -276,7 +276,7 @@ async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
     from control.router import ModelRouter
 
     async def empty(*_):
-        return {"spawn": [], "send": [], "why": ""}
+        return {"spawn": [], "send": [], "answer": "", "why": ""}
 
     r = ModelRouter("key")
     monkeypatch.setattr(r, "_ask", empty)
@@ -319,7 +319,7 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
                                "where": "Sprites are not available"}],
                     "send": [{"thread": "t_1", "message": "heads up", "kind": "steer", "workers": "", "where": ""}],
-                    "why": "new work"}
+                    "answer": "", "why": "new work"}
     body = seen[0]
     assert body["thinking"] == {"type": "disabled"}
     assert body["tool_choice"] == {"type": "function", "function": {"name": "route"}}
@@ -331,9 +331,25 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
     assert props["send"]["items"]["properties"]["kind"]["enum"] == ["steer", "work"]
     assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
+    assert "answer" in fn["parameters"]["required"] and props["answer"]["type"] == "string"
     # With no threads there is nothing to send to, so the schema has no send.
     await r.plan("fix it", [], places)
     assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
+
+
+async def test_the_router_model_answers_a_quick_question_itself():
+    """A plan that only answers is a plan: the request needs no thread. The
+    router is told how many images came with the request, which it cannot see."""
+    seen: list = []
+    r = router_answering(route_call({"spawn": [], "answer": "  **t_1** is busy fixing login.  ",
+                                     "why": "the directory answers it"}), seen)
+    plan = await r.plan("what is t_1 doing?", [{"id": "t_1", "title": "Fix login", "summary": "fixing login"}],
+                        [{"id": "sprites", "label": "Sprites", "why": ""}], images=2)
+    assert plan == {"spawn": [], "send": [], "answer": "**t_1** is busy fixing login.",
+                    "why": "the directory answers it"}
+    content = json.loads(seen[0]["messages"][1]["content"])
+    assert content["images"] == 2 and content["threads"][0]["summary"] == "fixing login"
+    assert "A quick question needs no thread" in seen[0]["messages"][0]["content"]
 
 
 async def test_the_router_model_says_whether_a_message_steers_a_busy_thread_or_is_new_work():

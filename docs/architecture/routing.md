@@ -18,7 +18,7 @@ sequenceDiagram
     API-->>UI: 202 {queued, seq}
     API->>Chain: route in the background
     Chain->>Router: plan(text, thread directory)
-    Router-->>Chain: {spawn: [...], send: [...], why}
+    Router-->>Chain: {spawn: [...], send: [...], answer, why}
     Chain->>Orch: spawn(...) / send(...)
     Chain->>Chain: log "route" event {spawned, sent, why, of: seq}
 ```
@@ -33,8 +33,14 @@ sequenceDiagram
     ```json
     {"spawn": [{"title": "Fix Safari export", "request": "..."}],
      "send":  [{"thread": "t_42", "message": "..."}],
+     "answer": "",
      "why": "one sentence"}
     ```
+
+    A quick question needs no thread: when the directory (or general
+    engineering knowledge) answers it, the router answers in `answer`
+    (markdown) and spawns nothing, so the reply comes back in one model call
+    with no worker bound. See [Quick questions](#quick-questions).
 
 4. Each spawn creates a thread (its `created` event holds the brief, shown in
    the UI as a neutral dashed row, not as your message) and starts binding it
@@ -65,7 +71,8 @@ tool calls are a DeepSeek beta feature, so the router asks on
 default.
 
 A request the model cannot plan (unreachable or refusing the call, an answer
-that is not one `route` call, or a plan that does nothing) is logged as an
+that is not one `route` call, or a plan that neither answers nor does
+anything) is logged as an
 `error` event in the project, with the status and body the API sent or what
 the model said; there is no rule-based stand-in outside the tests
 (`tests/doubles.py`).
@@ -73,6 +80,25 @@ the model said; there is no rule-based stand-in outside the tests
 Plans are cleaned before use (`clean_plan`): sends to unknown threads and
 empty entries are dropped, titles are capped at 80 characters. A project runs
 at most 64 threads at once; a spawn past that is refused.
+
+### Quick questions
+
+Starting a thread costs a worker bind (hub sync, bundle, post, worktree,
+session) and a model turn before anything comes back. A question the router
+can answer from what it is already sent does not need that, so the `route`
+call has an `answer` field. The router fills it when the request is a
+question that the directory (titles, states, summaries, files, load), the
+places, or general engineering knowledge answers in full ("what is t_42
+doing?", "did the login fix land?", "what does `git rebase --onto` do?"). A
+question about the project's code or files, one that needs the internet or a
+command, and anything that asks for work, goes to a thread as before; so
+does a question about attached images, which the router is told about (the
+`images` count) but cannot see. A request can do both: the router answers
+the question part and spawns or sends for the rest.
+
+The `route` event then carries `answer`, and the UI shows it as the router's
+reply, in markdown (`K_ANSWER`), with what went to threads, if anything, under
+it. The orchestrator decides this per message; there is no setting.
 
 ### Thread load
 

@@ -46,8 +46,10 @@ Startup = Callable[[str, str], None]
 # what the person typed; K_REQUEST is the brief a thread was spawned with,
 # which the router writes. K_RESULT is a turn's summary, shown as its answer;
 # K_STATE is a state change, which the Dialog leaves to the state badges.
+# K_ANSWER is the router's own answer to a quick question (a route with
+# `answer`), shown as markdown like a reply.
 (K_USER, K_ASSISTANT, K_TOOL_CALL, K_TOOL_RESULT, K_STATUS, K_PEER, K_ERROR, K_ROUTE, K_THINKING,
- K_RESULT, K_STATE, K_REQUEST) = range(1, 13)
+ K_RESULT, K_STATE, K_REQUEST, K_ANSWER) = range(1, 14)
 
 
 # Kept in the log and the SSE streams, left out of the transcripts the UI shows.
@@ -140,6 +142,10 @@ def display(ev: dict) -> dict:
         kind, label, text = K_RESULT, "Result", d.get("summary", "")
     elif t in ("error", "dropped"):
         kind, label, text = K_ERROR, t, d.get("error") or d.get("reason", "")
+    elif t == "route" and d.get("answer"):
+        kind, label, text = K_ANSWER, "router", d["answer"]
+        if d.get("spawned") or d.get("sent"):  # the rest of the request went to threads
+            text += f"\n\n*{d.get('summary', '')}*"
     elif t == "route":
         kind, label = K_ROUTE, "router"
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")

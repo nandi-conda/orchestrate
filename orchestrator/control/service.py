@@ -1927,7 +1927,7 @@ class Orchestrator:
             title = title_for(text) if text else image_title(images)
             plan = {"spawn": [{"title": title, "request": text}], "send": [], "why": "new thread requested"}
         else:
-            plan = await self.router.plan(text, directory, self.places.offered())
+            plan = await self.router.plan(text, directory, self.places.offered(), len(images or []))
         spawned, sent = [], []
         for s in plan["spawn"]:
             t = await self.spawn(project_id, s["title"], s["request"], images=images,
@@ -1949,8 +1949,12 @@ class Orchestrator:
             parts.append("started " + ", ".join(f"“{t['title']}”" for t in spawned))
         if sent:
             parts.append("told " + ", ".join(f"“{titles.get(tid, tid)}”" for tid in sent))
+        if plan.get("answer"):
+            parts.insert(0, "answered")
         result = {"request": text, "mode": mode, "spawned": spawned, "sent": sent, "why": plan.get("why", ""),
                   "summary": ", ".join(parts) or "nothing to do"}
+        if plan.get("answer"):  # a quick question the router answered: no thread, no worker
+            result["answer"] = plan["answer"]
         if of is not None:
             result["of"] = of
         await self.store.append_event(project_id, None, "route", result)
@@ -2058,7 +2062,11 @@ class Orchestrator:
             parts.append("started " + ", ".join(f"“{t['title']}”" for t in spawned))
         if told:
             parts.append("told " + ", ".join(f"“{titles.get(tid, tid)}”" for tid in told))
-        await self.store.append_event(project_id, None, "route", {
-            "request": text, "mode": "edit", "of": seq, "corrected": reached, "spawned": spawned,
-            "sent": list(dict.fromkeys(reached + told)), "why": plan.get("why", ""),
-            "summary": "edit: " + (", ".join(parts) or "nothing to do")})
+        if plan.get("answer"):
+            parts.insert(0, "answered")
+        result = {"request": text, "mode": "edit", "of": seq, "corrected": reached, "spawned": spawned,
+                  "sent": list(dict.fromkeys(reached + told)), "why": plan.get("why", ""),
+                  "summary": "edit: " + (", ".join(parts) or "nothing to do")}
+        if plan.get("answer"):
+            result["answer"] = plan["answer"]
+        await self.store.append_event(project_id, None, "route", result)
