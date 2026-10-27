@@ -62,9 +62,9 @@ name, a full disk, the network. A fix that would change what a feature does
 waits for your answer. The two startup lines in the next section are expected
 and ignored.
 
-File edits are accepted without asking (`--permission-mode acceptEdits`);
-commands such as the tests, `git` and the restart still ask, as Claude Code's
-own permission settings say.
+Claude Code starts in auto mode (`--permission-mode auto`), so it approves
+routine actions itself: edits, the tests, `git` and the restart. Claude Code's
+own permission settings still apply.
 
 ## Rendering without a GPU
 
