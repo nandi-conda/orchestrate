@@ -255,6 +255,26 @@ plane's checkout follows is the usual one); otherwise its runner is left
 running and the attach takes seconds. Respawn of a thread waiting on a
 worker being made calls that attach off too, and it starts again.
 
+### Installing on a sprite
+
+The install (git fetch, `pixi install` of the runner's environments,
+prime-agent) takes minutes, longer than one request through the Sprites API
+should be held open: a held `POST /exec` came back as a bare 502 from the
+API's gateway mid-install. So it runs detached on the sprite, in
+`/home/sprite/.orchestrate-install/<commit>-<id>/`: one short exec starts it
+in its own session and returns, and a short exec every 5 seconds looks at it,
+adding the lines it wrote since to the Worker log as `install | ...`. While it
+runs it holds the sprite active with a task on the sprite's Tasks API (a
+5 minute hold refreshed every minute, released when it ends), so the sprite
+does not pause under it. It ends one of four ways, each its own error with
+the end of its output: it exits 0 (the runner service is then put), it exits
+non-zero, it is gone without an exit code (the sprite rebooted under it), or
+it runs past 30 minutes.
+
+A Sprites API call that fails says what the API answered: the status, how
+long the call took, the request id its proxy gave it, and the body, or that
+it had none.
+
 ## Respawn, from each state
 
 Respawn (the button on every thread, or `POST /api/threads/<id>/respawn`)

@@ -357,6 +357,68 @@ git -C /opt/orchestrate checkout -q --force FETCH_HEAD
 ORCHESTRATE_REF="$ORCHESTRATE_COMMIT" bash /opt/orchestrate/runner/deploy/bootstrap.sh
 """
 
+# The install takes minutes (pixi install of the runner's environments), far
+# longer than one HTTP request through the Sprites API should be held open: a
+# held POST /exec came back as a bare 502 from the API's gateway mid-install.
+# So the install runs detached on the sprite: INSTALL_START puts BOOTSTRAP in
+# a run directory and starts it in its own session, which outlives the exec
+# that started it, and returns at once. While it runs it holds the sprite
+# active with a task on the Tasks API (docs.fly.io/sprites/keeping-sprites-
+# running: a 5 minute hold refreshed every minute, released when it ends), so
+# the sprite does not pause under it between the control plane's looks. It
+# writes its output to `log` and, when it ends, its exit code to `exit`.
+# INSTALL_LOOK, a short exec, says how the run stands and gives the log lines
+# after the first $INSTALL_FROM.
+INSTALL_ROOT = "/home/sprite/.orchestrate-install"
+INSTALL_TASK = "orchestrate-install"
+
+INSTALL_START = r"""
+set -euo pipefail
+rm -rf "$INSTALL_ROOT"
+run="$INSTALL_ROOT/$INSTALL_RUN"
+mkdir -p "$run"
+cat /proc/sys/kernel/random/boot_id > "$run/boot"
+cat > "$run/install.sh" <<'ORCHESTRATE_INSTALL_EOF'
+__BOOTSTRAP__
+ORCHESTRATE_INSTALL_EOF
+cat > "$run/run.sh" <<'ORCHESTRATE_INSTALL_EOF'
+run="$1"
+echo $$ > "$run/pid.tmp" && mv "$run/pid.tmp" "$run/pid"
+tasks() { curl -sS --unix-socket /.sprite/api.sock -H "Content-Type: application/json" "$@"; }
+( while :; do tasks -X PUT "http://sprite/v1/tasks/$INSTALL_TASK" -d '{"expire": "5m"}'; sleep 60; done ) \
+  >> "$run/hold.log" 2>&1 &
+hold=$!
+bash "$run/install.sh" > "$run/log" 2>&1
+code=$?
+kill "$hold"
+tasks -X DELETE "http://sprite/v1/tasks/$INSTALL_TASK" >> "$run/hold.log" 2>&1
+echo "$code" > "$run/exit.tmp" && mv "$run/exit.tmp" "$run/exit"
+ORCHESTRATE_INSTALL_EOF
+setsid bash "$run/run.sh" "$run" < /dev/null > "$run/run.log" 2>&1 &
+for _ in $(seq 100); do [ -s "$run/pid" ] && break; sleep 0.1; done
+if [ ! -s "$run/pid" ]; then
+  echo "the install did not start in 10s; its launcher said:"; cat "$run/run.log"; exit 1
+fi
+"""
+
+# The first line is the run's state: `exit <code>`, `running`, or `gone` (its
+# process is not there and it wrote no exit code: the sprite rebooted under
+# it, or it was killed). Liveness is read before the exit code, so a run that
+# ends between the two reads is seen as ended, never as gone.
+INSTALL_LOOK = r"""
+run="$INSTALL_ROOT/$INSTALL_RUN"
+alive=no
+if [ "$(cat /proc/sys/kernel/random/boot_id)" = "$(cat "$run/boot" 2>/dev/null)" ] \
+   && kill -0 "$(cat "$run/pid" 2>/dev/null)" 2>/dev/null; then alive=yes; fi
+if [ -f "$run/exit" ]; then echo "exit $(cat "$run/exit")"
+elif [ "$alive" = yes ]; then echo running
+else echo gone; fi
+tail -n "+$((INSTALL_FROM + 1))" "$run/log" 2>/dev/null
+"""
+# How often a running install is looked at, and how long it may take.
+INSTALL_LOOK_EVERY = 5.0
+INSTALL_TIMEOUT = 1800.0
+
 
 async def remote_commit(source: str, ref: str) -> str:
     """The commit `ref` names on `source` now: what a new worker runs."""
@@ -473,7 +535,10 @@ class SpritesProvider:
         # plane's key and token; the turns that cuts short resume when their
         # threads are posted again (runner/API.md, "Interrupted turns").
         async with steps.step("looking for its runner service"):
-            defined = (await self.http.get(f"/sprites/{name}/services/runner")).status_code == 200
+            r = await self.http.get(f"/sprites/{name}/services/runner")
+            if r.status_code not in (200, 404):
+                raise RuntimeError(failure(f"looking for sprite {name}'s runner service", r))
+            defined = r.status_code == 200
         if defined:
             async with steps.step(f"asking its runner whether it is orchestrate {commit[:12]} as this control "
                                   f"plane would start it (up to {SERVES_WAIT:.0f}s: a paused sprite wakes)"):
@@ -485,10 +550,7 @@ class SpritesProvider:
                        "removed and put again")
 
         async with steps.step(f"installing orchestrate {commit[:12]} on it (git fetch, pixi install, prime-agent)"):
-            out = await self.exec(name, BOOTSTRAP,
-                                  env={"ORCHESTRATE_REPO": self.source, "ORCHESTRATE_COMMIT": commit})
-        for line in out.strip().splitlines()[-10:]:
-            steps.note(f"  install | {line}")
+            await self.install(name, commit, steps)
         if defined:
             # A definition is removed, not replaced: the API answers a PUT whose
             # command is the one it already has with "Service already running
@@ -552,12 +614,58 @@ class SpritesProvider:
         r.raise_for_status()
         return True
 
+    async def install(self, name: str, commit: str, steps: Steps, script: str = BOOTSTRAP) -> None:
+        """Run `script` (BOOTSTRAP) for `commit` on sprite `name`, detached (INSTALL_START),
+        and look at it every INSTALL_LOOK_EVERY seconds until it ends, noting
+        each line it writes. Raises, with the end of its log, when it fails,
+        dies or takes longer than INSTALL_TIMEOUT."""
+        run = f"{commit[:12]}-{secrets.token_hex(4)}"
+        env = {"INSTALL_ROOT": INSTALL_ROOT, "INSTALL_RUN": run, "INSTALL_TASK": INSTALL_TASK}
+        await self.exec(name, INSTALL_START.replace("__BOOTSTRAP__", script.strip()), env={**env, "ORCHESTRATE_REPO": self.source,
+                                                  "ORCHESTRATE_COMMIT": commit})
+        steps.note(f"  install started on {name}, in {INSTALL_ROOT}/{run}")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + INSTALL_TIMEOUT
+        seen: list[str] = []  # the log's lines read so far
+        while True:
+            out = await self.exec(name, INSTALL_LOOK, env={**env, "INSTALL_FROM": str(len(seen))})
+            state, _, rest = out.partition("\n")
+            ended = state != "running"
+            lines = rest.split("\n")
+            # A last line without its newline may still be being written: it
+            # is read again next time, unless the run has ended.
+            if lines[-1] == "" or not ended:
+                lines = lines[:-1]
+            for line in lines:
+                steps.note(f"  install | {line}")
+            seen += lines
+            if state == "exit 0":
+                return
+            end = "\n".join(seen[-30:])
+            if state.startswith("exit "):
+                raise RuntimeError(f"installing orchestrate {commit[:12]} on sprite {name} failed "
+                                   f"({state}); its output ends:\n{end}")
+            if state == "gone":
+                raise RuntimeError(f"the install of orchestrate {commit[:12]} on sprite {name} stopped "
+                                   f"without finishing (the sprite restarted, or it was killed); its "
+                                   f"output ends:\n{end}")
+            if state != "running":
+                raise RuntimeError(f"looking at the install on sprite {name} gave {state!r}, not a state")
+            if loop.time() > deadline:
+                raise RuntimeError(f"installing orchestrate {commit[:12]} on sprite {name} took longer than "
+                                   f"{INSTALL_TIMEOUT:.0f}s; it is still running there; its output "
+                                   f"ends:\n{end}")
+            await asyncio.sleep(INSTALL_LOOK_EVERY)
+
     async def exec(self, name: str, script: str, env: dict | None = None) -> str:
+        """Run a short bash script on sprite `name` (POST /exec holds the
+        request until it ends: long work goes through `install`'s pattern)
+        and return its output."""
         params = [("cmd", "bash"), ("cmd", "-c"), ("cmd", script)]
         params += [("env", f"{k}={v}") for k, v in (env or {}).items()]
         r = await self.http.post(f"/sprites/{name}/exec", params=params)
         if r.status_code >= 400:
-            raise RuntimeError(f"sprite exec failed ({r.status_code}): {r.text[:500]}")
+            raise RuntimeError(failure(f"exec on sprite {name}", r))
         return r.text
 
     # A sprite service's stdout and stderr, timestamped (Sprites docs, "Services").
@@ -627,6 +735,21 @@ class SpritesProvider:
 
     async def close(self) -> None:
         await self.http.aclose()
+
+
+def failure(what: str, r: httpx.Response) -> str:
+    """A failed Sprites API call as one line that says enough to chase it: the
+    status and its reason, how long the call took, the request id the API's
+    proxy gave it, and the body, or that there was none (a gateway's 502)."""
+    try:
+        took = f" after {r.elapsed.total_seconds():.1f}s"
+    except RuntimeError:  # a response built by hand (tests) has no elapsed
+        took = ""
+    ids = [f"{h} {r.headers[h]}" for h in ("fly-request-id", "x-request-id", "server", "via") if h in r.headers]
+    body = r.text.strip()
+    return (f"{what} failed: {r.status_code} {r.reason_phrase}{took} ({r.request.method} {r.request.url.path}"
+            + (f"; {', '.join(ids)}" if ids else "") + "): "
+            + (body[:500] if body else "the API answered with an empty body"))
 
 
 def service_spec(service: dict) -> str:

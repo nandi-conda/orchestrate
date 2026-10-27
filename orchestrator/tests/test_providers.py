@@ -301,9 +301,8 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
     fake.bootstrap = None
     p.http = fake
 
-    async def no_exec(name, script, env=None):
-        fake.bootstrap = env
-        return ""
+    async def no_install(name, commit, steps):
+        fake.bootstrap = {"ORCHESTRATE_REPO": p.source, "ORCHESTRATE_COMMIT": commit}
 
     async def healthy(url, timeout=120.0):
         return {"ok": True, "commit": serving, "spec": spec}
@@ -319,7 +318,7 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
 
     env.setattr(providers, "remote_commit", resolve)
     env.setattr(p, "logs", logs)
-    env.setattr(p, "exec", no_exec)
+    env.setattr(p, "install", no_install)
     env.setattr(providers, "wait_healthy", healthy)
     env.setattr(p, "accepts_token", accepts)
     try:
@@ -371,6 +370,84 @@ async def test_sprites_create_makes_a_new_service(env):
     _, fake = await _sprites_create(env, defined=False)
     assert fake.deleted == 0
     assert fake.bootstrap == {"ORCHESTRATE_REPO": "https://example.com/fork.git", "ORCHESTRATE_COMMIT": "c0ffee"}
+
+
+class LocalSprite:
+    """POST /exec as the Sprites API runs it, on this machine: `bash -c` with
+    the given env, the request held until the script ends. The install's
+    scripts run for real (in a tmp INSTALL_ROOT; there is no /.sprite/api.sock
+    here, so its hold only logs that it could not be made)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.calls = 0
+
+    async def exec(self, name, script, env=None):
+        self.calls += 1
+        env = {**os.environ, **(env or {}), "INSTALL_ROOT": str(self.root)}
+        proc = await asyncio.create_subprocess_exec("bash", "-c", script, env=env,
+                                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        if proc.returncode:
+            raise RuntimeError(f"exec failed: {out.decode()}")
+        return out.decode()
+
+
+async def _install(env, tmp_path, script):
+    env.setattr(providers, "INSTALL_LOOK_EVERY", 0.05)
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    sprite = LocalSprite(tmp_path / "install")
+    env.setattr(p, "exec", sprite.exec)
+    steps = providers.Steps("worker orch-w1")
+    try:
+        await p.install("orch-w1", "c0ffee" * 6, steps, script=script)
+    finally:
+        await p.close()
+    return sprite, [line.split("s  ", 1)[1] for line in steps.lines]
+
+
+async def test_the_install_runs_detached_and_is_watched_until_it_ends(env, tmp_path):
+    """The install outlives the exec that starts it (a held exec came back as a
+    bare 502 mid-install), so each exec is short: one starts it, the others
+    look at it, noting the lines it wrote since the last look."""
+    script = 'echo "fetching $ORCHESTRATE_COMMIT"\nsleep 0.3\nprintf "pixi install\\nready"\n'
+    sprite, lines = await _install(env, tmp_path, script)
+    assert sprite.calls >= 3  # started, looked at while it ran, looked at once it ended
+    assert "  install | fetching " + "c0ffee" * 6 in lines
+    assert lines[-2:] == ["  install | pixi install", "  install | ready"]  # the last line, without its newline
+
+
+async def test_a_failed_install_says_how_it_ended(env, tmp_path):
+    with pytest.raises(RuntimeError, match=r"failed \(exit 3\); its output ends:\nno pixi here"):
+        await _install(env, tmp_path, "echo 'no pixi here'\nexit 3\n")
+
+
+async def test_an_install_that_dies_is_gone_not_running(env, tmp_path):
+    """A run whose process is not there and wrote no exit code (the sprite
+    rebooted under it) is reported, not waited on."""
+    with pytest.raises(RuntimeError, match="stopped without finishing"):
+        await _install(env, tmp_path, 'echo started\nkill -9 "$(cat "$INSTALL_ROOT/$INSTALL_RUN/pid")"\n')
+
+
+async def test_a_failed_sprites_call_says_what_the_api_answered():
+    """A gateway's 502 has no body: the error says so, with the request id."""
+    r = httpx.Response(502, headers={"fly-request-id": "01ABC"},
+                       request=httpx.Request("POST", "https://api.sprites.dev/v1/sprites/orch-w1/exec"))
+    assert providers.failure("exec on sprite orch-w1", r) == (
+        "exec on sprite orch-w1 failed: 502 Bad Gateway (POST /v1/sprites/orch-w1/exec; fly-request-id 01ABC): "
+        "the API answered with an empty body")
+
+
+async def test_looking_for_the_runner_service_fails_on_an_api_error(env):
+    """Only a 404 means "no runner service": a 502 is not taken for one."""
+    class Broken(FakeSprites):
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner"):
+                return httpx.Response(502, request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    with pytest.raises(RuntimeError, match="looking for sprite orch-w1's runner service failed: 502"):
+        await _sprites_create(env, defined=True, fake=Broken(True))
 
 
 async def test_a_sprite_serving_other_code_is_refused(env):
