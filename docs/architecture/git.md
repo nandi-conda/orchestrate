@@ -151,7 +151,8 @@ What the folder is decides what is done to it first (`hub.folder`):
 | a git repository's own folder (a checkout) | its config gets `receive.denyCurrentBranch=updateInstead`, so a push to its checked-out branch also updates its files |
 | a bare repository | used as it is |
 | not a git repository | `git init` on `main`, then as a checkout |
-| a checkout with anything not committed (or a branch with no commits yet) | one commit, "Add the folder's files", of everything its `.gitignore` leaves in: untracked files and changes to tracked ones, plus its own `pixi.toml`, `.gitignore` and `.gitattributes` even when ignored |
+| a checkout with anything not committed | one commit, "Add the folder's files", of everything its `.gitignore` leaves in: untracked files and changes to tracked ones, plus its own `pixi.toml`, `.gitignore` and `.gitattributes` even when ignored |
+| an empty folder (or a checkout whose branch has no commits and no files) | no commit: it is an empty repository, so it gets the project's history, on the branch it has checked out |
 | missing, inside another repository, a `.git` folder, or a checkout on no branch (detached HEAD) | refused with the reason |
 
 So the project starts from what is there and the folder starts clean: threads

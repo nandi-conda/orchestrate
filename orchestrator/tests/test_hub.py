@@ -469,6 +469,53 @@ async def test_a_folder_with_nothing_to_commit_gets_no_commit(tmp_path):
     await s.close()
 
 
+async def test_an_empty_folder_opens_as_the_projects_first_commit(tmp_path):
+    folder = tmp_path / "quack"
+    folder.mkdir()
+    s, p, orch = await opened(tmp_path, folder)
+    hub = orch.hub_path(p["id"])
+    assert git(hub, "log", "--format=%s", "main") == "Start the project"
+    assert git(folder, "rev-parse", "HEAD") == git(hub, "rev-parse", "main")
+    assert (folder / "pixi.toml").exists() and git(folder, "status", "--porcelain") == ""
+
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
+    landed = await event(s, p, t["id"], "landed")
+    assert git(folder, "rev-parse", "HEAD") == landed["commit"] and (folder / "a.txt").exists()
+    await wait_for(lambda: idle(s, t["id"]))
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
+@pytest.mark.parametrize("init", [False, True], ids=["plain", "git-init-on-master"])
+async def test_an_empty_folder_gets_the_work_a_project_already_has(tmp_path, init):
+    # A project with work landed is given an empty folder as its remote: the
+    # folder gets the project's history, on the branch it has checked out.
+    s, p, orch = await setup(tmp_path)
+    t = await orch.spawn(p["id"], "T", "write a.txt: one")
+    landed = await event(s, p, t["id"], "landed")
+    await wait_for(lambda: idle(s, t["id"]))
+    folder = tmp_path / "quack"
+    folder.mkdir()
+    if init:
+        git(folder, "init", "-q", "-b", "master")
+    branch = "master" if init else "main"
+
+    await orch.update_project(p["id"], repo_url=str(folder))
+    hub = orch.hub_path(p["id"])
+    assert git(folder, "symbolic-ref", "--short", "HEAD") == branch
+    assert git(folder, "rev-parse", "HEAD") == landed["commit"] == git(hub, "rev-parse", branch)
+    assert (folder / "a.txt").exists() and git(folder, "status", "--porcelain") == ""
+
+    await orch.send(t["id"], "write b.txt: two")
+    again = await landing(s, p, t["id"], 2)
+    assert git(folder, "rev-parse", "HEAD") == again["commit"] and (folder / "b.txt").exists()
+    await wait_for(lambda: idle(s, t["id"]))
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
 async def test_a_gitignore_that_ignores_itself_is_kept(tmp_path):
     # Ignored files are written over by a push; the pixi files never are,
     # because opening commits the folder's own.
