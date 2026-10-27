@@ -8,25 +8,29 @@ the laptop that you started on the desktop, and go on there.
 
 ## Set it up
 
-1. Make a Cloudflare API token with **Account > Workers Scripts: Edit** and
-   **Account > Workers R2 Storage: Edit** (the *Edit Cloudflare Workers* template
-   has both), and note your account id.
-2. Deploy the server from a checkout:
+1. Sign in to Cloudflare with wrangler and make the R2 bucket, from a checkout:
 
     ```bash
-    export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
-    cd sync && pixi run deploy
+    cd sync
+    pixi run install                                 # wrangler into node_modules
+    npx wrangler login                               # opens the browser
+    npx wrangler r2 bucket create orchestrate-sync   # once
     ```
 
-    It makes the R2 bucket `orchestrate-sync`, deploys the Worker, and prints:
+2. Give the Worker its token, then deploy it:
 
-    ```
-    ORCHESTRATE_SYNC_URL=https://orchestrate-sync.<you>.workers.dev
-    ORCHESTRATE_SYNC_TOKEN=<token>
+    ```bash
+    TOKEN=$(openssl rand -hex 32); echo "$TOKEN"     # keep it: this is ORCHESTRATE_SYNC_TOKEN
+    echo "$TOKEN" | npx wrangler secret put SYNC_TOKEN
+    npx wrangler deploy                              # or: pixi run deploy
     ```
 
-    The token is shown once. Deploying again keeps it; `pixi run deploy --new-token`
-    makes a new one, which every computer then needs.
+    `wrangler deploy` prints the Worker's URL,
+    `https://orchestrate-sync.<you>.workers.dev`: this is `ORCHESTRATE_SYNC_URL`.
+    `wrangler.toml` declares the Durable Object and the bucket binding. Deploying
+    again keeps the token; `secret put` again with a new one replaces it, and every
+    computer then needs the new one.
+
 3. Set both on every computer, as environment variables or in the keyring
    (`pixi run set-key ORCHESTRATE_SYNC_URL`, `pixi run set-key ORCHESTRATE_SYNC_TOKEN`),
    or on the Android app's Keys screen. The control plane sends the token as

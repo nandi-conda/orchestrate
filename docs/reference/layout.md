@@ -49,7 +49,6 @@
 | --- | --- |
 | `src/index.js` | the sync server: a Cloudflare Worker and its Durable Object (`SyncHub`) |
 | `wrangler.toml` | the Worker, its Durable Object and R2 bucket |
-| `deploy.mjs` | `pixi run deploy`: the bucket, the Worker, its token |
 
 ## Root
 

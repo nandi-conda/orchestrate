@@ -11,4 +11,4 @@ nodejs = ">=22"
 [tasks]
 install = { cmd = "npm ci", inputs = ["package-lock.json"], outputs = ["node_modules/.package-lock.json"], description = "Install wrangler and Automerge into node_modules" }
 dev = { cmd = "npx wrangler dev --local --port 8787", depends-on = ["install"], description = "Serve the sync server on http://127.0.0.1:8787 (local Durable Object and R2; the token is in .dev.vars)" }
-deploy = { cmd = "node deploy.mjs", depends-on = ["install"], description = "Deploy to your Cloudflare account (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID); prints the URL and, the first time, the sync token" }
+deploy = { cmd = "npx wrangler deploy", depends-on = ["install"], description = "Deploy the Worker with wrangler, signed in with `npx wrangler login` (docs/guide/sync.md has the one-time bucket and token steps)" }
