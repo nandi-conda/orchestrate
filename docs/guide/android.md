@@ -49,8 +49,6 @@ Change them from the app's **Settings**, **Edit keys…**; saving restarts the c
   storage (`~/.orchestrate` there). Uninstalling the app deletes them.
 - **git**: built from source for Android (`android/git/build.sh`) with
   curl and OpenSSL, for the hub's worktrees, rebases, bundles and pushes.
-- **Automerge**: its Python package (Rust), built for Android
-  (`android/automerge/build.sh`), for [sync](sync.md) with your other computers.
 - **Workers**: sprites. A phone runs no local workers: the router is told so
   and puts every thread on Sprites, even when a request says to run locally.
 

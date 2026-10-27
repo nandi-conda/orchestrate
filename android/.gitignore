@@ -4,4 +4,3 @@ local.properties
 *.jks
 *.keystore
 git/out/
-automerge/out/

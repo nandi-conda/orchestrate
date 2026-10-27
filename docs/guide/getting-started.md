@@ -37,11 +37,7 @@ nandi-testing mirrors only part of conda-forge (no python 3.12, an older Qt),
 so with it first the strict channel priority finds no solution.
 
 `pixi run package` in a checkout builds the same package into `output/`
-(`recipe/recipe.yaml`; `.github/workflows/package.yml` publishes it). Its
-`automerge` dependency is not on conda-forge, so the same workflow builds it
-from `recipe/automerge` for linux-64, osx-arm64, osx-64 and win-64 and
-publishes it to nandi-testing first; `pixi run package-automerge` builds it
-locally.
+(`recipe/recipe.yaml`; `.github/workflows/package.yml` publishes it).
 
 ### From a checkout
 

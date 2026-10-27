@@ -3,12 +3,6 @@
 # prefix.dev/nandi-testing with the org's PREFIX_API_KEY secret.
 # All the logic lives in https://github.com/nandi-conda/ci; ci/pre-package.sh
 # gives each run its own version, so every push is a new package.
-#
-# orchestrate needs automerge, which conda-forge does not have, so the
-# `automerge` job first builds recipe/automerge on each platform orchestrate
-# installs on and publishes it to the same channel. Its builds are cached by the
-# recipe's files, so a push that leaves the recipe alone only re-uploads them,
-# and the upload skips what the channel already has.
 name: Package
 
 on:
@@ -18,71 +12,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  automerge:
-    strategy:
-      matrix:
-        include:
-          - { platform: linux-64, os: depot-ubuntu-latest }
-          - { platform: osx-arm64, os: macos-latest }
-          - { platform: osx-64, os: macos-15-intel }
-          - { platform: win-64, os: windows-latest }
-    name: automerge (${{ matrix.platform }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Restore build
-        id: cached
-        uses: actions/cache/restore@v4
-        with:
-          path: output-automerge
-          key: automerge-${{ matrix.platform }}-${{ hashFiles('recipe/automerge/**') }}
-
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
-        with:
-          run-install: false
-
-      - name: Build
-        if: steps.cached.outputs.cache-hit != 'true'
-        run: pixi exec rattler-build build --recipe recipe/automerge/recipe.yaml -c conda-forge --output-dir output-automerge
-
-      # Saved right away, so a failed upload doesn't throw the build away.
-      - name: Save build
-        if: steps.cached.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: output-automerge
-          key: ${{ steps.cached.outputs.cache-primary-key }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: automerge-${{ matrix.platform }}
-          path: output-automerge/**/*.conda
-
-      - name: Publish to prefix.dev/nandi-testing
-        if: >-
-          github.event_name == 'push' &&
-          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-          github.repository_owner == 'nandi-conda'
-        env:
-          PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
-        run: pixi exec rattler-build upload prefix -c nandi-testing --skip-existing $(find output-automerge -name '*.conda')
-
   package:
-    needs: automerge
     uses: nandi-conda/ci/.github/workflows/conda-package.yml@main
     secrets: inherit
     permissions:
       contents: read
       id-token: write
     with:
-      # ultra, which compiles the UI, and automerge are on nandi-testing
+      # ultra, which compiles the UI, is on nandi-testing
       build-channels: conda-forge https://prefix.dev/nandi-testing
       # Installs take conda-forge first and nandi-testing second, as
       # orchestrator/pixi.toml does. The channel mirrors only some of
