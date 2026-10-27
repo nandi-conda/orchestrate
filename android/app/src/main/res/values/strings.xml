@@ -14,7 +14,7 @@
     <string name="key_deepseek">DeepSeek API key, for the router and every worker. Sent as Authorization: Bearer &lt;key&gt; to api.deepseek.com.</string>
     <string name="key_sprites">Fly Sprites org token. Workers run on Sprites; sent as Authorization: Bearer &lt;token&gt; to api.sprites.dev.</string>
     <string name="key_sync_url">Sync server URL, when it is not the public relay (https://orchestrate-sync.nandithebull.workers.dev).</string>
-    <string name="key_sync_space">Sync space key, copied from another computer's Settings to share its projects. Sent as X-Sync-Space: &lt;key&gt; to the sync server.</string>
+    <string name="key_sync_space">Sync space key, copied from another computer\'s Settings to share its projects. Sent as X-Sync-Space: &lt;key&gt; to the sync server.</string>
     <string name="key_opengateway">OpenGateway API key, for projects on deepseek/deepseek-v4.1-flash-ultrafast. Sent as Authorization: Bearer &lt;key&gt; to https://apis.opengateway.ai/v1.</string>
     <string name="key_github">GitHub fine-grained token with Contents: Read and write on the project repos, for projects with a GitHub remote. Workers never get it.</string>
     <string name="channel_name">Control plane</string>
