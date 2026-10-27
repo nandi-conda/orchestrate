@@ -24,6 +24,7 @@ pixi run set-key DEEPSEEK_API_KEY     # once: store the key in the system keyrin
 pixi run set-key SPRITES_TOKEN        # once: run threads on Fly Sprites
 pixi run serve                        # just the control plane + web UI on http://127.0.0.1:8000
 pixi run desktop                      # or: the UI in a desktop window, control plane in the same process
+pixi run desktop-fix                  # the desktop, run and watched by Claude Code, which lands fixes for what it prints
 pixi run test                         # every test suite: runner, orchestrator, desktop window
 pixi run worker                       # a runner service on :8080, for a standalone worker
 ```

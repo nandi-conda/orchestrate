@@ -41,6 +41,31 @@ environment). conda-forge has no Qt WebEngine for osx-64.
 - What the control plane is doing is printed to the terminal as `desktop: …`
   lines, and every worker's log follows with a `<worker> |` prefix.
 
+## Watched by Claude Code
+
+```sh
+pixi run desktop-fix      # from the repo root
+```
+
+Starts [Claude Code](https://code.claude.com) (the `claude` command, which has
+to be on your `PATH`) in the checkout, with
+[`.agents/desktop-fix.md`](https://github.com/nandi-conda/orchestrate/blob/main/.agents/desktop-fix.md)
+as its task. Claude runs `pixi run desktop` itself and watches everything it
+prints, worker logs included, keeping the whole output in
+`~/.orchestrate/desktop-fix.log`. Each error, warning or traceback it sees, it
+traces to the code, fixes with a test, runs the suites, commits only that fix
+to `main` and pushes it, then restarts the window so the fix is live. Your own
+uncommitted changes in the checkout are left alone.
+
+What it cannot fix in code it tells you instead: a missing secret by its exact
+name, a full disk, the network. A fix that would change what a feature does
+waits for your answer. The two startup lines in the next section are expected
+and ignored.
+
+File edits are accepted without asking (`--permission-mode acceptEdits`);
+commands such as the tests, `git` and the restart still ask, as Claude Code's
+own permission settings say.
+
 ## Rendering without a GPU
 
 The window is drawn on the CPU, with no OpenGL, EGL or GLX in the process: Qt
