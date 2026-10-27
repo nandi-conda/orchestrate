@@ -99,7 +99,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-0.54.0-pyh53cf698_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-      - conda: https://prefix.dev/nandi-testing/linux-64/automerge-0.2.0.dev4-py312hace5792_0.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
       osx-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
@@ -152,7 +151,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-64/xeus-zmq-3.0.0-hbc5e7e4_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/zeromq-4.3.5-h5dbc3f3_12.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-64/automerge-0.2.0.dev4-py312h9559492_0.conda
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -204,7 +202,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/xeus-zmq-3.0.0-h4f61b99_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-arm64/automerge-0.2.0.dev4-py312h6268c56_0.conda
       win-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -257,7 +254,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/xeus-zmq-3.0.0-h423d623_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zeromq-4.3.5-h3a581c9_12.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/win-64/automerge-0.2.0.dev4-py312h734394c_0.conda
   desktop:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -431,7 +427,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-0.54.0-pyh53cf698_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-      - conda: https://prefix.dev/nandi-testing/linux-64/automerge-0.2.0.dev4-py312hace5792_0.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
@@ -540,7 +535,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-arm64/automerge-0.2.0.dev4-py312h6268c56_0.conda
       win-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -639,7 +633,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/zeromq-4.3.5-h3a581c9_12.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/win-64/automerge-0.2.0.dev4-py312h734394c_0.conda
   desktop-test:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -822,7 +815,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-0.54.0-pyh53cf698_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-      - conda: https://prefix.dev/nandi-testing/linux-64/automerge-0.2.0.dev4-py312hace5792_0.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
@@ -940,7 +932,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-arm64/automerge-0.2.0.dev4-py312h6268c56_0.conda
       win-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -1048,7 +1039,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/zeromq-4.3.5-h3a581c9_12.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/win-64/automerge-0.2.0.dev4-py312h734394c_0.conda
   test:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -1158,7 +1148,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-0.54.0-pyh53cf698_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-      - conda: https://prefix.dev/nandi-testing/linux-64/automerge-0.2.0.dev4-py312hace5792_0.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
       osx-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
@@ -1243,7 +1232,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-64/zeromq-4.3.5-h5dbc3f3_12.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/zstd-1.5.7-hbc1a06c_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-64/automerge-0.2.0.dev4-py312h9559492_0.conda
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -1327,7 +1315,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/osx-arm64/automerge-0.2.0.dev4-py312h6268c56_0.conda
       win-64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiosqlite-0.22.1-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.15.1-pyh5ded981_1.conda
@@ -1400,7 +1387,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/zeromq-4.3.5-h3a581c9_12.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda
       - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
-      - conda: https://prefix.dev/nandi-testing/win-64/automerge-0.2.0.dev4-py312h734394c_0.conda
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -7538,20 +7524,6 @@ packages:
     - zstd >=1.5.7,<1.6.0a0
   size: 387535
   timestamp: 1786599623274
-- conda: https://prefix.dev/nandi-testing/linux-64/automerge-0.2.0.dev4-py312hace5792_0.conda
-  sha256: 7f15a4b7d82a245a467dd254ffd93ce6fc7c14483429e8d408352f51b80e3c29
-  md5: cc11a28bd64bfdc52372d155df7e3a66
-  depends:
-  - python
-  - __glibc >=2.17,<3.0.a0
-  - libgcc >=14
-  - python_abi 3.12.* *_cp312
-  constrains:
-  - __glibc >=2.17
-  license: MIT
-  run_exports: {}
-  size: 2006679
-  timestamp: 1793085737620
 - conda: https://prefix.dev/nandi-testing/noarch/ultra-0.1.20-pyh4616a5c_0.conda
   sha256: 81a224a9ab942d78683a55c9d9fc3b0ee0067e4d6d2ddaf9930ddb5a320f2fd4
   md5: a53ea6c65d37717d429bc8893e6ea66f
@@ -7562,42 +7534,3 @@ packages:
   run_exports: {}
   size: 23162
   timestamp: 1792621044773
-- conda: https://prefix.dev/nandi-testing/osx-64/automerge-0.2.0.dev4-py312h9559492_0.conda
-  sha256: af7e0f46b9c57c59ef3318ae9fb93caa95451a6bc920fcf72d1bc3706bc194d9
-  md5: 6a493bfae607231b477077ad6b2dc7d0
-  depends:
-  - python
-  - __osx >=10.13
-  - python_abi 3.12.* *_cp312
-  constrains:
-  - __osx >=10.13
-  license: MIT
-  run_exports: {}
-  size: 1974194
-  timestamp: 1793085742065
-- conda: https://prefix.dev/nandi-testing/osx-arm64/automerge-0.2.0.dev4-py312h6268c56_0.conda
-  sha256: 21b9562a25ffaea1db077c6fbec204c1d5966d1a9756f0ea6e1634e7d246cac8
-  md5: 819c7cfced82243e4c93113ada8c3a48
-  depends:
-  - python
-  - __osx >=11.0
-  - python_abi 3.12.* *_cp312
-  constrains:
-  - __osx >=11.0
-  license: MIT
-  run_exports: {}
-  size: 1819481
-  timestamp: 1793085738899
-- conda: https://prefix.dev/nandi-testing/win-64/automerge-0.2.0.dev4-py312h734394c_0.conda
-  sha256: 2a28b2278a1b5b716cbbab31c5862061e3fdb7d421c8879f2eef0f8b072a50b7
-  md5: fbf5718012f4b3f40b7fb0b075e862ef
-  depends:
-  - python
-  - vc >=14.3,<15
-  - vc14_runtime >=14.44.35208
-  - ucrt >=10.0.20348.0
-  - python_abi 3.12.* *_cp312
-  license: MIT
-  run_exports: {}
-  size: 1753262
-  timestamp: 1793085741256

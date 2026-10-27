@@ -5,20 +5,21 @@
 // made (or was given, to pair with another computer). Knowing the key is the
 // only way into a space, so it is shared like a secret link. Control planes
 // open every connection (they are never reached), so all of it is plain HTTP:
-// a sync round, a long-polled change feed, logs, leases, and blobs.
+// documents, logs, a long-polled change feed, leases, and blobs.
 //
 // Each space is one Durable Object, SyncHub, and its own prefix in R2:
 //
-// - Automerge documents, by name ("projects", "project:<id>"): small, and
-//   changed by any computer. A control plane syncs one with the Automerge
-//   sync protocol: it posts sync messages, the hub applies them and answers
-//   with its own. Each round of a sync names a `session`, so the hub keeps
-//   one sync state per control plane and document while a sync lasts.
+// - Documents, by name ("projects", "project:<id>"): each a set of rows by
+//   key (JSON text, kept in parts), the newest write of a key winning. Only
+//   a project's driver writes its rows (other computers add inbox rows of
+//   their own keys), so there is nothing to merge, and only each row's
+//   latest value is kept. POST /docs/<doc> {values: {key: value or null}}
+//   writes (null deletes); GET /docs/<doc>?after=<version> reads the rows
+//   written since, a page at a time.
 // - Logs ("log:<id>:main", "log:<id>:<thread id>"): a project's events, which
-//   only its driver writes and nobody changes, so they need no merging and
-//   can be any size. Each is a list of entries, each a uid and its row (JSON
-//   text, kept in parts), added once (POST /logs/<log>) and read a page at a
-//   time (GET /logs/<log>?after=<n>). Nothing holds a whole log in memory.
+//   nobody changes, so each is a list of entries, each a uid and its row,
+//   added once (POST /logs/<log>) and read a page at a time
+//   (GET /logs/<log>?after=<n>).
 // - A change feed: every change of a document or a log takes the next
 //   `version`, and GET /changes?since=<version> answers with the names of
 //   those changed since, waiting up to `wait` seconds for one.
@@ -29,15 +30,9 @@
 //   with the full table of refs after it. Only the project's driver adds one.
 // - Blobs (pasted images) in R2, each with the JSON its x-meta header gave.
 
-import * as Automerge from "@automerge/automerge";
-
 const LEASE_STALE = 30_000;
 const MAX_WAIT = 25;
-const PART = 1_000_000; // DO SQLite values stay under 2 MB
-const COMPACT_AFTER = 64; // incremental saves kept before a document is saved whole
-const SESSION_TTL = 10 * 60_000;
-const LOADED_MAX = 16; // documents kept loaded (a Worker has 128 MB)
-const PAGE_BYTES = 4_000_000; // of log rows, per GET /logs answer
+const PAGE_BYTES = 4_000_000; // of rows, per GET /docs or /logs answer
 const PAGE_ENTRIES = 1000;
 const TEXT_PART = 500_000; // UTF-16 units: at most 1.5 MB of UTF-8, under a DO SQLite value's 2 MB
 
@@ -57,35 +52,19 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
 
-function b64decode(s) {
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function b64encode(bytes) {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
-
-function sameHeads(a, b) {
-  return a.length === b.length && a.every((h, i) => h === b[i]);
-}
-
 export class SyncHub {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
     this.sql = ctx.storage.sql;
-    this.docs = new Map(); // name -> {doc, chunks}, most recently used last
-    this.sessions = new Map(); // `${session}\n${name}` -> {state, at}
     this.waiters = new Set();
     this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS docs (name TEXT PRIMARY KEY, version INTEGER NOT NULL)`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS chunks (name TEXT NOT NULL, n INTEGER NOT NULL,
-      part INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (name, n, part))`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS rows (doc TEXT NOT NULL, key TEXT NOT NULL, version INTEGER NOT NULL,
+      size INTEGER NOT NULL, deleted INTEGER NOT NULL, PRIMARY KEY (doc, key))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS rows_version ON rows (doc, version)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS row_parts (doc TEXT NOT NULL, key TEXT NOT NULL,
+      part INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (doc, key, part))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS leases (project TEXT PRIMARY KEY, holder TEXT NOT NULL,
       name TEXT NOT NULL, renewed_at INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS bundles (project TEXT NOT NULL, n INTEGER NOT NULL,
@@ -94,10 +73,11 @@ export class SyncHub {
       size INTEGER NOT NULL, PRIMARY KEY (log, n), UNIQUE (log, uid))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS entry_parts (log TEXT NOT NULL, n INTEGER NOT NULL,
       part INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (log, n, part))`);
-    // Logs were Automerge documents once: those are dropped, and their
-    // computers send the events again, as entries.
-    this.sql.exec(`DELETE FROM chunks WHERE name LIKE 'log:%'`);
-    this.sql.exec(`DELETE FROM docs WHERE name LIKE 'log:%' AND name NOT IN (SELECT DISTINCT log FROM entries)`);
+    // Documents were Automerge once: those are dropped, and each computer
+    // writes its rows again.
+    this.sql.exec(`DROP TABLE IF EXISTS chunks`);
+    this.sql.exec(`DELETE FROM docs WHERE name NOT IN (SELECT DISTINCT log FROM entries)
+      AND name NOT IN (SELECT DISTINCT doc FROM rows)`);
   }
 
   async fetch(request) {
@@ -107,8 +87,10 @@ export class SyncHub {
     const route = `${request.method} /${path[0] || ""}${path.length > 1 ? "/*" : ""}${path.length > 2 ? "/*" : ""}`;
     try {
       switch (route) {
-        case "POST /sync":
-          return json(this.sync(await request.json()));
+        case "POST /docs/*":
+          return json(this.write(decodeURIComponent(path[1]), await request.json()));
+        case "GET /docs/*":
+          return json(this.read(decodeURIComponent(path[1]), Number(url.searchParams.get("after") || 0)));
         case "GET /changes":
           return json(await this.changes(Number(url.searchParams.get("since") || 0),
             Math.min(Number(url.searchParams.get("wait") || 0), MAX_WAIT)));
@@ -147,47 +129,54 @@ export class SyncHub {
 
   // ------------------------------------------------------------ documents
 
-  load(name) {
-    let entry = this.docs.get(name);
-    if (entry) {
-      this.docs.delete(name);
-      this.docs.set(name, entry);
-      return entry;
+  // POST /docs/<doc> {values: {key: value or null}} -> {version}
+  write(doc, { values }) {
+    if (!doc || doc.startsWith("log:") || !values || typeof values !== "object") {
+      throw Object.assign(new Error("a document name and values are required"), { status: 400 });
     }
-    const rows = this.sql.exec(`SELECT n, data FROM chunks WHERE name = ? ORDER BY n, part`, name).toArray();
-    const ns = new Set(rows.map((r) => r.n));
-    const bytes = new Uint8Array(rows.reduce((size, r) => size + r.data.byteLength, 0));
-    let at = 0;
-    for (const r of rows) {
-      bytes.set(new Uint8Array(r.data), at);
-      at += r.data.byteLength;
+    const keys = Object.keys(values).filter((k) => values[k] === null || typeof values[k] === "string");
+    if (!keys.length) return { version: this.version() };
+    let version = 0;
+    for (const key of keys) {
+      const value = values[key];
+      version = this.bump(); // each row its own: a page of GET /docs ends between any two
+      this.sql.exec(`DELETE FROM row_parts WHERE doc = ? AND key = ?`, doc, key);
+      this.sql.exec(`INSERT INTO rows (doc, key, version, size, deleted) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (doc, key) DO UPDATE SET version = excluded.version, size = excluded.size,
+        deleted = excluded.deleted`, doc, key, version, value === null ? 0 : value.length, value === null ? 1 : 0);
+      if (value !== null) {
+        for (let part = 0; part * TEXT_PART < value.length || part === 0; part++) {
+          this.sql.exec(`INSERT INTO row_parts (doc, key, part, data) VALUES (?, ?, ?, ?)`,
+            doc, key, part, value.slice(part * TEXT_PART, (part + 1) * TEXT_PART));
+        }
+      }
     }
-    const doc = rows.length ? Automerge.load(bytes) : Automerge.init();
-    entry = { doc, chunks: ns.size, next: rows.length ? Math.max(...ns) + 1 : 0 };
-    this.docs.set(name, entry);
-    while (this.docs.size > LOADED_MAX) this.docs.delete(this.docs.keys().next().value);
-    return entry;
+    this.sql.exec(`INSERT INTO docs (name, version) VALUES (?, ?)
+      ON CONFLICT (name) DO UPDATE SET version = excluded.version`, doc, version);
+    this.wake();
+    return { version };
   }
 
-  store(name, entry) {
-    // An incremental save each change; the whole document once they pile up.
-    let data;
-    if (entry.chunks >= COMPACT_AFTER) {
-      data = Automerge.save(entry.doc);
-      this.sql.exec(`DELETE FROM chunks WHERE name = ?`, name);
-      entry.chunks = 0;
-    } else {
-      data = Automerge.saveIncremental(entry.doc);
+  // GET /docs/<doc>?after=<version> -> {rows: [{key, value, version}], more}:
+  // the rows written after `version` (value null: deleted), oldest first, at
+  // most PAGE_ENTRIES and PAGE_BYTES of them (at least one).
+  read(doc, after) {
+    const page = this.sql.exec(`SELECT key, version, size, deleted FROM rows WHERE doc = ? AND version > ?
+      ORDER BY version, key LIMIT ?`, doc, after, PAGE_ENTRIES + 1).toArray();
+    let more = page.length > PAGE_ENTRIES;
+    const out = [];
+    let bytes = 0;
+    for (const r of page.slice(0, PAGE_ENTRIES)) {
+      if (out.length && bytes + r.size > PAGE_BYTES) {
+        more = true;
+        break;
+      }
+      const value = r.deleted ? null : this.sql.exec(`SELECT data FROM row_parts WHERE doc = ? AND key = ?
+        ORDER BY part`, doc, r.key).toArray().map((p) => p.data).join("");
+      out.push({ key: r.key, value, version: r.version });
+      bytes += r.size;
     }
-    for (let part = 0; part * PART < data.length || part === 0; part++) {
-      this.sql.exec(`INSERT INTO chunks (name, n, part, data) VALUES (?, ?, ?, ?)`,
-        name, entry.next, part, data.subarray(part * PART, (part + 1) * PART));
-    }
-    entry.next += 1;
-    entry.chunks += 1;
-    const version = this.bump();
-    this.sql.exec(`INSERT INTO docs (name, version) VALUES (?, ?)
-      ON CONFLICT (name) DO UPDATE SET version = excluded.version`, name, version);
+    return { rows: out, more };
   }
 
   bump() {
@@ -201,42 +190,6 @@ export class SyncHub {
   version() {
     const row = this.sql.exec(`SELECT v FROM meta WHERE k = 'version'`).toArray()[0];
     return row ? row.v : 0;
-  }
-
-  // POST /sync {session, messages: [{doc, msg}]} -> {messages: [{doc, msg}]}
-  // `msg` is a base64 Automerge sync message; the answer holds one for each
-  // document the hub has something more to say about.
-  sync({ session, messages }) {
-    if (typeof session !== "string" || !Array.isArray(messages)) {
-      throw Object.assign(new Error("session and messages are required"), { status: 400 });
-    }
-    const now = Date.now();
-    for (const [key, s] of this.sessions) if (now - s.at > SESSION_TTL) this.sessions.delete(key);
-    const out = [];
-    let changed = false;
-    for (const { doc: name, msg } of messages) {
-      if (typeof name !== "string" || !name) continue;
-      const key = `${session}\n${name}`;
-      const s = this.sessions.get(key) || { state: Automerge.initSyncState() };
-      s.at = now;
-      const entry = this.load(name);
-      if (msg) {
-        const before = Automerge.getHeads(entry.doc);
-        const [doc, state] = Automerge.receiveSyncMessage(entry.doc, s.state, b64decode(msg));
-        entry.doc = doc;
-        s.state = state;
-        if (!sameHeads(before, Automerge.getHeads(doc))) {
-          this.store(name, entry);
-          changed = true;
-        }
-      }
-      const [state, reply] = Automerge.generateSyncMessage(entry.doc, s.state);
-      s.state = state;
-      this.sessions.set(key, s);
-      if (reply) out.push({ doc: name, msg: b64encode(reply) });
-    }
-    if (changed) this.wake();
-    return { messages: out };
   }
 
   // GET /changes?since=<version>&wait=<s> -> {version, docs}: the documents

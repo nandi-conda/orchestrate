@@ -11,27 +11,27 @@ drive it. The key is the only way into a space, so it is shared like a secret
 link. The control plane opens every connection to the sync server, as it
 does to workers; nothing ever connects to it.
 
-What is shared is a few Automerge documents, of which each computer keeps a
-replica (`sync.db` in its data directory) and syncs with the server's
-(Automerge's sync protocol, over POST /sync):
+What is shared is a few documents, each a set of rows (JSON text) by key, of
+which each computer keeps a copy (`sync.db` in its data directory). A row's
+newest write wins: only a project's driver writes its rows (others add
+inbox rows of their own), so there is nothing to merge, and the server keeps
+only each row's latest value. Each computer sends the server its writes
+(POST /docs/<doc>) and reads the rows written since it last looked
+(GET /docs/<doc>?after=<version>):
 
 - "projects": every project, keyed by its id.
 - "project:<id>": its threads ("thread:<id>"), the messages between them
-  ("message:<id>"), and its inbox ("inbox:<id>"): what the person did on a
-  computer that does not drive the project, for the one that does.
+  ("message:<id>"), and its inbox ("inbox:<time><id>"): what the person did
+  on a computer that does not drive the project, for the one that does.
 
 and the logs: "log:<id>:main", "log:<id>:<thread id>", the project's own
 events and each thread's. Events are never changed and only a project's
 driver logs them, so a log needs no merging: on the server it is a list of
 entries (uid and row), each added once, which can grow to any size. Each
 computer sends the server every event its store has that the server has not
-(LOG_PUSHED, per project), and fetches the entries of a log it has not got, a
+(a mark per project), and fetches the entries of a log it has not got, a
 page at a time. A model call's streaming `delta` events stay on the computer
 that has them; the call's own events, once it ends, are shared.
-
-Each value is a row as JSON, at the document's root. No document has nested
-objects: two computers making the same one at once would each make their
-own, and one would hide the other.
 
 The store stays what every part of the control plane reads (SyncedStore wraps
 it): a change of a document from another computer is applied to it, and
@@ -59,12 +59,13 @@ them to a worker whichever computer they were pasted on.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
+import re
 import secrets
 import socket
+import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -89,10 +90,8 @@ WAIT = 25.0  # how long a look at the change feed waits for a change
 PUSH_DELAY = 0.2  # writes made within this of each other are synced together
 RETRY = 2.0  # after the sync server could not be reached
 DRIVER_FRESH = 5.0  # a lease another computer holds is asked about again after this
-COMPACT_AFTER = 256  # changes kept per document before it is saved whole
-MAX_ROUNDS = 64
 LOG_BATCH = 2_000_000  # bytes of events per POST /logs
-FORMAT = 2  # of the replica: 2 since logs are entries on the server, no longer documents
+FORMAT = 3  # of the replica: 3 since documents are rows on the server, no longer Automerge
 LOCAL_EVENTS = {"delta"}  # a model call's streaming; its own events are shared once it ends
 LOCAL_THREAD_FIELDS = {"token"}
 HUB_REFS = ("refs/heads/", "refs/snapshots/", "refs/sessions/")
@@ -124,15 +123,6 @@ def space_key(data: str | Path) -> str:
     return key
 
 
-def automerge():
-    """Automerge's Python package (automerge.core), imported once a control
-    plane syncs. The Android app carries one built for it
-    (android/automerge/build.sh)."""
-    import automerge.core
-
-    return automerge.core
-
-
 def dumps(row: dict) -> str:
     return json.dumps(row, sort_keys=True, separators=(",", ":"))
 
@@ -159,6 +149,19 @@ def seq_refs(typ: str, payload: dict) -> list[tuple[dict, str]]:
     return out
 
 
+def refusal(r: httpx.Response) -> str:
+    """Why the server refused, in a line: its `error`, or the title of an
+    error page Cloudflare answered with instead (an exception in the Worker)."""
+    try:
+        return str(r.json().get("error", r.text))
+    except ValueError:
+        pass
+    title = re.search(r"<title>(.*?)</title>", r.text, re.S)
+    if title:
+        return " ".join(title.group(1).split())
+    return " ".join(r.text.split())[:200]
+
+
 class SyncClient:
     """The sync server's HTTP API (sync/src/index.js); every request names
     the space with `X-Sync-Space: <key>`."""
@@ -178,15 +181,14 @@ class SyncClient:
             raise SyncError(f"the sync server at {self.url} did not answer {method} {path}: "
                             f"{type(e).__name__}: {e}") from e
         if r.status_code >= 400:
-            try:
-                why = r.json().get("error", r.text)
-            except ValueError:
-                why = r.text
-            raise SyncError(f"the sync server refused {method} {path} ({r.status_code}): {why}")
+            raise SyncError(f"the sync server refused {method} {path} ({r.status_code}): {refusal(r)}")
         return r
 
-    async def sync(self, session: str, messages: list[dict]) -> list[dict]:
-        return (await self._call("POST", "/sync", json={"session": session, "messages": messages})).json()["messages"]
+    async def write(self, doc: str, values: dict[str, str | None]) -> int:
+        return (await self._call("POST", f"/docs/{doc}", json={"values": values})).json()["version"]
+
+    async def read(self, doc: str, after: int) -> dict:
+        return (await self._call("GET", f"/docs/{doc}", params={"after": after})).json()
 
     async def changes(self, since: int, wait: float) -> dict:
         return (await self._call("GET", "/changes", params={"since": since, "wait": wait},
@@ -236,22 +238,18 @@ class SyncClient:
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
-            raise SyncError(f"the sync server refused GET /blobs/{key} ({r.status_code}): {r.text}")
+            raise SyncError(f"the sync server refused GET /blobs/{key} ({r.status_code}): {refusal(r)}")
         return r.content, json.loads(r.headers.get("x-meta") or "{}")
 
 
 class Replica:
-    """This computer's copy of every synced document, in a SQLite file: each
-    document as its last whole save and the changes made since, so a change
-    is on disk as soon as it is made or received."""
+    """This computer's copy of the synced documents, in a SQLite file: each
+    row as the server last had it or this computer last wrote it, and the
+    writes the server has not taken yet (the outbox)."""
 
-    def __init__(self, path: Path, actor: bytes) -> None:
-        self.am = automerge()
+    def __init__(self, path: Path) -> None:
         self.path = path
-        self.actor = actor
         self.db = None
-        self.docs: dict = {}  # name -> automerge.core.Document
-        self.pending: dict[str, int] = {}  # changes stored since each document's last whole save
 
     async def open(self) -> None:
         import aiosqlite
@@ -259,10 +257,10 @@ class Replica:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(self.path)
         await self.db.execute("PRAGMA journal_mode=WAL")
-        await self.db.execute("CREATE TABLE IF NOT EXISTS saves (doc TEXT PRIMARY KEY, data BLOB NOT NULL)")
-        await self.db.execute("CREATE TABLE IF NOT EXISTS changes (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                              "doc TEXT NOT NULL, data BLOB NOT NULL)")
-        await self.db.execute("CREATE INDEX IF NOT EXISTS changes_doc ON changes(doc, id)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS rows (doc TEXT NOT NULL, key TEXT NOT NULL, "
+                              "value TEXT NOT NULL, PRIMARY KEY (doc, key))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS outbox (doc TEXT NOT NULL, key TEXT NOT NULL, "
+                              "value TEXT, PRIMARY KEY (doc, key))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         await self.db.commit()
 
@@ -271,69 +269,54 @@ class Replica:
             await self.db.close()
 
     async def names(self) -> list[str]:
-        async with self.db.execute("SELECT doc FROM saves UNION SELECT doc FROM changes") as cur:
+        """The documents with writes the server has not taken."""
+        async with self.db.execute("SELECT DISTINCT doc FROM outbox") as cur:
             return [r[0] for r in await cur.fetchall()]
 
-    async def doc(self, name: str):
-        doc = self.docs.get(name)
-        if doc is not None:
-            return doc
-        async with self.db.execute("SELECT data FROM saves WHERE doc = ?", (name,)) as cur:
-            row = await cur.fetchone()
-        async with self.db.execute("SELECT data FROM changes WHERE doc = ? ORDER BY id", (name,)) as cur:
-            changes = [r[0] for r in await cur.fetchall()]
-        data = (row[0] if row else b"") + b"".join(changes)
-        doc = self.am.Document.load(data) if data else self.am.Document()
-        doc.set_actor(self.actor)
-        self.docs[name] = doc
-        self.pending[name] = len(changes)
-        return doc
-
-    def items(self, doc) -> dict[str, str]:
-        out = {}
-        for key in doc.keys(self.am.ROOT):
-            got = doc.get(self.am.ROOT, key)
-            if got is not None and not isinstance(got[0], self.am.ObjType):
-                out[key] = got[0][1]
-        return out
-
-    def value(self, doc, key: str) -> str | None:
-        got = doc.get(self.am.ROOT, key)
-        return None if got is None or isinstance(got[0], self.am.ObjType) else got[0][1]
+    async def items(self, name: str) -> dict[str, str]:
+        async with self.db.execute("SELECT key, value FROM rows WHERE doc = ?", (name,)) as cur:
+            return {k: v for k, v in await cur.fetchall()}
 
     async def put(self, name: str, values: dict[str, str | None]) -> bool:
-        """Set (or, for None, delete) values of a document; whether anything changed."""
-        doc = await self.doc(name)
-        todo = {k: v for k, v in values.items() if self.value(doc, k) != v}
+        """Set (or, for None, delete) rows of a document, for the server too;
+        whether anything changed."""
+        have = await self.items(name)
+        todo = {k: v for k, v in values.items() if have.get(k) != v}
         if not todo:
             return False
-        with doc.transaction() as tx:
-            for key, value in todo.items():
-                if value is None:
-                    tx.delete(self.am.ROOT, key)
-                else:
-                    tx.put(self.am.ROOT, key, self.am.ScalarType.Str, value)
-        await self._keep(name, [doc.get_last_local_change().bytes])
+        for key, value in todo.items():
+            if value is None:
+                await self.db.execute("DELETE FROM rows WHERE doc = ? AND key = ?", (name, key))
+            else:
+                await self.db.execute("INSERT INTO rows (doc, key, value) VALUES (?, ?, ?) ON CONFLICT (doc, key) "
+                                      "DO UPDATE SET value = excluded.value", (name, key, value))
+            await self.db.execute("INSERT INTO outbox (doc, key, value) VALUES (?, ?, ?) ON CONFLICT (doc, key) "
+                                  "DO UPDATE SET value = excluded.value", (name, key, value))
+        await self.db.commit()
         return True
 
-    async def received(self, name: str, before: list[bytes]) -> None:
-        """Keep the changes a document received since its heads were `before`."""
-        doc = await self.doc(name)
-        await self._keep(name, [c.bytes for c in doc.get_changes(before)])
+    async def outbox(self, name: str) -> dict[str, str | None]:
+        async with self.db.execute("SELECT key, value FROM outbox WHERE doc = ?", (name,)) as cur:
+            return {k: v for k, v in await cur.fetchall()}
 
-    async def _keep(self, name: str, changes: list[bytes]) -> None:
-        if not changes:
-            return
-        self.pending[name] = self.pending.get(name, 0) + len(changes)
-        if self.pending[name] >= COMPACT_AFTER:
-            data = self.docs[name].save()
-            await self.db.execute("INSERT INTO saves (doc, data) VALUES (?, ?) ON CONFLICT (doc) "
-                                  "DO UPDATE SET data = excluded.data", (name, data))
-            await self.db.execute("DELETE FROM changes WHERE doc = ?", (name,))
-            self.pending[name] = 0
-        else:
-            await self.db.executemany("INSERT INTO changes (doc, data) VALUES (?, ?)",
-                                      [(name, c) for c in changes])
+    async def sent(self, name: str, values: dict[str, str | None]) -> None:
+        """The server took these writes: they leave the outbox, unless written again since."""
+        for key, value in values.items():
+            await self.db.execute("DELETE FROM outbox WHERE doc = ? AND key = ? AND value IS ?", (name, key, value))
+        await self.db.commit()
+
+    async def received(self, name: str, rows: list[dict]) -> None:
+        """Keep rows as the server has them; a row this computer has written
+        since, and the server has not taken yet, stays as written."""
+        pending = await self.outbox(name)
+        for r in rows:
+            if r["key"] in pending:
+                continue
+            if r["value"] is None:
+                await self.db.execute("DELETE FROM rows WHERE doc = ? AND key = ?", (name, r["key"]))
+            else:
+                await self.db.execute("INSERT INTO rows (doc, key, value) VALUES (?, ?, ?) ON CONFLICT (doc, key) "
+                                      "DO UPDATE SET value = excluded.value", (name, r["key"], r["value"]))
         await self.db.commit()
 
     async def state(self, key: str, default: Any = None) -> Any:
@@ -346,16 +329,20 @@ class Replica:
                               (key, json.dumps(value)))
         await self.db.commit()
 
-    async def forget_logs(self) -> None:
-        """Drop the logs kept as documents (FORMAT 1): they are sent again as entries."""
-        await self.db.execute("DELETE FROM saves WHERE doc LIKE 'log:%'")
-        await self.db.execute("DELETE FROM changes WHERE doc LIKE 'log:%'")
+    async def forget_automerge(self) -> None:
+        """Drop the documents kept as Automerge (FORMAT < 3): each computer
+        writes its rows again, and the server's are read from the start."""
+        await self.db.execute("DROP TABLE IF EXISTS saves")
+        await self.db.execute("DROP TABLE IF EXISTS changes")
+        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'doc%'")
         await self.db.commit()
-        self.docs = {k: v for k, v in self.docs.items() if not k.startswith("log:")}
 
     async def forget_space(self) -> None:
         """Forget where this replica was in its space's change feed and hubs."""
-        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'hub:%' OR k LIKE 'log%'")
+        await self.db.execute("DELETE FROM state WHERE k = 'version' OR k LIKE 'hub:%' OR k LIKE 'log%' "
+                              "OR k LIKE 'doc%'")
+        await self.db.execute("DELETE FROM rows")
+        await self.db.execute("DELETE FROM outbox")
         await self.db.commit()
 
 
@@ -425,7 +412,7 @@ class Sync:
         if not ident.exists():
             ident.write_text(f"c_{secrets.token_hex(8)}\n")
         self.holder = ident.read_text().strip()
-        self.replica = Replica(self.data / "sync.db", bytes.fromhex(self.holder.removeprefix("c_")).ljust(16, b"\0"))
+        self.replica = Replica(self.data / "sync.db")
         await self.replica.open()
         if await self.replica.state("space", self.space) != self.space:
             # Paired into another space: what this replica has goes to it as
@@ -433,7 +420,7 @@ class Sync:
             await self.replica.forget_space()
         await self.replica.set_state("space", self.space)
         if await self.replica.state("format", 1) < FORMAT:
-            await self.replica.forget_logs()
+            await self.replica.forget_automerge()
             await self.replica.set_state("format", FORMAT)
         self.version = await self.replica.state("version", 0)
 
@@ -456,9 +443,9 @@ class Sync:
         while True:
             try:
                 got = await self.client.changes(self.version, 0)
-                names = set(await self.replica.names()) | {n for n in got["docs"] if not n.startswith("log:")}
-                await self._sync(names)
-                await self._apply(names)
+                await self._push_docs(await self.replica.names())
+                names = {n for n in got["docs"] if not n.startswith("log:")}
+                await self._apply(await self._pull_docs(names))
                 await self._pull_logs([n for n in got["docs"] if n.startswith("log:")])
                 self.version = got["version"]
                 await self.replica.set_state("version", self.version)
@@ -488,7 +475,7 @@ class Sync:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         if self.dirty:
             with contextlib.suppress(Exception):
-                await self._sync(set(self.dirty))
+                await self._push_docs(set(self.dirty))
         for pid in sorted(self.logs_dirty):
             with contextlib.suppress(Exception):
                 await self._push_logs(pid)
@@ -502,41 +489,30 @@ class Sync:
 
     # ------------------------------------------------------------ syncing
 
-    async def _sync(self, names) -> set[str]:
-        """Sync documents with the server, all at once, until neither side has
-        anything more to say. Returns those that got changes from it."""
-        names = sorted(set(names))
-        if not names:
-            return set()
-        am = self.replica.am
-        session = uuid.uuid4().hex
-        states = {n: am.SyncState() for n in names}
-        changed: set[str] = set()
-        open_ = set(names)
-        for _ in range(MAX_ROUNDS):
-            if not open_:
-                return changed
-            out, sent = [], set()
-            for name in sorted(open_):
-                msg = (await self.replica.doc(name)).generate_sync_message(states[name])
-                if msg is not None:
-                    sent.add(name)
-                out.append({"doc": name, "msg": base64.b64encode(msg.encode()).decode() if msg else None})
-            replies = await self.client.sync(session, out)
-            answered = set()
-            for r in replies:
-                name = r["doc"]
-                if name not in states:
-                    continue
-                doc = await self.replica.doc(name)
-                before = doc.get_heads()
-                doc.receive_sync_message(states[name], am.Message.decode(base64.b64decode(r["msg"])))
-                if doc.get_heads() != before:
-                    await self.replica.received(name, before)
+    async def _push_docs(self, names) -> None:
+        """Send the server this computer's writes it has not taken yet."""
+        for name in sorted(set(names)):
+            values = await self.replica.outbox(name)
+            if values:
+                await self.client.write(name, values)
+                await self.replica.sent(name, values)
+
+    async def _pull_docs(self, names) -> set[str]:
+        """Read the rows written on the server since the last look, a page at
+        a time; the documents that had any."""
+        changed = set()
+        for name in sorted(set(names)):
+            after = await self.replica.state(f"docpull:{name}", 0)
+            while True:
+                page = await self.client.read(name, after)
+                if page["rows"]:
+                    await self.replica.received(name, page["rows"])
+                    after = page["rows"][-1]["version"]
+                    await self.replica.set_state(f"docpull:{name}", after)
                     changed.add(name)
-                answered.add(name)
-            open_ = answered | sent
-        raise SyncError(f"syncing {len(names)} document(s) did not settle in {MAX_ROUNDS} rounds")
+                if not page["more"]:
+                    break
+        return changed
 
     async def _push_loop(self) -> None:
         while True:
@@ -545,9 +521,7 @@ class Sync:
             self.kick.clear()
             names, self.dirty = self.dirty, set()
             try:
-                changed = await self._sync(names)
-                if changed:
-                    await self._apply(changed)
+                await self._push_docs(names)
             except asyncio.CancelledError:
                 self.dirty |= names
                 raise
@@ -563,7 +537,7 @@ class Sync:
                 got = await self.client.changes(self.version, WAIT)
                 docs = [n for n in got["docs"] if not n.startswith("log:")]
                 if docs:
-                    changed = await self._sync(docs)
+                    changed = await self._pull_docs(docs)
                     if changed:
                         await self._apply(changed)
                 await self._pull_logs([n for n in got["docs"] if n.startswith("log:")])
@@ -590,8 +564,7 @@ class Sync:
             names = set(names)
             order = sorted(names, key=lambda n: (n != INDEX, not n.startswith("project:"), n))
             for name in order:
-                doc = await self.replica.doc(name)
-                fresh = {k: v for k, v in self.replica.items(doc).items() if self.seen[name].get(k) != v}
+                fresh = {k: v for k, v in (await self.replica.items(name)).items() if self.seen[name].get(k) != v}
                 if name == INDEX:
                     await self._apply_projects(fresh)
                 elif name.startswith("project:"):
@@ -791,7 +764,7 @@ class Sync:
     async def _share_local_projects(self) -> None:
         """Share the projects only this computer has (made before it synced):
         it drives each, and writes all of it into the documents."""
-        index = self.replica.items(await self.replica.doc(INDEX))
+        index = await self.replica.items(INDEX)
         for p in await self.store.list_projects() + await self.store.list_projects(archived=True):
             if p["id"] in index or not await self.claim(p["id"]):
                 continue
@@ -895,7 +868,7 @@ class Sync:
 
     async def forward(self, project_id: str, op: str, args: dict) -> None:
         """Hand an action of this computer's person to the project's driver."""
-        iid = f"inbox:{uuid.uuid4().hex}"
+        iid = f"inbox:{time.time_ns():020d}{uuid.uuid4().hex[:8]}"  # oldest first
         await self._put(project_doc(project_id), {iid: dumps({"op": op, "args": args, "from": self.name})})
 
     def _run_inbox(self, project_id: str) -> None:
@@ -912,8 +885,7 @@ class Sync:
         name = project_doc(project_id)
         try:
             while project_id in self.held:
-                doc = await self.replica.doc(name)
-                entries = sorted((k, v) for k, v in self.replica.items(doc).items() if k.startswith("inbox:"))
+                entries = sorted((k, v) for k, v in (await self.replica.items(name)).items() if k.startswith("inbox:"))
                 if not entries:
                     return
                 key, value = entries[0]

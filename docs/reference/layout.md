@@ -10,7 +10,7 @@
 | `control/router.py` | `ModelRouter` (DeepSeek) |
 | `control/store.py` | the `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/hub.py` | the per-project hub repository: join a remote, take a thread's refs, land |
-| `control/sync.py` | sharing projects through the sync server: `SyncedStore`, the Automerge replica, leases (which computer drives a project), hubs as bundles |
+| `control/sync.py` | sharing projects through the sync server: `SyncedStore`, the replica of documents and logs, leases (which computer drives a project), hubs as bundles |
 | `control/gitio.py` | git subprocess and bundle helpers |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `Places` (where threads' workers can run, and why not) |
 | `control/runner_client.py` | HTTP client for the runner API |

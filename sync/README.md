@@ -1,7 +1,7 @@
 # Sync server
 
 The server orchestrate control planes on several computers share projects
-through: a Cloudflare Worker with a Durable Object per space (Automerge documents,
+through: a Cloudflare Worker with a Durable Object per space (documents of rows, logs,
 the change feed, leases, each project's hub as a list of git bundles) and an
 R2 bucket (the bundles and pasted images). See
 [docs/guide/sync.md](../docs/guide/sync.md) for what is shared and how a

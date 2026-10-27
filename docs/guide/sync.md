@@ -74,7 +74,7 @@ Files tab are on the computer that drives the project.
 
 | What | How |
 | --- | --- |
-| Projects, threads, messages between threads | Automerge documents, one per project |
+| Projects, threads, messages between threads | Documents of rows, one per project: each row's newest write wins, and the server keeps only that |
 | The project chat and each thread's events | Logs: on the server, a list of entries per thread, each event added once and fetched a page at a time, so a log can be any size (a reply streaming in shows on the driving computer only, until it ends) |
 | The project's hub: its main branch, each thread's branch, files and agent session | git bundles in R2, one per saved turn |
 | Pasted images | R2 |
@@ -91,7 +91,7 @@ project again.
 ## How the relay works
 
 `sync/` is a Cloudflare Worker with a Durable Object per space, which holds the
-space's documents (small: only the few Automerge ones are ever in its memory), its logs, its change feed, the leases (which computer drives which
+space's documents (rows, read a page at a time), its logs, its change feed, the leases (which computer drives which
 project) and each hub's list of bundles, and an R2 bucket for the bundles and
 images, under the space's prefix. Control planes reach it over HTTPS and nothing
 ever connects to them, as with workers. `pixi run dev` in `sync/` serves it

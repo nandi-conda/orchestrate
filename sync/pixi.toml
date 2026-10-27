@@ -11,6 +11,6 @@ python = "3.12.*"
 keyring = ">=25"
 
 [tasks]
-install = { cmd = "npm ci", inputs = ["package-lock.json"], outputs = ["node_modules/.package-lock.json"], description = "Install wrangler and Automerge into node_modules" }
+install = { cmd = "npm ci", inputs = ["package-lock.json"], outputs = ["node_modules/.package-lock.json"], description = "Install wrangler into node_modules" }
 dev = { cmd = "npx wrangler dev --local --port 8787", depends-on = ["install"], description = "Serve the sync server on http://127.0.0.1:8787 (local Durable Object and R2)" }
 deploy = { cmd = "node deploy.mjs", depends-on = ["install"], description = "Deploy the sync server to your Cloudflare account with wrangler (signs in if needed, makes the bucket); safe to run again" }

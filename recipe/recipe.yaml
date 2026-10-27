@@ -46,8 +46,6 @@ requirements:
     - keyring >=25
     - pyside6 >=6.8
     - qt6-webengine >=6.8
-    # the sync server's replica (control/sync.py); recipe/automerge builds it
-    - automerge ==0.2.0.dev4
     # project hubs, and a local worker's runner (`pixi run` in runner/)
     - git
     - pixi
