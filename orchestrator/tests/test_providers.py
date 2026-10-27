@@ -250,13 +250,13 @@ async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
         await r.plan("do it", [], [])
 
 
-def router_answering(message: dict, seen: list):
+def router_answering(message: dict, seen: list, finish_reason: str = "stop"):
     """A ModelRouter whose model answers every request with `message`."""
     from control.router import ModelRouter
 
     def handle(req: httpx.Request) -> httpx.Response:
         seen.append(json.loads(req.content))
-        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish_reason}]})
     r = ModelRouter("key")
     r.http = httpx.AsyncClient(base_url="https://api.deepseek.com/beta", transport=httpx.MockTransport(handle))
     return r
@@ -323,6 +323,26 @@ async def test_a_router_answer_that_is_not_a_route_call_is_an_error_saying_what_
         await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
     r = router_answering(route_call({"spawn": [], "why": "nothing asked"}), [])
     with pytest.raises(ValueError, match="planned nothing.*nothing asked"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
+
+
+async def test_a_route_call_the_model_was_stopped_in_is_an_error_naming_why():
+    """A call cut off mid-argument (here by the server running out of
+    resources) is refused for its finish_reason, before its arguments are read."""
+    places = [{"id": "sprites", "label": "Sprites", "why": ""}]
+    cut = route_call({})
+    cut["tool_calls"][0]["function"]["arguments"] = '{"spawn":[{"title":"Fix it","request":"fix the rou'
+    for reason in ("insufficient_system_resource", "content_filter", "aborted", "length", None):
+        r = router_answering(cut, [], finish_reason=reason)
+        with pytest.raises(ValueError, match=f"stopped before finishing its route call.*{reason!r}.*fix the rou"):
+            await r.plan("fix it", [], places)
+
+
+async def test_route_arguments_that_are_not_json_are_an_error_saying_what_came_back():
+    cut = route_call({})
+    cut["tool_calls"][0]["function"]["arguments"] = '{"spawn":[{"title":"Fix it","request":"fix the rou'
+    r = router_answering(cut, [], finish_reason="tool_calls")
+    with pytest.raises(ValueError, match="arguments that are not JSON.*Unterminated string.*fix the rou"):
         await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
 
 

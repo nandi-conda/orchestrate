@@ -218,6 +218,11 @@ def place_tool(places: list[dict]) -> dict:
                                           "where": {"type": "string", "description": WHERE_FIELD}}}}
 
 
+# How a turn that made its call whole ends: "tool_calls", or "stop" for a
+# forced tool_choice (OpenAI-compatible servers report either).
+FINISHED = ("tool_calls", "stop")
+
+
 class ModelRouter:
     """Asks the model to call one function (`route` or `place`) whose JSON
     schema is the answer's shape: a forced tool call in strict mode, which
@@ -245,11 +250,22 @@ class ModelRouter:
             raise RuntimeError(f"the router model ({self.model}) answered {r.status_code}: {r.text[:500]}")
         choice = r.json()["choices"][0]
         calls = choice["message"].get("tool_calls") or []
-        if choice.get("finish_reason") == "length" or len(calls) != 1 \
-                or calls[0]["function"]["name"] != tool["name"]:
+        said = json.dumps(choice["message"])[:500]
+        # The call is whole only when the model ended its turn: anything else
+        # (length, content_filter, insufficient_system_resource, aborted) cut it
+        # off wherever it was, mid-string included.
+        if choice.get("finish_reason") not in FINISHED:
+            raise ValueError(f"the router model ({self.model}) stopped before finishing its {tool['name']} call "
+                             f"(finish_reason {choice.get('finish_reason')!r}): {said}")
+        if len(calls) != 1 or calls[0]["function"]["name"] != tool["name"]:
             raise ValueError(f"the router model ({self.model}) did not call {tool['name']} once "
-                             f"(finish_reason {choice.get('finish_reason')!r}): {json.dumps(choice['message'])[:500]}")
-        return json.loads(calls[0]["function"]["arguments"])
+                             f"(finish_reason {choice.get('finish_reason')!r}): {said}")
+        arguments = calls[0]["function"]["arguments"]
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"the router model ({self.model}) called {tool['name']} with arguments that are "
+                             f"not JSON ({e}; finish_reason {choice.get('finish_reason')!r}): {arguments[:500]}") from None
 
     async def _ask(self, system: str, content: dict, directory: list[dict], places: list[dict]) -> dict:
         threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load", "workers")}
