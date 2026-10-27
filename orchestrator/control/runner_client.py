@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, AsyncIterator
 
 import httpx
@@ -22,10 +23,16 @@ class RunnerError(Exception):
 
 
 def runner_error(r: httpx.Response, body: bytes) -> RunnerError:
-    try:
-        error = json.loads(body).get("error") or ""
-    except (ValueError, AttributeError):
-        error = body.decode(errors="replace").strip()
+    """A web page in place of the runner's answer (a proxy's error page, when
+    the worker's process is not there) is given as its <title>, not its markup."""
+    if "html" in r.headers.get("content-type", ""):
+        title = re.search(rb"<title>(.*?)</title>", body, re.S | re.I)
+        error = title.group(1).decode(errors="replace").strip() if title else ""
+    else:
+        try:
+            error = json.loads(body).get("error") or ""
+        except (ValueError, AttributeError):
+            error = body.decode(errors="replace").strip()
     return RunnerError(r.status_code, r.request.method, r.request.url.path,
                        error[:2000] or f"{r.status_code} {r.reason_phrase}")
 

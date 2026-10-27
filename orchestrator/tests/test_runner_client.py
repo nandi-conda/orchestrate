@@ -41,3 +41,10 @@ async def test_an_empty_answer_names_the_status():
     c = client(404)
     with pytest.raises(RunnerError, match="answered 404 to POST /threads/t_1/stop: 404 Not Found$"):
         await c.stop("t_1")
+
+
+async def test_a_proxys_error_page_is_given_as_its_title():
+    page = "<!DOCTYPE html><html><head><title>502 Bad Gateway · Sprites</title></head><body>" + "x" * 5000 + "</body></html>"
+    c = client(502, text=page, headers={"content-type": "text/html; charset=utf-8"})
+    with pytest.raises(RunnerError, match=r"answered 502 to GET /health: 502 Bad Gateway · Sprites$"):
+        await c.health()
