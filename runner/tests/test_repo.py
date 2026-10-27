@@ -560,3 +560,9 @@ async def test_pruning_takes_other_projects_off_the_worker(tmp_path):
     assert (threads / a.id).exists() and a.id in h.threads
     assert await h.prune({"p"}) == []
     await stop_all(h)
+
+
+async def test_every_git_call_of_a_worker_flushes_refs_and_indexes_to_disk(tmp_path):
+    source(tmp_path)
+    repo = await seeded(tmp_path)
+    assert (await repo.git("config", "--get", "core.fsync")).out == "all"

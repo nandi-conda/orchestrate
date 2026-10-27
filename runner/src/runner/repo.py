@@ -84,7 +84,12 @@ def session_ref(tid: str) -> str:
 class Repo:
     def __init__(self, path: str | os.PathLike):
         self.path = Path(path)
-        self.env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        # core.fsync=all makes refs, indexes and reflogs durable as the objects
+        # already are: a worker's disk can go away under it (a sprite going
+        # cold), and a ref or index git had not flushed comes back empty or
+        # short, and the repository refuses every push after.
+        self.env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsync", "GIT_CONFIG_VALUE_0": "all"}
         self.base = ""
         self.opened = False
         self.opening = asyncio.Lock()  # requests come in at once; one makes the repository
