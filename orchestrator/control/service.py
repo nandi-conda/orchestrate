@@ -314,6 +314,7 @@ class Orchestrator:
         self.bind_steps: dict[str, Steps] = {}
         # Every chained task, not only each chain's last: close() ends them all.
         self.background: set[asyncio.Task] = set()
+        self.sweeping: list[asyncio.Task] = []  # each place's sweep, from start()
 
     def _background(self, work) -> asyncio.Task:
         """Run the coroutine `work` in the background, beside everything
@@ -338,31 +339,46 @@ class Orchestrator:
             await lw.client.close()
 
     async def start(self) -> None:
-        """Make each place's provider hold its pool's workers and nothing
-        else: every worker of ours it has outside the slots is destroyed
-        (workers each project had before the pools, a pool that was bigger,
-        workers of a control plane whose store is gone), and the store says
-        so of those it knew. A thread from before threads had a place, that
-        was on a worker, gets the place its worker was in; one that never
-        was is left for the router to place when it is put on a worker.
+        """Start without waiting on any network: what the store alone can do
+        is done here, the rest is started beside the work. A thread from
+        before threads had a place, that was on a worker, gets the place its
+        worker was in; one that never was is left for the router to place when
+        it is put on a worker. Each place's pool is swept (_sweep) and the sync
+        server caught up with (Sync.start) in the background: a provider or a
+        server that is slow or unreachable never holds the control plane up.
         Called once, before the control plane takes work."""
-        swept = set()
-        for place, provider in self.places.providers.items():
-            destroyed = await provider.sweep(self.pool)
-            swept.add(place)
-            if destroyed:
-                log.warning("destroyed %d %s worker(s) outside the pool's %d slots: %s",
-                            len(destroyed), place, self.pool, ", ".join(destroyed))
-        for w in await self.store.list_workers():
-            if w["lost_at"] is None and w["provider"] in swept and not (pooled(w) and w["idx"] <= self.pool):
-                await self.store.lose_worker(w["id"], f"workers are a pool of {self.pool} per place, shared by "
-                                                      "every project; this one was outside it and was destroyed", "")
         ran_on = {w["id"]: w["provider"] for w in await self.store.list_workers()}
         for p in await self.store.list_projects() + await self.store.list_projects(archived=True):
             for t in await self.store.list_threads(p["id"]) + await self.store.list_threads(p["id"], True):
                 if not t["workers"] and t["worker_id"] in ran_on:
                     await self.store.update_thread(t["id"], workers=ran_on[t["worker_id"]])
+        self.sweeping = [self._background(self._sweep(place, provider))
+                         for place, provider in self.places.providers.items()]
         await self.sync.start()
+
+    async def _sweep(self, place: str, provider: WorkerProvider) -> None:
+        """Make the place's provider hold its pool's workers and nothing else:
+        every worker of ours it has outside the slots is destroyed (workers
+        each project had before the pools, a pool that was bigger, workers of
+        a control plane whose store is gone), and the store says so of those
+        it knew. The slots' own workers are never touched, so threads can be
+        put on them meanwhile. A sweep that fails says why, and the next start
+        sweeps again."""
+        steps = Steps(f"sweep of {place} workers")
+        try:
+            async with steps.step(f"looking for {place} workers outside the pool's {self.pool} slots"):
+                destroyed = await provider.sweep(self.pool)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return  # the step logged why
+        if destroyed:
+            log.warning("destroyed %d %s worker(s) outside the pool's %d slots: %s",
+                        len(destroyed), place, self.pool, ", ".join(destroyed))
+        for w in await self.store.list_workers():
+            if w["lost_at"] is None and w["provider"] == place and not (pooled(w) and w["idx"] <= self.pool):
+                await self.store.lose_worker(w["id"], f"workers are a pool of {self.pool} per place, shared by "
+                                                      "every project; this one was outside it and was destroyed", "")
 
     def provider(self, worker: Worker) -> WorkerProvider:
         """The provider of the place a worker is in."""

@@ -40,10 +40,10 @@ def echo_app(tmp_path):
     from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
     from control.store import SqliteStore
 
-    def make(shutdown):
-        return create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+    def make(shutdown, on_startup, store=None):
+        return create_app(store or SqliteStore(str(tmp_path / "db.sqlite")),
                           local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
-                          shutdown_event=shutdown, repos=str(tmp_path / "repos"))
+                          shutdown_event=shutdown, repos=str(tmp_path / "repos"), on_startup=on_startup)
     return make
 
 

@@ -1783,6 +1783,7 @@ async def test_threads_on_a_projects_own_worker_from_before_the_pool_come_back_o
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
     orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     await orch.start()
+    await asyncio.gather(*orch.sweeping)  # in the background: starting never waits for it
     assert not (tmp_path / "w" / old).exists()
     row = {w["id"]: w for w in await s.list_workers()}[old]
     assert row["lost_at"] is not None and "pool of 3" in row["lost_reason"]

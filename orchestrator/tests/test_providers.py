@@ -776,6 +776,7 @@ async def test_threads_from_before_places_get_where_they_ran(tmp_path):
     await orch.start()
     assert (await store.get_thread(old["id"]))["workers"] == "sprites"
     assert (await store.get_thread(new["id"]))["workers"] == ""
+    await orch.close()
     await store.close()
 
 
@@ -796,3 +797,31 @@ async def test_the_router_model_never_places_a_thread_where_workers_cannot_run(m
         await r.place("do it", places)
     monkeypatch.setattr(r, "_call", lambda *_: asyncio.sleep(0, {"workers": "local", "where": "Chrome runs here"}))
     assert await r.place("why does Chrome crash", places) == {"workers": "local", "where": "Chrome runs here"}
+
+
+async def test_starting_never_waits_for_a_place_whose_sweep_hangs(tmp_path):
+    """A provider that does not answer (Sprites over a bad network) holds no
+    start up: its sweep runs in the background, and the other place's
+    sweep and the store's bookkeeping go on without it."""
+    from control.service import Orchestrator
+    from control.store import SqliteStore
+    from tests.doubles import HeuristicRouter
+
+    class Hanging(Recording):
+        async def sweep(self, slots):
+            await asyncio.Event().wait()
+
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    await store.open()
+    await store.upsert_worker({"id": "orch-w9", "provider": "local", "handle": "9", "url": "u",
+                               "token": "t", "capacity": 16, "index": 9})
+    orch = Orchestrator(store, providers.Places({"local": Recording("local"), "sprites": Hanging("sprites")}),
+                        HeuristicRouter(), tmp_path / "repos")
+    await asyncio.wait_for(orch.start(), 2)
+    local_sweep, sprites_sweep = orch.sweeping
+    await asyncio.wait_for(local_sweep, 2)
+    assert not sprites_sweep.done()
+    assert (await store.list_workers())[0]["lost_at"] is not None, "outside the pool: the local sweep lost it"
+    await orch.close()
+    assert sprites_sweep.cancelled()
+    await store.close()

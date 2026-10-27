@@ -38,8 +38,8 @@ def main() -> None:
     prepare_qt()
     app = QApplication([sys.argv[0], *rest])
     app.setApplicationName("Orchestrator")
-    control = ControlPlane(a.port, lambda shutdown: create_app(store=store_from_url(a.db), shutdown_event=shutdown,
-                                                               sync=sync))
+    control = ControlPlane(a.port, lambda shutdown, on_startup: create_app(
+        store=store_from_url(a.db), shutdown_event=shutdown, sync=sync, on_startup=on_startup))
     w = MainWindow(control)
     w.show()
     # Ctrl+C in the terminal closes the window (and stops the control plane).

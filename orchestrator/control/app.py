@@ -9,9 +9,11 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 from urllib.parse import quote
 
@@ -34,6 +36,11 @@ from .store import Store, store_from_url
 from .sync import NotDriving, Sync, SyncedStore, SyncError
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
+
+log = logging.getLogger("orchestrator")
+
+# Told each step of starting, (step, ""), as it begins, and (step, why) when it fails.
+Startup = Callable[[str, str], None]
 
 # Event kinds for the UI, which can't compare strings cheaply. K_USER is only
 # what the person typed; K_REQUEST is the brief a thread was spawned with,
@@ -276,9 +283,11 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
 def create_app(store: Store | None = None, places: Places | None = None,
                router: Router | None = None,
                shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS,
-               sync: Sync | None = None) -> Starlette:
+               sync: Sync | None = None, on_startup: Startup | None = None) -> Starlette:
     """The control plane's app. With `sync` (Sync.from_env), its projects are
-    shared with other computers' control planes through the sync server."""
+    shared with other computers' control planes through the sync server.
+    `on_startup` is told each step of starting as it begins, and the reason
+    when one fails (the desktop window shows them while it waits)."""
     store = store or store_from_url(None)
     if sync is not None:
         store = SyncedStore(store, sync)
@@ -286,13 +295,32 @@ def create_app(store: Store | None = None, places: Places | None = None,
     holder: dict = {}
 
     @asynccontextmanager
+    async def starting(what: str):
+        """One step of starting, logged and told to `on_startup`."""
+        log.info("starting: %s", what)
+        if on_startup is not None:
+            on_startup(what, "")
+        try:
+            yield
+        except BaseException as e:
+            if on_startup is not None:
+                on_startup(what, describe(e))
+            raise
+
+    @asynccontextmanager
     async def lifespan(app):
-        await store.open()
-        orch = Orchestrator(store, places or default_places(), router or default_router(), repos, sync=sync)
+        async with starting("opening the database" + (" and the sync replica" if sync is not None else "")):
+            await store.open()
+        async with starting("looking up where workers can run"):
+            where = places or default_places()
+        async with starting("setting up the router"):
+            routes_with = router or default_router()
+        orch = Orchestrator(store, where, routes_with, repos, sync=sync)
         holder["orch"] = orch
         app.state.orch = orch
         try:
-            await orch.start()
+            async with starting("loading projects and threads"):
+                await orch.start()
             yield
         finally:
             await orch.close()

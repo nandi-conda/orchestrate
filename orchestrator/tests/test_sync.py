@@ -95,6 +95,7 @@ class Computer:
     async def start(self) -> "Computer":
         await self.store.open()
         await self.orch.start()
+        await self.sync.caught_up.wait()  # in the background: starting never waits for it
         return self
 
     async def close(self) -> None:
@@ -283,11 +284,11 @@ async def test_a_computer_in_another_space_sees_none_of_its_projects(tmp_path, s
 
 async def test_a_computer_starts_without_the_server_and_catches_up_once_it_answers(tmp_path, sync_server, fast,
                                                                                   monkeypatch):
-    monkeypatch.setattr(sync_mod, "CONNECT_WAIT", 0.2)
     monkeypatch.setattr(sync_mod, "RETRY", 0.2)
     port = free_port()
     a = Computer(tmp_path / "a", f"http://127.0.0.1:{port}", "desktop")
-    await a.start()  # nothing listens there: starting goes on without it
+    await a.store.open()
+    await a.orch.start()  # nothing listens there: starting goes on without it
     try:
         assert not a.sync.caught_up.is_set()
         a.sync.client.http.base_url = sync_server  # the server answers from now on

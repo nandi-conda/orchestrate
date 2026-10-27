@@ -77,7 +77,6 @@ log = logging.getLogger("orchestrator.sync")
 URL_KEY, SPACE_KEY = "ORCHESTRATE_SYNC_URL", "ORCHESTRATE_SYNC_SPACE"
 DEFAULT_URL = "https://orchestrate-sync.nandithebull.workers.dev"  # ORCHESTRATE_SYNC_URL names another
 SPACE_HEX = 64  # a space's key: 32 random bytes, in hex
-CONNECT_WAIT = 5.0  # how long starting waits to catch up with the server before going on without it
 INDEX = "projects"
 RENEW_EVERY = 10.0
 WAIT = 25.0  # how long a look at the change feed waits for a change
@@ -414,12 +413,11 @@ class Sync:
         every one changed since the last look; each is applied to the store.
         Projects only this computer has are then shared, driven by it.
 
-        Starting waits CONNECT_WAIT for that, then goes on: a computer that
-        cannot reach the server starts all the same, and catches up once it
-        can. Until then it drives no project (claim raises SyncError)."""
+        All of that runs in the background: starting never waits on the
+        server, so a computer that cannot reach it (or a server that refuses
+        it) starts all the same, and catches up once it can. Until then it
+        drives no project (claim raises SyncError)."""
         self.tasks = [asyncio.create_task(self._catch_up())]
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(asyncio.shield(self.caught_up.wait()), CONNECT_WAIT)
 
     async def _catch_up(self) -> None:
         while True:

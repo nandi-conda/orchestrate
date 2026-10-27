@@ -31,8 +31,12 @@ place. That is the whole lifecycle policy:
   pauses on its own while nothing is connected to it, so an idle pool costs
   little. A lost worker's slot is filled again by a new worker of the same
   name.
-- **Swept at startup.** Before it takes work, the control plane lists each
-  place's workers and destroys every one of ours that is not a slot: each
+- **Swept at startup, in the background.** As it starts, the control plane
+  lists each place's workers and destroys every one of ours that is not a
+  slot (starting never waits for this: a provider that is slow or out of
+  reach holds nothing up, and a sweep that fails is logged and tried again on
+  the next start; the slots themselves are never touched, so work goes on
+  meanwhile): each
   project's own workers from before the pool (`orch-p-<id>-w<n>`), slots
   beyond the pool's size, and the pool of a control plane whose store is
   gone. The store marks the ones it knew as lost, with why. Sprites not named

@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import socket
 import sys
 import threading
+import time
 from typing import Callable
 
 import uvicorn
 from PySide6.QtCore import QObject, QTimer, Signal
 from starlette.applications import Starlette
 
+from control.app import Startup
 from control.server import Server
 
 POLL_MS = 100
@@ -25,8 +28,9 @@ STOP_SECONDS = 15
 
 STARTING, UP, DOWN = "starting", "up", "down"
 
-# Makes the control plane's app, given the event that ends its SSE streams on shutdown.
-AppFactory = Callable[[asyncio.Event], Starlette]
+# Makes the control plane's app, given the event that ends its SSE streams on
+# shutdown and what to tell each step of its starting (create_app's on_startup).
+AppFactory = Callable[[asyncio.Event, Startup], Starlette]
 
 
 def listen(port: int) -> socket.socket | None:
@@ -52,9 +56,12 @@ def listen(port: int) -> socket.socket | None:
 
 class ControlPlane(QObject):
     """The window's control plane: starting, up, or down (with why).
-    `changed` carries (state, text), which also goes to the terminal."""
+    `changed` carries (state, text), which also goes to the terminal.
+    `stepped` carries the steps of starting each time they change, as JSON:
+    a list of {what, at (time.time() it began), done, error}."""
 
     changed = Signal(str, str)
+    stepped = Signal(str)
 
     def __init__(self, port: int, make_app: AppFactory, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -66,6 +73,7 @@ class ControlPlane(QObject):
         self.thread: threading.Thread | None = None
         self.error = ""
         self.state, self.text = STARTING, ""
+        self.steps: list[dict] = []
         self.watch = QTimer(self)
         self.watch.timeout.connect(self._watch)
 
@@ -78,15 +86,30 @@ class ControlPlane(QObject):
                             f"`pixi run desktop --port {self.port + 100}`.")
             return
         self.error = ""
+        self.steps = []
+        self.stepped.emit("[]")
         self.loop = asyncio.new_event_loop()
         shutdown = asyncio.Event()
-        config = uvicorn.Config(self.make_app(shutdown), host="127.0.0.1", port=self.port, log_level="info",
-                                timeout_graceful_shutdown=5)
+        config = uvicorn.Config(self.make_app(shutdown, self._step), host="127.0.0.1", port=self.port,
+                                log_level="info", timeout_graceful_shutdown=5)
         self.server = Server(config, shutdown)
         self.thread = threading.Thread(target=self._serve, args=(sock,), name="control-plane", daemon=True)
         self.thread.start()
         self._set(STARTING, f"Starting the control plane at {self.base_url}…")
         self.watch.start(POLL_MS)
+
+    def _step(self, what: str, error: str) -> None:
+        """A step of starting began, or failed (`error`). Called on the
+        control plane's thread: the window gets a copy of the steps through
+        `stepped`, which Qt delivers on the window's thread."""
+        if error:
+            self.steps[-1]["error"] = error
+            self.error = f"{what} failed: {error}"
+        else:
+            if self.steps:
+                self.steps[-1]["done"] = True
+            self.steps.append({"what": what, "at": time.time(), "done": False, "error": ""})
+        self.stepped.emit(json.dumps(self.steps))
 
     def _serve(self, sock: socket.socket) -> None:
         """The control plane's thread. uvicorn ends a failed startup with
@@ -95,7 +118,8 @@ class ControlPlane(QObject):
         try:
             self.loop.run_until_complete(self.server.serve(sockets=[sock]))
         except BaseException as e:  # noqa: BLE001 - reported on the window, then the thread ends
-            self.error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            # A step that failed (_step) says more than how uvicorn ended.
+            self.error = self.error or (f"{type(e).__name__}: {e}" if str(e) else type(e).__name__)
         finally:
             self.loop.close()
 
