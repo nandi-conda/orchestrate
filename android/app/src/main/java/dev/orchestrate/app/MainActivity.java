@@ -28,6 +28,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.Toolbar;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
@@ -82,14 +83,26 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Pads the content clear of the system bars and the keyboard: Android
-     *  draws apps edge to edge, and adjustResize no longer resizes them. */
-    private void fitInsets() {
-        findViewById(android.R.id.content).setOnApplyWindowInsetsListener((view, insets) -> {
-            Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime());
-            view.setPadding(bars.left, 0, bars.right, bars.bottom);
+    /** Shows `content` under the app's toolbar. Android draws apps edge to
+     *  edge, under the status and navigation bars, and no longer resizes them
+     *  for the keyboard, so the window pads itself clear of all three; the
+     *  toolbar is part of the layout, so nothing lies under it. */
+    private void show(View content) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        Toolbar bar = new Toolbar(this);
+        bar.setTitle(R.string.app_name);
+        root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime()
+                    | WindowInsets.Type.displayCutout());
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
             return WindowInsets.CONSUMED;
         });
+        setContentView(root);
+        setActionBar(bar);
     }
 
     private void start() {
@@ -121,8 +134,7 @@ public class MainActivity extends Activity {
             edit.setOnClickListener(v -> showKeysForm());
             box.addView(edit, wrap());
         }
-        setContentView(scroll(box));
-        fitInsets();
+        show(scroll(box));
     }
 
     private void showKeysForm() {
@@ -176,8 +188,7 @@ public class MainActivity extends Activity {
             cancel.setOnClickListener(v -> start());
             box.addView(cancel, wrap());
         }
-        setContentView(scroll(box));
-        fitInsets();
+        show(scroll(box));
     }
 
     private void showWeb() {
@@ -189,8 +200,7 @@ public class MainActivity extends Activity {
         cookies.setCookie(ControlPlane.BASE_URL,
                 ControlPlane.COOKIE + "=" + ControlPlane.get().secret + "; Path=/; HttpOnly; SameSite=Strict");
         web = new WebView(this);
-        setContentView(web);
-        fitInsets();
+        show(web);
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
