@@ -314,7 +314,10 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .ev-arrow { margin: 0 6px; color: var(--muted-foreground); }
 
 /* Project orchestrator: one live line per working thread. */
-.working { display: grid; gap: 2px; padding: 6px 16px 0; }
+/* It scrolls on its own past a few rows, so many threads never push the log
+   and the request box off screen (desktop or phone). */
+.working { display: grid; align-content: start; gap: 2px; padding: 6px 16px 0; flex-shrink: 0;
+           max-height: min(30vh, 240px); overflow-y: auto; overscroll-behavior: contain; }
 .working:empty { display: none; }
 .working-row { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 8px; border: 0; border-radius: 6px;
                background: color-mix(in srgb, var(--primary) 4%, transparent); font: inherit; font-size: 13px;

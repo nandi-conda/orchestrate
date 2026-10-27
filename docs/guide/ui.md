@@ -63,7 +63,8 @@ the window while the transcript scrolls under it.
 
 **Project orchestrator** shows the router's decisions and every thread's events,
 newest last (up to the newest 2,000), with a live line per working thread
-saying what it is doing.
+saying what it is doing. Past a few lines that list scrolls on its own, so the
+log and the request box stay in view.
 
 ### Sending a request
 
