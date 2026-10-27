@@ -1,0 +1,11 @@
+{
+  "name": "orchestrate-sync",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@automerge/automerge": "3.5.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.153.0"
+  }
+}

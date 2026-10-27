@@ -61,6 +61,7 @@ nav:
       - Using the UI: guide/ui.md
       - The desktop window: guide/desktop.md
       - The Android app: guide/android.md
+      - Projects on several computers: guide/sync.md
   - Architecture:
       - Overview: architecture/overview.md
       - Workers never connect in: architecture/pull-mode.md

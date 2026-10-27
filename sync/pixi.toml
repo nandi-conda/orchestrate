@@ -1,0 +1,14 @@
+[workspace]
+name = "orchestrate-sync"
+version = "0.1.0"
+description = "The sync server orchestrate control planes share projects through: a Cloudflare Worker, a Durable Object and an R2 bucket"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+nodejs = ">=22"
+
+[tasks]
+install = { cmd = "npm ci", inputs = ["package-lock.json"], outputs = ["node_modules/.package-lock.json"], description = "Install wrangler and Automerge into node_modules" }
+dev = { cmd = "npx wrangler dev --local --port 8787", depends-on = ["install"], description = "Serve the sync server on http://127.0.0.1:8787 (local Durable Object and R2; the token is in .dev.vars)" }
+deploy = { cmd = "node deploy.mjs", depends-on = ["install"], description = "Deploy to your Cloudflare account (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID); prints the URL and, the first time, the sync token" }

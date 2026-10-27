@@ -210,6 +210,14 @@ def thread_refs(tid: str) -> list[str]:
     return [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}", f"refs/sessions/{tid}"]
 
 
+async def bare(path: Path) -> None:
+    """An empty repository at `path`, set up as every hub is."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await git(path.parent, "init", "-q", "--bare", str(path))
+    for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("gc.auto", "0")):
+        await git(path, "config", key, value)
+
+
 class Hub:
     def __init__(self, path: str | os.PathLike, name: str, token: str | None = None) -> None:
         self.path = Path(path).resolve()  # git runs in other directories
@@ -246,10 +254,7 @@ class Hub:
         new = self.path.with_name(self.path.name + ".new")
         if new.exists():
             shutil.rmtree(new)
-        new.parent.mkdir(parents=True, exist_ok=True)
-        await git(new.parent, "init", "-q", "--bare", str(new))
-        for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("gc.auto", "0")):
-            await git(new, "config", key, value)
+        await bare(new)
         base = "main"
         tree = await pixi_tree(new, None, self.name)
         commit = (await git(new, "commit-tree", tree, "-m", START)).out

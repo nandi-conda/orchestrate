@@ -10,6 +10,7 @@
 | `control/router.py` | `ModelRouter` (DeepSeek) |
 | `control/store.py` | the `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/hub.py` | the per-project hub repository: join a remote, take a thread's refs, land |
+| `control/sync.py` | sharing projects through the sync server: `SyncedStore`, the Automerge replica, leases (which computer drives a project), hubs as bundles |
 | `control/gitio.py` | git subprocess and bundle helpers |
 | `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `Places` (where threads' workers can run, and why not) |
 | `control/runner_client.py` | HTTP client for the runner API |
@@ -41,6 +42,14 @@
 | `skills/team/` | the team skill: its `SKILL.md` and the `team` module |
 | `models.json` | the models prime-agent knows (it runs `--offline`) |
 | `deploy/bootstrap.sh`, `deploy/start.sh`, `deploy/install-harness.sh` | prepare a Linux worker, start the service, install the pinned prime-agent |
+
+## sync/
+
+| Path | What |
+| --- | --- |
+| `src/index.js` | the sync server: a Cloudflare Worker and its Durable Object (`SyncHub`) |
+| `wrangler.toml` | the Worker, its Durable Object and R2 bucket |
+| `deploy.mjs` | `pixi run deploy`: the bucket, the Worker, its token |
 
 ## Root
 

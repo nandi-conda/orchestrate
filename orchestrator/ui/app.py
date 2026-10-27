@@ -103,6 +103,8 @@ GOT_PLACES: Const[i32] = 76
 THREADS_TOGGLE: Const[i32] = 77
 JUMP: Const[i32] = 78         # arg: seq of your message whose quote was clicked
 JUMP_MISS: Const[i32] = 79
+TAKE_OVER: Const[i32] = 80    # drive the open project from this computer
+TOOK_OVER: Const[i32] = 81
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -452,6 +454,10 @@ def post_project(i: i32, action: str) -> None:
 # ---- requests
 
 def fetch_threads() -> None:
+    # The project too: which computer drives it can change with its threads.
+    s_set(h_url, "/api/projects/")
+    s_add_ref(h_url, h_pid)
+    get(h_url, GOT_PROJECT)
     s_set(h_url, "/api/projects/")
     s_add_ref(h_url, h_pid)
     s_add(h_url, "/threads")
@@ -1219,6 +1225,19 @@ def update(msg: i32, arg: i32) -> None:
             set_title(h_t1)
         else:
             j_err(arg, h_set_err)
+            j_free(arg)
+    elif msg == TAKE_OVER:
+        if project != 0:
+            o = o_new()
+            s_set(h_url, "/api/projects/")
+            s_add_ref(h_url, h_pid)
+            s_add(h_url, "/drive")
+            post(h_url, o, TOOK_OVER)
+    elif msg == TOOK_OVER:
+        if j_ok(arg) == 1:
+            project = take(project, arg)
+            fetch_threads()
+        else:
             j_free(arg)
     elif msg == HOME:
         s_set(h_url, "/")
@@ -2855,6 +2874,19 @@ def project_window() -> None:
         else:
             text("no remote")
     end()
+    if project != 0:
+        # Projects shared with other computers: one drives each (runs its threads).
+        jstr(project, "driver_name", h_t1)
+        if s_len(h_t1) > 0 and j_int(project, "driven_here") == 0:
+            span("muted")
+            text("Driven by ")
+            text_ref(h_t1)
+            end()
+            btn_open("ghost", TAKE_OVER, 0)
+            cls("sm")
+            attr("title", "Drive this project from this computer: its threads move to this computer's workers")
+            text("Take over")
+            end()
 
     span("grow")
     end()

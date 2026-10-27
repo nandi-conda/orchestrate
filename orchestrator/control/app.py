@@ -31,6 +31,7 @@ from .runner_client import FileError
 from .service import (ENDS_STREAM, ArchivedError, EditError, NotOnWorker, Orchestrator, describe, editable,
                       image_title, prepared_text, tool_arg)
 from .store import Store, store_from_url
+from .sync import NotDriving, Sync, SyncedStore, SyncError
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
 
@@ -274,15 +275,20 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
 
 def create_app(store: Store | None = None, places: Places | None = None,
                router: Router | None = None,
-               shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS) -> Starlette:
+               shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS,
+               sync: Sync | None = None) -> Starlette:
+    """The control plane's app. With `sync` (Sync.from_env), its projects are
+    shared with other computers' control planes through the sync server."""
     store = store or store_from_url(None)
+    if sync is not None:
+        store = SyncedStore(store, sync)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}
 
     @asynccontextmanager
     async def lifespan(app):
         await store.open()
-        orch = Orchestrator(store, places or default_places(), router or default_router(), repos)
+        orch = Orchestrator(store, places or default_places(), router or default_router(), repos, sync=sync)
         holder["orch"] = orch
         app.state.orch = orch
         try:
@@ -306,8 +312,13 @@ def create_app(store: Store | None = None, places: Places | None = None,
     # ------------------------------------------------------------ UI API
 
     def project_view(p: dict) -> dict:
-        """A project and where its hub is: the git repository its threads' work goes to."""
-        return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve())}
+        """A project, where its hub is (the git repository its threads' work
+        goes to), and which computer drives it when projects are shared
+        (`driver_name`, "" while none does that this computer knows of, and
+        `driven_here`, 1 when it is this one)."""
+        driver = orch().sync.driver(p["id"]) or {"name": "", "me": False}
+        return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve()), "driver_name": driver["name"],
+                "driven_here": int(driver["me"])}
 
     async def list_projects(req: Request):
         """Live projects; ?archived=1 lists the archived ones instead."""
@@ -373,6 +384,14 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": "no such project"}, 404)
         except Exception as e:
             return JSONResponse({"error": f"could not take the project off the workers: {describe(e)}"}, 502)
+        return JSONResponse(project_view(p))
+
+    async def project_drive(req: Request):
+        """Take over: drive the project from this computer now (Orchestrator.take_over)."""
+        try:
+            p = await orch().take_over(req.path_params["pid"])
+        except KeyError:
+            return JSONResponse({"error": "no such project"}, 404)
         return JSONResponse(project_view(p))
 
     async def project_unarchive(req: Request):
@@ -523,7 +542,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
     def files_error(e: Exception) -> Response:
         if isinstance(e, KeyError):
             return JSONResponse({"error": "no such thread"}, 404)
-        if isinstance(e, (ArchivedError, NotOnWorker)):
+        if isinstance(e, (ArchivedError, NotOnWorker, NotDriving)):
             return JSONResponse({"error": str(e)}, 409)
         if isinstance(e, FileError):
             return JSONResponse({"error": str(e)}, e.status)
@@ -668,6 +687,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),
         Route("/api/projects/{pid}/unarchive", project_unarchive, methods=["POST"]),
+        Route("/api/projects/{pid}/drive", project_drive, methods=["POST"]),
         Route("/api/projects/{pid}/requests", post_request, methods=["POST"]),
         Route("/api/projects/{pid}/messages/{seq:int}/edit", edit_message, methods=["POST"]),
         Route("/api/projects/{pid}/threads", list_threads, methods=["GET"]),
@@ -690,4 +710,11 @@ def create_app(store: Store | None = None, places: Places | None = None,
         Route("/p/{pid}", index),
     ]
     routes.append(Mount("/ui", StaticFiles(directory=UI_DIR, check_dir=False)))
-    return Starlette(routes=routes, lifespan=lifespan)
+    async def not_driving(req: Request, e: NotDriving):
+        return JSONResponse({"error": str(e)}, 409)
+
+    async def sync_failed(req: Request, e: SyncError):
+        return JSONResponse({"error": str(e)}, 503)
+
+    return Starlette(routes=routes, lifespan=lifespan,
+                     exception_handlers={NotDriving: not_driving, SyncError: sync_failed})

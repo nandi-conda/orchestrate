@@ -4,6 +4,10 @@ Every runner event is relayed into the store, so the UI reads one ordered
 event log per project no matter how many workers the project has. Every
 project's commits gather in its hub, a git repository on this machine
 (hub.py), which the control plane syncs workers with.
+
+With a sync server (sync.py), projects are shared between computers, and the
+control plane drives only the projects whose lease it holds: what its person
+does in any other is forwarded to the computer that drives it.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from pathlib import Path
 
 import httpx
 
-from .hub import Hub, remote_url
+from .hub import Hub, is_folder, remote_url
 from .load import load_of, running
 from .providers import PLACES, Places, Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
@@ -33,6 +37,7 @@ from .secrets import get_secret
 from .states import BINDING, RUNNING, WORKER
 from .steps import Steps, describe
 from .store import Store, new_id, now
+from .sync import NotDriving, Solo, SyncError
 
 log = logging.getLogger("orchestrator")
 
@@ -254,8 +259,12 @@ def when(ts: float) -> str:
 
 class Orchestrator:
     def __init__(self, store: Store, places: Places, router: Router, repos: str | Path,
-                 max_running: int = 64, pool: int = POOL) -> None:
+                 max_running: int = 64, pool: int = POOL, sync=None) -> None:
         self.store = store
+        # The sync server's side of this computer (sync.Sync), or Solo
+        # without one: which projects it drives, and their hubs on the server.
+        self.sync = sync if sync is not None else Solo()
+        self.sync.bind(self)
         # One git repository per project, the hub its threads' work goes to (hub.py).
         self.repos = Path(repos).resolve()
         self.hubs: dict[str, Hub] = {}
@@ -352,6 +361,7 @@ class Orchestrator:
             for t in await self.store.list_threads(p["id"]) + await self.store.list_threads(p["id"], True):
                 if not t["workers"] and t["worker_id"] in ran_on:
                     await self.store.update_thread(t["id"], workers=ran_on[t["worker_id"]])
+        await self.sync.start()
 
     def provider(self, worker: Worker) -> WorkerProvider:
         """The provider of the place a worker is in."""
@@ -564,11 +574,12 @@ class Orchestrator:
             lw.unreachable_since = asyncio.get_running_loop().time()
         (log.info if to == "ready" else log.warning)("worker %s: %s -> %s: %s", wid, frm, to, reason)
         await self.store.set_worker_state(wid, to, reason)
-        # The worker is every project's: each project with a thread on it, or
-        # last on it, logs it.
+        # The worker is every project's: each project this computer drives with
+        # a thread on it, or last on it, logs it.
         for project_id in await self.store.projects_on_worker(wid):
-            await self.store.append_event(project_id, None, "worker_state",
-                                          {"worker": wid, "from": frm, "to": to, "reason": reason})
+            if self.sync.driving(project_id):
+                await self.store.append_event(project_id, None, "worker_state",
+                                              {"worker": wid, "from": frm, "to": to, "reason": reason})
         async with lw.changed:
             lw.changed.notify_all()
         await self._made_room()
@@ -933,8 +944,10 @@ class Orchestrator:
         data, refs = await lw.client.pull_thread(project["id"], t["id"], await hub.have(t["id"]))
         await hub.receive(t["id"], data, refs)
         if not land:
+            self._push_hub(project["id"])
             return {"landed": False, "base": hub.base}
         result = await hub.land(t["id"])
+        self._push_hub(project["id"])
         # Every turn that saves lands: its steps go to stdout only when it is slow or fails.
         await self._ship(lw, project, t["id"], Steps(f"thread {t['id']} landing", level=logging.DEBUG))
         return result
@@ -950,16 +963,37 @@ class Orchestrator:
 
     async def hub(self, project: dict) -> Hub:
         """The project's hub, made on first use and connected to the
-        project's remote (a project from before hubs had one may not be yet)."""
+        project's remote (a project from before hubs had one may not be yet).
+
+        A remote that is a folder is on the computer the project was opened
+        from a folder on: another computer that drives the project lands in
+        its hub only, and the work reaches the folder once the computer it is
+        on drives the project again (its hub lands the base there)."""
+        opened = False
         async with self._hubs_lock:
             hub = self.hubs.get(project["id"])
             if hub is None:
                 hub = Hub(self.hub_path(project["id"]), project["name"], get_secret("GITHUB_TOKEN"))
                 await hub.open()
-                if hub.url != project["repo_url"]:
-                    await hub.connect(project["repo_url"])
+                url = project["repo_url"]
+                elsewhere = is_folder(url) and not Path(url).is_dir() and not isinstance(self.sync, Solo)
+                if hub.url != url and not elsewhere:
+                    await hub.connect(url)
                 self.hubs[project["id"]] = hub
+                opened = True
+        if opened:
+            self._push_hub(project["id"])  # a new hub, or one that made its base a pixi project
         return hub
+
+    def _push_hub(self, project_id: str) -> None:
+        """Send the project's hub to the sync server, in the background."""
+        self._background(self._push_hub_now(project_id))
+
+    async def _push_hub_now(self, project_id: str) -> None:
+        try:
+            await self.sync.push_hub(project_id, self.hub_path(project_id))
+        except Exception as e:
+            log.warning("could not send project %s's hub to the sync server: %s", project_id, describe(e))
 
     async def create_project(self, name: str, model: str = "", repo_url: str = "") -> dict:
         """A new project; with `repo_url` (a project opened from a folder on
@@ -990,9 +1024,12 @@ class Orchestrator:
             raise KeyError(project_id)
         if "repo_url" in fields:
             fields["repo_url"] = remote_url(fields["repo_url"])
+        if await self._elsewhere(project_id, "update_project", {"fields": fields}):
+            return project
         if "repo_url" in fields and fields["repo_url"] != project["repo_url"]:
             hub = await self.hub(project)
             await hub.connect(fields["repo_url"])
+            self._push_hub(project_id)
         return await self.store.update_project(project_id, **fields)
 
     async def move(self, thread_id: str, place: str, where: str = "") -> None:
@@ -1267,6 +1304,9 @@ class Orchestrator:
             raise KeyError(to)
         if thread["archived_at"] is not None:
             raise ArchivedError(f"thread {to} is archived; unarchive it to message it")
+        if await self._elsewhere(thread["project_id"], "send", {"to": to, "body": body, "images": images,
+                                                                 "kind": kind}):
+            return {"id": "", "to_thread": to, "body": body, "forwarded": True}
         await self.open_project(thread["project_id"])
         msg = await self.store.add_message(thread["project_id"], sender, to, body, reply_to, hops)
         if hops > MAX_HOPS:
@@ -1392,6 +1432,8 @@ class Orchestrator:
             raise KeyError(thread_id)
         if t["archived_at"] is not None:
             raise ArchivedError(f"thread {thread_id} is archived; unarchive it to use it")
+        if await self._elsewhere(t["project_id"], "respawn", {"thread": thread_id}):
+            return
         await self.open_project(t["project_id"])
         task = self.binding.get(thread_id)
         if task is not None:
@@ -1444,6 +1486,10 @@ class Orchestrator:
         t = await self.store.get_thread(thread_id)
         if t is None:
             raise KeyError(thread_id)
+        if not self.sync.driving(t["project_id"]):
+            who = self.sync.driver(t["project_id"])
+            return (f"{who['name'] if who else 'Another computer'} drives this project: its threads run on that "
+                    "computer's workers, and their logs are there.\n")
         head = f"thread {thread_id} is {t['binding']}: {t['binding_reason'] or 'nothing recorded yet'}\n"
         steps = self.bind_steps.get(thread_id)
         if steps is not None:
@@ -1509,6 +1555,9 @@ class Orchestrator:
                           "and the Worker log tab says how that goes")
 
     async def stop(self, thread_id: str) -> None:
+        t = await self.store.get_thread(thread_id)
+        if t is not None and await self._elsewhere(t["project_id"], "stop", {"thread": thread_id}):
+            return
         task = self.binding.get(thread_id)
         if task is not None:
             task.cancel("stopped before it was on a worker")
@@ -1526,6 +1575,8 @@ class Orchestrator:
             raise KeyError(thread_id)
         if t["archived_at"] is not None:
             return t
+        if await self._elsewhere(t["project_id"], "archive", {"thread": thread_id}):
+            return t
         if t["state"] not in ENDED:
             await self.stop(thread_id)
         t = await self.store.update_thread(thread_id, archived_at=now())
@@ -1537,6 +1588,8 @@ class Orchestrator:
         if t is None:
             raise KeyError(thread_id)
         if t["archived_at"] is None:
+            return t
+        if await self._elsewhere(t["project_id"], "unarchive", {"thread": thread_id}):
             return t
         t = await self.store.update_thread(thread_id, archived_at=None)
         await self.store.append_event(t["project_id"], thread_id, "unarchived", {})
@@ -1562,6 +1615,8 @@ class Orchestrator:
             raise KeyError(project_id)
         if p["archived_at"] is not None:
             raise ArchivedError(f"project {p['name']} is archived; unarchive it to use it")
+        if not await self.sync.claim(project_id):
+            raise self.sync.not_driving(project_id)
         await self.recover(project_id)
         return p
 
@@ -1577,6 +1632,12 @@ class Orchestrator:
         come back with their next message or Respawn. Anything that uses a
         project's threads, or shows them, calls this first."""
         if project_id in self.recovered:
+            return
+        try:
+            if not await self.sync.claim(project_id):
+                return  # another computer drives it, and has its threads
+        except SyncError as e:
+            log.warning("cannot tell whether this computer may drive project %s: %s", project_id, e)
             return
         async with self._recover_locks.setdefault(project_id, asyncio.Lock()):
             if project_id not in self.recovered:
@@ -1605,6 +1666,8 @@ class Orchestrator:
         p = await self.store.get_project(project_id)
         if p is None:
             raise KeyError(project_id)
+        if await self._elsewhere(project_id, "archive_project", {}):
+            return p
         if p["archived_at"] is None:
             p = await self.store.update_project(project_id, archived_at=now())
             await self.store.append_event(project_id, None, "project_archived", {})
@@ -1628,8 +1691,108 @@ class Orchestrator:
             raise KeyError(project_id)
         if p["archived_at"] is None:
             return p
+        if await self._elsewhere(project_id, "unarchive_project", {}):
+            return p
         p = await self.store.update_project(project_id, archived_at=None)
         await self.store.append_event(project_id, None, "project_unarchived", {})
+        return p
+
+    # ---------------------------------------------------------------- driving
+    #
+    # With a sync server (sync.py), a project is driven by one computer at a
+    # time, the one holding its lease. Everything here that acts on a project
+    # first makes sure this computer drives it (open_project, recover): it
+    # takes the lease when nobody holds it, or its holder stopped renewing it.
+    # What the person does in a project another computer drives is forwarded
+    # to that computer (_elsewhere), which does it as if it were done there
+    # (forwarded); the result reaches this computer as the documents change.
+
+    async def _elsewhere(self, project_id: str, op: str, args: dict) -> bool:
+        """Whether another computer drives the project; if so, the action
+        `op` with `args` is forwarded to it."""
+        if await self.sync.claim(project_id):
+            return False
+        await self.sync.forward(project_id, op, args)
+        return True
+
+    async def _uid(self, seq: int | None) -> str | None:
+        return None if seq is None else (await self.store.uids_of([seq])).get(seq)
+
+    async def _seq(self, uid: str | None) -> int | None:
+        if uid is None:
+            return None
+        seq = (await self.store.seqs_of([uid])).get(uid)
+        if seq is None:
+            raise KeyError(f"no event {uid} in this project")
+        return seq
+
+    async def forwarded(self, project_id: str, op: str, args: dict, sender: str) -> None:
+        """Do what the person did on computer `sender`, in a project this one
+        drives (Sync.forward). What goes wrong is logged in the project."""
+        try:
+            if op == "submit":
+                await self.submit(project_id, args["text"], args["mode"], args.get("target"), args.get("images"),
+                                  await self._seq(args.get("quote_of")))
+            elif op == "edit":
+                await self.edit(project_id, await self._seq(args["of"]), args["text"])
+            elif op == "send":
+                await self.send(args["to"], args["body"], "user", images=args.get("images"), kind=args.get("kind"))
+            elif op in ("stop", "respawn", "archive", "unarchive"):
+                await getattr(self, op)(args["thread"])
+            elif op in ("archive_project", "unarchive_project"):
+                await getattr(self, op)(project_id)
+            elif op == "update_project":
+                await self.update_project(project_id, **args["fields"])
+            else:
+                raise ValueError(f"unknown action {op!r}")
+        except Exception as e:
+            log.exception("%s forwarded from %s in %s", op, sender, project_id)
+            await self.store.append_event(project_id, None, "error",
+                                          {"error": f"could not do what was sent from {sender or 'another computer'} "
+                                                    f"({op}): {describe(e)}"})
+
+    async def became_driver(self, project_id: str) -> None:
+        """This computer drives the project from now on (Sync.claim): its hub
+        is brought up to the one on the sync server before anything uses it,
+        and its threads are taken over from the store (recover)."""
+        self.hubs.pop(project_id, None)
+        self.recovered.discard(project_id)
+        await self.sync.pull_hub(project_id, self.hub_path(project_id))
+
+    async def let_go(self, project_id: str) -> None:
+        """Another computer drives the project now (it took the lease): its
+        threads are stopped on this computer's workers, and whatever those send
+        for them is dropped; the new driver brings them back on its own."""
+        self.recovered.discard(project_id)
+        self.hubs.pop(project_id, None)
+        cancelled = []
+        for t in await self.store.list_threads(project_id) + await self.store.list_threads(project_id, True):
+            tid = t["id"]
+            task = self.binding.get(tid)
+            if task is not None:
+                task.cancel("another computer drives its project now")
+                cancelled.append(task)
+            lw = self.by_thread.pop(tid, None)
+            if lw is not None:
+                lw.threads.discard(tid)
+                lw.moved_off.add(tid)
+                if lw.state == "ready":
+                    try:
+                        await lw.client.stop_if_there(tid)
+                    except Exception as e:
+                        log.warning("stopping thread %s on worker %s: %s", tid, lw.worker.id, describe(e))
+        if cancelled:
+            await asyncio.wait(cancelled)
+
+    async def take_over(self, project_id: str) -> dict:
+        """Drive the project from this computer now, whichever drives it
+        (Take over): the computer that did lets go of its threads, and they
+        come back here, from the hub."""
+        p = await self.store.get_project(project_id)
+        if p is None:
+            raise KeyError(project_id)
+        await self.sync.claim(project_id, take=True)
+        await self.recover(project_id)
         return p
 
     # ---------------------------------------------------------------- requests
@@ -1648,6 +1811,11 @@ class Orchestrator:
 
         `quote_of` is the seq of the event a reply to a selection quotes; the
         message logged for the person carries it, so the UI can go back to it."""
+        if await self.store.get_project(project_id) is None:
+            raise KeyError(project_id)
+        if await self._elsewhere(project_id, "submit", {"text": text, "mode": mode, "target": target,
+                                                        "images": images, "quote_of": await self._uid(quote_of)}):
+            return {"request": text, "mode": mode, "queued": True, "forwarded": True}
         await self.open_project(project_id)
         quote = await self.quote_source(project_id, quote_of) if quote_of is not None else None
         if mode == "thread":
@@ -1754,6 +1922,8 @@ class Orchestrator:
             raise KeyError(f"no message {seq} in this project")
         if not editable(ev):
             raise EditError("only your own messages can be edited")
+        if await self._elsewhere(project_id, "edit", {"of": ev["uid"], "text": text}):
+            return {"seq": seq, "text": text, "changed": True, "queued": True, "forwarded": True}
         await self.open_project(project_id)
         if ev["thread_id"] is not None:
             t = await self.store.get_thread(ev["thread_id"])

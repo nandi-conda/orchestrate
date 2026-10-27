@@ -16,6 +16,11 @@ asyncpg = ">=0.30"
 keyring = ">=25"
 ultra = ">=0.1.20,<0.2"
 
+# Projects shared through the sync server (control/sync.py). Automerge's
+# Python package is on PyPI only, and still a pre-release: pinned exactly.
+[pypi-dependencies]
+automerge = "==0.2.0.dev4"
+
 [feature.test.dependencies]
 pytest = ">=8"
 pytest-xdist = ">=3"

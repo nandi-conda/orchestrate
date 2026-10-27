@@ -23,6 +23,8 @@ collection is unlocked.
 | `DEEPSEEK_API_KEY` | A DeepSeek API key. The router uses it, and the control plane passes it to every worker, where prime-agent and the web tools use it. | `Authorization: Bearer <key>` to `https://api.deepseek.com` | Required: the control plane does not start, and says how to store it. |
 | `SPRITES_TOKEN` | A Fly Sprites API token for the org your sprites go in. | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` | Sprites is off: the router is told why and puts every thread on this computer. |
 | `GITHUB_TOKEN` | A GitHub **fine-grained** personal access token with **Contents: Read and write** on the repositories you attach to projects. Used by the control plane only; workers never get it. | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` | Projects without a remote work as usual; attaching a private remote, or pushing to any remote, fails with git's error. |
+| `ORCHESTRATE_SYNC_URL` | The URL of your sync server, which `pixi run deploy` in `sync/` prints ([Projects on several computers](sync.md)). Set it together with `ORCHESTRATE_SYNC_TOKEN`, or neither. | The base of every request to the sync server | Projects stay on this computer. One of the two without the other stops the control plane, saying which is missing. |
+| `ORCHESTRATE_SYNC_TOKEN` | The sync server's token, printed with its URL the first time it is deployed. | `Authorization: Bearer <token>` to the sync server | As above. |
 
 Missing secrets are printed at startup (`pixi run serve` or `pixi run desktop`)
 with the exact name, the header it is sent as, and the keyring backend that was
