@@ -7,6 +7,7 @@ run anywhere.
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -370,37 +371,66 @@ async def test_sprites_create_makes_a_new_service(env):
 
 
 class LocalSprite:
-    """POST /exec as the Sprites API runs it, on this machine: `bash -c` with
-    the given env, the request held until the script ends. The install's
-    scripts run for real (in a tmp INSTALL_ROOT; there is no /.sprite/api.sock
-    here, so its hold only logs that it could not be made)."""
+    """The Sprites API's exec and filesystem calls, served on this machine.
+    POST /exec runs `bash` with the given args and env, the request held until
+    it ends, and answers as the API does: stdout, stderr and the exit code in
+    frames with a stream byte and no length, which exec must not try to read.
+    The install's scripts run for real (in tmp dirs; there is no
+    /.sprite/api.sock here, so its hold only logs that it could not be made)."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.calls = 0
 
-    async def exec(self, name, script, env=None):
+    async def post(self, url, params=None, **kw):
+        assert url == "/sprites/orch-w1/exec"
         self.calls += 1
-        env = {**os.environ, **(env or {}), "INSTALL_ROOT": str(self.root)}
-        proc = await asyncio.create_subprocess_exec("bash", "-c", script, env=env,
-                                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        out, _ = await proc.communicate()
-        if proc.returncode:
-            raise RuntimeError(f"exec failed: {out.decode()}")
-        return out.decode()
+        args = [v for k, v in params if k == "cmd"]
+        env = {**os.environ, **dict(v.split("=", 1) for k, v in params if k == "env"),
+               "INSTALL_ROOT": str(self.root)}
+        proc = await asyncio.create_subprocess_exec(*args, env=env, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE)
+        out, err = await proc.communicate()
+        body = b"\x01" + out + b"\x02" + err + bytes([3, proc.returncode])
+        return httpx.Response(200, content=body, request=httpx.Request("POST", url))
+
+    async def get(self, url, params=None, **kw):
+        assert url == "/sprites/orch-w1/fs/read"
+        path = Path(params["path"])
+        if not path.exists():
+            return httpx.Response(404, json={"error": "not found"}, request=httpx.Request("GET", url))
+        return httpx.Response(200, content=path.read_bytes(), request=httpx.Request("GET", url))
+
+    async def request(self, method, url, json=None, **kw):
+        assert (method, url, json["recursive"]) == ("DELETE", "/sprites/orch-w1/fs/delete", True)
+        shutil.rmtree(json["path"])
+        return httpx.Response(200, request=httpx.Request(method, url))
+
+    async def aclose(self):
+        pass
+
+
+def _local_sprites(env, tmp_path):
+    env.setattr(providers, "EXEC_ROOT", str(tmp_path / "exec"))
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    p.http = LocalSprite(tmp_path / "install")
+    return p
 
 
 async def _install(env, tmp_path, script):
     env.setattr(providers, "INSTALL_LOOK_EVERY", 0.05)
-    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
-    sprite = LocalSprite(tmp_path / "install")
-    env.setattr(p, "exec", sprite.exec)
+    p = _local_sprites(env, tmp_path)
     steps = providers.Steps("worker orch-w1")
-    try:
-        await p.install("orch-w1", "c0ffee" * 6, steps, script=script)
-    finally:
-        await p.close()
-    return sprite, [line.split("s  ", 1)[1] for line in steps.lines]
+    await p.install("orch-w1", "c0ffee" * 6, steps, script=script)
+    return p.http, [line.split("s  ", 1)[1] for line in steps.lines]
+
+
+async def test_exec_reads_the_output_and_exit_code_from_files_not_the_framed_body(env, tmp_path):
+    p = _local_sprites(env, tmp_path)
+    assert await p.exec("orch-w1", 'echo "running $X"; echo oops >&2', env={"X": "now"}) == "running now\noops\n"
+    with pytest.raises(RuntimeError, match="exited 4; its output:\nnope"):
+        await p.exec("orch-w1", "echo nope; exit 4")
+    assert not list((tmp_path / "exec").iterdir())  # each call's files are removed
 
 
 async def test_the_install_runs_detached_and_is_watched_until_it_ends(env, tmp_path):

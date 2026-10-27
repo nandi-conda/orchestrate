@@ -278,6 +278,11 @@ the end of its output: it exits 0 (the runner service is then put), it exits
 non-zero, it is gone without an exit code (the sprite rebooted under it), or
 it runs past 30 minutes.
 
+Every exec's output and exit code are read from files on the sprite
+(through the filesystem API), never from the exec's response: that body
+multiplexes stdout, stderr and the exit code in frames with a stream byte and
+no length, which cannot be parsed reliably.
+
 A Sprites API call that fails says what the API answered: the status, how
 long the call took, the request id its proxy gave it, and the body, or that
 it had none.

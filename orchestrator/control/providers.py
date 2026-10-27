@@ -419,6 +419,11 @@ elif [ "$alive" = yes ]; then echo running
 else echo gone; fi
 tail -n "+$((INSTALL_FROM + 1))" "$run/log" 2>/dev/null
 """
+# SpritesProvider.exec runs each script as `bash -c EXEC_WRAP exec <dir>
+# <script>`: the script's output goes to <dir>/out and its exit code to
+# <dir>/code, for the filesystem API to read.
+EXEC_ROOT = "/tmp/orchestrate-exec"
+EXEC_WRAP = 'mkdir -p "$1" && { bash -c "$2" > "$1/out" 2>&1; echo $? > "$1/code"; }'
 # How often a running install is looked at, and how long it may take.
 INSTALL_LOOK_EVERY = 5.0
 INSTALL_TIMEOUT = 1800.0
@@ -678,24 +683,49 @@ class SpritesProvider:
             await asyncio.sleep(INSTALL_LOOK_EVERY)
 
     async def exec(self, name: str, script: str, env: dict | None = None) -> str:
-        """Run a short bash script on sprite `name` (POST /exec holds the
-        request until it ends: long work goes through `install`'s pattern)
-        and return its output."""
-        params = [("cmd", "bash"), ("cmd", "-c"), ("cmd", script)]
+        """Run a short bash script on sprite `name` and return its output
+        (stdout and stderr together); raise, with that output, if it exits
+        non-zero. POST /exec holds the request until the script ends, so long
+        work goes through `install`'s pattern.
+
+        The exec's own response body is not read: it is stdout, stderr and the
+        exit code multiplexed into frames with a stream byte and no length
+        (sprites-js: "HTTP combined frames can remain ambiguous"), so it cannot
+        be parsed reliably. EXEC_WRAP writes the output and the exit code to
+        files on the sprite instead, which the filesystem API reads back as
+        plain bytes, and the files are removed after."""
+        out = f"{EXEC_ROOT}/{secrets.token_hex(8)}"
+        params = [("cmd", "bash"), ("cmd", "-c"), ("cmd", EXEC_WRAP), ("cmd", "exec"), ("cmd", out),
+                  ("cmd", script)]
         params += [("env", f"{k}={v}") for k, v in (env or {}).items()]
         r = await self.http.post(f"/sprites/{name}/exec", params=params)
         if r.status_code >= 400:
             raise RuntimeError(failure(f"exec on sprite {name}", r))
-        return r.text
+        try:
+            code = (await self.read(name, f"{out}/code")).decode().strip()
+            output = (await self.read(name, f"{out}/out")).decode(errors="replace")
+        finally:
+            gone = await self.http.request("DELETE", f"/sprites/{name}/fs/delete",
+                                           json={"path": out, "workingDir": "/", "recursive": True,
+                                                 "asRoot": False})
+            if gone.status_code >= 400:
+                raise RuntimeError(failure(f"removing {out} on sprite {name}", gone))
+        if code != "0":
+            raise RuntimeError(f"a script on sprite {name} exited {code}; its output:\n{output[-2000:]}")
+        return output
+
+    async def read(self, name: str, path: str) -> bytes:
+        """The bytes of file `path` on sprite `name`."""
+        r = await self.http.get(f"/sprites/{name}/fs/read", params={"path": path, "workingDir": "/"})
+        if r.status_code >= 400:
+            raise RuntimeError(failure(f"reading {path} on sprite {name}", r))
+        return r.content
 
     # A sprite service's stdout and stderr, timestamped (Sprites docs, "Services").
     LOG = "/.sprite/logs/services/runner.log"
 
     async def logs(self, worker: Worker, lines: int) -> str:
-        r = await self.http.get(f"/sprites/{worker.handle}/fs/read", params={"path": self.LOG, "workingDir": "/"})
-        if r.status_code >= 400:
-            raise RuntimeError(f"reading {self.LOG} on sprite {worker.handle} failed ({r.status_code}): {r.text[:300]}")
-        return tail(r.content, lines)
+        return tail(await self.read(worker.handle, self.LOG), lines)
 
     async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
         """The runner service's log, from the Sprites API's log stream (NDJSON
