@@ -2,17 +2,20 @@
 
 A plan spawns new threads, sends messages to existing ones, or both:
 
-    {"spawn": [{"title": "...", "request": "...", "workers": "sprites"}],
-     "send":  [{"thread": "t_42", "message": "...", "workers": "local"}],
+    {"spawn": [{"title": "...", "request": "...", "workers": "sprites", "where": "..."}],
+     "send":  [{"thread": "t_42", "message": "...", "workers": "local", "where": "..."}],
      "why": "..."}
 
-The router also decides where each thread's workers run (providers.PLACES):
-on Sprites unless the request asks to run on the person's own computer
-("run it locally"); a thread spawned to carry on or help with an existing
-thread's work runs where that thread runs. `workers` on a send moves that
-thread there. A thread
-spawned without one (a new thread typed straight in, or one the plan left
-it off) is asked about with `place` when it is first put on a worker.
+The router also decides where each thread's workers run (providers.PLACES),
+from what the thread's work must touch, and says why in `where`: each place
+comes with what work there `reaches` (providers.REACHES). Work on the
+project's code runs on Sprites; work on the person's own computer (its
+processes, apps, files outside the project, hardware, logs, services) runs
+there. The person saying where decides. A thread spawned to carry on or help
+with an existing thread's work runs where that thread runs. `workers` on a
+send moves that thread there. A thread spawned without one (a new thread
+typed straight in, or one the plan left it off) is asked about with `place`
+when it is first put on a worker.
 
 When the person edits a request they sent, `revise` plans the edited text.
 Every thread the request already reached gets the edit as a correction from
@@ -46,26 +49,36 @@ to another worker and cuts its turn short); `busy_for` is seconds into its
 current turn.
 """
 
-PLACES = """Each thread's work runs on workers in one of `places`: "sprites" (cloud
-machines) unless the person asks for their own computer ("run locally", "on my
-machine", "on this computer", "don't use sprites"), then "local". A place with a
-non-empty `why` is unavailable: never pick it; pick the other one. Each thread
-has its `workers` in the directory. Give every spawned thread "workers". A thread
-spawned to continue, follow on from or help with an existing thread's work (that
-thread busy, backed_up or stalled, say) runs where that thread runs: its
-`workers`, unless the request asks for the other place. A send's "workers" is ""
-unless the request asks to move that thread to the other place.
+WHERE = """Each thread's work runs on workers in one of `places`; `reaches` says what
+work there can get at. Decide from what the work must touch to get done, not
+from the words it uses. Work on the project itself (its code, tests, builds,
+docs, research on the internet) runs on "sprites". Work that needs anything
+only the person's own computer has runs on "local": a process or app running
+there (why Chrome crashes, what is eating memory), its files outside the
+project, its hardware, devices, desktop, system logs, crash dumps or services,
+its local network. When the person says where ("run it locally", "on my
+machine", "on sprites"), that decides. A place with a non-empty `why` is
+unavailable: never pick it; pick the other one and say what the work will lack
+there. Say in "where", in one sentence, what in the work decided its place.
+"""
+
+PLACES = WHERE + """Each thread has its `workers` in the directory. Give every spawned thread
+"workers". A thread spawned to continue, follow on from or help with an
+existing thread's work (that thread busy, backed_up or stalled, say) runs where
+that thread runs: its `workers`, unless its work needs the other place.
+A send's "workers" is "" unless the request means that thread's work now needs
+the other place (its "where" says why; "" when it stays).
 """
 
 REPLY_FORMAT = """Answer by calling `route` once: `spawn` lists the new threads (each with a
-3-6 word title, its task and its workers), `send` the messages to existing
+3-6 word title, its task, its workers and where), `send` the messages to existing
 threads, and `why` says in one sentence why."""
 
 PLACE = """A request in a software project starts an agent thread. Decide where its
-workers run, one of `places`: "sprites" (cloud machines) unless the request asks
-for the person's own computer ("run locally", "on my machine", "on this computer",
-"don't use sprites"), then "local". A place with a non-empty `why` is unavailable:
-never pick it. Answer by calling `place` once."""
+workers run.
+""" + WHERE + """Answer by calling `place` once, with "workers" and "where"."""
+
+WHERE_FIELD = "one sentence: what in its work decided where it runs"
 
 SYSTEM = """You route requests in a software project to agent threads.
 Each thread is a long-lived agent working in its own git worktree.
@@ -105,8 +118,9 @@ class Router(Protocol):
                      places: list[dict]) -> dict:
         """Plan an edited request; `reached` are the threads the earlier text reached."""
 
-    async def place(self, request: str, places: list[dict]) -> str:
-        """Where a new thread with this request runs: an available place's id."""
+    async def place(self, request: str, places: list[dict]) -> dict:
+        """Where a new thread with this request runs: {"workers": an
+        available place's id, "where": why there}."""
 
 
 def title_for(text: str) -> str:
@@ -122,15 +136,16 @@ def available(places: list[dict]) -> set[str]:
 def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
     """Keep only well-formed entries that point at real threads, each with
     `workers` an available place, or "" (spawn: asked with `place` when it
-    is first put on a worker; send: not moved)."""
+    is first put on a worker; send: not moved), and `where` why there."""
     known, can = {t["id"] for t in directory}, available(places)
 
-    def where(s: dict) -> str:
-        return s["workers"] if s.get("workers") in can else ""
+    def placed(s: dict) -> dict:
+        workers = s["workers"] if s.get("workers") in can else ""
+        return {"workers": workers, "where": str(s.get("where") or "") if workers else ""}
     spawn = [{"title": str(s.get("title") or title_for(str(s.get("request", ""))))[:80],
-              "request": str(s["request"]), "workers": where(s)}
+              "request": str(s["request"]), **placed(s)}
              for s in plan.get("spawn") or [] if isinstance(s, dict) and s.get("request")]
-    send = [{"thread": s["thread"], "message": str(s["message"]), "workers": where(s)}
+    send = [{"thread": s["thread"], "message": str(s["message"]), **placed(s)}
             for s in plan.get("send") or []
             if isinstance(s, dict) and s.get("thread") in known and s.get("message")]
     return {"spawn": spawn, "send": send, "why": str(plan.get("why", ""))}
@@ -141,34 +156,37 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
     the answer has the plan's shape (strict mode). A spawn's `workers` is an
     available place; a send's is one, or "" to leave the thread where it is.
     `send` is offered only when there are threads to send to, and names one
-    of them."""
+    of them. `where` is why a thread runs (or moves) where it does."""
     can = sorted(available(places))
     # Nowhere to run: the thread is refused when it is first put on a worker.
     spawn = {"type": "object", "additionalProperties": False,
-             "required": ["title", "request", "workers"],
+             "required": ["title", "request", "workers", "where"],
              "properties": {"title": {"type": "string", "description": "3-6 word title"},
                             "request": {"type": "string", "description": "the task for that thread"},
-                            "workers": {"type": "string", "enum": can or [""]}}}
+                            "workers": {"type": "string", "enum": can or [""]},
+                            "where": {"type": "string", "description": WHERE_FIELD}}}
     props = {"spawn": {"type": "array", "items": spawn},
              "why": {"type": "string", "description": "one sentence"}}
     if directory:
         props["send"] = {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "required": ["thread", "message", "workers"],
+            "required": ["thread", "message", "workers", "where"],
             "properties": {"thread": {"type": "string", "enum": [t["id"] for t in directory]},
                            "message": {"type": "string", "description": "what to tell it"},
                            "workers": {"type": "string", "enum": [""] + can,
-                                       "description": "\"\" unless the request moves the thread"}}}}
+                                       "description": "\"\" unless its work now needs the other place"},
+                           "where": {"type": "string", "description": "why it moves; \"\" when it stays"}}}}
     return {"name": "route", "description": "Route the request: the threads to spawn and the messages to send.",
             "parameters": {"type": "object", "additionalProperties": False,
                            "required": list(props), "properties": props}}
 
 
 def place_tool(places: list[dict]) -> dict:
-    return {"name": "place", "description": "Say where the new thread's workers run.",
-            "parameters": {"type": "object", "additionalProperties": False, "required": ["workers"],
+    return {"name": "place", "description": "Say where the new thread's workers run, and why.",
+            "parameters": {"type": "object", "additionalProperties": False, "required": ["workers", "where"],
                            "properties": {"workers": {"type": "string",
-                                                      "enum": sorted(available(places)) or [""]}}}}
+                                                      "enum": sorted(available(places)) or [""]},
+                                          "where": {"type": "string", "description": WHERE_FIELD}}}}
 
 
 class ModelRouter:
@@ -222,11 +240,12 @@ class ModelRouter:
         return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
                                directory, places)
 
-    async def place(self, request: str, places: list[dict]) -> str:
-        got = (await self._call(PLACE, {"request": request, "places": places}, place_tool(places))).get("workers")
-        if got not in available(places):
-            raise ValueError(f"the router model ({self.model}) picked no place workers can run in: {got!r}")
-        return got
+    async def place(self, request: str, places: list[dict]) -> dict:
+        got = await self._call(PLACE, {"request": request, "places": places}, place_tool(places))
+        if got.get("workers") not in available(places):
+            raise ValueError(f"the router model ({self.model}) picked no place workers can run in: "
+                             f"{got.get('workers')!r}")
+        return {"workers": got["workers"], "where": str(got.get("where") or "")}
 
 
 ROUTER_MODEL = "deepseek-flash"

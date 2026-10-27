@@ -828,6 +828,16 @@ def service_log_lines(ev: dict) -> list[str]:
 # (Worker.provider), with how the UI names it.
 PLACES = {"local": "This computer", "sprites": "Sprites"}
 
+# What a thread's work can reach in each place: the router places threads by
+# what their work must touch (router.py), so this is what it goes by.
+REACHES = {
+    "local": ("the person's own computer, where this control plane runs, through the runner's sandbox: its "
+              "system read-only (installed programs, /etc, system logs, crash dumps) and its local "
+              "network; not its running processes, the person's home, or its devices"),
+    "sprites": ("a cloud machine with the project's repository, the internet and whatever tools the thread "
+                "installs; it sees nothing of the person's computer"),
+}
+
 
 class PlaceRefused(Exception):
     """A thread was to run where this control plane runs no workers."""
@@ -855,9 +865,11 @@ class Places:
         raise PlaceRefused(f"workers cannot run on {PLACES[place]}: {self.refused[place]}")
 
     def offered(self) -> list[dict]:
-        """Every place, in PLACES order, as the UI shows it: `why` is empty
-        for those this control plane runs workers in."""
-        return [{"id": p, "label": label, "why": self.refused.get(p, "")} for p, label in PLACES.items()]
+        """Every place, in PLACES order, as the UI and the router see it:
+        what work there `reaches`, and `why` not, empty for those this
+        control plane runs workers in."""
+        return [{"id": p, "label": label, "reaches": REACHES[p], "why": self.refused.get(p, "")}
+                for p, label in PLACES.items()]
 
     async def close(self) -> None:
         for provider in self.providers.values():

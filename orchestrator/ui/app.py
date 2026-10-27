@@ -1191,7 +1191,11 @@ def thread_badges(t: i32) -> None:
         el("span")
         cls("badge")
         cls("secondary")
-        attr("title", "Its workers run here, as its request asked; the rest run on Sprites")
+        # The router's reason for putting it here, when it gave one.
+        jstr(t, "workers_why", h_t3)
+        if s_len(h_t3) == 0:
+            s_set(h_t3, "Its workers run on this computer; the rest run on Sprites")
+        attr_ref("title", h_t3)
         text_ref(h_plabel)
         end()
 

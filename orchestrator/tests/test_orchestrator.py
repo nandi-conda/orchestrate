@@ -333,7 +333,8 @@ async def test_heuristic_router():
     many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [], HERE)
     assert [s["request"] for s in many["spawn"]] == ["login page", "export bug", "docs"]
     sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}], HERE)
-    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "workers": ""}]
+    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "workers": "",
+                              "where": ""}]
     assert (await r.plan("fix it locally", [], HERE))["spawn"][0]["workers"] == "local"
     assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
@@ -341,11 +342,11 @@ async def test_heuristic_router():
 def test_clean_plan_drops_unknown_threads():
     plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
                        "send": [{"thread": "t_nope", "message": "m"},
-                                {"thread": "t_1", "message": "m", "workers": "local"}]},
+                                {"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]},
                       [{"id": "t_1"}], HERE)
     # Sprites is not available here: that thread is placed when it is put on a worker.
-    assert [s["workers"] for s in plan["spawn"]] == [""]
-    assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local"}]
+    assert [(s["workers"], s["where"]) for s in plan["spawn"]] == [("", "")]
+    assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]
 
 
 def free_port() -> int:
@@ -977,7 +978,7 @@ class NoRoutingRouter:
         raise AssertionError("the router was asked to plan a request with no text")
 
     async def place(self, request, places):
-        return "local"
+        return {"workers": "local", "where": ""}
 
 
 async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, monkeypatch):
@@ -2363,9 +2364,10 @@ class StandInSprites(LocalProvider):
 
 
 async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
-    """Threads go on Sprites unless the request says to run locally; a place
-    this control plane runs no workers in is never picked, and saying so
-    to an existing thread moves it."""
+    """Threads go where the router puts them (the heuristic router: Sprites
+    unless the request says to run locally), with its reason; a place this
+    control plane runs no workers in is never picked, and saying so to an
+    existing thread moves it, with the reason in its `moved` event."""
     from control.providers import Places
 
     places = Places({"local": LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
@@ -2375,7 +2377,9 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
-            assert [p["id"] for p in (await c.get("/api/places")).json()] == ["local", "sprites"]
+            offered = (await c.get("/api/places")).json()
+            assert [p["id"] for p in offered] == ["local", "sprites"]
+            assert all(p["reaches"] for p in offered)  # what the router places threads by
             pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
             cloud = (await c.post(f"/api/projects/{pid}/requests",
                                   json={"text": "add a login page", "mode": "new"})).json()["spawned"][0]["id"]
@@ -2393,7 +2397,7 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
                         and e["payload"]["mode"] == "auto"] or None
             local_tid = (await wait_for(routed))[0]["payload"]["spawned"][0]["id"]
             t = await wait_for(lambda: bound(local_tid))
-            assert (t["workers"], t["worker_id"]) == ("local", "w1")
+            assert (t["workers"], t["worker_id"], t["workers_why"]) == ("local", "w1", "the request says where")
 
             # "run locally" in a request that goes to the cloud thread moves it.
             await c.post(f"/api/projects/{pid}/requests",
@@ -2403,6 +2407,9 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
                 t = (await c.get(f"/api/threads/{cloud}")).json()
                 return t if t["worker_id"] == "w1" and t["binding"] == "bound" else None
             assert (await wait_for(moved))["workers"] == "local"
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            assert [e["payload"] for e in log if e["type"] == "moved"] == [
+                {"from": "sprites", "to": "local", "why": "the request says where"}]
 
 
 async def test_sprites_without_a_token_is_never_picked(tmp_path):

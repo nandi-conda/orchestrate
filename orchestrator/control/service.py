@@ -897,7 +897,8 @@ class Orchestrator:
         try:
             # A thread it spawns runs where it runs.
             t = await self.spawn(project_id, title or title_for(request), request, parent,
-                                 workers=caller["workers"])
+                                 workers=caller["workers"],
+                                 where=f"it runs where thread {caller['id']}, which started it, runs")
         except (RuntimeError, ArchivedError) as e:
             raise PeerCallError(str(e)) from None
         return {"id": t["id"], "title": t["title"]}
@@ -985,9 +986,10 @@ class Orchestrator:
             await hub.connect(fields["repo_url"])
         return await self.store.update_project(project_id, **fields)
 
-    async def move(self, thread_id: str, place: str) -> None:
+    async def move(self, thread_id: str, place: str, where: str = "") -> None:
         """Have a thread's workers run on `place` from now on (the router
-        read it in a request, "run it locally"): PlaceRefused, and nothing
+        read in a request that its work needs that place, for the reason
+        `where`): PlaceRefused, and nothing
         changed, for a place this control plane runs none in. A thread on a
         worker elsewhere, or being put on one, is stopped there and unbound
         (a turn under way fails); it comes back on a worker of `place`, from
@@ -996,8 +998,9 @@ class Orchestrator:
         t = await self.store.get_thread(thread_id)
         if t["workers"] == place:
             return
-        await self.store.update_thread(thread_id, workers=place)
-        await self.store.append_event(t["project_id"], thread_id, "moved", {"from": t["workers"], "to": place})
+        await self.store.update_thread(thread_id, workers=place, workers_why=where)
+        await self.store.append_event(t["project_id"], thread_id, "moved",
+                                      {"from": t["workers"], "to": place, "why": where})
         why = f"its workers run on {PLACES[place]} now; it comes back there with its next message, or with Respawn"
         task = self.binding.get(thread_id)
         if task is not None:
@@ -1060,11 +1063,11 @@ class Orchestrator:
     # ---------------------------------------------------------------- threads
 
     async def spawn(self, project_id: str, title: str, request: str, parent: str | None = None,
-                    images: list[dict] | None = None, workers: str = "") -> dict:
+                    images: list[dict] | None = None, workers: str = "", where: str = "") -> dict:
         """A new thread, put on a worker in the background. `workers` is where
-        its workers run, as the router planned it (PlaceRefused for a place
-        this control plane runs none in); "" has the router decide from its
-        request when it is first put on a worker (_bind)."""
+        its workers run, as the router planned it, and `where` why (PlaceRefused
+        for a place this control plane runs none in); "" has the router decide
+        from its request when it is first put on a worker (_bind)."""
         project = await self.open_project(project_id)
         if workers:
             self.places.provider(workers)
@@ -1072,7 +1075,7 @@ class Orchestrator:
                    if t["state"] in ("queued", "working")]
         if len(running) >= self.max_running:
             raise RuntimeError(f"project has {len(running)} running threads (limit {self.max_running})")
-        thread = await self.store.create_thread(project["id"], title, request, workers, parent)
+        thread = await self.store.create_thread(project["id"], title, request, workers, parent, where)
         tid = thread["id"]
         created = {"title": title, "request": request, "parent": parent}
         if images:
@@ -1128,9 +1131,10 @@ class Orchestrator:
         try:
             if not t["workers"]:
                 async with steps.step("asking the router where its workers run"):
-                    place = await self.router.place(t["request"], self.places.offered())
-                t = await self.store.update_thread(tid, workers=place)
-                steps.note(f"its workers run on {PLACES[place]}")
+                    placed = await self.router.place(t["request"], self.places.offered())
+                t = await self.store.update_thread(tid, workers=placed["workers"], workers_why=placed["where"])
+            steps.note(f"its workers run on {PLACES[t['workers']]}"
+                       + (f": {t['workers_why']}" if t["workers_why"] else ""))
             lw = old
             if lw is not None and lw.worker.provider != t["workers"]:
                 steps.note(f"worker {lw.worker.id} is on {PLACES[lw.worker.provider]}, and its workers run "
@@ -1622,13 +1626,14 @@ class Orchestrator:
             plan = await self.router.plan(text, directory, self.places.offered())
         spawned, sent = [], []
         for s in plan["spawn"]:
-            t = await self.spawn(project_id, s["title"], s["request"], images=images, workers=s.get("workers", ""))
+            t = await self.spawn(project_id, s["title"], s["request"], images=images,
+                                 workers=s.get("workers", ""), where=s.get("where", ""))
             spawned.append({"id": t["id"], "title": t["title"]})
         # A message the router wrote is from the router; one sent directly is the user's own.
         sender = "user" if mode == "thread" else "router"
         for s in plan["send"]:
             if s.get("workers"):
-                await self.move(s["thread"], s["workers"])
+                await self.move(s["thread"], s["workers"], s.get("where", ""))
             await self.send(s["thread"], s["message"], sender, images=images)
             sent.append(s["thread"])
         # The summary names threads by title; the ids stay in spawned and sent.
@@ -1726,11 +1731,12 @@ class Orchestrator:
             await self.send(tid, body, "user", edit=seq)
         spawned, told = [], []
         for s in plan["spawn"]:
-            t = await self.spawn(project_id, s["title"], s["request"], workers=s.get("workers", ""))
+            t = await self.spawn(project_id, s["title"], s["request"],
+                                 workers=s.get("workers", ""), where=s.get("where", ""))
             spawned.append({"id": t["id"], "title": t["title"]})
         for s in plan["send"]:
             if s.get("workers"):
-                await self.move(s["thread"], s["workers"])
+                await self.move(s["thread"], s["workers"], s.get("where", ""))
             await self.send(s["thread"], s["message"], "router")
             told.append(s["thread"])
         titles = {t["id"]: t["title"] for t in directory}

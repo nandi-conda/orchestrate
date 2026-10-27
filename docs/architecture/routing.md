@@ -106,27 +106,40 @@ beside the thread's state, marked once the thread is backed up.
 ### Where threads run
 
 There is no setting for it: the router decides, per thread, whether its
-workers run on Sprites or on this computer. Each plan entry carries
-`workers`: `"sprites"` unless the request asks for the person's own computer
-("run it locally", "on my machine", "don't use sprites"), then `"local"`. The
-router sees `places` (`GET /api/places`): the places this control plane can
-run workers in, and why not the others (no `SPRITES_TOKEN`, not Linux, a
-phone). It never picks an unavailable one, so without a token every thread
-goes on this computer, and on a phone every thread goes on Sprites.
+workers run on Sprites or on this computer, from what the thread's work must
+touch, not from keywords. Work on the project (code, tests, builds, docs,
+research on the internet) goes on Sprites; work that needs something only the
+person's own computer has (a process or app running there, why Chrome keeps
+crashing, files outside the project, its hardware, system logs, crash dumps,
+services, its local network) goes on this computer. The person saying where
+("run it locally", "on sprites") decides.
+
+The router sees `places` (`GET /api/places`): each place with what work there
+`reaches` (`providers.REACHES`, true to the runner's sandbox there), and why
+not, for the ones this control plane runs no workers in (no `SPRITES_TOKEN`,
+not Linux, a phone). It never picks an unavailable one, so without a token
+every thread goes on this computer, and on a phone every thread goes on
+Sprites; its reason then says what the work will lack.
+
+Each plan entry carries `workers` and `where`, the router's one-sentence
+reason. The thread keeps it as `workers_why`: its Worker log says "its workers
+run on This computer: ...", and its "This computer" badge shows it on hover.
 
 - A thread with no place yet (one typed with **New thread**, or created by
   `POST /api/projects/{id}/threads`, or one the plan left without) is placed
-  by `Router.place` from its request when it is first put on a worker; its
-  Worker log says "asking the router where its workers run".
+  by `Router.place` (which answers `workers` and `where` the same way) from
+  its request when it is first put on a worker; its Worker log says "asking
+  the router where its workers run".
 - A thread a peer spawns runs where its parent runs, so a local thread that
   needs help gets local helpers.
 - A thread the router spawns to carry on or help with an existing thread's
   work (that thread busy, backed up or stalled) runs where that thread runs,
   unless the request asks for the other place. The router sees each thread's
   `workers` in the directory.
-- A `send` entry with `workers` moves that thread (`Orchestrator.move`): it
-  is stopped and unbound where it runs, and comes back on the new place with
-  the message, from its work in the hub. Its log shows a `moved` event.
+- A `send` entry with `workers` moves that thread (`Orchestrator.move`), when
+  the request means its work now needs the other place: it is stopped and
+  unbound where it runs, and comes back on the new place with the message,
+  from its work in the hub. Its log shows a `moved` event with the reason.
 
 ## Sending never waits
 

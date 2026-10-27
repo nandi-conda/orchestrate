@@ -73,8 +73,9 @@ class Store(Protocol):
         or archived_at (Orchestrator.archive_project)."""
 
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None) -> dict:
-        """A new thread whose workers run on `workers` (providers.PLACES)."""
+                            parent_id: str | None = None, workers_why: str = "") -> dict:
+        """A new thread whose workers run on `workers` (providers.PLACES),
+        for the reason `workers_why` (the router's)."""
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         """The project's threads that are not archived, or with archived=True
         only the archived ones; working (queued or working) threads first,
@@ -196,13 +197,13 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
-                 "archived_at", "binding", "binding_reason", "workers")
+                 "archived_at", "binding", "binding_reason", "workers", "workers_why")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
 # A thread's `workers` is where its workers run (providers.PLACES), as the
 # router decided; "" only in a database from before threads had a place,
-# until Orchestrator.start fills it in.
+# until Orchestrator.start fills it in. `workers_why` is the router's reason.
 ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("threads", "workers", "TEXT NOT NULL DEFAULT ''"),
                  ("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
@@ -216,7 +217,8 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("workers", "state", "TEXT NOT NULL DEFAULT 'ready'"),
                  ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''"),
                  ("events", "peer_id", "TEXT"),
-                 ("threads", "busy_since", "DOUBLE PRECISION")]
+                 ("threads", "busy_since", "DOUBLE PRECISION"),
+                 ("threads", "workers_why", "TEXT NOT NULL DEFAULT ''")]
 
 
 def _thread(row: dict) -> dict:
@@ -284,10 +286,10 @@ class _SqlStore:
 
     # threads
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None) -> dict:
+                            parent_id: str | None = None, workers_why: str = "") -> dict:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
-               "workers": workers,
+               "workers": workers, "workers_why": workers_why,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
                "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
                "busy_since": t}

@@ -253,12 +253,17 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     places = [{"id": "local", "label": "This computer", "why": ""},
               {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
     seen: list = []
-    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local"}],
-                                     "send": [{"thread": "t_1", "message": "heads up", "workers": ""}],
+    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
+                                                "where": "Sprites are not available"}],
+                                     "send": [{"thread": "t_1", "message": "heads up", "workers": "",
+                                               "where": "it stays"}],
                                      "why": "new work"}), seen)
     plan = await r.plan("fix it", [{"id": "t_1", "title": "Old"}], places)
-    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local"}],
-                    "send": [{"thread": "t_1", "message": "heads up", "workers": ""}], "why": "new work"}
+    # A send that moves nothing keeps no reason for a move.
+    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
+                               "where": "Sprites are not available"}],
+                    "send": [{"thread": "t_1", "message": "heads up", "workers": "", "where": ""}],
+                    "why": "new work"}
     body = seen[0]
     assert body["thinking"] == {"type": "disabled"}
     assert body["tool_choice"] == {"type": "function", "function": {"name": "route"}}
@@ -266,6 +271,7 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     assert fn["strict"] is True and fn["name"] == "route"
     props = fn["parameters"]["properties"]
     assert props["spawn"]["items"]["properties"]["workers"]["enum"] == ["local"]
+    assert "where" in props["spawn"]["items"]["required"] and "where" in props["send"]["items"]["required"]
     assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
     assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
     # With no threads there is nothing to send to, so the schema has no send.
@@ -743,11 +749,12 @@ async def test_the_router_model_never_places_a_thread_where_workers_cannot_run(m
     r = ModelRouter("key")
 
     async def answer(system, content, tool):
-        assert content["places"] == places and "run locally" in system
+        assert content["places"] == places and "run it locally" in system
         assert tool["parameters"]["properties"]["workers"]["enum"] == ["local"]
-        return {"workers": "sprites"}
+        assert tool["parameters"]["required"] == ["workers", "where"]
+        return {"workers": "sprites", "where": "it is code"}
     monkeypatch.setattr(r, "_call", answer)
     with pytest.raises(ValueError, match="picked no place"):
         await r.place("do it", places)
-    monkeypatch.setattr(r, "_call", lambda *_: asyncio.sleep(0, {"workers": "local"}))
-    assert await r.place("do it", places) == "local"
+    monkeypatch.setattr(r, "_call", lambda *_: asyncio.sleep(0, {"workers": "local", "where": "Chrome runs here"}))
+    assert await r.place("why does Chrome crash", places) == {"workers": "local", "where": "Chrome runs here"}

@@ -142,7 +142,8 @@ def display(ev: dict) -> dict:
         text = f"project {label}"
     elif t == "moved":
         kind, label = K_STATUS, "moved"
-        text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now"
+        text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now" + \
+            (f": {d['why']}" if d.get("why") else "")
     elif t == "worker_lost":
         kind, label, text = K_ERROR, "worker lost", d.get("error", "")
     elif t == "worker_restarted":
@@ -255,7 +256,7 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
     is bound to (states.py), each with why, and its load (load.py)."""
     view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
                               "binding", "binding_reason", "worker_id", "files", "archived_at", "created_at",
-                              "updated_at", "load", "workers")}
+                              "updated_at", "load", "workers", "workers_why")}
     view["worker_state"], view["worker_reason"] = orch.worker_state(t)
     return view
 
