@@ -90,7 +90,7 @@ Then create a project, type a request, and press Enter. The
 | --- | --- | --- |
 | nothing | the control plane does not start: `DEEPSEEK_API_KEY` is required | |
 | `DEEPSEEK_API_KEY` | the real runner as a local subprocess (Linux), a pool of 3 shared by every project | `deepseek-flash` (`ModelRouter`) |
-| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, a pool of 3: `orch-w1`..`orch-w3` | `deepseek-flash` |
+| `DEEPSEEK_API_KEY` + `SPRITES_TOKEN` | the real runner on Fly Sprites, a pool of 3: `orch-<pool>-w1`..`orch-<pool>-w3` | `deepseek-flash` |
 
 !!! warning "Sprites cost money"
     With `SPRITES_TOKEN` stored, the first thread creates a billable sprite,

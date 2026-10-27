@@ -2,10 +2,12 @@
 
 ## The worker pool
 
-Workers are a **pool of 3, shared by every project** (`POOL` in
-`orchestrator/control/service.py`). Each worker sits in a numbered slot, and a
-slot always names the same worker: `orch-w1`, `orch-w2`, `orch-w3` on Sprites
-(labeled `orchestrator`), `w1`..`w3` locally. That is the whole lifecycle
+Workers are a **pool of 3 per control plane, shared by every project**
+(`POOL` in `orchestrator/control/service.py`). The pool has a name, made once
+and kept in the control plane's store (`Store.pool_id`, eight hex digits).
+Each worker sits in a numbered slot, and a slot always names the same worker:
+`orch-<pool>-w1`, `orch-<pool>-w2`, `orch-<pool>-w3` on Sprites (labeled
+`orchestrator-<pool>`), `w1`..`w3` locally. That is the whole lifecycle
 policy:
 
 - **Made only to fill an empty slot.** A thread goes on the least loaded
@@ -19,11 +21,12 @@ policy:
   little. A lost worker's slot is filled again by a new worker of the same
   name.
 - **Swept at startup.** Before it takes work, the control plane lists the
-  provider's workers and destroys every one of ours that is not a slot: each
-  project's own workers from before the pool (`orch-p-<id>-w<n>`), slots
-  beyond the pool's size, and the pool of a control plane whose store is
-  gone. The store marks the ones it knew as lost, with why. Sprites not named
-  `orch-` with the label or the old per-project names are never touched.
+  provider's workers and destroys every one of its pool's that is not a
+  slot (slots beyond the pool's size), and those from before pools had
+  names: the one pool every control plane shared (`orch-w<n>`, labeled
+  `orchestrator`) and each project's own workers (`orch-p-<id>-w<n>`). The
+  store marks the ones it knew as lost, with why. Other pools' sprites, and
+  sprites that are not ours, are never touched.
 - **Projects share workers, not repositories.** A worker keeps one
   repository per project (`.repos/<project>`), a thread sees only its own
   project's, and each peer call is answered within the calling thread's
@@ -31,9 +34,11 @@ policy:
   worktrees, homes); its hub keeps everything, so unarchiving brings its
   threads back on the pool.
 
-One control plane uses a Sprites organization's pool at a time: a second one
-pointed at the same token attaches to the same slots and restarts their
-runners under its own token.
+Several control planes can share one Sprites organization (the phone app
+and the desktop window, say): each has its own pool, so none restarts
+another's runners under its own token or prunes its projects off them. A
+pool whose store is deleted is left on the organization; destroy its
+`orch-<pool>-w<n>` sprites by hand.
 
 ## Worker states and thread binding
 
@@ -197,7 +202,7 @@ as a thread's state.
   and reason, and that Respawn brings it back.
 - **Now:** while binding, the activity line names the step under way
   (`picking a worker of the pool`, `waiting for worker slot 2 to come up`,
-  `sending worker orch-w1 the bundle (12 KiB)`, ...), with how long it has
+  `sending worker orch-3f9a1c2b-w1 the bundle (12 KiB)`, ...), with how long it has
   taken once it passes 15 seconds.
 - **The Files tab** of a thread on no ready worker answers at once with
   where the thread stands, and lists the files once its binding event says
@@ -208,8 +213,8 @@ as a thread's state.
 - **The Worker log tab** opens with two lines, then the worker's runner log:
 
   ```text
-  thread t_ab12 is bound: on worker orch-w1, idle until its next message
-  worker orch-w1 is ready: its runner answers again
+  thread t_ab12 is bound: on worker orch-3f9a1c2b-w1, idle until its next message
+  worker orch-3f9a1c2b-w1 is ready: its runner answers again
   ```
 
   Then, once a thread has been put on a worker by this control plane, the
@@ -230,10 +235,10 @@ waiting on:
 ```text
 INFO:orchestrator:thread t_ab12: picking a worker of the pool ...
 INFO:orchestrator:thread t_ab12: waiting for worker slot 1 to come up ...
-INFO:orchestrator:worker orch-w1: making sprite orch-w1, or finding it made ...
-INFO:orchestrator:worker orch-w1: asking its runner whether it is orchestrate 1a2b3c4d5e6f as this control plane would start it (up to 60s: a paused sprite wakes) ...
-INFO:orchestrator:worker orch-w1: installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) ...
-INFO:orchestrator:worker orch-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
+INFO:orchestrator:worker orch-3f9a1c2b-w1: making sprite orch-3f9a1c2b-w1, or finding it made ...
+INFO:orchestrator:worker orch-3f9a1c2b-w1: asking its runner whether it is orchestrate 1a2b3c4d5e6f as this control plane would start it (up to 60s: a paused sprite wakes) ...
+INFO:orchestrator:worker orch-3f9a1c2b-w1: installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) ...
+INFO:orchestrator:worker orch-3f9a1c2b-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
 ```
 
 A worker being made holds up only the threads waiting for it: other threads

@@ -241,6 +241,7 @@ class Orchestrator:
         # so a later control plane attaches to it again by its slot. A lost
         # worker's slot is filled again with a new worker of the same name.
         self.pool = pool
+        self.pool_id = ""  # the pool's name (Store.pool_id), from start()
         self.workers: list[LiveWorker] = []
         # Notified whenever a worker may have room again (a thread's state
         # changed, a worker's did, a start was posted); _pick_worker waits on it.
@@ -304,18 +305,20 @@ class Orchestrator:
 
     async def start(self) -> None:
         """Make the provider hold the pool's workers and nothing else: every
-        worker of ours it has outside the slots is destroyed (workers each
-        project had before the pool, a pool that was bigger, workers of a
-        control plane whose store is gone), and the store says so of those it
-        knew. Called once, before the control plane takes work."""
-        destroyed = await self.provider.sweep(self.pool)
+        worker of this pool it has outside the slots is destroyed (a pool that
+        was bigger), with those from before pools had names (each project's
+        own, then the one pool every control plane shared), and the store says
+        so of those it knew. Other control planes' pools are left alone.
+        Called once, before the control plane takes work."""
+        self.pool_id = await self.store.pool_id()
+        destroyed = await self.provider.sweep(self.pool, self.pool_id)
         if destroyed:
             log.warning("destroyed %d worker(s) outside the pool's %d slots: %s",
                         len(destroyed), self.pool, ", ".join(destroyed))
         for w in await self.store.list_workers():
-            if w["lost_at"] is None and not (pooled(w) and w["idx"] <= self.pool):
-                await self.store.lose_worker(w["id"], f"workers are a pool of {self.pool} shared by every "
-                                                      "project; this one was outside it and was destroyed", "")
+            if w["lost_at"] is None and (w["id"] in destroyed or not (pooled(w) and w["idx"] <= self.pool)):
+                await self.store.lose_worker(w["id"], f"outside this control plane's pool of {self.pool} "
+                                                      "workers, so it was destroyed", "")
 
     # ---------------------------------------------------------------- workers
 
@@ -438,7 +441,7 @@ class Orchestrator:
         thread of `project`, whose log says so. Only _attached calls it, so
         each slot has one attach at a time."""
         spec = worker_spec(index)
-        spec.steps = steps
+        spec.pool, spec.steps = self.pool_id, steps
         spec.token = next((w["token"] for w in await self.store.list_workers()
                            if w["idx"] == index and pooled(w) and w["lost_at"] is None), "")
         async with steps.step(f"making or finding its worker ({self.provider.name} provider)"):

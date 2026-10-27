@@ -97,8 +97,8 @@ class Recording:
     async def destroy(self, worker) -> None:
         self.destroyed.append(worker)
 
-    async def sweep(self, slots):
-        return [f"{self.name}-swept-beyond-{slots}"]
+    async def sweep(self, slots, pool):
+        return [f"{self.name}-swept-{pool}-beyond-{slots}"]
 
     async def close(self) -> None:
         pass
@@ -200,7 +200,9 @@ async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
     try:
         assert (p.source, p.ref) == ("https://example.com/fork.git", "dev")
-        assert p.sprite_name(1) == "orch-w1"
+        assert p.sprite_name(1, "3f9a1c2b") == "orch-3f9a1c2b-w1"
+        with pytest.raises(ValueError, match="pool"):
+            p.sprite_name(1, "")
     finally:
         await p.close()
 
@@ -233,7 +235,7 @@ async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
     try:
         with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
-            await p.create(providers.WorkerSpec(index=1))
+            await p.create(providers.WorkerSpec(index=1, pool="ab12"))
     finally:
         await p.close()
 
@@ -316,7 +318,7 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
     env.setattr(providers, "wait_healthy", healthy)
     env.setattr(p, "accepts_token", accepts)
     try:
-        return await p.create(providers.WorkerSpec(index=1, token="stored")), fake
+        return await p.create(providers.WorkerSpec(index=1, pool="ab12", token="stored")), fake
     finally:
         await fake.aclose()
 
@@ -325,7 +327,7 @@ async def test_sprites_create_restarts_a_runner_an_earlier_control_plane_started
     """`start` leaves a running runner as it was: its old code and its old
     model key. A service already defined is restarted from the new definition."""
     worker, fake = await _sprites_create(env, defined=True)
-    assert worker.id == "orch-w1" and fake.labels == ["orchestrator"]  # the slot's sprite, labeled
+    assert worker.id == "orch-ab12-w1" and fake.labels == ["orchestrator-ab12"]  # the slot's sprite, labeled
     assert fake.actions == ["restart"]
     assert worker.token == "stored" and fake.service["env"]["RUNNER_TOKEN"] == "stored"
     assert fake.service["env"]["DEEPSEEK_API_KEY"] == "key"
@@ -372,7 +374,7 @@ async def test_a_local_runner_that_exits_at_startup_says_why(tmp_path, monkeypat
     monkeypatch.setattr(p, "command", lambda: [sys.executable, "-c",
                                                "print('bubblewrap cannot make a sandbox here'); raise SystemExit(1)"])
     with pytest.raises(RuntimeError, match="exited with code 1.*\n.*bubblewrap cannot make a sandbox here"):
-        await p.create(providers.WorkerSpec(index=1))
+        await p.create(providers.WorkerSpec(index=1, pool="ab12"))
 
 
 async def test_local_follow_yields_the_backlog_then_each_new_line(tmp_path):
@@ -467,19 +469,22 @@ async def test_a_new_sprite_is_made_with_the_label(env):
 
     p.http = types.SimpleNamespace(post=post, aclose=lambda: asyncio.sleep(0))
     with pytest.raises(RuntimeError, match="stop after"):
-        await p.create(providers.WorkerSpec(index=2))
-    assert made == [{"name": "orch-w2", "url_settings": {"auth": "public"}, "labels": ["orchestrator"]}]
+        await p.create(providers.WorkerSpec(index=2, pool="ab12"))
+    assert made == [{"name": "orch-ab12-w2", "url_settings": {"auth": "public"}, "labels": ["orchestrator-ab12"]}]
 
 
 async def test_sprites_sweep_destroys_ours_outside_the_slots_only(env):
-    """Labeled sprites beyond the pool, and each project's own workers from
-    before the pool, go; the slots and sprites that are not ours stay."""
+    """This pool's sprites beyond its slots go, and so do those from before
+    pools had names (the one shared pool, each project's own workers); its
+    slots, another control plane's pool and sprites that are not ours stay."""
     p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
-    pages = {None: {"sprites": [{"name": "orch-w1", "labels": ["orchestrator"]},
-                                {"name": "orch-w4", "labels": ["orchestrator"]},
+    pages = {None: {"sprites": [{"name": "orch-ab12-w1", "labels": ["orchestrator-ab12"]},
+                                {"name": "orch-ab12-w4", "labels": ["orchestrator-ab12"]},
+                                {"name": "orch-cd34-w4", "labels": ["orchestrator-cd34"]},
+                                {"name": "orch-w1", "labels": ["orchestrator"]},
                                 {"name": "orch-p-ab12cd34-w1", "labels": []}],
                     "has_more": True, "next_continuation_token": "next"},
-             "next": {"sprites": [{"name": "orch-w3", "labels": ["orchestrator"]},
+             "next": {"sprites": [{"name": "orch-ab12-w3", "labels": ["orchestrator-ab12"]},
                                   {"name": "orch-notes", "labels": []}],
                       "has_more": False}}
     asked, deleted = [], []
@@ -493,8 +498,8 @@ async def test_sprites_sweep_destroys_ours_outside_the_slots_only(env):
         return httpx.Response(204, request=httpx.Request("DELETE", url))
 
     p.http = types.SimpleNamespace(get=get, delete=delete)
-    assert await p.sweep(3) == ["orch-p-ab12cd34-w1", "orch-w4"]
-    assert sorted(deleted) == ["/sprites/orch-p-ab12cd34-w1", "/sprites/orch-w4"]
+    assert await p.sweep(3, "ab12") == ["orch-ab12-w4", "orch-p-ab12cd34-w1", "orch-w1"]
+    assert sorted(deleted) == ["/sprites/orch-ab12-w4", "/sprites/orch-p-ab12cd34-w1", "/sprites/orch-w1"]
     assert all(a["prefix"] == "orch-" for a in asked) and len(asked) == 2
 
 
@@ -502,11 +507,11 @@ async def test_local_sweep_deletes_worker_directories_outside_the_slots(tmp_path
     for d in ("w1", "w2", "w3", "p_1-w1"):
         (tmp_path / d).mkdir()
     p = providers.LocalProvider(workdir=str(tmp_path), command=ECHO_RUNNER)
-    assert await p.sweep(2) == ["p_1-w1", "w3"]
+    assert await p.sweep(2, "ab12") == ["p_1-w1", "w3"]
     assert sorted(d.name for d in tmp_path.iterdir()) == ["w1", "w2"]
 
 
 async def test_auto_sweeps_the_provider_the_pool_is_on(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     p = providers.AutoProvider(local=Recording("local"), sprites=Recording("sprites"))
-    assert await p.sweep(3) == ["sprites-swept-beyond-3"]
+    assert await p.sweep(3, "ab12") == ["sprites-swept-ab12-beyond-3"]

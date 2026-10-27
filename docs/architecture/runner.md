@@ -9,9 +9,9 @@ connects out to the control plane.
 ## Workers on Fly Sprites
 
 With `SPRITES_TOKEN` stored, each worker is a [Fly Sprite](https://sprites.dev)
-named for its slot in the pool, `orch-w1` to `orch-w3`, and labeled
-`orchestrator`. Workers are not per thread or per project: the pool of 3 is
-shared by every project, each worker holding one repository per project. New
+named for its control plane's pool and its slot in it, `orch-<pool>-w1` to
+`orch-<pool>-w3`, and labeled `orchestrator-<pool>`. Workers are not per
+thread or per project: the pool of 3 is shared by every project of its control plane, each worker holding one repository per project. New
 threads go to the least loaded worker, and wait when all are full. See
 [The worker pool](../worker-lifecycle.md#the-worker-pool).
 
@@ -145,7 +145,7 @@ The exact paths are in the [runner API reference](../reference/runner-api.md#san
 ## Logs
 
 Every worker's runner log streams to the control plane's stdout, each line
-prefixed with its worker (`orch-w1 | INFO: runner.harness: ...`);
+prefixed with its worker (`orch-3f9a1c2b-w1 | INFO: runner.harness: ...`);
 attaching a worker prints its last 50 lines first. For a sprite the control
 plane follows `GET /v1/sprites/<name>/services/runner/logs` (NDJSON); for a
 local worker, its `runner.log`. Tracebacks, prime-agent's stderr, failed model

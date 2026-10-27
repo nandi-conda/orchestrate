@@ -127,6 +127,11 @@ class Store(Protocol):
         `lost_at` is set once it was lost. `project_id` is "" for the pool's
         workers, and names the project of a worker from before workers were
         a pool shared by every project (each project had its own)."""
+    async def pool_id(self) -> str:
+        """The name of this store's worker pool, made the first time it is
+        asked for and the same ever after. Each control plane's pool is its
+        own (providers name its workers with it), so two control planes on
+        one Sprites org never take each other's workers."""
 
 
 class Notifier:
@@ -173,6 +178,7 @@ SCHEMA = [
         created_at DOUBLE PRECISION NOT NULL, lost_at DOUBLE PRECISION,
         lost_reason TEXT NOT NULL DEFAULT '', lost_log TEXT NOT NULL DEFAULT '',
         state TEXT NOT NULL DEFAULT 'ready', state_reason TEXT NOT NULL DEFAULT '')""",
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ]
 
 SQLITE_EVENTS = """CREATE TABLE IF NOT EXISTS events (
@@ -448,6 +454,12 @@ class _SqlStore:
         rows = await self._fetch(self._q("SELECT DISTINCT project_id FROM threads WHERE worker_id = ? "
                                          "ORDER BY project_id"), worker_id)
         return [r["project_id"] for r in rows]
+
+    async def pool_id(self) -> str:
+        # Two control planes opening one new store at once make one name: the first insert wins.
+        await self._exec(self._q("INSERT INTO meta (key, value) VALUES ('pool', ?) ON CONFLICT (key) DO NOTHING"),
+                         secrets.token_hex(4))
+        return (await self._fetchone(self._q("SELECT value FROM meta WHERE key = 'pool'")))["value"]
 
 
 class SqliteStore(_SqlStore):

@@ -5,12 +5,14 @@ every project. The control plane keeps a pool of a fixed number of workers,
 shared by all its projects, each in a slot numbered from 1 (WorkerSpec.index):
 a slot always names the same worker, so the pool never holds more workers
 than it has slots, and a provider can tell which of the workers it has are
-the pool's (`sweep` destroys the rest).
+the pool's (`sweep` destroys the rest). The pool has a name of its own, kept
+in the control plane's store (Store.pool_id): two control planes (a phone and
+a desktop) on one Sprites org each have their own workers.
 
 - `LocalProvider` starts runners from ../runner as subprocesses on this
   machine. It needs DEEPSEEK_API_KEY, as the runner does.
-- `SpritesProvider` makes a Fly Sprite per slot, `orch-w<n>`, labeled
-  `orchestrator`, installs the runner on it and runs it as a sprite service
+- `SpritesProvider` makes a Fly Sprite per slot, `orch-<pool>-w<n>`, labeled
+  `orchestrator-<pool>`, installs the runner on it and runs it as a sprite service
   on port 8080.
 - `AutoProvider` is the default: sprites whenever `SPRITES_TOKEN` is stored,
   local workers otherwise.
@@ -64,6 +66,7 @@ class Worker:
 @dataclass
 class WorkerSpec:
     index: int  # the pool slot, from 1: it names the worker
+    pool: str = ""  # the pool's name (Store.pool_id): it names the worker too
     capacity: int = 16
     env: dict = field(default_factory=dict)
     # The token of the worker this slot names, when one was made before: a
@@ -86,10 +89,11 @@ class WorkerProvider(Protocol):
 
     async def destroy(self, worker: Worker) -> None: ...
 
-    async def sweep(self, slots: int) -> list[str]:
-        """Destroy every worker of the control plane's this provider has that
-        is not in one of the pool's `slots` (left by an earlier pool, or a
-        control plane whose store is gone); the names of those destroyed."""
+    async def sweep(self, slots: int, pool: str) -> list[str]:
+        """Destroy every worker of pool `pool` this provider has that is not
+        in one of its `slots` (left by an earlier, bigger pool), and those
+        from before pools had names; the names of those destroyed. Other
+        pools' workers are left alone: another control plane uses them."""
 
     async def exists(self, worker: Worker) -> bool:
         """Whether the worker is still there, whatever its runner answers now.
@@ -284,9 +288,11 @@ class LocalProvider:
     def worker_name(index: int) -> str:
         return f"w{index}"
 
-    async def sweep(self, slots: int) -> list[str]:
+    async def sweep(self, slots: int, pool: str) -> list[str]:
         """Every worker directory but the slots' (each holds a worker's disk
-        and log) is deleted, its runner stopped if this provider started it."""
+        and log) is deleted, its runner stopped if this provider started it.
+        The directories are in the control plane's own data directory, so
+        they are its pool's whatever its name."""
         keep = {self.worker_name(i) for i in range(1, slots + 1)}
         gone = sorted(d.name for d in self.workdir.iterdir() if d.is_dir() and d.name not in keep) \
             if self.workdir.exists() else []
@@ -365,9 +371,11 @@ async def remote_commit(source: str, ref: str) -> str:
 class SpritesProvider:
     """Workers on Fly Sprites (https://api.sprites.dev/v1, Bearer $SPRITES_TOKEN).
 
-    Each worker is a sprite named `<prefix>w<slot>` (`orch-w1`, ...) and
-    labeled `orchestrator`, so the control plane can find every sprite it
-    made among the organization's (`sweep`). The sprite's URL is public at the
+    Each worker is a sprite named `<prefix><pool>-w<slot>` (`orch-3f9a1c2b-w1`,
+    ...) and labeled `orchestrator-<pool>`, so a control plane finds its own
+    sprites among the organization's (`sweep`) and never another's: each has
+    its own runner token and projects, and would restart the other's runners
+    and prune its projects off them. The sprite's URL is public at the
     proxy level; the runner itself requires RUNNER_TOKEN, so the Authorization
     header stays free for it.
     """
@@ -397,12 +405,19 @@ class SpritesProvider:
         self.http = httpx.AsyncClient(base_url=self.API, timeout=httpx.Timeout(60.0, read=600.0),
                                       headers={"authorization": f"Bearer {self.token}"})
 
-    def sprite_name(self, index: int) -> str:
-        return f"{self.prefix}w{index}"
+    def sprite_name(self, index: int, pool: str) -> str:
+        if not pool:
+            raise ValueError("a sprite worker needs its pool's name (Store.pool_id)")
+        return f"{self.prefix}{pool}-w{index}"
 
-    def ours(self, sprite: dict) -> bool:
-        """A sprite the control plane made: labeled, or named as each project's
-        own workers were before workers became a shared pool (`<prefix>p-<id>-w<n>`)."""
+    def label(self, pool: str) -> str:
+        return f"{self.LABEL}-{pool}"
+
+    def unnamed(self, sprite: dict) -> bool:
+        """A sprite of a control plane from before pools had names: labeled
+        just `orchestrator` (the one pool every control plane shared,
+        `<prefix>w<n>`), or named as each project's own workers were before
+        that (`<prefix>p-<id>-w<n>`). No control plane uses these now."""
         name = sprite.get("name") or ""
         legacy = re.fullmatch(re.escape(self.prefix) + r"p-[0-9a-f]+-w\d+", name)
         return self.LABEL in (sprite.get("labels") or []) or legacy is not None
@@ -420,9 +435,11 @@ class SpritesProvider:
             if not page.get("has_more") or not token:
                 return out
 
-    async def sweep(self, slots: int) -> list[str]:
-        keep = {self.sprite_name(i) for i in range(1, slots + 1)}
-        gone = sorted(s["name"] for s in await self.sprites() if self.ours(s) and s["name"] not in keep)
+    async def sweep(self, slots: int, pool: str) -> list[str]:
+        keep = {self.sprite_name(i, pool) for i in range(1, slots + 1)}
+        label = self.label(pool)
+        gone = sorted(s["name"] for s in await self.sprites()
+                      if (label in (s.get("labels") or []) and s["name"] not in keep) or self.unnamed(s))
         for name in gone:
             await self.destroy(Worker(id=name, provider=self.name, handle=name, url=""))
         return gone
@@ -433,13 +450,13 @@ class SpritesProvider:
         if not get_secret("DEEPSEEK_API_KEY"):
             raise RuntimeError("SpritesProvider needs DEEPSEEK_API_KEY (env or keyring): "
                                "the runner cannot start without it")
-        name, steps = self.sprite_name(spec.index), spec.steps
+        name, label, steps = self.sprite_name(spec.index, spec.pool), self.label(spec.pool), spec.steps
         steps.name = f"worker {name}"
         async with steps.step(f"making sprite {name}, or finding it made"):
             r = await self.http.post("/sprites", json={"name": name, "url_settings": {"auth": "public"},
-                                                       "labels": [self.LABEL]})
+                                                       "labels": [label]})
             if r.status_code == 409:  # the slot's sprite is there: it carries the label too
-                (await self.http.put(f"/sprites/{name}", json={"labels": [self.LABEL]})).raise_for_status()
+                (await self.http.put(f"/sprites/{name}", json={"labels": [label]})).raise_for_status()
             elif r.status_code not in (200, 201):
                 r.raise_for_status()
             info = (await self.http.get(f"/sprites/{name}")).raise_for_status().json()
@@ -700,10 +717,10 @@ class AutoProvider:
         if provider is not None:
             await provider.destroy(worker)
 
-    async def sweep(self, slots: int) -> list[str]:
+    async def sweep(self, slots: int, pool: str) -> list[str]:
         """The pool is sprites when a token is stored, local workers otherwise."""
         provider = self.sprites()
-        return await (provider or self.local()).sweep(slots)
+        return await (provider or self.local()).sweep(slots, pool)
 
     async def exists(self, worker: Worker) -> bool:
         provider = self._of(worker)

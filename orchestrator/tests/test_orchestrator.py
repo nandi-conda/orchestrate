@@ -4,6 +4,7 @@ echo runner (control.devrunner), served over real HTTP so the peer API is used."
 import asyncio
 import base64
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -2253,3 +2254,51 @@ async def test_reading_files_never_waits_for_a_binding(tmp_path, monkeypatch):
                 r = await c.get(f"/api/threads/{tid}/files?path=")
                 return r.status_code == 200 or None
             await wait_for(listed)
+
+
+async def test_a_store_names_its_pool_once(tmp_path):
+    """Each control plane's workers are its own pool, named by its store:
+    the same name every time it is asked, across restarts."""
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    name = await s.pool_id()
+    assert re.fullmatch(r"[0-9a-f]{8}", name) and await s.pool_id() == name
+    await s.close()
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    assert await s.pool_id() == name
+    await s.close()
+    other = SqliteStore(str(tmp_path / "other.sqlite"))
+    await other.open()
+    assert await other.pool_id() != name
+    await other.close()
+
+
+async def test_a_worker_of_the_shared_pool_is_lost_once_the_sweep_destroys_it(tmp_path):
+    """A slot's sprite of the one pool every control plane shared (orch-w1)
+    is destroyed by the sweep; the store says it is lost, so its slot is
+    filled with this control plane's own worker."""
+    from control.service import Orchestrator
+
+    class Sweeping:
+        name = "sprites"
+
+        def __init__(self):
+            self.swept = []
+
+        async def sweep(self, slots, pool):
+            self.swept.append(pool)
+            return ["orch-w1"]
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    await s.upsert_worker({"id": "orch-w1", "provider": "sprites", "handle": "orch-w1",
+                           "url": "https://orch-w1.invalid", "token": "x", "index": 1})
+    provider = Sweeping()
+    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    await orch.start()
+    assert provider.swept == [await s.pool_id()] and orch.pool_id == provider.swept[0]
+    row = (await s.list_workers())[0]
+    assert row["lost_at"] is not None and "pool of 3" in row["lost_reason"]
+    await orch.close()
+    await s.close()
