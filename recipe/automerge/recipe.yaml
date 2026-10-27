@@ -1,0 +1,54 @@
+# Automerge's Python package (automerge-py, Rust built with maturin), which the
+# control plane's sync (orchestrator/control/sync.py) imports. conda-forge does
+# not have it, so .github/workflows/package.yml builds it from the PyPI sdist on
+# every platform orchestrate installs on and publishes it to
+# prefix.dev/nandi-testing, before it builds orchestrate.
+#
+# The sdist has no LICENSE, so the recipe carries the one from the release tag.
+# Python versions are in variants.yaml. Build it locally with
+# `pixi run package-automerge`.
+context:
+  version: 0.2.0.dev4
+
+package:
+  name: automerge
+  version: ${{ version }}
+
+source:
+  url: https://pypi.org/packages/source/a/automerge/automerge-${{ version }}.tar.gz
+  sha256: 68540722ecab8ecb22edc19d470b9a0718ac5b13ade17509f5ae793f2f8242d6
+
+build:
+  number: 0
+  script:
+    - ${{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ stdlib('c') }}
+    - ${{ compiler('rust') }}
+  host:
+    - python
+    - pip
+    - maturin >=1.4,<2
+  run:
+    - python
+
+tests:
+  - python:
+      imports:
+        - automerge
+        - automerge.core
+  - files:
+      recipe:
+        - test_automerge.py
+    script:
+      - python test_automerge.py
+
+about:
+  homepage: https://github.com/automerge/automerge-py
+  repository: https://github.com/automerge/automerge-py
+  license: MIT
+  license_file: LICENSE
+  summary: Python bindings for Automerge, a CRDT for building collaborative applications
