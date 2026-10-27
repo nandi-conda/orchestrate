@@ -133,6 +133,8 @@ export function imports({ str, strs, vals, dispatch }) {
       return 1;
     },
     nav_push: (u) => { history.pushState(null, "", strs[u]); },
+    host_keys: () => (window.orchestrateApp ? 1 : 0),
+    open_host_keys: () => { window.orchestrateApp.keys(); },
     on_nav: (msg) => { addEventListener("popstate", () => dispatch(msg, 0)); },
     set_title: (h) => { document.title = strs[h]; },
     // Parsed markdown, by its source: a pane with a long history re-renders every

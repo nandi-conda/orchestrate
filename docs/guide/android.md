@@ -36,7 +36,7 @@ On first start the app asks for the control plane's keys:
 They are encrypted with a key that the Android Keystore holds, kept in the
 app's private storage, and given to the control plane as environment
 variables, where it looks first ([Credentials and configuration](configuration.md)).
-Change them from the menu, **Keys**; saving restarts the control plane.
+Change them from the app's **Settings**, **Edit keys…**; saving restarts the control plane.
 
 ## What runs on the phone
 

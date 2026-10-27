@@ -95,6 +95,17 @@ def nav_push(url: i32) -> None:
     pass
 
 @jscall
+def host_keys() -> i32:
+    """1 when the page is in the Android app, whose own Keys screen holds the
+    keys (window.orchestrateApp, MainActivity.Host)."""
+    pass
+
+@jscall
+def open_host_keys() -> None:
+    """Show the Android app's Keys screen in place of the page."""
+    pass
+
+@jscall
 def on_nav(msg: i32) -> None:
     """update(msg, 0) whenever Back or Forward changes the address."""
     pass

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- No window action bar: MainActivity puts its own Toolbar in the layout. -->
+    <!-- No action bar or title: the UI has its own header. -->
     <style name="Theme.Orchestrator" parent="android:Theme.DeviceDefault.DayNight">
         <item name="android:windowActionBar">false</item>
         <item name="android:windowNoTitle">true</item>
