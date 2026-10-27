@@ -120,6 +120,11 @@ class DeltaBuffer:
 
 log = logging.getLogger("runner")
 
+# Room on the worker's disk, as a share of it: below ROOM_LOW free, the
+# runner takes threads it does not run off it until ROOM_HIGH is free
+# (ThreadHost.make_room).
+ROOM_LOW, ROOM_HIGH = 0.15, 0.30
+
 
 def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
@@ -392,6 +397,8 @@ class ThreadHost:
         self.subscribers: dict[str | None, set[asyncio.Queue]] = {}
         self._seq = 0
         self.stopping = ""  # why the runner is stopping, once it is (shut_down)
+        self.making_room = asyncio.Lock()
+        self.room: asyncio.Task | None = None  # a make_room a turn's end started
 
     # events -----------------------------------------------------------------
     def _emit(self, t: AgentThread, type: str, data: Any):
@@ -401,6 +408,8 @@ class ThreadHost:
         for key in (t.id, None):
             for q in self.subscribers.get(key, ()):
                 q.put_nowait(ev)
+        if type == "turn_done" and (self.room is None or self.room.done()):  # a turn's builds take disk
+            self.room = asyncio.create_task(self.make_room(), name="make room")
 
     def subscribe(self, thread_id: str | None = None) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -483,6 +492,7 @@ class ThreadHost:
         from its start. Each step is a `preparing` event, and the end
         a `prepared` one saying whether it resumes."""
         if self.repos:
+            await self.make_room()
             repo = self.repos.get(t.project)
             Path(t.root).parent.mkdir(parents=True, exist_ok=True)
             t.emit("preparing", {"step": "making its worktree"})
@@ -503,6 +513,60 @@ class ThreadHost:
                        "images": images or []}
         else:
             t.set_state("idle")
+
+    def free(self) -> float:
+        """The share of the worker's disk (the one its threads are on) that is free."""
+        usage = shutil.disk_usage(self.workdir)
+        return usage.free / usage.total
+
+    def hosts(self, tid: str) -> bool:
+        """Whether the thread runs here: its task, working or idle, is alive."""
+        t = self.threads.get(tid)
+        return t is not None and t.task is not None and not t.task.done()
+
+    async def make_room(self) -> None:
+        """Keep the worker's disk from filling up. Every thread leaves its
+        worktree (build output and all), HOME and /tmp behind, and a worker
+        is shared by every project, so they pile up. When less than ROOM_LOW
+        of the disk is free, the threads this runner does not run whose
+        work is all in the hub (Repo.in_hub) are taken off it, the longest
+        untouched first, until ROOM_HIGH is free: such a thread comes back
+        from the hub's branch, snapshot and session when it is next started
+        here, as it would on another worker. A thread with a turn cut short
+        here, or a save that failed, keeps everything."""
+        if not self.repos:
+            return
+        async with self.making_room:
+            if self.free() >= ROOM_LOW:
+                return
+            log.warning("only %.0f%% of the disk is free: taking threads this runner does not run off it",
+                        self.free() * 100)
+            idle = []
+            for project in self.repos.projects():
+                repo = self.repos.get(project)
+                for tree in await self.repos.worktrees(project):
+                    tid = tree.name
+                    if self.hosts(tid) or (self.workdir / ".team" / f"{tid}.turn").exists():  # cut short here
+                        continue
+                    when = await repo.in_hub(tid)
+                    if when is not None:
+                        idle.append((when, project, tid, tree))
+            for _, project, tid, tree in sorted(idle):
+                if self.free() >= ROOM_HIGH:
+                    break
+                repo = self.repos.get(project)
+                async with repo.lock:  # a start of the thread waits for this, and is checked for here
+                    if self.hosts(tid):
+                        continue
+                    await repo.drop(tree, tid)
+                    for path in (self.workdir / ".home" / tid, self.workdir / ".tmp" / tid):
+                        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
+                log.info("thread %s (project %s) is off this worker until it is started here again: "
+                         "the hub has its work; %.0f%% of the disk is free now", tid, project, self.free() * 100)
+            if self.free() < ROOM_LOW:
+                log.warning("only %.0f%% of the disk is free after taking off every thread that could go: "
+                            "the threads this runner runs, or work not yet in the hub, hold the rest",
+                            self.free() * 100)
 
     async def prune(self, keep: set[str]) -> list[str]:
         """Take every project not in `keep` off this worker: its threads here

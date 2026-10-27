@@ -952,21 +952,20 @@ class Orchestrator:
 
     async def peer_save(self, lw: LiveWorker, caller: dict, thread_id: str, land: bool = False) -> dict:
         """A thread's turn ended: take its branch, snapshot and session into the hub;
-        with `land`, land the branch there and send the worker the new base
-        and branch (runner/API.md, "Repository")."""
+        with `land`, land the branch there. Either way the worker is sent the
+        hub's base and the thread's refs back, so it knows the hub has all of
+        the thread's work (runner/API.md, "Repository"; a worker short of disk
+        takes off threads whose work the hub has)."""
         self._as_caller(caller, thread_id)
         t = caller
         project = await self.store.get_project(t["project_id"])
         hub = await self.hub(project)
         data, refs = await lw.client.pull_thread(project["id"], t["id"], await hub.have(t["id"]))
         await hub.receive(t["id"], data, refs)
-        if not land:
-            self._push_hub(project["id"])
-            return {"landed": False, "base": hub.base}
-        result = await hub.land(t["id"])
+        result = await hub.land(t["id"]) if land else {"landed": False, "base": hub.base}
         self._push_hub(project["id"])
-        # Every turn that saves lands: its steps go to stdout only when it is slow or fails.
-        await self._ship(lw, project, t["id"], Steps(f"thread {t['id']} landing", level=logging.DEBUG))
+        # Every turn saves: its steps go to stdout only when it is slow or fails.
+        await self._ship(lw, project, t["id"], Steps(f"thread {t['id']} saving", level=logging.DEBUG))
         return result
 
     PEER_OPS = {"list_threads": peer_list_threads, "read_thread": peer_read_thread,

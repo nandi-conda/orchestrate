@@ -328,6 +328,24 @@ A Sprites API call that fails says what the API answered: the status, how
 long the call took, the request id its proxy gave it, and the body, or that
 it had none.
 
+## A worker's disk
+
+A worker is shared by every project, and every thread that ran on it leaves
+its worktree (build output included), its HOME and its /tmp there, so the
+runner keeps its disk from filling up:
+
+- pixi's packages and the worktrees' environments live in one cache per
+  project on the worker (`.cache/<project>`, one mount in the sandbox), so
+  each environment hard-links to the packages instead of copying them.
+- When less than 15% of the disk is free (checked before a thread's worktree
+  is made and after every turn), the runner takes off the threads it does not
+  run whose work is all in the hub, the longest untouched first, until 30% is
+  free. After every save the control plane sends the worker the hub's refs
+  of the thread back, which is how the runner knows. Such a thread comes back
+  from the hub's branch, snapshot and session the next time it starts there,
+  as it would on another worker. A thread whose turn was cut short there, or
+  whose save failed, keeps everything; so does every thread it runs.
+
 ## Respawn, from each state
 
 Respawn (the button on every thread, or `POST /api/threads/<id>/respawn`)

@@ -98,6 +98,49 @@ async def test_asking_what_a_worker_has_writes_nothing(tmp_path):
     assert config.stat().st_ino == before
 
 
+async def test_a_worker_short_of_disk_takes_off_threads_whose_work_the_hub_has(tmp_path, monkeypatch):
+    """Below ROOM_LOW free, the threads the runner does not run go, longest
+    untouched first, until ROOM_HIGH is free; one whose work is only here
+    (a failed save, a turn cut short) stays, and so does one it runs."""
+    source(tmp_path)
+    h = await host(tmp_path)
+    repo, work = h.repos.get("p"), tmp_path / "threads"
+
+    async def saved(tid, in_hub=True, at=0):
+        ws = await repo.worktree(work / tid, tid)
+        (work / tid / "build.out").write_text(tid)
+        await ws.commit(f"work of {tid}")
+        repo.env["GIT_COMMITTER_DATE"] = f"@{1_700_000_000 + at}"  # when its last turn ended
+        await ws.snapshot()
+        del repo.env["GIT_COMMITTER_DATE"]
+        agent = work / ".home" / tid / ".prime-agent"
+        (agent / "sessions").mkdir(parents=True)
+        (agent / "sessions" / "s.jsonl").write_text(tid)
+        await repo.save_session(tid, agent, ("sessions",))
+        if in_hub:  # what the orchestrator sends back after a save
+            for ours, hub in ((f"refs/heads/thread/{tid}", f"refs/remotes/origin/thread/{tid}"),
+                              (f"refs/snapshots/{tid}", f"refs/remotes/origin-snapshots/{tid}"),
+                              (f"refs/sessions/{tid}", f"refs/remotes/origin-sessions/{tid}")):
+                await repo.git("update-ref", hub, ours)
+
+    await saved("t_old", at=1)
+    await saved("t_new", at=2)
+    await saved("t_unsaved", in_hub=False)
+    await saved("t_cut", at=0)
+    (work / ".team").mkdir(exist_ok=True)
+    (work / ".team" / "t_cut.turn").write_text("{}")
+    room = iter([0.10, 0.10, 0.20, 0.40, 0.40, 0.40])  # each look at the disk; a drop frees some
+    monkeypatch.setattr(h, "free", lambda: next(room))
+    await h.make_room()
+    assert not (work / "t_old").exists() and not (work / ".home" / "t_old").exists()
+    for kept in ("t_new", "t_unsaved", "t_cut"):  # t_new: ROOM_HIGH was free once t_old went
+        assert (work / kept / "build.out").exists()
+    assert not await repo.exists("refs/sessions/t_old")  # made again from the hub's when it comes back
+    ws = await repo.worktree(work / "t_old", "t_old")
+    assert (work / "t_old" / "build.out").read_text() == "t_old"  # its snapshot's files
+    assert ws.branch == "thread/t_old"
+
+
 async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
     """Other threads' worktrees and the repository's checkout are hidden; the
     thread can still commit, since its worktree's git dir is in the view."""

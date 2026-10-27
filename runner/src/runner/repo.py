@@ -263,6 +263,31 @@ class Repo:
             await self.git("checkout-index", "-a", "-f", cwd=directory, env=env)
             await self.git("update-ref", session_ref(tid), theirs)
 
+    async def in_hub(self, tid: str) -> float | None:
+        """When the hub has everything this worker has of the thread (its
+        branch, snapshot and session are what the orchestrator last brought
+        back), the time of its snapshot; else None: a turn whose save failed
+        left work only here."""
+        theirs = {f"refs/heads/thread/{tid}": f"refs/remotes/origin/thread/{tid}",
+                  snapshot_ref(tid): f"refs/remotes/origin-snapshots/{tid}",
+                  session_ref(tid): f"refs/remotes/origin-sessions/{tid}"}
+        for ours, hub in theirs.items():
+            mine = await self.git("rev-parse", "-q", "--verify", ours, check=False)
+            if mine.code:
+                continue
+            if (await self.git("merge-base", "--is-ancestor", ours, hub, check=False)).code:
+                return None
+        when = await self.git("log", "-1", "--format=%ct", snapshot_ref(tid), check=False)
+        return float(when.out) if when.code == 0 and when.out else 0.0
+
+    async def drop(self, path: str | os.PathLike, tid: str) -> None:
+        """Take a thread's worktree off this worker, and its session with it
+        (the agent directory goes with the thread's HOME): the next time the
+        thread starts here, both are made again from the hub's. The caller
+        holds the lock."""
+        await self.git("worktree", "remove", "--force", str(path))
+        await self.git("update-ref", "-d", session_ref(tid), check=False)
+
     async def worktree(self, path: str | os.PathLike, tid: str) -> "Workspace":
         """The thread's worktree at `path` on `thread/<tid>`. One this worker
         already has is kept as it is, with its uncommitted and ignored files,
