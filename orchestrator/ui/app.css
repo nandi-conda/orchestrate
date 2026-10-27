@@ -21,6 +21,16 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .form { display: grid; gap: 8px; padding: 8px 0; }
 .form .help { margin: 0; font-size: 12px; color: var(--muted-foreground); }
 .repo-path { margin: 0; overflow-wrap: anywhere; }
+/* Project settings: one block per setting, spaced apart; inside a block, label,
+   control and help sit close. */
+.settings-form { gap: 18px; padding: 4px 0 8px; }
+.setting { display: grid; gap: 8px; min-width: 0; }
+.setting .help { line-height: 1.45; }
+.model-pick { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
+.model-pick .toggle { display: grid; gap: 2px; justify-items: center; height: auto; padding: 8px 6px; white-space: nowrap; }
+.model-name { font-size: 13px; font-weight: 500; }
+.model-via { font-size: 11px; color: var(--muted-foreground); }
+.setting .repo-path { padding: 8px 10px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); background: var(--muted); color: var(--muted-foreground); }
 
 .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 .appbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); }

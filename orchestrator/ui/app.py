@@ -15,7 +15,7 @@ from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, ke
                    s_copy, http_get_ref, j_ok, j_err, j_at, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
-                toggle_group_open, toggle, tabs_list_open, tab, aria)
+                toggle_group_open, toggle_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
@@ -3198,30 +3198,46 @@ def project_window() -> None:
     end()
 
 
+def model_choice(i: i32, name: str, via: str) -> None:
+    """One model in the settings' picker: its name over who serves it."""
+    model_id(i, h_t3)
+    toggle_open(s_eq(h_set_model, h_t3) == 1, SET_MODEL, i)
+    span("model-name")
+    text(name)
+    end()
+    span("model-via")
+    text(via)
+    end()
+    end()
+
+
 def settings_dialog() -> None:
     """The open project's name, model and remote, and where its repository is."""
     dialog_open("Project settings", "", SETTINGS_HIDE)
     el("div")
     cls("form")
+    cls("settings-form")
+    div("setting")
     label("Name")
     input_open("my-app", h_set_name, SET_NAME_IN)
     autofocus()
     on_enter(SETTINGS_SAVE, 0)
     end()
+    end()
+    div("setting")
     label("Model")
     toggle_group_open()
-    model_id(0, h_t3)
-    toggle("deepseek-flash", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 0)
-    model_id(1, h_t3)
-    toggle("deepseek-v4-pro", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 1)
-    model_id(2, h_t3)
-    toggle("V4.1 Flash UltraFast (OpenGateway)", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 2)
+    cls("model-pick")
+    model_choice(0, "Flash", "DeepSeek")
+    model_choice(1, "V4 Pro", "DeepSeek")
+    model_choice(2, "V4.1 UltraFast", "OpenGateway")
     end()
     el("p")
     cls("help")
-    text("What the project's threads run on. UltraFast goes through OpenGateway and needs "
-         "OPENGATEWAY_API_TOKEN (Settings on the project list, Keys).")
+    text("What this project's threads run on. OpenGateway needs OPENGATEWAY_API_TOKEN in Keys.")
     end()
+    end()
+    div("setting")
     label("Remote (optional)")
     div("field-row")
     input_open("https://github.com/you/repo or /home/you/my-app", h_repo, REPO_IN)
@@ -3233,11 +3249,11 @@ def settings_dialog() -> None:
         folder_picker()
     el("p")
     cls("help")
-    text("With a remote, the project's main branch follows its default branch and finished threads "
-         "are pushed there. An empty repository gets this project's history; one with history must "
-         "share it, unless nothing has landed here yet. A folder on this computer works too: "
-         "threads land in its checked-out branch. Clearing it keeps everything here.")
+    text("Finished threads push to its default branch. Use an empty repository, one that shares "
+         "this project's history, or a folder on this computer. Clear it to keep work here only.")
     end()
+    end()
+    div("setting")
     label("Local repository")
     el("p")
     cls("mono")
@@ -3245,6 +3261,7 @@ def settings_dialog() -> None:
     if project != 0:
         jstr(project, "repo_path", h_t1)
         text_ref(h_t1)
+    end()
     end()
     if s_len(h_set_err) > 0:
         el("div")
