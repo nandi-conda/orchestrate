@@ -34,6 +34,9 @@ for line in sys.stdin:
 class Forever(PrimeAgent):
     """prime-agent whose every turn runs until its process is killed."""
 
+    def __init__(self):
+        super().__init__(env={"DEEPSEEK_API_KEY": "faux"})
+
     async def start(self, place, *, model, append_prompt):
         for d in (place.view.root, place.view.home, place.view.tmp):
             Path(d).mkdir(parents=True, exist_ok=True)
@@ -74,14 +77,16 @@ async def test_a_turn_the_runners_shutdown_cuts_short_is_interrupted_and_resumes
     agent = Forever()
     again = host(tmp_path, agent)
     t = await again.start(project="p", title="T", request="do it", id="t_cut")
-    assert t.resumed
     await until(lambda: t.state == "working")
+    assert t.resumed and {"resumed": True, "idle": False} in [e["data"] for e in t.events if e["type"] == "prepared"]
     ins = [e["data"] for e in t.events if e["type"] == "message_in"]
     assert ins == [{"from": "runner", "body": RESUME}]  # not the request again: its session has it
     await again.stop("t_cut")
     assert not (tmp_path / ".team" / "t_cut.turn").exists()  # stopped on purpose: nothing to resume
     later = host(tmp_path, Forever())
-    assert not (await later.start(project="p", title="T", id="t_cut")).resumed
+    t = await later.start(project="p", title="T", id="t_cut")
+    await until(lambda: t.state == "idle")
+    assert not t.resumed
     await later.stop("t_cut")
 
 

@@ -17,11 +17,13 @@ starts and back when it ends, and nothing else reshuffles.
 
 A thread's `busy_since` is when the turn it is in began (its state queued,
 working or waiting), NULL between turns; `update_thread` keeps it as the state
-changes. With `backlog` (the messages to a thread it has not got to) it is
-what load.py makes a thread's load from.
+changes; load.py makes a thread's `busy_for` from it.
 
 Events carry a project-wide sequence number (`seq`), so a client can resume a
-project or thread stream from `?after=seq`.
+project or thread stream from `?after=seq`. `seq` is this store's own: a
+control plane sharing projects through the sync server (sync.py) names an
+event by its `uid`, the same in every store that has it, and the `import_*`
+methods take rows another control plane wrote, as they are.
 
 Pasted images are stored here too, as rows in `images`, so every control plane
 instance serving the same database can show them. Events and messages carry
@@ -55,6 +57,11 @@ def now() -> float:
     return time.time()
 
 
+def new_uid() -> str:
+    """An event's id in every store that has it: events are many, so it is longer than new_id's."""
+    return f"e_{secrets.token_hex(8)}"
+
+
 class Store(Protocol):
     async def open(self) -> None: ...
     async def close(self) -> None: ...
@@ -73,8 +80,9 @@ class Store(Protocol):
         or archived_at (Orchestrator.archive_project)."""
 
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None) -> dict:
-        """A new thread whose workers run on `workers` (providers.PLACES)."""
+                            parent_id: str | None = None, workers_why: str = "") -> dict:
+        """A new thread whose workers run on `workers` (providers.PLACES),
+        for the reason `workers_why` (the router's)."""
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         """The project's threads that are not archived, or with archived=True
         only the archived ones; working (queued or working) threads first,
@@ -96,18 +104,20 @@ class Store(Protocol):
         log that has outgrown one page. list_events pages from the front, which
         is what a stream resuming from its last event needs; a pane needs the end."""
     async def get_event(self, seq: int) -> dict | None: ...
+    async def seqs_of(self, uids: list[str]) -> dict[str, int]:
+        """The seq of each event of `uids` this store has, by uid."""
+    async def uids_of(self, seqs: list[int]) -> dict[int, str]:
+        """The uid of each event of `seqs`, by seq."""
+    async def event_uids(self, project_id: str, thread_id: str | None) -> set[str]:
+        """The uids of the events logged on a thread (None: on the project itself)."""
     async def wait_events(self, project_id: str, after: int, timeout: float) -> None:
         """Return when an event with seq > after may exist, or on timeout."""
 
     async def add_message(self, project_id: str, sender: str, to_thread: str, body: str,
                           reply_to: str | None = None, hops: int = 0) -> dict: ...
     async def list_messages(self, thread_id: str, unread_only: bool = False) -> list[dict]: ...
+    async def get_message(self, message_id: str) -> dict | None: ...
     async def mark_read(self, message_ids: list[str]) -> None: ...
-    async def backlog(self, project_id: str) -> dict[str, int]:
-        """Per live thread of the project, the messages to it it has not got
-        to: those not yet delivered to its runner, and those that came in
-        during the turn it is in (they steer that turn, so they are still on
-        its plate). Threads with none are left out."""
 
     async def add_image(self, project_id: str, media_type: str, data: bytes, name: str = "") -> dict:
         """Store an image's bytes; returns its reference for an event or message."""
@@ -123,6 +133,18 @@ class Store(Protocol):
         """A worker's state (states.WORKER) and why it is in it."""
     async def projects_on_worker(self, worker_id: str) -> list[str]:
         """The projects with a thread on the worker, or last on it (threads.worker_id)."""
+    async def import_project(self, row: dict) -> None:
+        """Insert or replace a project as another control plane wrote it (sync.py)."""
+    async def import_thread(self, row: dict) -> None:
+        """Insert or replace a thread as another control plane wrote it."""
+    async def import_message(self, row: dict) -> None:
+        """Insert or replace a message as another control plane wrote it."""
+    async def import_event(self, event: dict) -> dict | None:
+        """Log an event another control plane logged (its uid, type, payload,
+        time and peer), under this store's next seq; None when it is here already."""
+    async def import_image(self, image: dict) -> None:
+        """Keep an image another control plane stored (its row, `data` included)."""
+
     async def list_workers(self) -> list[dict]:
         """Every worker ever made; `idx` is the pool slot it was made for,
         `lost_at` is set once it was lost. `project_id` is "" for the pool's
@@ -202,13 +224,13 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
-                 "archived_at", "binding", "binding_reason", "workers")
+                 "archived_at", "binding", "binding_reason", "workers", "workers_why")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
 # A thread's `workers` is where its workers run (providers.PLACES), as the
 # router decided; "" only in a database from before threads had a place,
-# until Orchestrator.start fills it in.
+# until Orchestrator.start fills it in. `workers_why` is the router's reason.
 ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("threads", "workers", "TEXT NOT NULL DEFAULT ''"),
                  ("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
@@ -222,7 +244,11 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("workers", "state", "TEXT NOT NULL DEFAULT 'ready'"),
                  ("workers", "state_reason", "TEXT NOT NULL DEFAULT ''"),
                  ("events", "peer_id", "TEXT"),
-                 ("threads", "busy_since", "DOUBLE PRECISION")]
+                 ("threads", "busy_since", "DOUBLE PRECISION"),
+                 ("threads", "workers_why", "TEXT NOT NULL DEFAULT ''"),
+                 ("events", "uid", "TEXT")]
+# Made once every event has its uid (_fill_uids).
+EVENTS_UID_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS events_uid ON events(uid)"
 
 
 def _thread(row: dict) -> dict:
@@ -235,6 +261,11 @@ def _event(row: dict) -> dict:
     row = dict(row)
     row["payload"] = json.loads(row["payload"])
     return row
+
+
+def event_row(ev: dict) -> tuple:
+    return (ev["project_id"], ev["thread_id"], ev["type"], json.dumps(ev["payload"]), ev["created_at"],
+            ev["peer_id"], ev["uid"])
 
 
 def _project(row: dict) -> dict:
@@ -254,7 +285,7 @@ class _SqlStore:
 
     async def _exec(self, sql: str, *args: Any) -> None: ...
     async def _fetch(self, sql: str, *args: Any) -> list[dict]: ...
-    async def _insert_event(self, row: tuple) -> int: ...
+    async def _insert_event(self, ev: dict) -> int: ...
 
     async def _fetchone(self, sql: str, *args: Any) -> dict | None:
         rows = await self._fetch(sql, *args)
@@ -290,10 +321,10 @@ class _SqlStore:
 
     # threads
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None) -> dict:
+                            parent_id: str | None = None, workers_why: str = "") -> dict:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
-               "workers": workers,
+               "workers": workers, "workers_why": workers_why,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
                "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
                "busy_since": t}
@@ -340,14 +371,73 @@ class _SqlStore:
             await self._exec(self._q(f"UPDATE threads SET {', '.join(sets)} WHERE id = ?"), *args)
         return await self.get_thread(thread_id)
 
+    async def _upsert(self, table: str, row: dict) -> None:
+        await self._exec(self._q(f"DELETE FROM {table} WHERE id = ?"), row["id"])
+        cols = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        await self._exec(self._q(f"INSERT INTO {table} ({cols}) VALUES ({marks})"), *row.values())
+
+    async def import_project(self, row: dict) -> None:
+        row = {**row, "settings": json.dumps(row.get("settings") or {})}
+        await self._upsert("projects", row)
+
+    async def import_thread(self, row: dict) -> None:
+        row = {**row, "files": json.dumps(row.get("files") or [])}
+        await self._upsert("threads", row)
+
+    async def import_message(self, row: dict) -> None:
+        await self._upsert("messages", row)
+
+    async def import_image(self, image: dict) -> None:
+        await self._upsert("images", image)
+
     # events
     async def append_event(self, project_id: str, thread_id: str | None, type: str,
                            payload: dict, peer_id: str | None = None) -> dict:
-        t = now()
-        seq = await self._insert_event((project_id, thread_id, type, json.dumps(payload), t, peer_id))
+        ev = {"project_id": project_id, "thread_id": thread_id, "type": type, "payload": payload,
+              "created_at": now(), "peer_id": peer_id, "uid": new_uid()}
+        ev["seq"] = await self._insert_event(ev)
         self.notifier.poke(project_id)
-        return {"seq": seq, "project_id": project_id, "thread_id": thread_id, "type": type,
-                "payload": payload, "created_at": t, "peer_id": peer_id}
+        return ev
+
+    async def import_event(self, event: dict) -> dict | None:
+        if await self.seqs_of([event["uid"]]):
+            return None
+        ev = {k: event[k] for k in ("project_id", "thread_id", "type", "payload", "created_at", "peer_id", "uid")}
+        ev["seq"] = await self._insert_event(ev)
+        self.notifier.poke(ev["project_id"])
+        return ev
+
+    async def seqs_of(self, uids: list[str]) -> dict[str, int]:
+        out = {}
+        for uid in set(uids):
+            r = await self._fetchone(self._q("SELECT seq FROM events WHERE uid = ?"), uid)
+            if r:
+                out[uid] = r["seq"]
+        return out
+
+    async def uids_of(self, seqs: list[int]) -> dict[int, str]:
+        out = {}
+        for seq in set(seqs):
+            r = await self._fetchone(self._q("SELECT uid FROM events WHERE seq = ?"), seq)
+            if r:
+                out[seq] = r["uid"]
+        return out
+
+    async def event_uids(self, project_id: str, thread_id: str | None) -> set[str]:
+        if thread_id is None:
+            rows = await self._fetch(self._q("SELECT uid FROM events WHERE project_id = ? AND thread_id IS NULL"),
+                                     project_id)
+        else:
+            rows = await self._fetch(self._q("SELECT uid FROM events WHERE project_id = ? AND thread_id = ?"),
+                                     project_id, thread_id)
+        return {r["uid"] for r in rows}
+
+    async def _fill_uids(self) -> None:
+        """Give each event from before events had a uid one, then index them."""
+        for r in await self._fetch("SELECT seq FROM events WHERE uid IS NULL"):
+            await self._exec(self._q("UPDATE events SET uid = ? WHERE seq = ?"), new_uid(), r["seq"])
+        await self._exec(EVENTS_UID_INDEX)
 
     async def _merge_peer_messages(self) -> None:
         """Once, when events gain `peer_id`: a message between threads used to
@@ -408,13 +498,8 @@ class _SqlStore:
             sql += " AND read_at IS NULL"
         return await self._fetch(self._q(sql + " ORDER BY created_at"), thread_id)
 
-    async def backlog(self, project_id: str) -> dict[str, int]:
-        rows = await self._fetch(self._q(
-            "SELECT m.to_thread AS id, COUNT(*) AS n FROM messages m JOIN threads t ON t.id = m.to_thread "
-            "WHERE t.project_id = ? AND t.archived_at IS NULL "
-            "AND (m.read_at IS NULL OR (t.busy_since IS NOT NULL AND m.created_at >= t.busy_since)) "
-            "GROUP BY m.to_thread"), project_id)
-        return {r["id"]: int(r["n"]) for r in rows}
+    async def get_message(self, message_id: str) -> dict | None:
+        return await self._fetchone(self._q("SELECT * FROM messages WHERE id = ?"), message_id)
 
     async def mark_read(self, message_ids: list[str]) -> None:
         t = now()
@@ -493,6 +578,7 @@ class SqliteStore(_SqlStore):
         await self.db.commit()
         if ("events", "peer_id") in added:
             await self._merge_peer_messages()
+        await self._fill_uids()
 
     async def close(self) -> None:
         if self.db is not None:
@@ -506,9 +592,9 @@ class SqliteStore(_SqlStore):
         async with self.db.execute(sql, args) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
-    async def _insert_event(self, row: tuple) -> int:
+    async def _insert_event(self, ev: dict) -> int:
         cur = await self.db.execute("INSERT INTO events (project_id, thread_id, type, payload, created_at, "
-                                    "peer_id) VALUES (?, ?, ?, ?, ?, ?)", row)
+                                    "peer_id, uid) VALUES (?, ?, ?, ?, ?, ?, ?)", event_row(ev))
         await self.db.commit()
         return cur.lastrowid
 
@@ -545,6 +631,7 @@ class PostgresStore(_SqlStore):
                 await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
         if not had_peer_id:
             await self._merge_peer_messages()
+        await self._fill_uids()
         # A dedicated connection hears appends made by any instance.
         self._listener = await asyncpg.connect(self.dsn)
         await self._listener.add_listener(self.CHANNEL, lambda *a: self.notifier.poke(a[3]))
@@ -563,11 +650,11 @@ class PostgresStore(_SqlStore):
         async with self.pool.acquire() as c:
             return [dict(r) for r in await c.fetch(sql, *args)]
 
-    async def _insert_event(self, row: tuple) -> int:
+    async def _insert_event(self, ev: dict) -> int:
         async with self.pool.acquire() as c:
-            seq = await c.fetchval("INSERT INTO events (project_id, thread_id, type, payload, created_at, peer_id) "
-                                   "VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq", *row)
-            await c.execute("SELECT pg_notify($1, $2)", self.CHANNEL, row[0])
+            seq = await c.fetchval("INSERT INTO events (project_id, thread_id, type, payload, created_at, peer_id, "
+                                   "uid) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq", *event_row(ev))
+            await c.execute("SELECT pg_notify($1, $2)", self.CHANNEL, ev["project_id"])
             return seq
 
 

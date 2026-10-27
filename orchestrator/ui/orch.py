@@ -19,6 +19,11 @@ def o_lit(o: i32, k: str, v: str) -> None:
     pass
 
 @jscall
+def o_int(o: i32, k: str, h: i32) -> None:
+    """Set key k of object o to the whole number written in handle h."""
+    pass
+
+@jscall
 def o_images(o: i32, k: str) -> None:
     """Set key k of object o to the images attached to the request being composed."""
     pass
@@ -126,16 +131,36 @@ def md_str(i: i32, dst: i32) -> None:
     pass
 
 @jscall
+def code_put(key: i32, text: i32) -> i32:
+    """The id of the code shown at key (a place, e.g. "ev-12:0" for a reply's
+    first code span), now holding the string in handle text. A key keeps its
+    id, so a code block still streaming in is one id that grows."""
+    pass
+
+@jscall
+def code_text(id: i32, dst: i32) -> None:
+    """Write the text code_put last gave id to dst."""
+    pass
+
+@jscall
 def clip_copy(h: i32, ok: i32, arg: i32, fail: i32) -> None:
     """Put the string in handle h on the clipboard. update(ok, arg) once it is
     there; if the browser refuses, h holds why and update(fail, h) runs."""
     pass
 
 @jscall
-def on_select(text: i32, style: i32, msg: i32) -> None:
+def on_select(text: i32, style: i32, src: i32, msg: i32) -> None:
     """Follow the text selection in the pane (#pane): while there is one, its
     text is in handle text, a style placing a button over it in handle style,
-    and update(msg, 1) runs whenever either changes; update(msg, 0) when it ends."""
+    the seq of the event row it starts in in handle src ("" when that row is
+    still streaming), and update(msg, 1) runs whenever any changes;
+    update(msg, 0) when it ends."""
+    pass
+
+@jscall
+def jump_to(seq: i32, miss: i32) -> None:
+    """After the next render, scroll the pane's row for event seq into view and
+    flash it; update(miss, seq) if the pane has no such row."""
     pass
 
 @jscall
@@ -157,6 +182,12 @@ def on_paste(msg: i32) -> None:
     """Follow image pastes: an image on the clipboard (a screenshot, a copied
     picture) is added to the request being composed and update(msg, 1) runs.
     Pasting text is left to the input."""
+    pass
+
+@jscall
+def newline_keys() -> None:
+    """In the request box (#req, a textarea), Shift+Enter adds a line and plain
+    Enter sends without one, so pasted and typed text keeps its lines."""
     pass
 
 @jscall

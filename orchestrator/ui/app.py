@@ -15,13 +15,13 @@ from ultra import (el, end, text, text_ref, num, cls, cls_if, attr, attr_ref, ke
                    s_copy, http_get_ref, j_ok, j_err, j_at, j_len, j_idx, j_str, j_int, j_has, j_free, div, span)
 from ui import (btn, btn_open, card_open, card_header, card_content_open, card_footer_open,
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
-                toggle_group_open, toggle, tabs_list_open, tab, aria)
+                toggle_group_open, toggle_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, is_img, path_join, path_dir,
+                  clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
-                  img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row,
-                  host_folders, host_pick_folder)
+                  img_drop, img_stash, img_restore, img_clear, on_zoom, newline_keys, j_put_row,
+                  host_folders, host_pick_folder, code_put, code_text)
 
 # ---- Msg
 GOT_PROJECTS: Const[i32] = 1
@@ -80,7 +80,7 @@ EDITED: Const[i32] = 53
 SETTINGS_SHOW: Const[i32] = 54
 SETTINGS_HIDE: Const[i32] = 55
 SET_NAME_IN: Const[i32] = 56
-SET_MODEL_IN: Const[i32] = 57
+SET_MODEL: Const[i32] = 57      # arg: the model's index (model_id)
 SETTINGS_SAVE: Const[i32] = 58
 SETTINGS_SAVED: Const[i32] = 59
 PASTED: Const[i32] = 60
@@ -100,6 +100,25 @@ PICK_OPEN: Const[i32] = 73     # arg: a folder of the listing; -1 its parent; -2
 PICK_USE: Const[i32] = 74
 PICKED: Const[i32] = 75       # arg: the field the desktop window's folder dialog picked for
 GOT_PLACES: Const[i32] = 76
+THREADS_TOGGLE: Const[i32] = 77
+JUMP: Const[i32] = 78         # arg: seq of your message whose quote was clicked
+JUMP_MISS: Const[i32] = 79
+TAKE_OVER: Const[i32] = 80    # drive the open project from this computer
+TOOK_OVER: Const[i32] = 81
+APP_SHOW: Const[i32] = 82     # the app's Settings, from the project list
+APP_HIDE: Const[i32] = 83
+GOT_APP: Const[i32] = 84
+KEY_EDIT: Const[i32] = 85     # arg: the key's index; -1 closes its field
+KEY_IN: Const[i32] = 86
+KEY_SAVE: Const[i32] = 87
+KEY_SAVED: Const[i32] = 88
+SPACE_COPY: Const[i32] = 89   # copy this computer's sync space key, to pair another computer
+COPY_CODE: Const[i32] = 90    # arg: the code's id (code_put)
+CODE_COPIED: Const[i32] = 91
+CODE_COPIED_DONE: Const[i32] = 92
+SWITCH_SHOW: Const[i32] = 93   # the project switcher in a project's header; arg 0 closes it
+GOT_SWITCH: Const[i32] = 94
+SWITCH: Const[i32] = 95        # arg: the switcher's row
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -169,14 +188,27 @@ files_loading: i32 = 0
 fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text}); 0 for an image
 fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
+threads_open: i32 = 1    # the thread list is unfolded on a phone (a desktop shows it always)
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
+proj_busy: i32 = 0       # 1 + the card being archived or unarchived, 0 when none is
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
+jump_seq: i32 = 0        # or at this event instead, the one a clicked quote came from (0 = none)
+md_quote: i32 = 0        # seq of the message whose first block quote md() links to its source (0 = none)
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
+SPACE_COPIED: Const[i32] = -2  # `copied` while the sync space key is the one just copied
+code_copied: i32 = 0     # id of the code span or block just copied (shows a check), 0 when none
+md_codes: i32 = 0        # code spans and blocks md() has drawn so far in the markdown it is on
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
 show_settings: i32 = 0   # the open project's settings dialog is up
+switching: i32 = 0       # the project switcher under the project's name is open
+switch_list: i32 = 0     # JSON handle: the live projects it lists
 saving_settings: i32 = 0
+show_app: i32 = 0        # the app's Settings dialog is up
+app: i32 = 0             # JSON handle: the app's settings (GET /api/settings)
+key_edit: i32 = -1       # index of the key whose field is open, -1 when none
+saving_key: i32 = 0
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -207,7 +239,6 @@ h_stopped: i32 = 0
 h_bound: i32 = 0
 h_unbound: i32 = 0
 h_ready: i32 = 0
-h_backed_up: i32 = 0
 h_local: i32 = 0         # "local", the place a thread is badged for
 h_place: i32 = 0         # scratch for a place id while finding its label
 h_plabel: i32 = 0        # a place's label, for a thread's badge
@@ -220,6 +251,9 @@ h_md: i32 = 0            # scratch for markdown text
 h_mdtid: i32 = 0         # thread whose worktree the markdown being drawn names images in ("" = none)
 h_mdbase: i32 = 0        # and the worktree directory its relative image paths start from
 h_mdsrc: i32 = 0         # scratch for an image's worktree path
+h_mdkey: i32 = 0         # where the markdown being drawn is shown, so its code keeps its id
+h_code: i32 = 0          # scratch for a code span's text
+h_ckey: i32 = 0          # and its key: h_mdkey and how many code spans came before it
 h_run: i32 = 0           # thread id of the thinking run being grouped
 h_tid: i32 = 0           # scratch for a thread id while finding its title
 h_clip: i32 = 0          # the text being copied
@@ -227,10 +261,16 @@ h_seltext: i32 = 0       # the text selected in the pane
 h_selpos: i32 = 0        # style placing the Reply button over the selection
 h_quote: i32 = 0         # the selection the next request replies to ("" = none)
 h_lastq: i32 = 0         # the quote being sent, put back if the send fails
+h_selsrc: i32 = 0        # seq of the event the pane's selection is in ("" = none, e.g. a reply still streaming)
+h_qsrc: i32 = 0          # seq of the event the quote came from ("" = none)
+h_lastqsrc: i32 = 0      # and of the quote being sent
+h_evid: i32 = 0          # scratch for a row's element id
 h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 h_edit: i32 = 0          # the text of the message being edited
 h_img: i32 = 0           # scratch for an image's URL while it is drawn
+h_key: i32 = 0           # the value typed for the key being set ("" removes it)
+h_key_err: i32 = 0       # why the key could not be kept, or the settings read
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -258,12 +298,13 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_bound, h_unbound, h_ready, h_backed_up, h_local, h_place, h_plabel
+    global h_bound, h_unbound, h_ready, h_local, h_place, h_plabel
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
-    global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
+    global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc, h_mdkey, h_code, h_ckey
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
+    global h_selsrc, h_qsrc, h_lastqsrc, h_evid
     global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
-    global h_img, h_when, h_when_full, host_picks
+    global h_img, h_when, h_when_full, host_picks, h_key, h_key_err
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -301,8 +342,6 @@ def init() -> None:
     s_set(h_unbound, "unbound")
     h_ready = s_new()
     s_set(h_ready, "ready")
-    h_backed_up = s_new()
-    s_set(h_backed_up, "backed_up")
     h_local = s_new()
     s_set(h_local, "local")
     h_place = s_new()
@@ -316,6 +355,9 @@ def init() -> None:
     h_mdtid = s_new()
     h_mdbase = s_new()
     h_mdsrc = s_new()
+    h_mdkey = s_new()
+    h_code = s_new()
+    h_ckey = s_new()
     h_run = s_new()
     h_tid = s_new()
     h_clip = s_new()
@@ -323,16 +365,23 @@ def init() -> None:
     h_selpos = s_new()
     h_quote = s_new()
     h_lastq = s_new()
+    h_selsrc = s_new()
+    h_qsrc = s_new()
+    h_lastqsrc = s_new()
+    h_evid = s_new()
     h_body = s_new()
     h_act = s_new()
     h_edit = s_new()
     h_img = s_new()
+    h_key = s_new()
+    h_key_err = s_new()
     host_picks = host_folders()
     s_set(h_url, "/api/places")
     get(h_url, GOT_PLACES)
     on_nav(NAV)
-    on_select(h_seltext, h_selpos, SELECTED)
+    on_select(h_seltext, h_selpos, h_selsrc, SELECTED)
     on_paste(PASTED)
+    newline_keys()
     on_zoom()
     show_address()
 
@@ -359,7 +408,7 @@ def open_project(id: i32) -> None:
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
     global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived, editing
-    global show_settings, saving_settings
+    global show_settings, saving_settings, threads_open, switching, switch_list
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -377,13 +426,17 @@ def leave_project() -> None:
     s_clear(h_err)
     s_clear(h_wlog_err)
     s_clear(h_quote)
+    s_clear(h_qsrc)
     mode = AUTO
     pane_tab = DIALOG
     sending = 0
     show_archived = 0
+    threads_open = 1
     editing = 0
     show_settings = 0
     saving_settings = 0
+    switching = 0
+    switch_list = take_none(switch_list)
 
 
 def enter_project() -> None:
@@ -438,6 +491,10 @@ def post_project(i: i32, action: str) -> None:
 # ---- requests
 
 def fetch_threads() -> None:
+    # The project too: which computer drives it can change with its threads.
+    s_set(h_url, "/api/projects/")
+    s_add_ref(h_url, h_pid)
+    get(h_url, GOT_PROJECT)
     s_set(h_url, "/api/projects/")
     s_add_ref(h_url, h_pid)
     s_add(h_url, "/threads")
@@ -452,6 +509,80 @@ def row_id(i: i32, id: i32) -> None:
     e = j_idx(threads, i)
     jstr(e, "id", id)
     j_free(e)
+
+
+def open_thread() -> None:
+    """Show thread h_sel in the pane, at its newest events."""
+    global threads_open, mode, editing, jump, wlog, files
+    # The pane takes the room on a phone; its header brings the list back.
+    threads_open = 0
+    if mode == AUTO and show_archived == 0:
+        mode = TO_THREAD
+    editing = 0
+    jump = 1
+    fetch_transcript()
+    wlog = take_none(wlog)
+    s_clear(h_wlog_err)
+    if pane_tab == WLOG:
+        fetch_wlog()
+    files = take_none(files)
+    s_clear(h_fpath)
+    s_clear(h_files_err)
+    close_fview()
+    if pane_tab == FILES:
+        fetch_files()
+
+
+def go_to_quoted(seq: i32) -> None:
+    """Show the event the quote in your message seq came from, highlighted: in
+    the pane if it is there, else in its thread (or the project's activity,
+    for the project's own events), opened at it rather than at the bottom."""
+    global jump_seq, pane_tab
+    src: i32 = plog
+    n: i32 = 0
+    i: i32
+    e: i32
+    of: i32 = 0
+    if s_len(h_sel) > 0:
+        src = transcript
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        if j_int(e, "seq") == seq and j_has(e, "quote_of") == 1:
+            of = j_int(e, "quote_of")
+            jstr(e, "quote_thread", h_tid)
+        j_free(e)
+    if of == 0:
+        return
+    if shows_seq(src, of) == 1:
+        jump_to(of, JUMP_MISS)
+    elif s_len(h_tid) > 0 and s_eq(h_tid, h_sel) == 0:
+        jump_seq = of
+        s_copy(h_sel, h_tid)
+        pane_tab = DIALOG
+        open_thread()
+    elif s_len(h_tid) == 0 and s_len(h_sel) > 0:
+        jump_seq = of
+        show_activity()
+    else:
+        s_set(h_err, "The quoted message is older than this view shows.")
+
+
+def shows_seq(src: i32, seq: i32) -> i32:
+    """1 if the events src (the transcript or project orchestrator) have this seq."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    found: i32 = 0
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        if j_int(e, "seq") == seq:
+            found = 1
+        j_free(e)
+    return found
 
 
 def show_activity() -> None:
@@ -606,12 +737,27 @@ def land() -> None:
     """New pane content has arrived. Content navigation asked for opens at the
     bottom; content that streamed in keeps the bottom in view only if the
     reader was already there, so scrolling up to read is left alone."""
-    global jump
-    if jump == 1:
+    global jump, jump_seq
+    if jump_seq != 0:
+        jump = 0
+        jump_to(jump_seq, JUMP_MISS)
+        jump_seq = 0
+    elif jump == 1:
         jump = 0
         scroll_end("pane")
     else:
         scroll_follow("pane")
+
+
+def model_id(i: i32, dst: i32) -> None:
+    """The model a project runs on, by its index in the settings' choice, in
+    dst: control/models.py MODELS, "" being the runner's default (deepseek-flash)."""
+    if i == 1:
+        s_set(dst, "deepseek-v4-pro")
+    elif i == 2:
+        s_set(dst, "deepseek/deepseek-v4.1-flash-ultrafast")
+    else:
+        s_clear(dst)
 
 
 def place_label(id: i32, dst: i32) -> None:
@@ -632,8 +778,10 @@ def place_label(id: i32, dst: i32) -> None:
 def update(msg: i32, arg: i32) -> None:
     global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
-    global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
-    global picking, folders, folders_loading
+    global copied, code_copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
+    global proj_busy
+    global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
+    global switching, switch_list
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -643,23 +791,94 @@ def update(msg: i32, arg: i32) -> None:
         projects = take(projects, arg)
     elif msg == GOT_PLACES:
         places = take(places, arg)
+    elif msg == APP_SHOW:
+        show_app = 1
+        key_edit = -1
+        s_clear(h_key_err)
+        s_set(h_url, "/api/settings")
+        get(h_url, GOT_APP)
+    elif msg == APP_HIDE:
+        if saving_key == 0:
+            show_app = 0
+            key_edit = -1
+            s_clear(h_key)
+    elif msg == GOT_APP:
+        if j_ok(arg) == 1:
+            app = take(app, arg)
+        else:
+            j_err(arg, h_key_err)
+            j_free(arg)
+    elif msg == KEY_EDIT:
+        if saving_key == 0:
+            key_edit = arg
+            s_clear(h_key)
+            s_clear(h_key_err)
+    elif msg == KEY_IN:
+        s_copy(h_key, arg)
+    elif msg == KEY_SAVE:
+        if key_edit >= 0 and saving_key == 0 and app != 0:
+            saving_key = 1
+            s_clear(h_key_err)
+            o = o_new()
+            key_name(key_edit, h_t1)
+            o_str(o, "name", h_t1)
+            o_str(o, "value", h_key)
+            s_set(h_url, "/api/settings/keys")
+            post(h_url, o, KEY_SAVED)
+    elif msg == KEY_SAVED:
+        saving_key = 0
+        if j_ok(arg) == 1:
+            app = take(app, arg)
+            key_edit = -1
+            s_clear(h_key)
+        else:
+            j_err(arg, h_key_err)
+            j_free(arg)
     elif msg == OPEN:
         e = j_idx(projects, arg)
         jstr(e, "id", h_t1)
         j_free(e)
         open_project(h_t1)
+    elif msg == SWITCH_SHOW:
+        switching = arg
+        if switching == 1:
+            # Live projects only, fresh each time: others may have come or gone.
+            s_set(h_url, "/api/projects")
+            get(h_url, GOT_SWITCH)
+    elif msg == GOT_SWITCH:
+        if switching == 1:
+            switch_list = take(switch_list, arg)
+        else:
+            j_free(arg)
+    elif msg == SWITCH:
+        switching = 0
+        e = j_idx(switch_list, arg)
+        jstr(e, "id", h_t1)
+        j_free(e)
+        if s_eq(h_t1, h_pid) == 0:
+            open_project(h_t1)
     elif msg == PROJ_SHOW_ARCHIVED:
         proj_archived = arg
+        proj_busy = 0
         loading = 1
         projects = take_none(projects)
         s_clear(h_err)
         fetch_projects()
     elif msg == PROJ_ARCHIVE:
-        post_project(arg, "archive")
+        # Archiving stops the project's threads and takes it off the workers,
+        # so the reply can take a while: the card says so until it comes.
+        if proj_busy == 0:
+            proj_busy = arg + 1
+            s_clear(h_err)
+            post_project(arg, "archive")
     elif msg == PROJ_UNARCHIVE:
-        post_project(arg, "unarchive")
+        if proj_busy == 0:
+            proj_busy = arg + 1
+            s_clear(h_err)
+            post_project(arg, "unarchive")
     elif msg == PROJ_ARCHIVED:
         # Either way the project leaves the list on screen.
+        proj_busy = 0
         if j_ok(arg) == 1:
             s_clear(h_err)
             if screen == 0:
@@ -772,23 +991,15 @@ def update(msg: i32, arg: i32) -> None:
         e = j_idx(threads, arg)
         jstr(e, "id", h_sel)
         j_free(e)
-        if mode == AUTO and show_archived == 0:
-            mode = TO_THREAD
-        editing = 0
-        jump = 1
-        fetch_transcript()
-        wlog = take_none(wlog)
-        s_clear(h_wlog_err)
-        if pane_tab == WLOG:
-            fetch_wlog()
-        files = take_none(files)
-        s_clear(h_fpath)
-        s_clear(h_files_err)
-        close_fview()
-        if pane_tab == FILES:
-            fetch_files()
+        open_thread()
     elif msg == ACTIVITY:
+        threads_open = 0
         show_activity()
+    elif msg == THREADS_TOGGLE:
+        if threads_open == 1:
+            threads_open = 0
+        else:
+            threads_open = 1
     elif msg == GOT_TRANSCRIPT:
         transcript = take(transcript, arg)
         if pane_tab != WLOG and pane_tab != FILES:
@@ -805,8 +1016,10 @@ def update(msg: i32, arg: i32) -> None:
             sending = 1
             s_copy(h_last, h_req)
             s_copy(h_lastq, h_quote)
+            s_copy(h_lastqsrc, h_qsrc)
             s_clear(h_req)
             s_clear(h_quote)
+            s_clear(h_qsrc)
             s_clear(h_err)
             # A reply to a selection goes out as markdown: the quote, then the reply.
             s_clear(h_body)
@@ -816,6 +1029,8 @@ def update(msg: i32, arg: i32) -> None:
             s_add_ref(h_body, h_last)
             o = o_new()
             o_str(o, "text", h_body)
+            if s_len(h_lastq) > 0 and s_len(h_lastqsrc) > 0:
+                o_int(o, "quote_of", h_lastqsrc)
             if img_count() > 0:
                 o_images(o, "images")
                 img_stash()
@@ -842,6 +1057,7 @@ def update(msg: i32, arg: i32) -> None:
                 s_copy(h_req, h_last)
             if s_len(h_quote) == 0:
                 s_copy(h_quote, h_lastq)
+                s_copy(h_qsrc, h_lastqsrc)
             img_restore()
         else:
             img_clear()
@@ -852,6 +1068,20 @@ def update(msg: i32, arg: i32) -> None:
         # arg is the reply's seq; its raw markdown is what gets copied.
         if find_text(arg, h_clip) == 1:
             clip_copy(h_clip, COPIED, arg, COPY_FAILED)
+    elif msg == SPACE_COPY:
+        if app != 0:
+            jstr(app, "sync.space", h_clip)
+            clip_copy(h_clip, COPIED, SPACE_COPIED, COPY_FAILED)
+    elif msg == COPY_CODE:
+        # arg is a code span's id; its text is what md() last drew for it.
+        code_text(arg, h_clip)
+        clip_copy(h_clip, CODE_COPIED, arg, COPY_FAILED)
+    elif msg == CODE_COPIED:
+        code_copied = arg
+        after(1500, CODE_COPIED_DONE, arg)
+    elif msg == CODE_COPIED_DONE:
+        if code_copied == arg:
+            code_copied = 0
     elif msg == COPIED:
         copied = arg
         after(1500, COPIED_DONE, arg)
@@ -865,13 +1095,19 @@ def update(msg: i32, arg: i32) -> None:
         selecting = arg
     elif msg == QUOTE:
         s_copy(h_quote, h_seltext)
+        s_copy(h_qsrc, h_selsrc)
         if s_len(h_sel) > 0 and show_archived == 0:
             mode = TO_THREAD
         sel_clear()
         focus_end("req")
     elif msg == UNQUOTE:
         s_clear(h_quote)
+        s_clear(h_qsrc)
         focus_end("req")
+    elif msg == JUMP:
+        go_to_quoted(arg)
+    elif msg == JUMP_MISS:
+        s_set(h_err, "The quoted message is older than this view shows.")
     elif msg == EDIT:
         # arg is the seq of one of your messages; it opens for editing in place.
         if find_text(arg, h_edit) == 1:
@@ -992,6 +1228,8 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == SHOW_ARCHIVED:
         show_archived = arg
         threads = take_none(threads)
+        # The list that was just asked for is the one to read.
+        threads_open = 1
         show_activity()
         fetch_threads()
     elif msg == STOPPED:
@@ -1095,8 +1333,8 @@ def update(msg: i32, arg: i32) -> None:
             picking = 0
     elif msg == SET_NAME_IN:
         s_copy(h_set_name, arg)
-    elif msg == SET_MODEL_IN:
-        s_copy(h_set_model, arg)
+    elif msg == SET_MODEL:
+        model_id(arg, h_set_model)
     elif msg == REPO_IN:
         s_copy(h_repo, arg)
     elif msg == SETTINGS_SAVE:
@@ -1122,6 +1360,19 @@ def update(msg: i32, arg: i32) -> None:
             set_title(h_t1)
         else:
             j_err(arg, h_set_err)
+            j_free(arg)
+    elif msg == TAKE_OVER:
+        if project != 0:
+            o = o_new()
+            s_set(h_url, "/api/projects/")
+            s_add_ref(h_url, h_pid)
+            s_add(h_url, "/drive")
+            post(h_url, o, TOOK_OVER)
+    elif msg == TOOK_OVER:
+        if j_ok(arg) == 1:
+            project = take(project, arg)
+            fetch_threads()
+        else:
             j_free(arg)
     elif msg == HOME:
         s_set(h_url, "/")
@@ -1171,38 +1422,19 @@ def thread_badges(t: i32) -> None:
         jstr(t, "state", h_t2)
         if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1:
             state_badge(h_t2)
-    backlog_badge(t)
     jstr(t, "workers", h_t2)
     if s_eq(h_t2, h_local) == 1:
         place_label(h_t2, h_plabel)
         el("span")
         cls("badge")
         cls("secondary")
-        attr("title", "Its workers run here, as its request asked; the rest run on Sprites")
+        # The router's reason for putting it here, when it gave one.
+        jstr(t, "workers_why", h_t3)
+        if s_len(h_t3) == 0:
+            s_set(h_t3, "Its workers run on this computer; the rest run on Sprites")
+        attr_ref("title", h_t3)
         text_ref(h_plabel)
         end()
-
-
-def backlog_badge(t: i32) -> None:
-    """How many messages the thread has not got to (load.py in the control
-    plane), when any; marked once it is backed up, when the router gives
-    new work to a new thread rather than it."""
-    n: i32
-    n = j_int(t, "load.backlog")
-    if n == 0:
-        return
-    jstr(t, "load.level", h_t2)
-    el("span")
-    cls("badge")
-    cls("outline")
-    cls_if("backed-up", s_eq(h_t2, h_backed_up) == 1)
-    if s_eq(h_t2, h_backed_up) == 1:
-        attr("title", "Backed up: new work goes to a new thread")
-    else:
-        attr("title", "Messages it has not got to yet")
-    num(n)
-    text(" waiting")
-    end()
 
 
 def error_banner() -> None:
@@ -1233,6 +1465,7 @@ def project_list() -> None:
     if proj_archived == 1:
         btn("← Projects", "ghost", PROJ_SHOW_ARCHIVED, 0)
     else:
+        btn("Settings", "ghost", APP_SHOW, 0)
         btn("Archived", "ghost", PROJ_SHOW_ARCHIVED, 1)
         btn("Open folder", "outline", NEW_SHOW, 1)
         btn("New project", "", NEW_SHOW, 0)
@@ -1301,7 +1534,14 @@ def project_list() -> None:
         end()
         el("button")
         cls("project-archive")
-        if proj_archived == 1:
+        if proj_busy == i + 1:
+            cls("busy")
+            attr("aria-busy", "true")
+            if proj_archived == 1:
+                text("Unarchiving…")
+            else:
+                text("Archiving…")
+        elif proj_archived == 1:
             on_click(PROJ_UNARCHIVE, i)
             attr("title", "Unarchive")
             attr("aria-label", "Unarchive")
@@ -1320,6 +1560,231 @@ def project_list() -> None:
         new_project_dialog()
     elif show_new == 2:
         open_folder_dialog()
+    if show_app == 1:
+        app_dialog()
+
+
+def key_name(i: i32, dst: i32) -> None:
+    """The name of the app settings' key i."""
+    ks: i32 = j_at(app, "keys")
+    e: i32 = j_idx(ks, i)
+    jstr(e, "name", dst)
+    j_free(e)
+    j_free(ks)
+
+
+def app_dialog() -> None:
+    """This computer's control plane: its router model, data folder, sync
+    server, where workers run and the keys it uses, each kept in the keyring
+    from here unless the environment sets it."""
+    i: i32
+    e: i32 = 0
+    ks: i32 = 0
+    n: i32 = 0
+    dialog_open("Settings", "This computer's orchestrator, for every project. "
+                "Each project has its own settings too.", APP_HIDE)
+    el("div")
+    cls("form")
+    cls("app-settings")
+    if app == 0:
+        if s_len(h_key_err) > 0:
+            el("div")
+            cls("alert")
+            cls("destructive")
+            attr("role", "alert")
+            text_ref(h_key_err)
+            end()
+        else:
+            el("p")
+            cls("muted")
+            text("Loading…")
+            end()
+    else:
+        label("Router model")
+        el("p")
+        cls("mono")
+        cls("repo-path")
+        jstr(app, "router_model", h_t1)
+        text_ref(h_t1)
+        end()
+        label("Data folder")
+        el("p")
+        cls("mono")
+        cls("repo-path")
+        jstr(app, "data_dir", h_t1)
+        text_ref(h_t1)
+        end()
+        label("Sync")
+        el("p")
+        cls("help")
+        if j_has(app, "sync.url") == 1:
+            text("Projects are shared with your other computers through ")
+            span("mono")
+            jstr(app, "sync.url", h_t1)
+            text_ref(h_t1)
+            end()
+            text(", in this computer's space. This computer is ")
+            jstr(app, "sync.computer", h_t1)
+            text_ref(h_t1)
+            text(".")
+        else:
+            text("Off: projects stay on this computer.")
+        end()
+        if j_has(app, "sync.url") == 1 and j_int(app, "sync.caught_up") == 0:
+            el("div")
+            cls("alert")
+            cls("destructive")
+            attr("role", "alert")
+            jstr(app, "sync.problem", h_t1)
+            if s_len(h_t1) > 0:
+                text("Not reached yet, so nothing is shared: ")
+                text_ref(h_t1)
+            else:
+                text("Catching up with the sync server…")
+            end()
+        if j_has(app, "sync.space") == 1:
+            label("Space key")
+            el("p")
+            cls("help")
+            text("To share these projects with another computer, copy this key and set it there as "
+                 "ORCHESTRATE_SYNC_SPACE (in its Settings). Anyone with the key can see and change them.")
+            end()
+            div("settings-row")
+            span("mono")
+            cls("repo-path")
+            jstr(app, "sync.space", h_t1)
+            text_ref(h_t1)
+            end()
+            btn_open("outline", SPACE_COPY, 0)
+            cls("sm")
+            if copied == SPACE_COPIED:
+                text("Copied")
+            else:
+                text("Copy")
+            end()
+            end()
+        label("Workers")
+        div("settings-list")
+        if places != 0:
+            n = j_len(places, "")
+        for i in range(n):
+            e = j_idx(places, i)
+            div("settings-item")
+            div("settings-row")
+            span("title")
+            jstr(e, "label", h_t1)
+            text_ref(h_t1)
+            end()
+            jstr(e, "why", h_t2)
+            if s_len(h_t2) == 0:
+                badge("available", "secondary")
+            else:
+                badge("off", "outline")
+            end()
+            if s_len(h_t2) > 0:
+                el("p")
+                cls("help")
+                text_ref(h_t2)
+                end()
+            end()
+            j_free(e)
+        end()
+        label("Keys")
+        el("p")
+        cls("help")
+        jstr(app, "keyring", h_t1)
+        if s_len(h_t1) > 0:
+            text("Read from the environment first, then the keyring. Keys kept here go to the keyring "
+                 "and are used from the app's next start.")
+        else:
+            text("This computer has no keyring: set keys in the environment the app starts in.")
+        end()
+        ks = j_at(app, "keys")
+        n = j_len(ks, "")
+        div("settings-list")
+        for i in range(n):
+            e = j_idx(ks, i)
+            key_row(e, i)
+            j_free(e)
+        end()
+        j_free(ks)
+        if key_edit < 0 and s_len(h_key_err) > 0:
+            key_error()
+    end()
+    dialog_footer_open()
+    btn("Close", "outline", APP_HIDE, 0)
+    end()
+    end()
+
+
+def key_row(e: i32, i: i32) -> None:
+    """A key: its name and where it is found, what it is for, and a field
+    to keep it in the keyring while it is open."""
+    div("settings-item")
+    div("settings-row")
+    span("mono")
+    jstr(e, "name", h_t1)
+    text_ref(h_t1)
+    end()
+    jstr(e, "source", h_t2)
+    if s_len(h_t2) == 0:
+        badge("not set", "outline")
+    else:
+        el("span")
+        cls("badge")
+        cls("secondary")
+        text_ref(h_t2)
+        end()
+    span("grow")
+    end()
+    # One the environment sets is changed there: it wins over the keyring.
+    jstr(app, "keyring", h_t1)
+    s_set(h_t3, "environment")
+    if key_edit != i and s_len(h_t1) > 0 and s_eq(h_t2, h_t3) == 0:
+        btn_open("ghost", KEY_EDIT, i)
+        cls("sm")
+        if s_len(h_t2) == 0:
+            text("Set…")
+        else:
+            text("Change…")
+        end()
+    end()
+    el("p")
+    cls("help")
+    jstr(e, "what", h_t1)
+    text_ref(h_t1)
+    text(". Sent as ")
+    jstr(e, "sent", h_t1)
+    text_ref(h_t1)
+    text(".")
+    end()
+    if key_edit == i:
+        div("field-row")
+        input_open("empty removes it from the keyring", h_key, KEY_IN)
+        attr("type", "password")
+        autofocus()
+        on_enter(KEY_SAVE, 0)
+        end()
+        btn("Cancel", "outline", KEY_EDIT, -1)
+        btn_open("", KEY_SAVE, 0)
+        if saving_key == 1:
+            text("Saving…")
+        else:
+            text("Save")
+        end()
+        end()
+        if s_len(h_key_err) > 0:
+            key_error()
+    end()
+
+
+def key_error() -> None:
+    el("div")
+    cls("alert")
+    cls("destructive")
+    attr("role", "alert")
+    text_ref(h_key_err)
+    end()
 
 
 def new_project_dialog() -> None:
@@ -1481,7 +1946,19 @@ def thread_list() -> None:
     e: i32 = 0
     el("aside")
     cls("threads")
+    cls_if("collapsed", threads_open == 0)
     div("threads-head")
+    btn_open("ghost", THREADS_TOGGLE, 0)
+    cls("sm")
+    cls("threads-toggle")
+    aria("aria-expanded", threads_open == 1)
+    attr("title", "Show or hide the thread list")
+    attr("aria-label", "Show or hide the thread list")
+    if threads_open == 1:
+        text("▾")
+    else:
+        text("▸")
+    end()
     span("title")
     if show_archived == 1:
         text("Archived")
@@ -1536,11 +2013,13 @@ def thread_list() -> None:
         cls("thread")
         cls_if("active", s_eq(h_t3, h_sel) == 1)
         on_click(SELECT, i)
-        div("thread-top")
-        span("thread-title")
+        # The title has a line of its own and wraps, so a long one reads in
+        # full; the badges go on the line under it.
+        div("thread-label")
         jstr(e, "title", h_t1)
         text_ref(h_t1)
         end()
+        div("thread-badges")
         thread_badges(e)
         end()
         jstr(e, "activity", h_t1)
@@ -1731,6 +2210,7 @@ def event_images(e: i32) -> None:
 def event_row(e: i32, show_thread: i32) -> None:
     """One dialog entry. While the model streams, its reasoning and reply show
     as they grow; finished reasoning is grouped by thinking_group."""
+    global md_quote
     k: i32
     live: i32
     k = j_int(e, "kind")
@@ -1738,6 +2218,10 @@ def event_row(e: i32, show_thread: i32) -> None:
     el("div")
     cls("ev")
     key(j_int(e, "seq"))
+    # a quote's way back to the row it was selected from (jump_to)
+    s_set(h_evid, "ev-")
+    s_add_num(h_evid, j_int(e, "seq"))
+    attr_ref("id", h_evid)
     cls_if("ev-user", k == K_USER)
     cls_if("ev-request", k == K_REQUEST)
     cls_if("ev-assistant", k == K_ASSISTANT)
@@ -1779,7 +2263,12 @@ def event_row(e: i32, show_thread: i32) -> None:
         el("div")
         cls("ev-text")
         cls("md")
+        if k == K_USER and j_has(e, "quote_of") == 1:
+            md_quote = j_int(e, "seq")
+        s_set(h_mdkey, "ev-")
+        s_add_num(h_mdkey, j_int(e, "seq"))
         md(h_t1)
+        md_quote = 0
         end()
     else:
         el("div")
@@ -1888,14 +2377,25 @@ def quote_chip() -> None:
 def md(h: i32) -> None:
     """The markdown in handle h, as elements. A reply still streaming in is
     parsed whole on each render, so it reads right at every step. Images name
-    files in thread h_mdtid's worktree, relative to its directory h_mdbase."""
+    files in thread h_mdtid's worktree, relative to its directory h_mdbase.
+    Code copies in one click: a block by its copy button, a span by clicking
+    it, unless the span is inside something a click already does (a link, or a
+    quote that jumps to its source). h_mdkey says where the markdown is shown."""
+    global md_codes
     n: i32
     i: i32
     op: i32
+    depth: i32 = 0     # elements open
+    clicks: i32 = 0    # depth of the open link or jumping quote, 0 when none
+    block: i32 = 0     # the next code opens inside a code block's pre
+    md_codes = 0
     n = md_parse(h)
     for i in range(n):
         op = md_op(i)
         if op == MD_END:
+            if depth == clicks:
+                clicks = 0
+            depth -= 1
             end()
         elif op == MD_TEXT:
             md_str(i, h_md)
@@ -1924,12 +2424,75 @@ def md(h: i32) -> None:
             cls("center")
         elif op == MD_ALIGN_R:
             cls("right")
+        elif op == 20:
+            depth += 1
+            code_button(code_id(i + 1, n))
+            el("pre")
+            block = 1
+        elif op == 21:
+            depth += 1
+            el("code")
+            if block == 0 and clicks == 0:
+                code_click(code_id(i, n))
+            block = 0
         else:
+            depth += 1
+            if op == 33 or (op == 22 and md_quote != 0):
+                if clicks == 0:
+                    clicks = depth
             md_open(op)
 
 
+def code_id(i: i32, n: i32) -> i32:
+    """The id COPY_CODE copies code op i's text by. It stays the same for the
+    same code in the same place while the markdown grows (code_put), so its
+    check outlasts a render."""
+    global md_codes
+    s_clear(h_code)
+    if i + 1 < n:
+        if md_op(i + 1) == MD_TEXT:
+            md_str(i + 1, h_code)
+    s_copy(h_ckey, h_mdkey)
+    s_add(h_ckey, ":")
+    s_add_num(h_ckey, md_codes)
+    md_codes += 1
+    return code_put(h_ckey, h_code)
+
+
+def code_button(cid: i32) -> None:
+    """A code block's copy icon, a check for a moment after."""
+    btn_open("ghost", COPY_CODE, cid)
+    cls("icon")
+    cls("sm")
+    cls("md-copy")
+    if code_copied == cid:
+        attr("title", "Copied")
+        attr("aria-label", "Copied")
+        span("icon icon-check")
+        end()
+    else:
+        attr("title", "Copy")
+        attr("aria-label", "Copy")
+        span("icon icon-copy")
+        end()
+    end()
+
+
+def code_click(cid: i32) -> None:
+    """A code span copies itself when clicked, and turns green for a moment."""
+    cls("md-copyable")
+    cls_if("copied", code_copied == cid)
+    if code_copied == cid:
+        attr("title", "Copied")
+    else:
+        attr("title", "Click to copy")
+    on_click(COPY_CODE, cid)
+
+
 def md_open(op: i32) -> None:
-    """Open the element for markdown op code op (TAGS in ui/markdown.js)."""
+    """Open the element for markdown op code op (TAGS in ui/markdown.js). The
+    first block quote of a reply to a selection goes back to where it came from."""
+    global md_quote
     if op == 10:
         el("p")
     elif op == 11:
@@ -1956,6 +2519,11 @@ def md_open(op: i32) -> None:
         el("code")
     elif op == 22:
         el("blockquote")
+        if md_quote != 0:
+            cls("quote-link")
+            attr("title", "Go to the quoted message")
+            on_click(JUMP, md_quote)
+            md_quote = 0
     elif op == 23:
         el("hr")
     elif op == 24:
@@ -2315,6 +2883,8 @@ def thinking_steps(src: i32, n: i32) -> i32:
             jstr(e, "text", h_t1)
             s_copy(h_mdtid, h_sel)
             s_clear(h_mdbase)
+            s_set(h_mdkey, "ev-")
+            s_add_num(h_mdkey, j_int(e, "seq"))
             md(h_t1)
             end()
             end()
@@ -2422,6 +2992,8 @@ def file_view() -> None:
         jstr(fview, "text", h_t1)
         s_copy(h_mdtid, h_sel)
         path_dir(h_mdbase, h_fview)
+        s_set(h_mdkey, "file:")
+        s_add_ref(h_mdkey, h_fview)
         md(h_t1)
         end()
 
@@ -2686,10 +3258,12 @@ def request_box() -> None:
     end()
     end()
     div("composer-row")
-    el("input")
+    el("textarea")
     cls("input")
     cls("grow")
+    cls("composer-box")
     attr("id", "req")
+    attr("rows", "1")
     if s_len(h_quote) > 0:
         attr("placeholder", "Reply to the quote…")
     elif img_count() > 0:
@@ -2711,7 +3285,8 @@ def request_box() -> None:
 
 
 def from_input() -> None:
-    # value + events for the request input
+    # value + events for the request box; Enter sends, Shift+Enter adds a line
+    # (newline_keys)
     value_ref(h_req)
     on_input(REQ_IN)
     on_enter(SEND, 0)
@@ -2726,13 +3301,7 @@ def project_window() -> None:
     cls("sm")
     text("← All projects")
     end()
-    el("h1")
-    if project != 0:
-        jstr(project, "name", h_t1)
-        text_ref(h_t1)
-    else:
-        text("Project")
-    end()
+    project_switcher()
     if project != 0 and j_has(project, "archived_at") == 1:
         el("span")
         cls("badge")
@@ -2748,6 +3317,19 @@ def project_window() -> None:
         else:
             text("no remote")
     end()
+    if project != 0:
+        # Projects shared with other computers: one drives each (runs its threads).
+        jstr(project, "driver_name", h_t1)
+        if s_len(h_t1) > 0 and j_int(project, "driven_here") == 0:
+            span("muted")
+            text("Driven by ")
+            text_ref(h_t1)
+            end()
+            btn_open("ghost", TAKE_OVER, 0)
+            cls("sm")
+            attr("title", "Drive this project from this computer: its threads move to this computer's workers")
+            text("Take over")
+            end()
 
     span("grow")
     end()
@@ -2770,20 +3352,123 @@ def project_window() -> None:
     end()
 
 
+def project_switcher() -> None:
+    """The project's name, which opens a list of the live projects to switch to
+    in place; the open one is ticked."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    div("proj-switch")
+    el("button")
+    cls("proj-switch-btn")
+    on_click(SWITCH_SHOW, 1 - switching)
+    on_escape(SWITCH_SHOW, 0)
+    attr("title", "Switch project")
+    attr("aria-haspopup", "menu")
+    if switching == 1:
+        attr("aria-expanded", "true")
+    else:
+        attr("aria-expanded", "false")
+    el("h1")
+    if project != 0:
+        jstr(project, "name", h_t1)
+        text_ref(h_t1)
+    else:
+        text("Project")
+    end()
+    span("icon icon-chevron-down")
+    end()
+    end()
+    if switching == 1:
+        # Clicking anywhere off the menu closes it.
+        div("proj-scrim")
+        on_click(SWITCH_SHOW, 0)
+        end()
+        el("div")
+        cls("proj-menu")
+        attr("role", "menu")
+        if switch_list == 0:
+            el("p")
+            cls("muted")
+            cls("proj-menu-note")
+            text("Loading…")
+            end()
+        else:
+            n = j_len(switch_list, "")
+        for i in range(n):
+            e = j_idx(switch_list, i)
+            jstr(e, "id", h_t3)
+            el("button")
+            cls("proj-menu-item")
+            key(i + 1)
+            attr("role", "menuitem")
+            cls_if("active", s_eq(h_t3, h_pid) == 1)
+            on_click(SWITCH, i)
+            span("proj-menu-name")
+            jstr(e, "name", h_t1)
+            text_ref(h_t1)
+            end()
+            span("proj-menu-remote muted mono")
+            jstr(e, "repo_url", h_t2)
+            if s_len(h_t2) > 0:
+                text_ref(h_t2)
+            else:
+                text("no remote")
+            end()
+            end()
+            j_free(e)
+        el("button")
+        cls("proj-menu-item")
+        cls("proj-menu-all")
+        key(n + 1)
+        attr("role", "menuitem")
+        on_click(HOME, 0)
+        text("All projects")
+        end()
+        end()
+    end()
+
+
+def model_choice(i: i32, name: str, via: str) -> None:
+    """One model in the settings' picker: its name over who serves it."""
+    model_id(i, h_t3)
+    toggle_open(s_eq(h_set_model, h_t3) == 1, SET_MODEL, i)
+    span("model-name")
+    text(name)
+    end()
+    span("model-via")
+    text(via)
+    end()
+    end()
+
+
 def settings_dialog() -> None:
     """The open project's name, model and remote, and where its repository is."""
     dialog_open("Project settings", "", SETTINGS_HIDE)
     el("div")
     cls("form")
+    cls("settings-form")
+    div("setting")
     label("Name")
     input_open("my-app", h_set_name, SET_NAME_IN)
     autofocus()
     on_enter(SETTINGS_SAVE, 0)
     end()
-    label("Model (optional)")
-    input_open("the runner's default", h_set_model, SET_MODEL_IN)
-    on_enter(SETTINGS_SAVE, 0)
     end()
+    div("setting")
+    label("Model")
+    toggle_group_open()
+    cls("model-pick")
+    model_choice(0, "Flash", "DeepSeek")
+    model_choice(1, "V4 Pro", "DeepSeek")
+    model_choice(2, "V4.1 UltraFast", "OpenGateway")
+    end()
+    el("p")
+    cls("help")
+    text("What this project's threads run on. OpenGateway needs OPENGATEWAY_API_TOKEN in Keys.")
+    end()
+    end()
+    div("setting")
     label("Remote (optional)")
     div("field-row")
     input_open("https://github.com/you/repo or /home/you/my-app", h_repo, REPO_IN)
@@ -2795,11 +3480,11 @@ def settings_dialog() -> None:
         folder_picker()
     el("p")
     cls("help")
-    text("With a remote, the project's main branch follows its default branch and finished threads "
-         "are pushed there. An empty repository gets this project's history; one with history must "
-         "share it, unless nothing has landed here yet. A folder on this computer works too: "
-         "threads land in its checked-out branch. Clearing it keeps everything here.")
+    text("Finished threads push to its default branch. Use an empty repository, one that shares "
+         "this project's history, or a folder on this computer. Clear it to keep work here only.")
     end()
+    end()
+    div("setting")
     label("Local repository")
     el("p")
     cls("mono")
@@ -2807,6 +3492,7 @@ def settings_dialog() -> None:
     if project != 0:
         jstr(project, "repo_path", h_t1)
         text_ref(h_t1)
+    end()
     end()
     if s_len(h_set_err) > 0:
         el("div")

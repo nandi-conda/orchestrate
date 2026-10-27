@@ -7,6 +7,7 @@ run anywhere.
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -97,6 +98,9 @@ class Recording:
     async def destroy(self, worker) -> None:
         self.destroyed.append(worker)
 
+    def worker_name(self, index, pool=""):
+        return f"{self.name}-{pool}-w{index}"
+
     async def sweep(self, slots, pool):
         self.swept = getattr(self, "swept", []) + [pool]
         return [f"{self.name}-swept-{pool}-beyond-{slots}"]
@@ -135,6 +139,27 @@ def test_a_place_nobody_offers_says_why():
 def test_passthrough_env_reads_a_keyring_only_secret(env):
     env.setattr(secrets, "get_secret", lambda name: "deepseek" if name == "DEEPSEEK_API_KEY" else None)
     assert providers.passthrough_env() == {"DEEPSEEK_API_KEY": "deepseek"}
+
+
+def test_passthrough_env_gives_workers_the_opengateway_token(env):
+    keys = {"DEEPSEEK_API_KEY": "deepseek", "OPENGATEWAY_API_TOKEN": "og"}
+    env.setattr(secrets, "get_secret", keys.get)
+    assert providers.passthrough_env() == keys
+
+
+def test_a_project_model_names_its_provider_to_the_runner():
+    from control.models import MODELS, worker_model
+
+    assert worker_model("") is None
+    assert worker_model("deepseek-v4-pro") == {"provider": "deepseek", "model": "deepseek-v4-pro"}
+    assert worker_model("deepseek/deepseek-v4.1-flash-ultrafast") == {
+        "provider": "opengateway", "model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+    with pytest.raises(ValueError, match="no model 'gpt-4o'"):
+        worker_model("gpt-4o")
+    # Each is one runner/models.json declares under that provider.
+    declared = json.loads((Path(__file__).resolve().parents[2] / "runner" / "models.json").read_text())["providers"]
+    for name, (provider, _) in MODELS.items():
+        assert name in [m["id"] for m in declared[provider]["models"]]
 
 
 def test_passthrough_env_never_includes_the_sprites_token(env):
@@ -179,24 +204,21 @@ def test_an_install_inside_another_repository_uses_the_public_repository(tmp_pat
     assert providers.repo_source_default(install) == (providers.DEFAULT_SOURCE, providers.DEFAULT_REF)
 
 
-def test_checkout_note_warns_when_the_branch_was_never_pushed(tmp_path):
-    root = _checkout(tmp_path)
-    assert "clone will fail" in providers.checkout_note(root, "feature/x")
-
-
-def test_checkout_note_is_quiet_when_the_branch_matches(tmp_path):
+def test_checkout_note_is_quiet_when_origin_names_this_checkouts_head(tmp_path):
+    """origin's commit is what remote_commit asked origin for: a missing or
+    stale remote-tracking ref here (none in this checkout) says nothing."""
     root = _checkout(tmp_path)
     _commit(root, "one")
-    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/feature/x", "HEAD"], check=True)
-    assert providers.checkout_note(root, "feature/x") == ""
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert providers.checkout_note(root, "feature/x", head) == ""
 
 
 def test_checkout_note_warns_about_unpushed_commits(tmp_path):
     root = _checkout(tmp_path)
     _commit(root, "one")
-    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/feature/x", "HEAD"], check=True)
+    pushed = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     _commit(root, "two")
-    assert "not this checkout's HEAD" in providers.checkout_note(root, "feature/x")
+    assert "not this checkout's HEAD" in providers.checkout_note(root, "feature/x", pushed)
 
 
 async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
@@ -204,9 +226,9 @@ async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
     try:
         assert (p.source, p.ref) == ("https://example.com/fork.git", "dev")
-        assert p.sprite_name(1, "3f9a1c2b") == "orch-3f9a1c2b-w1"
+        assert p.worker_name(1, "3f9a1c2b") == "orch-3f9a1c2b-w1"
         with pytest.raises(ValueError, match="pool"):
-            p.sprite_name(1, "")
+            p.worker_name(1, "")
     finally:
         await p.close()
 
@@ -232,6 +254,102 @@ async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
     monkeypatch.setattr(r, "_ask", empty)
     with pytest.raises(ValueError, match="planned nothing"):
         await r.plan("do it", [], [])
+
+
+def router_answering(message: dict, seen: list, finish_reason: str = "stop"):
+    """A ModelRouter whose model answers every request with `message`."""
+    from control.router import ModelRouter
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish_reason}]})
+    r = ModelRouter("key")
+    r.http = httpx.AsyncClient(base_url="https://api.deepseek.com/beta", transport=httpx.MockTransport(handle))
+    return r
+
+
+def route_call(plan: dict) -> dict:
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "route", "arguments": json.dumps(plan)}}]}
+
+
+async def test_the_router_model_answers_with_one_forced_strict_route_call():
+    """The plan is the arguments of a `route` call the model is made to make,
+    in strict mode (so they have the plan's schema), with thinking off."""
+    places = [{"id": "local", "label": "This computer", "why": ""},
+              {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
+    seen: list = []
+    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
+                                                "where": "Sprites are not available"}],
+                                     "send": [{"thread": "t_1", "message": "heads up", "kind": "steer",
+                                               "workers": "", "where": "it stays"}],
+                                     "why": "new work"}), seen)
+    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old", "load": {"level": "busy", "busy_for": 9}}],
+                        places)
+    # A send that moves nothing keeps no reason for a move.
+    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
+                               "where": "Sprites are not available"}],
+                    "send": [{"thread": "t_1", "message": "heads up", "kind": "steer", "workers": "", "where": ""}],
+                    "why": "new work"}
+    body = seen[0]
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "route"}}
+    fn = body["tools"][0]["function"]
+    assert fn["strict"] is True and fn["name"] == "route"
+    props = fn["parameters"]["properties"]
+    assert props["spawn"]["items"]["properties"]["workers"]["enum"] == ["local"]
+    assert "where" in props["spawn"]["items"]["required"] and "where" in props["send"]["items"]["required"]
+    assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
+    assert props["send"]["items"]["properties"]["kind"]["enum"] == ["steer", "work"]
+    assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
+    # With no threads there is nothing to send to, so the schema has no send.
+    await r.plan("fix it", [], places)
+    assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
+
+
+async def test_the_router_model_says_whether_a_message_steers_a_busy_thread_or_is_new_work():
+    seen: list = []
+    call = {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "kind", "arguments": json.dumps({"kind": "work", "why": "a new job"})}}]}
+    r = router_answering(call, seen)
+    got = await r.kind("now write the docs", "user", {"id": "t_1", "title": "Fix login", "request": "fix login",
+                                                       "summary": "", "state": "working"})
+    assert got == {"kind": "work", "why": "a new job"}
+    fn = seen[0]["tools"][0]["function"]
+    assert fn["name"] == "kind" and fn["parameters"]["properties"]["kind"]["enum"] == ["steer", "work"]
+    content = json.loads(seen[0]["messages"][1]["content"])
+    assert content["message"] == "now write the docs" and content["thread"]["title"] == "Fix login"
+
+
+async def test_a_router_answer_that_is_not_a_route_call_is_an_error_saying_what_came_back():
+    r = router_answering({"role": "assistant", "content": "I would spawn a thread"}, [])
+    with pytest.raises(ValueError, match="did not call route once.*I would spawn a thread"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
+    r = router_answering(route_call({"spawn": [], "why": "nothing asked"}), [])
+    with pytest.raises(ValueError, match="planned nothing.*nothing asked"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
+
+
+async def test_a_route_call_the_model_was_stopped_in_is_an_error_naming_why():
+    """A call cut off mid-argument (here by the server running out of
+    resources) is refused for its finish_reason, before its arguments are read."""
+    places = [{"id": "sprites", "label": "Sprites", "why": ""}]
+    cut = route_call({})
+    cut["tool_calls"][0]["function"]["arguments"] = '{"spawn":[{"title":"Fix it","request":"fix the rou'
+    for reason in ("insufficient_system_resource", "content_filter", "aborted", "length", None):
+        r = router_answering(cut, [], finish_reason=reason)
+        with pytest.raises(ValueError, match=f"stopped before finishing its route call.*{reason!r}.*fix the rou"):
+            await r.plan("fix it", [], places)
+
+
+async def test_route_arguments_that_are_not_json_are_an_error_saying_what_came_back():
+    cut = route_call({})
+    cut["tool_calls"][0]["function"]["arguments"] = '{"spawn":[{"title":"Fix it","request":"fix the rou'
+    r = router_answering(cut, [], finish_reason="tool_calls")
+    with pytest.raises(ValueError, match="arguments that are not JSON.*Unterminated string.*fix the rou"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
 
 
 async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(env):
@@ -304,9 +422,8 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
     fake.bootstrap = None
     p.http = fake
 
-    async def no_exec(name, script, env=None):
-        fake.bootstrap = env
-        return ""
+    async def no_install(name, commit, steps):
+        fake.bootstrap = {"ORCHESTRATE_REPO": p.source, "ORCHESTRATE_COMMIT": commit}
 
     async def healthy(url, timeout=120.0):
         return {"ok": True, "commit": serving, "spec": spec}
@@ -322,7 +439,7 @@ async def _sprites_create(env, defined: bool, serving: str = "c0ffee", spec: str
 
     env.setattr(providers, "remote_commit", resolve)
     env.setattr(p, "logs", logs)
-    env.setattr(p, "exec", no_exec)
+    env.setattr(p, "install", no_install)
     env.setattr(providers, "wait_healthy", healthy)
     env.setattr(p, "accepts_token", accepts)
     try:
@@ -374,6 +491,147 @@ async def test_sprites_create_makes_a_new_service(env):
     _, fake = await _sprites_create(env, defined=False)
     assert fake.deleted == 0
     assert fake.bootstrap == {"ORCHESTRATE_REPO": "https://example.com/fork.git", "ORCHESTRATE_COMMIT": "c0ffee"}
+
+
+class LocalSprite:
+    """The Sprites API's exec and filesystem calls, served on this machine.
+    POST /exec runs `bash` with the given args and env, the request held until
+    it ends, and answers as the API does: stdout, stderr and the exit code in
+    frames with a stream byte and no length, which exec must not try to read.
+    The install's scripts run for real (in tmp dirs; there is no
+    /.sprite/api.sock here, so its hold only logs that it could not be made)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.calls = 0
+
+    async def post(self, url, params=None, **kw):
+        assert url == "/sprites/orch-w1/exec"
+        self.calls += 1
+        args = [v for k, v in params if k == "cmd"]
+        env = {**os.environ, **dict(v.split("=", 1) for k, v in params if k == "env"),
+               "INSTALL_ROOT": str(self.root)}
+        proc = await asyncio.create_subprocess_exec(*args, env=env, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE)
+        out, err = await proc.communicate()
+        body = b"\x01" + out + b"\x02" + err + bytes([3, proc.returncode])
+        return httpx.Response(200, content=body, request=httpx.Request("POST", url))
+
+    async def get(self, url, params=None, **kw):
+        assert url == "/sprites/orch-w1/fs/read"
+        path = Path(params["path"])
+        if not path.exists():
+            return httpx.Response(404, json={"error": "not found"}, request=httpx.Request("GET", url))
+        return httpx.Response(200, content=path.read_bytes(), request=httpx.Request("GET", url))
+
+    async def request(self, method, url, json=None, **kw):
+        assert (method, url, json["recursive"]) == ("DELETE", "/sprites/orch-w1/fs/delete", True)
+        shutil.rmtree(json["path"])
+        return httpx.Response(200, request=httpx.Request(method, url))
+
+    async def aclose(self):
+        pass
+
+
+def _local_sprites(env, tmp_path):
+    env.setattr(providers, "EXEC_ROOT", str(tmp_path / "exec"))
+    p = providers.SpritesProvider(token="tok", source="https://example.com/fork.git", ref="dev")
+    p.http = LocalSprite(tmp_path / "install")
+    return p
+
+
+async def _install(env, tmp_path, script):
+    env.setattr(providers, "INSTALL_LOOK_EVERY", 0.05)
+    p = _local_sprites(env, tmp_path)
+    steps = providers.Steps("worker orch-w1")
+    await p.install("orch-w1", "c0ffee" * 6, steps, script=script)
+    return p.http, [line.split("s  ", 1)[1] for line in steps.lines]
+
+
+async def test_exec_reads_the_output_and_exit_code_from_files_not_the_framed_body(env, tmp_path):
+    p = _local_sprites(env, tmp_path)
+    assert await p.exec("orch-w1", 'echo "running $X"; echo oops >&2', env={"X": "now"}) == "running now\noops\n"
+    with pytest.raises(RuntimeError, match="exited 4; its output:\nnope"):
+        await p.exec("orch-w1", "echo nope; exit 4")
+    assert not list((tmp_path / "exec").iterdir())  # each call's files are removed
+
+
+async def test_the_install_runs_detached_and_is_watched_until_it_ends(env, tmp_path):
+    """The install outlives the exec that starts it (a held exec came back as a
+    bare 502 mid-install), so each exec is short: one starts it, the others
+    look at it, noting the lines it wrote since the last look."""
+    script = 'echo "fetching $ORCHESTRATE_COMMIT"\nsleep 0.3\nprintf "pixi install\\nready"\n'
+    sprite, lines = await _install(env, tmp_path, script)
+    assert sprite.calls >= 3  # started, looked at while it ran, looked at once it ended
+    assert "  install | fetching " + "c0ffee" * 6 in lines
+    assert lines[-2:] == ["  install | pixi install", "  install | ready"]  # the last line, without its newline
+
+
+async def test_a_failed_install_says_how_it_ended(env, tmp_path):
+    with pytest.raises(RuntimeError, match=r"failed \(exit 3\); its output ends:\nno pixi here"):
+        await _install(env, tmp_path, "echo 'no pixi here'\nexit 3\n")
+
+
+async def test_an_install_that_dies_is_gone_not_running(env, tmp_path):
+    """A run whose process is not there and wrote no exit code (the sprite
+    rebooted under it) is reported, not waited on."""
+    with pytest.raises(RuntimeError, match="stopped without finishing"):
+        await _install(env, tmp_path, 'echo started\nkill -9 "$(cat "$INSTALL_ROOT/$INSTALL_RUN/pid")"\n')
+
+
+async def test_a_failed_sprites_call_says_what_the_api_answered():
+    """A gateway's 502 has no body: the error says so, with the request id."""
+    r = httpx.Response(502, headers={"fly-request-id": "01ABC"},
+                       request=httpx.Request("POST", "https://api.sprites.dev/v1/sprites/orch-w1/exec"))
+    assert providers.failure("exec on sprite orch-w1", r) == (
+        "exec on sprite orch-w1 failed: 502 Bad Gateway (POST /v1/sprites/orch-w1/exec; fly-request-id 01ABC): "
+        "the API answered with an empty body")
+
+
+async def test_looking_for_the_runner_service_fails_on_an_api_error(env):
+    """Only a 404 means "no runner service": a 502 is not taken for one."""
+    class Broken(FakeSprites):
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner"):
+                return httpx.Response(502, request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    with pytest.raises(RuntimeError, match="looking for sprite orch-ab12-w1's runner service failed: 502"):
+        await _sprites_create(env, defined=True, fake=Broken(True))
+
+
+async def test_a_cold_sprites_services_manager_is_waited_for(env):
+    """A cold sprite's services API answers 500 "services manager not started"
+    until it has booted it: that is waited out, then the answer read."""
+    env.setattr(providers, "SERVICES_LOOK_EVERY", 0.0)
+
+    class Booting(FakeSprites):
+        booting = 2
+
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner") and self.booting:
+                self.booting -= 1
+                return httpx.Response(500, text="services manager not started - call Start() first",
+                                      request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    _, fake = await _sprites_create(env, defined=False, fake=Booting(False))
+    assert fake.booting == 0 and fake.bootstrap is not None  # then found no service, and installed
+
+
+async def test_a_services_manager_that_never_starts_is_an_error(env):
+    env.setattr(providers, "SERVICES_LOOK_EVERY", 0.0)
+    env.setattr(providers, "SERVICES_WAIT", 0.05)
+
+    class Stuck(FakeSprites):
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner"):
+                return httpx.Response(500, text="services manager not started - call Start() first",
+                                      request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    with pytest.raises(RuntimeError, match=r"services manager not started.*\(still, after 0s\)"):
+        await _sprites_create(env, defined=True, fake=Stuck(True))
 
 
 async def test_a_sprite_serving_other_code_is_refused(env):
@@ -547,6 +805,7 @@ async def test_threads_from_before_places_get_where_they_ran(tmp_path):
     await orch.start()
     assert (await store.get_thread(old["id"]))["workers"] == "sprites"
     assert (await store.get_thread(new["id"]))["workers"] == ""
+    await orch.close()
     await store.close()
 
 
@@ -557,40 +816,68 @@ async def test_the_router_model_never_places_a_thread_where_workers_cannot_run(m
               {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
     r = ModelRouter("key")
 
-    async def answer(system, content):
-        assert content["places"] == places and "run locally" in system
-        return {"workers": "sprites"}
-    monkeypatch.setattr(r, "_json", answer)
+    async def answer(system, content, tool):
+        assert content["places"] == places and "run it locally" in system
+        assert tool["parameters"]["properties"]["workers"]["enum"] == ["local"]
+        assert tool["parameters"]["required"] == ["workers", "where"]
+        return {"workers": "sprites", "where": "it is code"}
+    monkeypatch.setattr(r, "_call", answer)
     with pytest.raises(ValueError, match="picked no place"):
         await r.place("do it", places)
-    monkeypatch.setattr(r, "_json", lambda *_: asyncio.sleep(0, {"workers": "local"}))
-    assert await r.place("do it", places) == "local"
+    monkeypatch.setattr(r, "_call", lambda *_: asyncio.sleep(0, {"workers": "local", "where": "Chrome runs here"}))
+    assert await r.place("why does Chrome crash", places) == {"workers": "local", "where": "Chrome runs here"}
 
 
-async def test_a_worker_of_the_shared_pool_is_lost_once_the_sweep_destroys_it(tmp_path):
-    """Each place's provider is swept with this control plane's pool name. A
-    slot's sprite of the one pool every control plane shared (orch-w1) is
-    destroyed by the sweep; the store says it is lost, so its slot is filled
-    with this control plane's own worker."""
+async def test_starting_never_waits_for_a_place_whose_sweep_hangs(tmp_path):
+    """A provider that does not answer (Sprites over a bad network) holds no
+    start up: its sweep runs in the background, and the other place's
+    sweep and the store's bookkeeping go on without it."""
     from control.service import Orchestrator
     from control.store import SqliteStore
     from tests.doubles import HeuristicRouter
 
-    class Sweeping(Recording):
+    class Hanging(Recording):
         async def sweep(self, slots, pool):
-            self.swept = [pool]
-            return ["orch-w1"]
+            await asyncio.Event().wait()
+
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    await store.open()
+    await store.upsert_worker({"id": "orch-w9", "provider": "local", "handle": "9", "url": "u",
+                               "token": "t", "capacity": 16, "index": 9})
+    orch = Orchestrator(store, providers.Places({"local": Recording("local"), "sprites": Hanging("sprites")}),
+                        HeuristicRouter(), tmp_path / "repos")
+    await asyncio.wait_for(orch.start(), 2)
+    local_sweep, sprites_sweep = orch.sweeping
+    await asyncio.wait_for(local_sweep, 2)
+    assert not sprites_sweep.done()
+    assert (await store.list_workers())[0]["lost_at"] is not None, "outside the pool: the local sweep lost it"
+    await orch.close()
+    assert sprites_sweep.cancelled()
+    await store.close()
+
+
+async def test_a_worker_of_the_shared_pool_is_lost_before_any_thread_can_use_it(tmp_path):
+    """Each control plane's workers are a pool of its own. A stored worker of
+    the pool every control plane shared (orch-w1) is lost as the control
+    plane starts, before a thread could be put on it, and each place is
+    swept with this pool's name (the sweep destroys it)."""
+    from control.service import Orchestrator
+    from control.store import SqliteStore
+    from tests.doubles import HeuristicRouter
 
     store = SqliteStore(str(tmp_path / "db.sqlite"))
     await store.open()
     await store.upsert_worker({"id": "orch-w1", "provider": "sprites", "handle": "orch-w1", "url": "u",
                                "token": "t", "capacity": 16, "index": 1})
-    local, sprites = Recording("local"), Sweeping("sprites")
+    local, sprites = Recording("local"), Recording("sprites")
     orch = Orchestrator(store, providers.Places({"local": local, "sprites": sprites}),
                         HeuristicRouter(), tmp_path / "repos")
     await orch.start()
     name = await store.pool_id()
-    assert orch.pool_id == name and local.swept == [name] and sprites.swept == [name]
+    assert orch.pool_id == name
     row = (await store.list_workers())[0]
-    assert row["lost_at"] is not None and "pool of 3" in row["lost_reason"]
+    assert row["lost_at"] is not None and name in row["lost_reason"]
+    await asyncio.gather(*orch.sweeping)
+    assert local.swept == [name] and sprites.swept == [name]
+    await orch.close()
     await store.close()

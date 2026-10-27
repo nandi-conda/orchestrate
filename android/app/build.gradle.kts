@@ -9,6 +9,8 @@ val buildNumber = (findProperty("buildNumber") as String?)?.toInt() ?: 1
 val orchestrator = rootDir.resolve("../orchestrator")
 val uiDist = orchestrator.resolve("ui/dist")
 val gitLibs = rootDir.resolve("git/out")
+// Sync's Automerge, built for the phone (automerge/build.sh): PyPI has no Android wheel.
+val automergeWheel = rootDir.resolve("automerge/out/automerge-0.2.0.dev4-cp312-cp312-android_33_arm64_v8a.whl")
 
 // The control package next to the built ultra UI, as control/app.py expects
 // to find it (UI_DIR = ../ui/dist).
@@ -19,6 +21,9 @@ val controlPlane = tasks.register<Sync>("controlPlane") {
         }
         check(gitLibs.resolve("arm64-v8a/libgit.so").exists()) {
             "build git first: ANDROID_NDK_HOME=... android/git/build.sh android/git/out/arm64-v8a"
+        }
+        check(automergeWheel.exists()) {
+            "build automerge first: ANDROID_NDK_HOME=... android/automerge/build.sh android/automerge/out"
         }
     }
     from(orchestrator.resolve("control")) {
@@ -83,6 +88,7 @@ chaquopy {
         version = "3.12"
         pip {
             install("-r", "requirements.txt")
+            install(automergeWheel.path)
         }
     }
     sourceSets.getByName("main") {
@@ -90,6 +96,9 @@ chaquopy {
     }
 }
 
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("PythonSources") }.configureEach {
+tasks.matching {
+    (it.name.startsWith("merge") && it.name.endsWith("PythonSources")) ||
+        (it.name.startsWith("generate") && it.name.endsWith("PythonRequirements"))
+}.configureEach {
     dependsOn(controlPlane)
 }

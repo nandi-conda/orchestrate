@@ -4,6 +4,7 @@ echo runner (control.devrunner), served over real HTTP so the peer API is used."
 import asyncio
 import base64
 import json
+import os
 import re
 import socket
 import subprocess
@@ -17,7 +18,7 @@ import pytest
 import uvicorn
 
 from control import app as app_mod
-from control import service
+from control import secrets, service
 from control.service import NotOnWorker
 from control.app import create_app
 from control.providers import LocalProvider
@@ -46,6 +47,12 @@ async def binds(s, pid, tid):
     first puts a new thread on a worker, each later one brings it back."""
     return [e["payload"] for e in await s.list_events(pid, tid)
             if e["type"] == "binding" and e["payload"]["to"] == "bound"]
+
+
+async def prepared(s, pid, tid):
+    """What the runner said each time it had made the thread's worktree and
+    session (its `prepared` event, after it answered the post)."""
+    return [e["payload"] for e in await s.list_events(pid, tid) if e["type"] == "prepared"]
 
 
 async def unbinds(s, pid, tid):
@@ -333,7 +340,8 @@ async def test_heuristic_router():
     many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [], HERE)
     assert [s["request"] for s in many["spawn"]] == ["login page", "export bug", "docs"]
     sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}], HERE)
-    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "workers": ""}]
+    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "kind": "work", "workers": "",
+                              "where": ""}]
     assert (await r.plan("fix it locally", [], HERE))["spawn"][0]["workers"] == "local"
     assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
@@ -341,11 +349,13 @@ async def test_heuristic_router():
 def test_clean_plan_drops_unknown_threads():
     plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
                        "send": [{"thread": "t_nope", "message": "m"},
-                                {"thread": "t_1", "message": "m", "workers": "local"}]},
+                                {"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
+                                 "where": "its logs are here"}]},
                       [{"id": "t_1"}], HERE)
     # Sprites is not available here: that thread is placed when it is put on a worker.
-    assert [s["workers"] for s in plan["spawn"]] == [""]
-    assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local"}]
+    assert [(s["workers"], s["where"]) for s in plan["spawn"]] == [("", "")]
+    assert plan["send"] == [{"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
+                             "where": "its logs are here"}]
 
 
 def free_port() -> int:
@@ -357,7 +367,7 @@ def free_port() -> int:
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
-    # One running thread per worker, so peer calls have to cross workers.
+    # One running thread per worker: the second thread fills a second slot.
     monkeypatch.setattr(service, "CAPACITY", 1)
     port = free_port()
     url = f"http://127.0.0.1:{port}"
@@ -438,9 +448,9 @@ async def test_end_to_end_with_echo_runner(server):
         # Workers never call the control plane, so it serves no peer API.
         assert (await c.get(f"/api/peer/projects/{pid}/threads")).status_code == 404
 
-        # Across workers: list, read and message threads on another worker.
+        # Peers: list, read and message another thread, wherever it runs.
         on = {t["id"]: t["worker_id"] for t in (await c.get(f"/api/projects/{pid}/threads")).json()}
-        assert on[ids[0]] and on[ids[1]] and on[ids[0]] != on[ids[1]]
+        assert on[ids[0]] and on[ids[1]]
         await c.post(f"/api/projects/{pid}/requests", json={
             "text": f"list: export\nread {ids[0]}\ntell {ids[0]}: hello from the export thread",
             "mode": "thread", "target": ids[1]})
@@ -817,7 +827,11 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
             assert (await c.get("/api/threads/t_nope/files")).status_code == 404
 
 
-async def test_project_settings_change_name_model_and_remote(tmp_path):
+async def test_project_settings_change_name_model_and_remote(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+    monkeypatch.delenv("OPENGATEWAY_API_TOKEN", raising=False)
+    monkeypatch.setattr(secrets, "_from_keyring", lambda name: None)
+    monkeypatch.setattr(secrets, "_from_keyring_label", lambda name: None)
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                      local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
@@ -829,8 +843,19 @@ async def test_project_settings_change_name_model_and_remote(tmp_path):
             pid = p["id"]
             assert p["repo_url"] == "" and p["repo_path"].endswith(f"{pid}.git")
 
-            r = await c.post(f"/api/projects/{pid}/settings", json={"name": " renamed ", "model": "m"})
-            assert r.status_code == 200 and (r.json()["name"], r.json()["model"]) == ("renamed", "m")
+            r = await c.post(f"/api/projects/{pid}/settings", json={"name": " renamed ", "model": "deepseek-v4-pro"})
+            assert r.status_code == 200 and (r.json()["name"], r.json()["model"]) == ("renamed", "deepseek-v4-pro")
+            # A model is one of control/models.py's, and this computer has its provider's key.
+            r = await c.post(f"/api/projects/{pid}/settings", json={"model": "m"})
+            assert r.status_code == 400 and "no model 'm'" in r.json()["error"]
+            ultrafast = {"model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+            r = await c.post(f"/api/projects/{pid}/settings", json=ultrafast)
+            assert r.status_code == 400 and "OPENGATEWAY_API_TOKEN" in r.json()["error"]
+            assert (await c.get(f"/api/projects/{pid}")).json()["model"] == "deepseek-v4-pro"
+            monkeypatch.setenv("OPENGATEWAY_API_TOKEN", "og")
+            r = await c.post(f"/api/projects/{pid}/settings", json=ultrafast)
+            assert r.status_code == 200 and r.json()["model"] == ultrafast["model"]
+            assert (await c.post(f"/api/projects/{pid}/settings", json={"model": ""})).json()["model"] == ""
             assert (await c.post(f"/api/projects/{pid}/settings", json={"name": ""})).status_code == 400
 
             empty = tmp_path / "remote.git"
@@ -896,6 +921,34 @@ async def test_the_folder_picker_lists_folders_from_home(tmp_path, monkeypatch):
             assert r.status_code == 400 and "no folder" in r.json()["error"]
 
 
+async def test_the_folder_picker_lists_a_folder_it_cannot_look_into(tmp_path, monkeypatch):
+    """A folder only root may read (a system folder at the root of the disk, a
+    mount of someone else's) is listed like any other and marked not a
+    repository: the picker used to fail the whole listing of the folder it is
+    in, on looking for its .git."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "open").mkdir()
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked").chmod(0o000)
+    try:
+        try:
+            os.listdir(tmp_path / "locked")
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("a folder with no permissions is readable here (root)")
+        app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                         local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
+                         HeuristicRouter(), repos=str(tmp_path / "repos"))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                         timeout=20) as c:
+                home = (await c.get("/api/folders")).json()
+        assert sorted((e["name"], e["git"]) for e in home["entries"]) == [("locked", False), ("open", False)]
+    finally:
+        (tmp_path / "locked").chmod(0o755)
+
+
 async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypatch):
     """An image's bytes live in the store: events and the transcript carry only
     its id, /api/images/<id> serves the bytes, and the runner gets them base64
@@ -949,7 +1002,7 @@ class NoRoutingRouter:
         raise AssertionError("the router was asked to plan a request with no text")
 
     async def place(self, request, places):
-        return "local"
+        return {"workers": "local", "where": ""}
 
 
 async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, monkeypatch):
@@ -1148,8 +1201,8 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
 
 async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monkeypatch):
     """A worker whose runner stops answering (a sprite waking, this machine's
-    network down) is not lost while its provider still has it: its threads
-    stay on it and carry on once it answers again."""
+    network down) is not lost while its provider still has it: a thread no
+    work came for meanwhile stays on it and carries on once it answers again."""
     import signal
 
     from control.service import Orchestrator
@@ -1170,6 +1223,10 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     proc.send_signal(signal.SIGSTOP)
     await asyncio.sleep(1.5)  # several watches that get no answer
     proc.send_signal(signal.SIGCONT)
+
+    async def back():
+        return lw.state == "ready" or None
+    await wait_for(back)
     await orch.send(t["id"], "again")
 
     async def answered():
@@ -1279,7 +1336,8 @@ async def test_a_turn_a_runner_restart_cuts_short_resumes_on_that_worker(tmp_pat
     moves = [(e["payload"]["from"], e["payload"]["to"]) for e in events if e["type"] == "binding"]
     assert moves == [("unbound", "binding"), ("binding", "bound"), ("bound", "binding"), ("binding", "bound")]
     bound = await binds(s, p["id"], t["id"])
-    assert [b["worker"] for b in bound] == [w.id, w.id] and "resuming the turn" in bound[-1]["reason"]
+    assert [b["worker"] for b in bound] == [w.id, w.id]
+    assert (await prepared(s, p["id"], t["id"]))[-1] == {"resumed": True, "idle": False}
     await orch.close()
     await provider.close()
     await s.close()
@@ -1317,7 +1375,8 @@ async def test_a_turn_under_way_goes_on_after_a_control_plane_restart(tmp_path, 
     events = await s.list_events(p["id"], t["id"])
     assert "error" not in [e["type"] for e in events] and await unbinds(s, p["id"], t["id"]) == []
     bound = await binds(s, p["id"], t["id"])
-    assert [b["worker"] for b in bound] == [wid, wid] and "resuming the turn" in bound[-1]["reason"]
+    assert [b["worker"] for b in bound] == [wid, wid]
+    assert (await prepared(s, p["id"], t["id"]))[-1] == {"resumed": True, "idle": False}
     await orch.close()
     await provider.close()
     await s.close()
@@ -1363,6 +1422,71 @@ async def test_a_worker_unreachable_for_too_long_is_reattached_and_its_thread_co
     assert orch.by_thread[t["id"]] is lw and orch.workers == [lw]
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [lw.worker.id] * 2
     assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def test_a_message_to_a_thread_whose_worker_does_not_answer_moves_it_to_a_ready_worker(tmp_path, monkeypatch):
+    """Work never waits for a worker to answer again: a message to a thread
+    on an unreachable worker moves the thread to another worker of the pool
+    (from its last saved turn in the hub) and is delivered there. Once the
+    first worker answers again, the thread is stopped there, and nothing it
+    sends for that thread is taken."""
+    import signal
+
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    monkeypatch.setattr(service, "HEALTH_EVERY", 0.1)
+    monkeypatch.setattr(service, "HEALTH_TIMEOUT", 0.2)
+    monkeypatch.setattr(service, "READY_TIMEOUT", 60)
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos", pool=2)
+    t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    first = orch.by_thread[t["id"]]
+    proc = provider.procs[first.worker.id]
+    proc.send_signal(signal.SIGSTOP)
+    await orch.send(t["id"], "again")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: again")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    now = orch.by_thread[t["id"]]
+    assert now is not first and now.state == "ready" and first.state == "unreachable"
+    assert t["id"] in first.moved_off
+    assert [b["worker"] for b in await binds(s, p["id"], t["id"])] == [first.worker.id, now.worker.id]
+    assert "notes.txt" in [e["name"] for e in (await orch.list_files(t["id"], ""))["entries"]]
+    stopped = []
+    stop_if_there = first.client.stop_if_there
+
+    async def recording_stop(tid):
+        stopped.append(tid)
+        await stop_if_there(tid)
+    first.client.stop_if_there = recording_stop
+    proc.send_signal(signal.SIGCONT)
+    async def back():
+        return first.state == "ready" or None
+    await wait_for(back)
+    assert stopped == [t["id"]] and orch.by_thread[t["id"]] is now
+    assert not first.unstopped
+    # It is stopped there once: the next time that worker stops answering and
+    # comes back, the thread is not stopped there again.
+    proc.send_signal(signal.SIGSTOP)
+    async def gone():
+        return first.state == "unreachable" or None
+    await wait_for(gone)
+    proc.send_signal(signal.SIGCONT)
+    await wait_for(back)
+    assert stopped == [t["id"]]
+    await wait_for(lambda: idle_of(s, t["id"]))
+    await orch._ingest({"thread": t["id"], "type": "state", "data": {"state": "stopped"}}, first)
+    assert (await s.get_thread(t["id"]))["state"] == "idle"  # w1's copy of it does not count
     await orch.close()
     await provider.close()
     await s.close()
@@ -1514,7 +1638,7 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
     await wait_for(answered)
     events = await s.list_events(p["id"], t["id"])
     revived = await binds(s, p["id"], t["id"])
-    assert len(revived) == 1 and "working on its request" in revived[0]["reason"]
+    assert len(revived) == 1 and await prepared(s, p["id"], t["id"]) == [{"resumed": False, "idle": False}]
     assert "could not put it on a worker: RuntimeError: the sprite did not come up" in \
         (await unbinds(s, p["id"], t["id"]))[0]
     assert [e for e in events if e["type"] == "message_in"] == []  # the request's echo was expected
@@ -1670,6 +1794,7 @@ async def test_threads_on_a_projects_own_worker_from_before_the_pool_come_back_o
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
     orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     await orch.start()
+    await asyncio.gather(*orch.sweeping)  # in the background: starting never waits for it
     assert not (tmp_path / "w" / old).exists()
     row = {w["id"]: w for w in await s.list_workers()}[old]
     assert row["lost_at"] is not None and "pool of 3" in row["lost_reason"]
@@ -1970,6 +2095,46 @@ async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monke
             assert [e["text"] for e in tr if e["seq"] == msg["seq"]] == ["use passkeys"]
 
 
+async def test_a_reply_to_a_selection_names_where_its_quote_came_from(tmp_path, monkeypatch):
+    """A reply to selected text records the event the quote was selected from,
+    with its thread, so the UI can go back to it; a quote of no event in the
+    project is refused."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), GatedRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            tid = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": "say IFn.invoke", "mode": "new"})).json()["spawned"][0]["id"]
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            src = tr[0]["seq"]
+
+            # Sent straight to the thread: its message carries the quote's source.
+            r = await c.post(f"/api/projects/{pid}/requests", json={
+                "text": "> IFn.invoke\n\nwhat does this do?", "mode": "thread", "target": tid, "quote_of": src})
+            assert r.status_code == 200
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            mine = [e for e in tr if e["type"] == "message_in" and e["text"].startswith("> IFn.invoke")][0]
+            assert (mine["quote_of"], mine["quote_thread"]) == (src, tid)
+
+            # Left to the router: the request in the project's log carries it.
+            seq = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": "> IFn.invoke\n\nand this?", "quote_of": src})).json()["seq"]
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            req = [e for e in log if e["seq"] == seq][0]
+            assert (req["quote_of"], req["quote_thread"]) == (src, tid)
+
+            # A message without a quote has none; a quote of nothing is refused.
+            assert all("quote_of" not in e for e in log if e["type"] == "created")
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "x", "quote_of": 999999})
+            assert r.status_code == 404
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "x", "quote_of": "7"})
+            assert r.status_code == 400
+
+
 async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, monkeypatch, capsys):
     """Each worker's runner log is printed as it is written, tagged with the
     worker. Once the worker is lost, its thread's worker log says which worker
@@ -2033,22 +2198,21 @@ async def test_a_thread_that_never_started_says_why(tmp_path):
 
 
 def test_a_threads_load_comes_to_one_level():
-    from control.load import BACKLOG, load_of
+    from control.load import load_of
 
     t = {"state": "idle", "binding": "bound", "busy_since": None}
-    assert load_of(t, 0, "ready", 100.0) == {"level": "idle", "backlog": 0, "busy_for": 0}
-    # A message on its way to an idle thread: it is about to be busy.
-    assert load_of(t, 1, "ready", 100.0)["level"] == "busy"
+    assert load_of(t, "ready", 100.0) == {"level": "idle", "busy_for": 0}
+    # Just handed a job: it is on it before the store shows its turn.
+    assert load_of(t, "ready", 100.0, taken=True)["level"] == "busy"
     working = {**t, "state": "working", "busy_since": 40.0}
-    assert load_of(working, 0, "ready", 100.0) == {"level": "busy", "backlog": 0, "busy_for": 60}
-    assert load_of(working, BACKLOG, "ready", 100.0) == {"level": "backed_up", "backlog": BACKLOG, "busy_for": 60}
-    # Being put on a worker counts as busy; whatever it is sent waits on a worker that is away.
-    assert load_of({**t, "binding": "binding"}, 0, "", 100.0)["level"] == "busy"
-    assert load_of(working, BACKLOG, "unreachable", 100.0)["level"] == "stalled"
-    assert load_of(t, 0, "reattaching", 100.0)["level"] == "stalled"
+    assert load_of(working, "ready", 100.0) == {"level": "busy", "busy_for": 60}
+    # Being put on a worker counts as busy; a worker that is away stalls it.
+    assert load_of({**t, "binding": "binding"}, "", 100.0)["level"] == "busy"
+    assert load_of(working, "unreachable", 100.0)["level"] == "stalled"
+    assert load_of(t, "reattaching", 100.0)["level"] == "stalled"
 
 
-async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tmp_path, monkeypatch):
+async def test_store_keeps_when_a_turn_began(tmp_path, monkeypatch):
     from control import store as store_mod
 
     clock = iter(range(1, 1000))
@@ -2060,20 +2224,9 @@ async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tm
     assert t["busy_since"] is not None  # a new thread is queued: its first turn has begun
     idle = await s.update_thread(t["id"], state="idle")
     assert idle["busy_since"] is None
-    first = await s.add_message(p["id"], "user", t["id"], "go")  # the message that starts its turn
-    await s.mark_read([first["id"]])
     began = (await s.update_thread(t["id"], state="queued"))["busy_since"]
-    assert began > first["created_at"]
     assert (await s.update_thread(t["id"], state="working"))["busy_since"] == began  # the same turn
-    assert await s.backlog(p["id"]) == {}
-    steer = await s.add_message(p["id"], "user", t["id"], "also this")  # delivered mid-turn: still to do
-    await s.mark_read([steer["id"]])
-    await s.add_message(p["id"], "router", t["id"], "and this")  # not delivered yet
-    assert await s.backlog(p["id"]) == {t["id"]: 2}
-    await s.update_thread(t["id"], state="idle")
-    assert await s.backlog(p["id"]) == {t["id"]: 1}  # the turn took what it was sent; one is still on its way
-    await s.update_thread(t["id"], archived_at=1.0)
-    assert await s.backlog(p["id"]) == {}
+    assert (await s.update_thread(t["id"], state="idle"))["busy_since"] is None
     await s.close()
 
 
@@ -2102,26 +2255,61 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
     async def working():
         return (await s.get_thread(t["id"]))["state"] == "working"
     await wait_for(working)
-    await orch.send(t["id"], "second")
-    await orch.send(t["id"], "third")
     await orch.handle_request(p["id"], "something else", "auto")
     seen = {d["id"]: d["load"] for d in router.directories[-1]}[t["id"]]
-    assert (seen["level"], seen["backlog"]) == ("backed_up", 2)
+    assert seen["level"] == "busy" and seen["busy_for"] >= 0
     new = next(d for d in await orch.directory(p["id"]) if d["id"] != t["id"])
     assert new["load"]["level"] == "busy"  # a new thread starts on its request
 
     async def idle():
         load = {d["id"]: d["load"] for d in await orch.directory(p["id"])}[t["id"]]
-        return load == {"level": "idle", "backlog": 0, "busy_for": 0}
+        return load == {"level": "idle", "busy_for": 0}
     await wait_for(idle, timeout=30)
     await orch.close()
     await orch.places.close()
     await s.close()
 
 
-async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp_path, monkeypatch):
-    """The pool never holds more than its slots: with every worker full, a new
-    thread waits, says so, and starts once a turn ends and makes room."""
+async def test_a_busy_thread_is_steered_but_new_work_for_it_goes_to_a_new_thread(tmp_path, monkeypatch):
+    """One job per thread, nothing queued: a message about its job reaches a
+    busy thread's turn; new work sent to it (the router says which) starts a
+    new thread where it runs, with its job as context, and its log says so."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "1.5")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
+                        HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def working():
+        return (await s.get_thread(t["id"]))["state"] == "working" or None
+    await wait_for(working)
+    await orch.send(t["id"], "use tabs, not spaces")
+    await orch.send(t["id"], "new job: write the docs")
+
+    async def handed():
+        return next((e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "handed_off"), None)
+    ev = await wait_for(handed)
+    new = await s.get_thread(ev["payload"]["to"])
+    assert new["workers"] == "local" and new["parent_id"] is None
+    assert new["request"].startswith("new job: write the docs") and "“T”" in new["request"]
+    await wait_for(lambda: idle_of(s, t["id"]))
+    bodies = [e["payload"]["body"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "message_in"]
+    assert "use tabs, not spaces" in bodies
+    echoes = [e["payload"]["content"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "assistant"]
+    assert not any("write the docs" in c for c in echoes)
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
+async def test_a_full_pool_puts_a_new_thread_on_the_least_loaded_worker_at_once(tmp_path, monkeypatch):
+    """The pool never holds more than its slots, and a thread never waits for
+    room: with every worker full, a new thread goes on the least loaded one
+    at once (CAPACITY only spreads threads) and says so in its Worker log."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "1.0")
@@ -2145,13 +2333,13 @@ async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp
     await wait_for(working)
     second = await orch.spawn(p["id"], "Second", "two")
 
-    async def waiting():
-        t = await s.get_thread(second["id"])
-        return t["binding"] == "binding" and t["activity"].startswith("waiting for room") or None
-    await wait_for(waiting)
-    await wait_for(lambda: idle_of(s, second["id"]))
+    async def bound():
+        return (await s.get_thread(second["id"]))["binding"] == "bound" or None
+    await wait_for(bound)
+    assert (await s.get_thread(first["id"]))["state"] == "working"  # it went on beside it, not after it
     assert made == [1] and [lw.worker.id for lw in orch.workers] == ["w1"]
     assert (await s.get_thread(second["id"]))["worker_id"] == "w1"
+    assert "it goes on the least loaded one" in await orch.worker_logs(second["id"])
     await orch.close()
     await provider.close()
     await s.close()
@@ -2193,11 +2381,11 @@ async def test_projects_share_a_worker_and_see_only_their_own_threads(tmp_path, 
     await s.close()
 
 
-async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it(tmp_path, monkeypatch):
-    """Making a worker (a sprite installing) takes no lock: while the second
-    slot's worker is being made for one thread, another thread binds on the
-    first worker, which has room. The waiting thread's Worker log says what
-    it waits on, step by step, the worker's own steps with it."""
+async def test_a_worker_slow_to_come_up_holds_up_no_thread(tmp_path, monkeypatch):
+    """Making a worker (a sprite installing) takes no lock and keeps no
+    thread waiting while a worker is ready: with the first worker full, a
+    new thread goes on it at once and the second slot's worker is made in
+    the background, its steps in the Worker log, for the threads after it."""
     from control.service import Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.3")
@@ -2222,24 +2410,18 @@ async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it
         return (await s.get_thread(a["id"]))["state"] == "working" or None
     await wait_for(working)
     b = await orch.spawn(p["id"], "B", "two")
-
-    async def b_waits():
-        return "waiting for local worker slot 2" in (await s.get_thread(b["id"]))["activity"] or None
-    await wait_for(b_waits)
-    await wait_for(lambda: idle_of(s, a["id"]))
-    c = await orch.spawn(p["id"], "C", "three")
-    await wait_for(lambda: idle_of(s, c["id"]))
-    assert (await s.get_thread(c["id"]))["worker_id"] == "w1"
-    assert (await s.get_thread(b["id"]))["binding"] == "binding"
+    await wait_for(lambda: idle_of(s, b["id"]))
+    assert (await s.get_thread(b["id"]))["worker_id"] == "w1"
     text = await orch.worker_logs(b["id"])
-    assert "picking a worker of the pool ..." in text and "waiting for local worker slot 2 to come up ..." in text
-    assert "worker slot 2, which it waits on:" in text and "making or finding its worker" in text
+    assert "it goes on the least loaded one while slot 2 is filled" in text
+    assert ("local", 2) in orch.attaching and [lw.worker.id for lw in orch.workers] == ["w1"]
 
     provider.gate.set()
-    await wait_for(lambda: idle_of(s, b["id"]))
-    assert [lw.worker.id for lw in orch.workers] == ["w1", "w2"]
-    text = await orch.worker_logs(b["id"])
-    assert "waiting for local worker slot 2 to come up: done in" in text and "bound: on worker w" in text
+
+    async def filled():
+        return [lw.worker.id for lw in orch.workers] == ["w1", "w2"] or None
+    await wait_for(filled)
+    assert "attached at http://" in orch.attach_steps[("local", 2)].text()
     await orch.close()
     await provider.close()
     await s.close()
@@ -2276,14 +2458,15 @@ class StandInSprites(LocalProvider):
     name = "sprites"
 
     @staticmethod
-    def worker_name(index: int) -> str:
+    def worker_name(index: int, pool: str = "") -> str:
         return f"s{index}"
 
 
 async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
-    """Threads go on Sprites unless the request says to run locally; a place
-    this control plane runs no workers in is never picked, and saying so
-    to an existing thread moves it."""
+    """Threads go where the router puts them (the heuristic router: Sprites
+    unless the request says to run locally), with its reason; a place this
+    control plane runs no workers in is never picked, and saying so to an
+    existing thread moves it, with the reason in its `moved` event."""
     from control.providers import Places
 
     places = Places({"local": LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
@@ -2293,7 +2476,9 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
                                      timeout=20) as c:
-            assert [p["id"] for p in (await c.get("/api/places")).json()] == ["local", "sprites"]
+            offered = (await c.get("/api/places")).json()
+            assert [p["id"] for p in offered] == ["local", "sprites"]
+            assert all(p["reaches"] for p in offered)  # what the router places threads by
             pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
             cloud = (await c.post(f"/api/projects/{pid}/requests",
                                   json={"text": "add a login page", "mode": "new"})).json()["spawned"][0]["id"]
@@ -2311,7 +2496,7 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
                         and e["payload"]["mode"] == "auto"] or None
             local_tid = (await wait_for(routed))[0]["payload"]["spawned"][0]["id"]
             t = await wait_for(lambda: bound(local_tid))
-            assert (t["workers"], t["worker_id"]) == ("local", "w1")
+            assert (t["workers"], t["worker_id"], t["workers_why"]) == ("local", "w1", "the request says where")
 
             # "run locally" in a request that goes to the cloud thread moves it.
             await c.post(f"/api/projects/{pid}/requests",
@@ -2321,6 +2506,9 @@ async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
                 t = (await c.get(f"/api/threads/{cloud}")).json()
                 return t if t["worker_id"] == "w1" and t["binding"] == "bound" else None
             assert (await wait_for(moved))["workers"] == "local"
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            assert [e["payload"] for e in log if e["type"] == "moved"] == [
+                {"from": "sprites", "to": "local", "why": "the request says where"}]
 
 
 async def test_sprites_without_a_token_is_never_picked(tmp_path):
@@ -2359,3 +2547,63 @@ async def test_a_store_names_its_pool_once(tmp_path):
     await other.open()
     assert await other.pool_id() != name
     await other.close()
+
+
+async def test_app_settings_show_keys_and_keep_them_in_the_keyring(tmp_path, monkeypatch):
+    """The project list's Settings: each key with where it is found, kept in
+    the keyring from there, except one the environment sets (it wins)."""
+    import keyring
+    from keyring.backend import KeyringBackend
+    from control import secrets
+
+    class Memory(KeyringBackend):
+        priority = 1
+
+        def __init__(self):
+            super().__init__()
+            self.kept = {}
+
+        def get_password(self, service, username):
+            return self.kept.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.kept[(service, username)] = password
+
+        def delete_password(self, service, username):
+            from keyring.errors import PasswordDeleteError
+            if self.kept.pop((service, username), None) is None:
+                raise PasswordDeleteError(username)
+
+    memory = Memory()
+    before = keyring.get_keyring()
+    keyring.set_keyring(memory)
+    try:
+        monkeypatch.setattr(secrets, "_COPIED", set())
+        monkeypatch.setattr(secrets, "_from_keyring_label", lambda n: None)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+        monkeypatch.delenv("SPRITES_TOKEN", raising=False)
+        app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                         local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
+                         HeuristicRouter(), repos=str(tmp_path / "repos"))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+                got = (await c.get("/api/settings")).json()
+                keys = {k["name"]: k["source"] for k in got["keys"]}
+                assert keys["DEEPSEEK_API_KEY"] == "environment" and keys["SPRITES_TOKEN"] == ""
+                assert got["sync"] is None and got["keyring"].endswith("Memory")
+
+                r = await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": " tok "})
+                assert r.status_code == 200
+                assert {k["name"]: k["source"] for k in r.json()["keys"]}["SPRITES_TOKEN"] == "keyring"
+                assert memory.kept[("orchestrate", "SPRITES_TOKEN")] == "tok"
+
+                r = await c.post("/api/settings/keys", json={"name": "DEEPSEEK_API_KEY", "value": "x"})
+                assert r.status_code == 400 and "environment" in r.json()["error"]
+                r = await c.post("/api/settings/keys", json={"name": "NOPE", "value": "x"})
+                assert r.status_code == 400
+
+                r = await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": ""})
+                assert r.status_code == 200 and ("orchestrate", "SPRITES_TOKEN") not in memory.kept
+                assert (await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": ""})).status_code == 200
+    finally:
+        keyring.set_keyring(before)

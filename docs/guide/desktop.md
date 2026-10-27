@@ -31,6 +31,13 @@ environment). conda-forge has no Qt WebEngine for osx-64.
   so it is GNOME's, KDE's or your desktop's own, on Wayland and X11 alike.
 - If the port is taken, the window says so, and how to free it
   (`fuser -k 8000/tcp`, or `kill $(lsof -t -i :8000)`), with a **Retry**.
+- Until the control plane answers, the window shows a page in the app's own
+  look with each step of starting as it runs (opening the database, looking
+  up where workers can run, setting up the router, loading projects and
+  threads), how long the running one has taken, and, if one fails, why, with
+  a **Retry**. None of these steps waits on the network: the sweep of each
+  place's workers and catching up with the sync server run once the window
+  shows the UI.
 - What the control plane is doing is printed to the terminal as `desktop: …`
   lines, and every worker's log follows with a `<worker> |` prefix.
 

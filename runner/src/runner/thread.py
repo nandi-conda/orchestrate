@@ -90,19 +90,25 @@ class Limits:
 class DeltaBuffer:
     """Gathers a streaming reply into `delta` events: one per kind (and tool) at
     a time, sent every `every` seconds or `size` characters, so the UI follows
-    the model without an event per token."""
+    the model without an event per token. Reply and reasoning text start at
+    their first non-blank character: the blank lines a model writes before a
+    tool call are no reply, so they make no row."""
 
     def __init__(self, emit: Callable[[str, Any], None], every: float = 0.25, size: int = 400):
         self._emit, self.every, self.size = emit, every, size
         self.kind, self.name, self.parts = "", "", []
+        self.started = False  # the part has had a non-blank character
         self.sent = time.monotonic()
 
     def __call__(self, kind: str, text: str, name: str = "") -> None:
         if (kind, name) != (self.kind, self.name):
             self.flush()
-            self.kind, self.name = kind, name
+            self.kind, self.name, self.started = kind, name, kind == "tool"
             if kind == "tool":  # a tool call starts: say which, before its arguments arrive
                 self._emit("delta", {"kind": kind, "name": name, "text": ""})
+        if not self.started:
+            text = text.lstrip()
+            self.started = bool(text)
         if text:
             self.parts.append(text)
         if sum(map(len, self.parts)) >= self.size or time.monotonic() - self.sent >= self.every:
@@ -119,6 +125,11 @@ class DeltaBuffer:
 
 
 log = logging.getLogger("runner")
+
+# Room on the worker's disk, as a share of it: below ROOM_LOW free, the
+# runner takes threads it does not run off it until ROOM_HIGH is free
+# (ThreadHost.make_room).
+ROOM_LOW, ROOM_HIGH = 0.15, 0.30
 
 
 def _id() -> str:
@@ -152,6 +163,8 @@ class AgentThread:
         self.spawned = 0
         self.events: list[dict] = []
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self.preparing = True  # its worktree and session are being made (ThreadHost._prepare)
+        self.first: dict | None = None  # the message its first turn takes, before its inbox's (ThreadHost._prepare)
         self.harness: Harness | None = None
         self.team = TeamServer(self, place.socket)
         self.task: asyncio.Task | None = None
@@ -190,12 +203,18 @@ class AgentThread:
         await self.harness.prompt(user_text(item["from"], item["body"]), item.get("images"))
         return True
 
-    async def run(self):
+    async def run(self, prepare: Callable[[], Any] | None = None):
+        """The thread's life: `prepare` (its worktree and session, which can
+        take minutes: ThreadHost.start returns before it), then its agent,
+        fed its messages one turn at a time."""
         try:
+            if prepare is not None:
+                await prepare()
             await self.team.start()
             self.harness = await self.agent.start(self.place, model=self.model, append_prompt=self.prompt())
             while True:
-                if await self._send(await self.inbox.get()):
+                item, self.first = self.first or await self.inbox.get(), None
+                if await self._send(item):
                     await self._turn()
         except asyncio.CancelledError:
             if not self.stopping:
@@ -301,7 +320,9 @@ class AgentThread:
 class Turn:
     """One turn's prime-agent events, as the runner's: `delta`s while the model
     streams, then per model call its `reasoning`, `assistant`, `tool_call`s and
-    `usage`, and a `tool_result` per call it ran."""
+    `usage`, and a `tool_result` per call it ran. Text that is only blank
+    (DeepSeek writes "\\n\\n" before a tool call) is no reply or reasoning, so
+    it is not an event."""
 
     def __init__(self, t: AgentThread):
         self.t = t
@@ -346,9 +367,9 @@ class Turn:
         blocks = m.get("content") or []
         reasoning = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        if reasoning:
+        if reasoning.strip():
             self.t.emit("reasoning", {"content": reasoning})
-        if text:
+        if text.strip():
             self.final = text
             self.t.emit("assistant", {"content": text})
         for b in blocks:
@@ -384,6 +405,8 @@ class ThreadHost:
         self.subscribers: dict[str | None, set[asyncio.Queue]] = {}
         self._seq = 0
         self.stopping = ""  # why the runner is stopping, once it is (shut_down)
+        self.making_room = asyncio.Lock()
+        self.room: asyncio.Task | None = None  # a make_room a turn's end started
 
     # events -----------------------------------------------------------------
     def _emit(self, t: AgentThread, type: str, data: Any):
@@ -393,6 +416,8 @@ class ThreadHost:
         for key in (t.id, None):
             for q in self.subscribers.get(key, ()):
                 q.put_nowait(ev)
+        if type == "turn_done" and (self.room is None or self.room.done()):  # a turn's builds take disk
+            self.room = asyncio.create_task(self.make_room(), name="make room")
 
     def subscribe(self, thread_id: str | None = None) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -409,7 +434,8 @@ class ThreadHost:
     def _place(self, tid: str, project: str) -> Place:
         """Where the thread lives on this worker: its worktree, and the view
         its kernel gets of the worker: that, its project's repository's git dir, the
-        thread's own home and /tmp under `.home/` and `.tmp/`, its team socket,
+        thread's own home and /tmp under `.home/` and `.tmp/`, its project's
+        package cache under `.cache/`, its team socket,
         the kernel's Python environment and prime-agent's skills read-only, and pixi."""
         work = self.workdir.resolve()
         socket = str(work / ".team" / f"{tid}.sock")
@@ -418,6 +444,7 @@ class ThreadHost:
                                f"address ({SOCKET_ADDRESS_MAX - 1} bytes): use a shorter workdir than "
                                f"{str(work)!r}")
         view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
+                    cache=str(work / ".cache" / project),
                     writable=((str(self.repos.get(project).path.resolve() / ".git"),) if self.repos else ())
                     + (socket,),
                     hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")),
@@ -440,6 +467,9 @@ class ThreadHost:
         continues its branch and its agent's session; with no `request` it
         waits idle for its next message. `images` belong to the request. An
         id whose thread here has ended (stopped or failed) is started afresh.
+        It returns at once, the thread `queued`: making its worktree and
+        session (_prepare) is the start of its task, since that can take
+        minutes (a snapshot with many files to write).
 
         A thread whose turn this worker's runner was cut off in resumes that
         turn ("Interrupted turns" above): its session has the turn's messages,
@@ -449,40 +479,109 @@ class ThreadHost:
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
+        self.agent.check_model(model)
         place = self._place(tid, project)
-        workspace = None
-        session = ""
-        if self.repos:
-            repo = self.repos.get(project)
-            Path(place.view.root).parent.mkdir(parents=True, exist_ok=True)
-            workspace = await repo.worktree(place.view.root, tid)
-            await repo.session(tid, place.agent_dir, SESSION)
-            session = await repo.session_commit(tid)
-        resumed = self._interrupted(place, session)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
-                        peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=workspace,
+                        peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=None,
                         emit=self._emit, summary=summary)
-        t.session, t.resumed, t.stopping = session, resumed, self.stopping
+        t.stopping = self.stopping
         if old is not None:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
-        if resumed:
-            log.info("thread %s: resuming the turn the runner's restart cut short", tid)
-            t.deliver(RESUME, sender="runner")
+        t.task = asyncio.create_task(t.run(lambda: self._prepare(t, request, images)), name=tid)
+        return t
+
+    async def _prepare(self, t: AgentThread, request: str | None, images: list[dict] | None) -> None:
+        """Make the thread's worktree and session on this worker, then give it
+        its first message: RESUME for a turn cut short here, else its request,
+        else nothing (it goes idle). Messages posted meanwhile (the control
+        plane sends a thread on a job only steering) steer that first turn
+        from its start. Each step is a `preparing` event, and the end
+        a `prepared` one saying whether it resumes."""
+        if self.repos:
+            await self.make_room()
+            repo = self.repos.get(t.project)
+            Path(t.root).parent.mkdir(parents=True, exist_ok=True)
+            t.emit("preparing", {"step": "making its worktree"})
+            t.workspace = await repo.worktree(t.root, t.id)
+            t.branch = t.workspace.branch
+            t.emit("preparing", {"step": "taking its session"})
+            await repo.session(t.id, t.place.agent_dir, SESSION)
+            t.session = await repo.session_commit(t.id)
+        t.resumed = self._interrupted(t.place, t.session)
+        t.preparing = False
+        idle = not t.resumed and request is None
+        t.emit("prepared", {"resumed": t.resumed, "idle": idle})
+        if t.resumed:
+            log.info("thread %s: resuming the turn the runner's restart cut short", t.id)
+            t.first = {"from": "runner", "body": RESUME, "hops": 0, "images": []}
         elif request is not None:
-            t.deliver(request, sender="user" if parent is None else parent, images=images)
+            t.first = {"from": "user" if t.parent is None else t.parent, "body": request, "hops": 0,
+                       "images": images or []}
         else:
             t.set_state("idle")
-        t.task = asyncio.create_task(t.run(), name=tid)
-        return t
+
+    def free(self) -> float:
+        """The share of the worker's disk (the one its threads are on) that is free."""
+        usage = shutil.disk_usage(self.workdir)
+        return usage.free / usage.total
+
+    def hosts(self, tid: str) -> bool:
+        """Whether the thread runs here: its task, working or idle, is alive."""
+        t = self.threads.get(tid)
+        return t is not None and t.task is not None and not t.task.done()
+
+    async def make_room(self) -> None:
+        """Keep the worker's disk from filling up. Every thread leaves its
+        worktree (build output and all), HOME and /tmp behind, and a worker
+        is shared by every project, so they pile up. When less than ROOM_LOW
+        of the disk is free, the threads this runner does not run whose
+        work is all in the hub (Repo.in_hub) are taken off it, the longest
+        untouched first, until ROOM_HIGH is free: such a thread comes back
+        from the hub's branch, snapshot and session when it is next started
+        here, as it would on another worker. A thread with a turn cut short
+        here, or a save that failed, keeps everything."""
+        if not self.repos:
+            return
+        async with self.making_room:
+            if self.free() >= ROOM_LOW:
+                return
+            log.warning("only %.0f%% of the disk is free: taking threads this runner does not run off it",
+                        self.free() * 100)
+            idle = []
+            for project in self.repos.projects():
+                repo = self.repos.get(project)
+                for tree in await self.repos.worktrees(project):
+                    tid = tree.name
+                    if self.hosts(tid) or (self.workdir / ".team" / f"{tid}.turn").exists():  # cut short here
+                        continue
+                    when = await repo.in_hub(tid)
+                    if when is not None:
+                        idle.append((when, project, tid, tree))
+            for _, project, tid, tree in sorted(idle):
+                if self.free() >= ROOM_HIGH:
+                    break
+                repo = self.repos.get(project)
+                async with repo.lock:  # a start of the thread waits for this, and is checked for here
+                    if self.hosts(tid):
+                        continue
+                    await repo.drop(tree, tid)
+                    for path in (self.workdir / ".home" / tid, self.workdir / ".tmp" / tid):
+                        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
+                log.info("thread %s (project %s) is off this worker until it is started here again: "
+                         "the hub has its work; %.0f%% of the disk is free now", tid, project, self.free() * 100)
+            if self.free() < ROOM_LOW:
+                log.warning("only %.0f%% of the disk is free after taking off every thread that could go: "
+                            "the threads this runner runs, or work not yet in the hub, hold the rest",
+                            self.free() * 100)
 
     async def prune(self, keep: set[str]) -> list[str]:
         """Take every project not in `keep` off this worker: its threads here
-        are stopped and forgotten, and its repository and their worktrees,
-        homes, /tmp and team sockets deleted. The orchestrator keeps all of
-        it in its hub, so the project comes back from there if it is ever
-        used again. Returns the projects removed."""
+        are stopped and forgotten, and its repository, its package cache and
+        its threads' worktrees, homes, /tmp and team sockets deleted. The
+        orchestrator keeps all that matters in its hub, so the project comes
+        back from there if it is ever used again. Returns the projects removed."""
         gone = [p for p in self.repos.projects() if p not in keep] if self.repos else []
         for project in gone:
             for tid in [t.id for t in self.threads.values() if t.project == project]:
@@ -491,10 +590,11 @@ class ThreadHost:
             for tree in await self.repos.worktrees(project):
                 tid = tree.name
                 for path in (tree, self.workdir / ".home" / tid, self.workdir / ".tmp" / tid):
-                    shutil.rmtree(path, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
                 for leftover in (self.workdir / ".team").glob(f"{tid}.*"):
                     leftover.unlink(missing_ok=True)
-            self.repos.remove(project)
+            await asyncio.to_thread(shutil.rmtree, self.workdir / ".cache" / project, ignore_errors=True)
+            await asyncio.to_thread(self.repos.remove, project)
             log.info("project %s is no longer on this worker", project)
         return gone
 
@@ -534,7 +634,7 @@ class ThreadHost:
         """Wait until a thread has finished at least one turn and its inbox is empty (tests, CLI)."""
         t = self.threads[thread_id]
         async def _w():
-            while not (t.state in ("idle", "failed", "stopped") and t.inbox.empty()
+            while not (t.state in ("idle", "failed", "stopped") and t.first is None and t.inbox.empty()
                        and any(e["type"] in ("turn_done", "error") for e in t.events)):
                 await asyncio.sleep(0.02)
         await asyncio.wait_for(_w(), timeout)

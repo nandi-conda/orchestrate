@@ -52,11 +52,23 @@ image-only request also skips it and spawns one thread.
 
 | Router | When | How it decides |
 | --- | --- | --- |
-| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
+| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. One job per thread: every send has a `kind`, `steer` (about the job the thread is on; a busy thread takes it mid-turn) or `work` (a new job, which only an idle thread takes). See [Steer or new work](#steer-or-new-work). |
 
-A request the model cannot plan (unreachable, an answer that is not a plan, or
-a plan that does nothing) is logged as an `error` event in the project; there
-is no rule-based stand-in outside the tests (`tests/doubles.py`).
+The model answers by calling one function, `route` (`place` when a new thread
+is put on a worker), whose JSON schema is the plan: `tool_choice` names it and
+the function is `strict`, so the arguments have the plan's shape. Spawns'
+`workers` are an enum of the available places, and a send's `thread` an enum
+of the directory's ids (`send` is left out when there are no threads). Strict
+tool calls are a DeepSeek beta feature, so the router asks on
+`https://api.deepseek.com/beta`, and with thinking off: a forced
+`tool_choice` is refused in thinking mode, which `deepseek-flash` is in by
+default.
+
+A request the model cannot plan (unreachable or refusing the call, an answer
+that is not one `route` call, or a plan that does nothing) is logged as an
+`error` event in the project, with the status and body the API sent or what
+the model said; there is no rule-based stand-in outside the tests
+(`tests/doubles.py`).
 
 Plans are cleaned before use (`clean_plan`): sends to unknown threads and
 empty entries are dropped, titles are capped at 80 characters. A project runs
@@ -68,13 +80,9 @@ Each thread in the directory carries a `load`, made by `control/load.py` from
 what the control plane already knows:
 
 ```json
-{"level": "backed_up", "backlog": 2, "busy_for": 312}
+{"level": "busy", "busy_for": 312}
 ```
 
-- `backlog` is the messages to the thread it has not got to
-  (`Store.backlog`): those not yet delivered to its runner, and those that
-  came in during its current turn (they steer that turn, so they are still on
-  its plate). The message that started the turn is not counted.
 - `busy_for` is seconds since its current turn began (`threads.busy_since`,
   set when its state enters queued, working or waiting and cleared when it
   leaves them), 0 between turns.
@@ -82,34 +90,71 @@ what the control plane already knows:
 
 | Level | When |
 | --- | --- |
-| `idle` | not in a turn, nothing waiting: takes new work at once |
-| `busy` | in a turn, being put on a worker, or one message on its way |
-| `backed_up` | `backlog` is 2 (`load.BACKLOG`) or more: what it is sent now waits behind them |
-| `stalled` | its worker is unreachable or being reattached: whatever it is sent waits for the worker |
+| `idle` | not in a turn: takes a new job at once |
+| `busy` | in a turn, being put on a worker, or just handed a job (`Orchestrator.taken`) |
+| `stalled` | its worker is unreachable or being reattached: a message to it moves it to a ready worker |
 
 The thread list API (`GET /api/projects/{id}/threads`, `GET /api/threads/{id}`)
-returns the same `load`, and the UI shows the backlog as an "N waiting" badge
-beside the thread's state, marked once the thread is backed up.
+returns the same `load`.
+
+### Steer or new work
+
+A thread does one job at a time, and nothing queues behind it: it can be
+steered, but not given more work. Every message to a thread is delivered at
+once (`Orchestrator._deliver`), as one of:
+
+- **steer**: about the job the thread is on (a correction, guidance, an
+  answer or result it needs, a course correction from another thread). A
+  busy thread takes it mid-turn: the model reads it before its next call.
+- **work**: a new job, even one that follows on from the thread's. An idle
+  thread takes it and starts a turn. For a busy thread it goes to a **new
+  thread** instead (`_hand_off`): it runs where the busy thread runs, its
+  request is the message with the busy thread's job as context, a thread
+  that sent it is its parent, and the busy thread's log shows `handed off`.
+
+Who says which: the router's own sends carry `kind` in the plan; an edit's
+correction always steers; a message typed straight to a thread, or sent by
+another thread, is put to the router (`Router.kind`, a forced `kind` tool
+call) only when the thread is busy. A thread just handed a job counts as busy
+until the runner takes it, so two jobs sent at once never both land on it.
 
 ### Where threads run
 
 There is no setting for it: the router decides, per thread, whether its
-workers run on Sprites or on this computer. Each plan entry carries
-`workers`: `"sprites"` unless the request asks for the person's own computer
-("run it locally", "on my machine", "don't use sprites"), then `"local"`. The
-router sees `places` (`GET /api/places`): the places this control plane can
-run workers in, and why not the others (no `SPRITES_TOKEN`, not Linux, a
-phone). It never picks an unavailable one, so without a token every thread
-goes on this computer, and on a phone every thread goes on Sprites.
+workers run on Sprites or on this computer, from what the thread's work must
+touch, not from keywords. Work on the project (code, tests, builds, docs,
+research on the internet) goes on Sprites; work that needs something only the
+person's own computer has (a process or app running there, why Chrome keeps
+crashing, files outside the project, its hardware, system logs, crash dumps,
+services, its local network) goes on this computer. The person saying where
+("run it locally", "on sprites") decides.
+
+The router sees `places` (`GET /api/places`): each place with what work there
+`reaches` (`providers.REACHES`, true to the runner's sandbox there), and why
+not, for the ones this control plane runs no workers in (no `SPRITES_TOKEN`,
+not Linux, a phone). It never picks an unavailable one, so without a token
+every thread goes on this computer, and on a phone every thread goes on
+Sprites; its reason then says what the work will lack.
+
+Each plan entry carries `workers` and `where`, the router's one-sentence
+reason. The thread keeps it as `workers_why`: its Worker log says "its workers
+run on This computer: ...", and its "This computer" badge shows it on hover.
 
 - A thread with no place yet (one typed with **New thread**, or created by
   `POST /api/projects/{id}/threads`, or one the plan left without) is placed
-  by `Router.place` from its request when it is first put on a worker; its
-  Worker log says "asking the router where its workers run".
-- A thread a peer spawns runs where its parent runs.
-- A `send` entry with `workers` moves that thread (`Orchestrator.move`): it
-  is stopped and unbound where it runs, and comes back on the new place with
-  the message, from its work in the hub. Its log shows a `moved` event.
+  by `Router.place` (which answers `workers` and `where` the same way) from
+  its request when it is first put on a worker; its Worker log says "asking
+  the router where its workers run".
+- A thread a peer spawns runs where its parent runs, so a local thread that
+  needs help gets local helpers.
+- A thread the router spawns to carry on or help with an existing thread's
+  work (that thread busy or stalled) runs where that thread runs,
+  unless the request asks for the other place. The router sees each thread's
+  `workers` in the directory.
+- A `send` entry with `workers` moves that thread (`Orchestrator.move`), when
+  the request means its work now needs the other place: it is stopped and
+  unbound where it runs, and comes back on the new place with the message,
+  from its work in the hub. Its log shows a `moved` event with the reason.
 
 ## Sending never waits
 
@@ -117,12 +162,17 @@ No API handler awaits the router model, a provider creating a worker, or a
 runner call. That is why Enter clears the box at once even when a new sprite
 takes a minute to boot.
 
-- `POST /requests` with `mode: auto` answers 202 and routes on `request_chain`.
+Nothing runs one after another: every request is routed, and every message
+delivered, in its own background task, beside the rest.
+
+- `POST /requests` with `mode: auto` answers 202 and routes in the background.
+  An edit of a request is re-assessed once that request's own routing has
+  run, since it says which threads the request reached.
 - `spawn` returns the thread at once, already in the `binding` state ("starting
   on a worker"); binding runs as a background task.
-- `send` logs `message_in` itself and delivers on the thread's `thread_chain`
-  once its binding is done, so messages to a thread still starting arrive, in
-  order, when it starts. A message from another thread is that one event,
+- `send` logs `message_in` itself and delivers in the background once the
+  thread's binding is done; a thread still starting is on its job, so it is
+  sent only steering (see above). A message from another thread is that one event,
   with the sender as its `peer_id`, so both threads' logs list it and the UI
   shows it once, as "sender → recipient".
 

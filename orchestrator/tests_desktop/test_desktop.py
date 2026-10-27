@@ -325,3 +325,60 @@ def test_the_window_has_the_app_icon(qtbot, tmp_path):
     w = window(qtbot, tmp_path)
     assert not w.windowIcon().pixmap(64, 64).isNull()
     w.close()
+
+
+class SlowStore:
+    """A store whose open waits for `go`, then fails with `fail` or opens."""
+
+    def __init__(self, path, go: threading.Event, fail: str = "") -> None:
+        from control.store import SqliteStore
+        self.inner, self.go, self.fail = SqliteStore(path), go, fail
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def open(self) -> None:
+        import asyncio
+        while not self.go.is_set():
+            await asyncio.sleep(0.05)
+        if self.fail:
+            raise RuntimeError(self.fail)
+        await self.inner.open()
+
+
+def slow_window(qtbot, tmp_path, go, fail=""):
+    make = echo_app(tmp_path)
+    w = MainWindow(ControlPlane(free_port(), lambda shutdown, on_startup: make(
+        shutdown, on_startup, SlowStore(str(tmp_path / "db.sqlite"), go, fail))))
+    qtbot.addWidget(w)
+    w.show()
+    return w
+
+
+def test_the_load_page_shows_each_step_of_starting_as_it_runs(qtbot, tmp_path):
+    go = threading.Event()
+    w = slow_window(qtbot, tmp_path, go)
+    qtbot.waitUntil(lambda: "opening the database" in page_text(qtbot, w), timeout=WAIT)
+    assert js(qtbot, w, "getComputedStyle(document.body).getPropertyValue('--background')").strip(), \
+        "the UI's own stylesheet (ui.css) is on it"
+    assert js(qtbot, w, "!!document.querySelector('#steps .spin')"), "the running step says so"
+    qtbot.waitUntil(lambda: "1s" in page_text(qtbot, w), timeout=WAIT)  # and how long it has run
+    go.set()
+    qtbot.waitUntil(lambda: w.control.state == UP, timeout=WAIT)
+    qtbot.waitUntil(lambda: "Projects" in page_text(qtbot, w), timeout=WAIT)
+    assert [s["what"] for s in json.loads(w.steps)] == [
+        "opening the database", "looking up where workers can run", "setting up the router",
+        "loading projects and threads"]
+    w.close()
+
+
+def test_a_step_that_fails_shows_why_on_the_load_page(qtbot, tmp_path):
+    go = threading.Event()
+    go.set()
+    w = slow_window(qtbot, tmp_path, go, fail="disk full")
+    qtbot.waitUntil(lambda: w.control.state == DOWN, timeout=WAIT)
+    assert "opening the database failed: RuntimeError: disk full" in w.control.text
+    qtbot.waitUntil(lambda: "RuntimeError: disk full" in page_text(qtbot, w), timeout=WAIT)
+    assert js(qtbot, w, "!!document.querySelector('#steps .failed')")
+    assert "Retry" in page_text(qtbot, w)
+    w.close()

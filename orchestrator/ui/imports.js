@@ -8,6 +8,7 @@ export function imports({ str, strs, vals, dispatch }) {
   let doc = { op: [], s: [] }; // the markdown md_parse last parsed
   const mdCache = new Map(); // markdown source -> its parsed doc
   const MD_CACHE = 4096;
+  const codeIds = new Map(), codeText = [""]; // code_put: place -> id, id -> text
   const follow = new Map(); // element id -> keeps the bottom in view (scroll_follow)
   const placed = new WeakMap(); // element -> the scrollTop toEnd last set
   const toEnd = (sel) => {
@@ -61,6 +62,7 @@ export function imports({ str, strs, vals, dispatch }) {
     o_new: () => put({}),
     o_str: (o, k, h) => { vals[o][str(k)] = strs[h] ?? ""; },
     o_lit: (o, k, v) => { vals[o][str(k)] = str(v); },
+    o_int: (o, k, h) => { vals[o][str(k)] = parseInt(strs[h], 10); },
     o_images: (o, k) => { if (images.length) vals[o][str(k)] = images.slice(); },
     http_post: (u, o, msg) => {
       const h = put(null);
@@ -95,7 +97,7 @@ export function imports({ str, strs, vals, dispatch }) {
       // Typed events (event: <type>) don't reach onmessage; listen to the ones we emit.
       for (const t of ["request", "created", "state", "message_in", "message_out", "delta", "reasoning", "assistant", "tool_call",
                        "tool_result", "usage", "turn_done", "dropped", "error", "route", "worker",
-                       "saved", "landed", "land_conflict",
+                       "saved", "landed", "land_conflict", "preparing", "prepared",
                        "archived", "unarchived", "edited"])
         es.addEventListener(t, es.onmessage);
       streams.set(id, es);
@@ -150,6 +152,16 @@ export function imports({ str, strs, vals, dispatch }) {
     },
     md_op: (i) => doc.op[i],
     md_str: (i, d) => { strs[d] = doc.s[i]; },
+    // Code the panes show, for its copy click: an id per place (key), which
+    // keeps it while the text there grows. Ids start at 1 (0 = none).
+    code_put: (k, t) => {
+      const key = strs[k] ?? "";
+      let id = codeIds.get(key);
+      if (id === undefined) { id = codeText.length; codeIds.set(key, id); codeText.push(""); }
+      codeText[id] = strs[t] ?? "";
+      return id;
+    },
+    code_text: (id, d) => { strs[d] = codeText[id] ?? ""; },
     // A pane row by seq: a live row (a reply still streaming) is one seq that
     // grows, and a part that starts is a new row at the end of the list. A row
     // never shrinks: a stream resumed mid-reply after a reconnect starts its
@@ -173,15 +185,17 @@ export function imports({ str, strs, vals, dispatch }) {
         (e) => { strs[h] = String(e && e.message || e); dispatch(fail, h); });
     },
     // Text selected inside the pane (#pane): its text goes to th, a style
-    // that puts the Reply button over it to sh, and update(msg, 1). When the
-    // selection goes away (or leaves the pane), update(msg, 0).
-    on_select: (th, sh, msg) => {
+    // that puts the Reply button over it to sh, the seq of the event row it
+    // starts in to qh ("" for a row still streaming, whose seq won't last),
+    // and update(msg, 1). When the selection goes away (or leaves the pane),
+    // update(msg, 0).
+    on_select: (th, sh, qh, msg) => {
       let last = "", queued = false;
       const inPane = (n) => !!(n && (n.nodeType === 1 ? n : n.parentElement)?.closest("#pane"));
       const check = () => {
         queued = false;
         const sel = getSelection();
-        let txt = "", style = "";
+        let txt = "", style = "", src = "";
         if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
           const r = sel.getRangeAt(0);
           if (inPane(r.startContainer) && inPane(r.endContainer)) {
@@ -193,13 +207,17 @@ export function imports({ str, strs, vals, dispatch }) {
             const above = b.top - 40 >= pane.top;
             const y = Math.round(above ? b.top - 40 : Math.min(b.bottom + 6, pane.bottom - 36));
             style = `top:${y}px;left:${x}px`;
+            const n = r.startContainer;
+            const row = (n.nodeType === 1 ? n : n.parentElement).closest(".ev[id^='ev-']");
+            if (row && !row.classList.contains("ev-live")) src = row.id.slice(3);
           }
         }
-        const k = txt ? txt + "\u0000" + style : "";
+        const k = txt ? txt + "\u0000" + style + "\u0000" + src : "";
         if (k === last) return;
         last = k;
         strs[th] = txt;
         strs[sh] = style;
+        strs[qh] = src;
         dispatch(msg, txt ? 1 : 0);
       };
       const soon = () => { if (!queued) { queued = true; requestAnimationFrame(check); } };
@@ -210,6 +228,21 @@ export function imports({ str, strs, vals, dispatch }) {
       document.addEventListener("mousedown", (e) => {
         if (e.target.closest && e.target.closest(".sel-reply")) e.preventDefault();
       }, true);
+    },
+    // Bring the pane's row for event seq into view after the next render and
+    // flash it; update(miss, seq) if the pane doesn't have it. Scrolling it
+    // into view leaves the bottom, so the pane stops following new events
+    // until the reader scrolls back down.
+    jump_to: (seq, miss) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const row = document.getElementById("ev-" + seq);
+        if (!row || !row.closest("#pane")) { dispatch(miss, seq); return; }
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+        row.classList.remove("ev-flash");
+        void row.offsetWidth; // restart the flash when it is already on
+        row.classList.add("ev-flash");
+        row.addEventListener("animationend", () => row.classList.remove("ev-flash"), { once: true });
+      }));
     },
     sel_clear: () => { getSelection().removeAllRanges(); },
     // dst = each line of src as a markdown quote ("> line").
@@ -239,6 +272,16 @@ export function imports({ str, strs, vals, dispatch }) {
             try { images.push(await shrink(f)); dispatch(msg, images.length); } catch {}
           }
         })();
+      }, true);
+    },
+    // The request box is a textarea: Shift+Enter is kept from ultra's Enter
+    // handler (on the root, below document) so the browser adds the line,
+    // and plain Enter, which sends, adds none.
+    newline_keys: () => {
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.isComposing || e.target.id !== "req") return;
+        if (e.shiftKey) e.stopPropagation();
+        else e.preventDefault();
       }, true);
     },
     img_count: () => images.length,

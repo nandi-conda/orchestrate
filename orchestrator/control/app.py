@@ -9,9 +9,11 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 from urllib.parse import quote
 
@@ -22,17 +24,23 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import paths
+from . import paths, secrets
 from .providers import PLACES, Places, default_places
 from .gitio import GitError
 from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
-from .runner_client import FileError
+from .runner_client import RunnerError
 from .service import (ENDS_STREAM, ArchivedError, EditError, NotOnWorker, Orchestrator, describe, editable,
-                      image_title, tool_arg)
+                      image_title, prepared_text, tool_arg)
 from .store import Store, store_from_url
+from .sync import NotDriving, Sync, SyncedStore, SyncError
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
+
+log = logging.getLogger("orchestrator")
+
+# Told each step of starting, (step, ""), as it begins, and (step, why) when it fails.
+Startup = Callable[[str, str], None]
 
 # Event kinds for the UI, which can't compare strings cheaply. K_USER is only
 # what the person typed; K_REQUEST is the brief a thread was spawned with,
@@ -140,9 +148,14 @@ def display(ev: dict) -> dict:
     elif t in ("project_archived", "project_unarchived"):
         kind, label = K_STATUS, t.removeprefix("project_")
         text = f"project {label}"
+    elif t == "handed_off":
+        kind, label = K_STATUS, "handed off"
+        text = f"a message to it was new work while it was on its own job, so “{d.get('title', '')}” took it" + \
+            (f": {d['why']}" if d.get("why") else "")
     elif t == "moved":
         kind, label = K_STATUS, "moved"
-        text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now"
+        text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now" + \
+            (f": {d['why']}" if d.get("why") else "")
     elif t == "worker_lost":
         kind, label, text = K_ERROR, "worker lost", d.get("error", "")
     elif t == "worker_restarted":
@@ -161,6 +174,10 @@ def display(ev: dict) -> dict:
             then = "working on its request again" if d.get("request") else "idle until its next message"
             text = f"back on worker {d.get('worker')}, {then}"
         kind, label = K_STATUS, "revived"
+    elif t == "preparing":
+        kind, label, text = K_STATE, "preparing", d.get("step", "")
+    elif t == "prepared":
+        kind, label, text = K_STATUS, "ready", prepared_text(d)
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     elif t == "saved":
@@ -180,6 +197,9 @@ def display(ev: dict) -> dict:
     images = d.get("images") or []
     if images:
         out["images"] = images
+    if kind == K_USER and d.get("quote"):
+        # a reply to a selection: the event its quote came from, to go back to
+        out["quote_of"], out["quote_thread"] = d["quote"]["of"], d["quote"]["thread"]
     return out
 
 
@@ -255,26 +275,52 @@ def thread_view(t: dict, orch: Orchestrator) -> dict:
     is bound to (states.py), each with why, and its load (load.py)."""
     view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
                               "binding", "binding_reason", "worker_id", "files", "archived_at", "created_at",
-                              "updated_at", "load", "workers")}
+                              "updated_at", "load", "workers", "workers_why")}
     view["worker_state"], view["worker_reason"] = orch.worker_state(t)
     return view
 
 
 def create_app(store: Store | None = None, places: Places | None = None,
                router: Router | None = None,
-               shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS) -> Starlette:
+               shutdown_event: asyncio.Event | None = None, repos: str | Path = paths.REPOS,
+               sync: Sync | None = None, on_startup: Startup | None = None) -> Starlette:
+    """The control plane's app. With `sync` (Sync.from_env), its projects are
+    shared with other computers' control planes through the sync server.
+    `on_startup` is told each step of starting as it begins, and the reason
+    when one fails (the desktop window shows them while it waits)."""
     store = store or store_from_url(None)
+    if sync is not None:
+        store = SyncedStore(store, sync)
     stop = shutdown_event if shutdown_event is not None else asyncio.Event()
     holder: dict = {}
 
     @asynccontextmanager
+    async def starting(what: str):
+        """One step of starting, logged and told to `on_startup`."""
+        log.info("starting: %s", what)
+        if on_startup is not None:
+            on_startup(what, "")
+        try:
+            yield
+        except BaseException as e:
+            if on_startup is not None:
+                on_startup(what, describe(e))
+            raise
+
+    @asynccontextmanager
     async def lifespan(app):
-        await store.open()
-        orch = Orchestrator(store, places or default_places(), router or default_router(), repos)
+        async with starting("opening the database" + (" and the sync replica" if sync is not None else "")):
+            await store.open()
+        async with starting("looking up where workers can run"):
+            where = places or default_places()
+        async with starting("setting up the router"):
+            routes_with = router or default_router()
+        orch = Orchestrator(store, where, routes_with, repos, sync=sync)
         holder["orch"] = orch
         app.state.orch = orch
         try:
-            await orch.start()
+            async with starting("loading projects and threads"):
+                await orch.start()
             yield
         finally:
             await orch.close()
@@ -294,8 +340,13 @@ def create_app(store: Store | None = None, places: Places | None = None,
     # ------------------------------------------------------------ UI API
 
     def project_view(p: dict) -> dict:
-        """A project and where its hub is: the git repository its threads' work goes to."""
-        return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve())}
+        """A project, where its hub is (the git repository its threads' work
+        goes to), and which computer drives it when projects are shared
+        (`driver_name`, "" while none does that this computer knows of, and
+        `driven_here`, 1 when it is this one)."""
+        driver = orch().sync.driver(p["id"]) or {"name": "", "me": False}
+        return {**p, "repo_path": str(orch().hub_path(p["id"]).resolve()), "driver_name": driver["name"],
+                "driven_here": int(driver["me"])}
 
     async def list_projects(req: Request):
         """Live projects; ?archived=1 lists the archived ones instead."""
@@ -317,7 +368,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": "name is required"}, 400)
         try:
             p = await orch().create_project(name, str(b.get("model", "")).strip(), folder)
-        except GitError as e:
+        except (GitError, ValueError) as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p), 201)
 
@@ -330,8 +381,10 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": str(e)}, 400)
 
     async def project_settings(req: Request):
-        """Change any of a project's name, model and remote (`repo_url`, "" to
-        remove it). A remote the hub cannot join is refused with git's reason."""
+        """Change any of a project's name, model (one of models.MODELS, "" for
+        the runner's default) and remote (`repo_url`, "" to remove it). A
+        remote the hub cannot join is refused with git's reason, a model this
+        computer has not got the key for with the key's name."""
         b = await body(req)
         fields = {k: str(b[k]).strip() for k in ("name", "model", "repo_url") if k in b}
         if fields.get("name") == "":
@@ -340,7 +393,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
             p = await orch().update_project(req.path_params["pid"], **fields)
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
-        except GitError as e:
+        except (GitError, ValueError) as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p))
 
@@ -349,6 +402,42 @@ def create_app(store: Store | None = None, places: Places | None = None,
         why this control plane runs none there ("" where it does). The
         router picks one per thread."""
         return JSONResponse(orch().places.offered())
+
+    async def app_settings(req: Request):
+        """This computer's control plane, for the Settings on the project
+        list: where its data is, the router's model, the sync server it shares
+        projects through, the key of its space, and whether it has caught up
+        with it (`caught_up`, else `problem` says why not; null when none), and each key it uses, with where
+        it is found (`source`: "environment", "keyring" or "" for nowhere).
+        `keyring` names the keyring backend, "" when there is none."""
+        def keys() -> list[dict]:
+            return [{"name": n, "what": what, "sent": sent, "source": secrets.source(n)}
+                    for n, (what, sent) in secrets.KNOWN.items()]
+
+        return JSONResponse({
+            "data_dir": str(paths.DATA),
+            "router_model": getattr(orch().router, "model", ""),
+            "sync": None if sync is None else {"url": sync.client.url, "computer": sync.name, "space": sync.space,
+                                              "caught_up": int(sync.caught_up.is_set()), "problem": sync.problem},
+            "keyring": secrets.keyring_backend() or "",
+            "keys": await asyncio.to_thread(keys),
+        })
+
+    async def app_key(req: Request):
+        """Keep a key in the keyring: {name, value}, "" removing it. One set
+        in the environment is refused, since the environment wins."""
+        b = await body(req)
+        name, value = str(b.get("name", "")), str(b.get("value", "")).strip()
+        if name not in secrets.KNOWN:
+            return JSONResponse({"error": f"no such key: {name!r}"}, 400)
+        if await asyncio.to_thread(secrets.source, name) == "environment":
+            return JSONResponse({"error": f"{name} is set in the environment, which wins over the keyring; "
+                                          f"change it there"}, 400)
+        try:
+            await asyncio.to_thread(secrets.store, name, value)
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return await app_settings(req)
 
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
@@ -360,7 +449,16 @@ def create_app(store: Store | None = None, places: Places | None = None,
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
         except Exception as e:
-            return JSONResponse({"error": f"could not take the project off the workers: {describe(e)}"}, 502)
+            log.exception("archiving project %s", req.path_params["pid"])
+            return JSONResponse({"error": f"could not archive the project: {describe(e)}"}, 502)
+        return JSONResponse(project_view(p))
+
+    async def project_drive(req: Request):
+        """Take over: drive the project from this computer now (Orchestrator.take_over)."""
+        try:
+            p = await orch().take_over(req.path_params["pid"])
+        except KeyError:
+            return JSONResponse({"error": "no such project"}, 404)
         return JSONResponse(project_view(p))
 
     async def project_unarchive(req: Request):
@@ -368,6 +466,9 @@ def create_app(store: Store | None = None, places: Places | None = None,
             p = await orch().unarchive_project(req.path_params["pid"])
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
+        except Exception as e:
+            log.exception("unarchiving project %s", req.path_params["pid"])
+            return JSONResponse({"error": f"could not unarchive the project: {describe(e)}"}, 502)
         return JSONResponse(project_view(p))
 
     async def post_request(req: Request):
@@ -385,8 +486,11 @@ def create_app(store: Store | None = None, places: Places | None = None,
         mode = b.get("mode", "auto")
         if mode not in ("auto", "thread", "new"):
             return JSONResponse({"error": "mode is auto, thread or new"}, 400)
+        quote_of = b.get("quote_of")
+        if quote_of is not None and (not isinstance(quote_of, int) or isinstance(quote_of, bool)):
+            return JSONResponse({"error": "quote_of is the seq of the event quoted"}, 400)
         try:
-            result = await orch().submit(pid, text, mode, b.get("target") or None, images)
+            result = await orch().submit(pid, text, mode, b.get("target") or None, images, quote_of)
         except KeyError as e:
             return JSONResponse({"error": str(e.args[0])}, 404)
         except (RuntimeError, ArchivedError) as e:
@@ -508,10 +612,10 @@ def create_app(store: Store | None = None, places: Places | None = None,
     def files_error(e: Exception) -> Response:
         if isinstance(e, KeyError):
             return JSONResponse({"error": "no such thread"}, 404)
-        if isinstance(e, (ArchivedError, NotOnWorker)):
+        if isinstance(e, (ArchivedError, NotOnWorker, NotDriving)):
             return JSONResponse({"error": str(e)}, 409)
-        if isinstance(e, FileError):
-            return JSONResponse({"error": str(e)}, e.status)
+        if isinstance(e, RunnerError) and e.status < 500:
+            return JSONResponse({"error": e.error}, e.status)
         return JSONResponse({"error": f"could not read the thread's files: {describe(e)}"}, 502)
 
     async def thread_files(req: Request):
@@ -649,10 +753,13 @@ def create_app(store: Store | None = None, places: Places | None = None,
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/folders", list_folders, methods=["GET"]),
         Route("/api/places", list_places, methods=["GET"]),
+        Route("/api/settings", app_settings, methods=["GET"]),
+        Route("/api/settings/keys", app_key, methods=["POST"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),
         Route("/api/projects/{pid}/unarchive", project_unarchive, methods=["POST"]),
+        Route("/api/projects/{pid}/drive", project_drive, methods=["POST"]),
         Route("/api/projects/{pid}/requests", post_request, methods=["POST"]),
         Route("/api/projects/{pid}/messages/{seq:int}/edit", edit_message, methods=["POST"]),
         Route("/api/projects/{pid}/threads", list_threads, methods=["GET"]),
@@ -675,4 +782,11 @@ def create_app(store: Store | None = None, places: Places | None = None,
         Route("/p/{pid}", index),
     ]
     routes.append(Mount("/ui", StaticFiles(directory=UI_DIR, check_dir=False)))
-    return Starlette(routes=routes, lifespan=lifespan)
+    async def not_driving(req: Request, e: NotDriving):
+        return JSONResponse({"error": str(e)}, 409)
+
+    async def sync_failed(req: Request, e: SyncError):
+        return JSONResponse({"error": str(e)}, 503)
+
+    return Starlette(routes=routes, lifespan=lifespan,
+                     exception_handlers={NotDriving: not_driving, SyncError: sync_failed})

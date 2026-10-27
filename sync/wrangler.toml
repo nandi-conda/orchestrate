@@ -1,0 +1,21 @@
+# The sync server: one Worker, a Durable Object per space holding its synced
+# documents, leases and hub manifests, and an R2 bucket for git bundles and
+# images (README.md). `pixi run deploy` deploys it.
+name = "orchestrate-sync"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+# Served at https://orchestrate-sync.<account>.workers.dev only: no preview URLs.
+workers_dev = true
+preview_urls = false
+
+[[durable_objects.bindings]]
+name = "SYNC"
+class_name = "SyncHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncHub"]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "orchestrate-sync"

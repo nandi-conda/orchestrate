@@ -45,4 +45,19 @@ case_("a resumed stream does not shrink the row the pane has", { grew: 1, rows: 
   return { grew, rows: texts(rows) };
 });
 
+const str = (v) => { strs.push(v); return strs.length - 1; };
+const copyOf = (id) => { const d = str(""); api.code_text(id, d); return strs[d]; };
+
+case_("code keeps its id while it streams in, and copies what it has now", { same: true, text: "pixi run test" }, () => {
+  const a = api.code_put(str("ev-7:0"), str("pixi run"));
+  const b = api.code_put(str("ev-7:0"), str("pixi run test"));
+  return { same: a === b && a > 0, text: copyOf(b) };
+});
+
+case_("each place is its own code", { texts: ["a", "b", "c"] }, () => {
+  const ids = [api.code_put(str("ev-8:0"), str("a")), api.code_put(str("ev-8:1"), str("b")),
+               api.code_put(str("ev-9:0"), str("c"))];
+  return { texts: ids.map(copyOf) };
+});
+
 console.log(JSON.stringify(cases));

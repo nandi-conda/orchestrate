@@ -66,6 +66,35 @@
      "maxTokens": 393216
     }
    ]
+  },
+  "opengateway": {
+   "baseUrl": "https://apis.opengateway.ai/v1",
+   "api": "openai-completions",
+   "apiKey": "OPENGATEWAY_API_TOKEN",
+   "compat": {
+    "supportsDeveloperRole": false,
+    "supportsStore": false,
+    "requiresReasoningContentOnAssistantMessages": true
+   },
+   "models": [
+    {
+     "id": "deepseek/deepseek-v4.1-flash-ultrafast",
+     "name": "DeepSeek V4.1 Flash UltraFast (OpenGateway)",
+     "reasoning": true,
+     "input": [
+      "text",
+      "image"
+     ],
+     "cost": {
+      "input": 0.3,
+      "output": 1.2,
+      "cacheRead": 0.006,
+      "cacheWrite": 0
+     },
+     "contextWindow": 1000000,
+     "maxTokens": 65536
+    }
+   ]
   }
  }
 }

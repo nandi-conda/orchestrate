@@ -21,22 +21,29 @@ on Sprites (labeled `orchestrator-<pool>`), `w1`..`w3` on this computer. A threa
 place. That is the whole lifecycle policy:
 
 - **Made only to fill an empty slot.** A thread goes on the least loaded
-  ready worker with room (16 running threads each). When none has room, the
-  first empty slot is filled. When every slot is filled and none has room,
-  or the ones with room are not ready (a sprite waking, a network blip), the
-  thread **waits** ("waiting for room" on its Now line) and starts as soon as
-  a turn ends somewhere. No fourth worker is ever made.
+  ready worker with room (16 running threads each). When none has room, it
+  **does not wait**: it goes on the least loaded ready worker anyway (16 only
+  spreads threads; the runner sets no limit), and the first empty slot, if
+  any, is filled in the background for the threads after it. Only when no
+  worker of its place answers at all does a thread wait: for the slot being
+  filled, or, with every slot filled, for the first worker that answers ("no
+  … worker answers" on its Now line). No fourth worker is ever made.
 - **Kept, not destroyed.** Workers outlive the control plane, and a sprite
   pauses on its own while nothing is connected to it, so an idle pool costs
   little. A lost worker's slot is filled again by a new worker of the same
   name.
-- **Swept at startup.** Before it takes work, the control plane lists each
-  place's workers and destroys every one of its pool's that is not a slot
-  (slots beyond the pool's size), and those from before pools had names:
-  the one pool every control plane shared (`orch-w<n>`, labeled
-  `orchestrator`) and each project's own workers (`orch-p-<id>-w<n>`). The
-  store marks the ones it knew as lost, with why. Other control planes'
-  pools, and sprites that are not ours, are never touched.
+- **Swept at startup, in the background.** As it starts, the control plane
+  lists each place's workers and destroys every one of its pool's that is
+  not a slot (starting never waits for this: a provider that is slow or out of
+  reach holds nothing up, and a sweep that fails is logged and tried again on
+  the next start; the slots themselves are never touched, so work goes on
+  meanwhile): its pool's slots beyond the pool's size, and those from
+  before pools had names, the one pool every control plane shared
+  (`orch-w<n>`, labeled `orchestrator`) and each project's own workers
+  (`orch-p-<id>-w<n>`). The store marks the ones it knew as lost, with why;
+  a stored worker not of this pool is marked lost at once, before any thread
+  can go on it. Other control planes' pools, and sprites that are not ours,
+  are never touched.
 - **Projects share workers, not repositories.** A worker keeps one
   repository per project (`.repos/<project>`), a thread sees only its own
   project's, and each peer call is answered within the calling thread's
@@ -90,7 +97,17 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `ready` | its runner answers `/health` | | |
 | `unreachable` | `/health` fails but its provider still has it: a sprite waking from a pause, or this machine's network down | a failed health check (every 10 s, before every delivery, when picking a worker) | it answers again; or reattached |
-| `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable, or Respawn / a thread being put back on it | ready once it answers; unreachable again if it fails, and another try 300 s later |
+| `reattaching` | the provider is starting its runner again, on the same disk and with the same token (Sprites restarts the runner service; a local worker gets a new process) | 300 s (`READY_TIMEOUT`) unreachable | ready once it answers; unreachable again if it fails, and another try 300 s later |
+
+**Work never waits for a worker to answer.** A message to a thread whose
+worker is unreachable or reattaching moves the thread to a ready worker of
+the pool at once, from its branch, snapshot and session in the hub, and is
+delivered there. A turn it had under way on the old worker is cut short: it
+goes on from its last saved turn. The old worker keeps the thread on a
+"moved off" list: once it answers again the thread is stopped there, and
+until then nothing it sends for that thread is taken (its peer calls for it
+are refused, since the thread is no longer on it). A thread no work comes
+for while its worker is away stays on it and carries on when it answers.
 | `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its slot filled again by a new worker of the same name. Its threads are unbound and come back on the pool |
 
 `ready → ready` is a runner restart: `/health` returns a new `boot` id (the
@@ -149,7 +166,7 @@ stateDiagram-v2
 | Binding | Means | Way back to bound |
 | --- | --- | --- |
 | `bound` | a live worker's runner has the thread | |
-| `binding` | being put on a worker: one picked (a slot filled, or waiting for room), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
+| `binding` | being put on a worker: one picked (a slot filled, or the first worker to answer when none does), the project's hub shipped to it, the thread posted | bound when that finishes; unbound if it fails or Respawn starts it over |
 | `unbound` | on no worker | its next message, or Respawn |
 
 Each move is stored with its reason (`threads.binding_reason`) and logged as a
@@ -166,11 +183,11 @@ Each move is stored with its reason (`threads.binding_reason`) and logged as a
   `stopped before it was on a worker`.
 
 **Where a thread goes when it is bound.** On the worker it was last on, while
-that worker is not lost, so it continues in the same worktree (uncommitted
-and ignored files included); an unreachable one is reattached first.
-Otherwise on the least loaded ready worker of the pool (an empty slot filled
-when none has room; waiting for room when every slot is filled), from its
-branch, snapshot and session in the hub. If its runner still runs it
+that worker is ready, so it continues in the same worktree (uncommitted and
+ignored files included). One that does not answer is not waited for.
+Otherwise on the least loaded ready worker of the pool, over 16 if need be
+(an empty slot is filled in the background), from its branch, snapshot and
+session in the hub. If its runner still runs it
 (only the control plane lost track), it is bound as it is: "found again on
 worker …". A thread with no saved turn yet gets its original request again;
 the rest come back idle and wait for their next message.
@@ -251,13 +268,88 @@ INFO:orchestrator:worker orch-3f9a1c2b-w1: installing orchestrate 1a2b3c4d5e6f o
 INFO:orchestrator:worker orch-3f9a1c2b-w1: still installing orchestrate 1a2b3c4d5e6f on it (git fetch, pixi install, prime-agent) (45s so far)
 ```
 
-A worker being made holds up only the threads waiting for it: other threads
-bind on a worker with room meanwhile. A sprite is reinstalled and its runner
+A step the runner refuses fails with the runner's own words, not just its
+status, so the line says what to fix:
+
+```text
+WARNING:orchestrator:thread t_ab12: sending worker orch-3f9a1c2b-w1 the bundle (1 KiB): failed after 0.2s: RunnerError: the worker answered 400 to POST /projects/p_1/repo: refs the orchestrator may not set: refs/heads/x
+```
+
+A worker being made holds up no thread while another worker of the place
+answers: threads bind on the least loaded ready one meanwhile, and only a
+thread with no worker answering at all waits for it. A sprite is reinstalled and its runner
 restarted whenever the commit, model key, token or settings it would run
 with changed since it was started (a new commit on the branch the control
 plane's checkout follows is the usual one); otherwise its runner is left
 running and the attach takes seconds. Respawn of a thread waiting on a
 worker being made calls that attach off too, and it starts again.
+
+### Posting a thread to its runner
+
+`POST /threads` answers at once: the runner registers the thread `queued`
+and makes its worktree and session afterwards, in the thread's own task. That
+can take minutes (a worktree made again from the hub writes every file of its
+snapshot, ignored build output included), and a request held open that long
+is cut off (the control plane's 30 s read timeout, and Fly's proxy). The
+thread is bound as soon as the runner answers. Each step of making it
+arrives as a `preparing` event (the thread's activity: "making its worktree",
+"taking its session"), and the end as `prepared`, which says whether it
+resumes a turn cut short there, goes idle, or works on its request; the
+Worker log tab shows that line. The thread is on a job from the start
+(busy), so it is sent only steering meanwhile, and that steers its first turn
+from the moment the turn begins; new work goes to a new thread. If making it fails, the thread reports the error and goes `failed`;
+Respawn starts it again. Until it is made, the Files tab says "its worktree
+is still being made".
+
+### Waking a cold sprite
+
+A cold sprite's services API answers `500 services manager not started`
+until the sprite has booted it, so looking for its runner service waits that
+answer out, for up to 60 seconds, asking again every second. Any other
+answer, or that one after 60 seconds, is an error.
+
+### Installing on a sprite
+
+The install (git fetch, `pixi install` of the runner's environments,
+prime-agent) takes minutes, longer than one request through the Sprites API
+should be held open: a held `POST /exec` came back as a bare 502 from the
+API's gateway mid-install. So it runs detached on the sprite, in
+`/home/sprite/.orchestrate-install/<commit>-<id>/`: one short exec starts it
+in its own session and returns, and a short exec every 5 seconds looks at it,
+adding the lines it wrote since to the Worker log as `install | ...`. While it
+runs it holds the sprite active with a task on the sprite's Tasks API (a
+5 minute hold refreshed every minute, released when it ends), so the sprite
+does not pause under it. It ends one of four ways, each its own error with
+the end of its output: it exits 0 (the runner service is then put), it exits
+non-zero, it is gone without an exit code (the sprite rebooted under it), or
+it runs past 30 minutes.
+
+Every exec's output and exit code are read from files on the sprite
+(through the filesystem API), never from the exec's response: that body
+multiplexes stdout, stderr and the exit code in frames with a stream byte and
+no length, which cannot be parsed reliably.
+
+A Sprites API call that fails says what the API answered: the status, how
+long the call took, the request id its proxy gave it, and the body, or that
+it had none.
+
+## A worker's disk
+
+A worker is shared by every project, and every thread that ran on it leaves
+its worktree (build output included), its HOME and its /tmp there, so the
+runner keeps its disk from filling up:
+
+- pixi's packages and the worktrees' environments live in one cache per
+  project on the worker (`.cache/<project>`, one mount in the sandbox), so
+  each environment hard-links to the packages instead of copying them.
+- When less than 15% of the disk is free (checked before a thread's worktree
+  is made and after every turn), the runner takes off the threads it does not
+  run whose work is all in the hub, the longest untouched first, until 30% is
+  free. After every save the control plane sends the worker the hub's refs
+  of the thread back, which is how the runner knows. Such a thread comes back
+  from the hub's branch, snapshot and session the next time it starts there,
+  as it would on another worker. A thread whose turn was cut short there, or
+  whose save failed, keeps everything; so does every thread it runs.
 
 ## Respawn, from each state
 

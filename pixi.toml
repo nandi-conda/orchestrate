@@ -16,6 +16,8 @@ desktop = { cmd = "pixi run --manifest-path orchestrator desktop", description =
 worker = { cmd = "pixi run --manifest-path runner serve", description = "Run a runner service on :8080 (a worker; the control plane starts one per project itself)" }
 test = { cmd = "pixi run --manifest-path runner test && pixi run --manifest-path orchestrator test && pixi run --manifest-path orchestrator test-desktop", description = "Run every test suite: runner, orchestrator, the desktop window" }
 package = { cmd = "pixi exec rattler-build build --recipe recipe/recipe.yaml -c conda-forge -c https://prefix.dev/nandi-testing --output-dir output", env = { ORCHESTRATE_VERSION = "0.1.0" }, description = "Build the orchestrate conda package into output/ (CI publishes it on every push to main)" }
+package-automerge = { cmd = "pixi exec rattler-build build --recipe recipe/automerge/recipe.yaml -c conda-forge --output-dir output", description = "Build the automerge conda package orchestrate needs into output/ (CI publishes it to nandi-testing)" }
+deploy-sync = { cmd = "pixi run --manifest-path sync deploy", description = "Deploy the sync server to your Cloudflare account with wrangler (signs in if needed); safe to run again" }
 set-key = { cmd = "pixi run --manifest-path runner set-key", description = "Store a secret in the system keyring, e.g. pixi run set-key DEEPSEEK_API_KEY" }
 
 # The documentation site (mkdocs.yml, docs/). It documents both subprojects, so

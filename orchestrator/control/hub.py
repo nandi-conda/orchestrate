@@ -121,14 +121,16 @@ def remote_url(url: str) -> str:
     return str(Path(url).expanduser().resolve()) if url and is_folder(url) else url
 
 
-async def folder(path: str) -> None:
+async def folder(path: str) -> str | None:
     """Make the folder at `path` (as remote_url writes it) a remote the hub can
-    land in. A bare repository is one as it is. A git repository's own folder
-    lets pushes update its checked-out branch and files; a folder that is not
-    one becomes one (on `main`). The project starts from what is there: what
-    the folder has not committed (what its .gitignore leaves out stays out)
-    gets a commit, so threads see every file in it and no landing has to
-    write over one. The files that make it a pixi project are its own in that
+    land in, and say which branch it has checked out (None for a bare
+    repository, which is one as it is). A git repository's own folder lets
+    pushes update its checked-out branch and files; a folder that is not one
+    becomes one (on `main`). The project starts from what is there: what the
+    folder has not committed (what its .gitignore leaves out stays out) gets a
+    commit, so threads see every file in it and no landing has to write over
+    one. A folder with nothing in it gets no commit: it stays an empty
+    repository, which gets the project's history (Hub.connect). The files that make it a pixi project are its own in that
     commit even when ignored, so making it one edits them, never replaces
     them. Refused: no such folder, a folder inside another repository (open
     that one), and a checkout on no branch."""
@@ -141,31 +143,43 @@ async def folder(path: str) -> None:
     else:
         bare, in_git_dir = repo.out.split()
         if bare == "true":
-            return
+            return None
         if in_git_dir == "true":
             raise GitError(f"{path} is inside a repository's .git folder; open the folder it belongs to")
         top = (await git(where, "rev-parse", "--show-toplevel")).out
         if Path(top).resolve() != where:
             raise GitError(f"{path} is inside the git repository {top}; open that folder instead")
-    if (await git(where, "symbolic-ref", "-q", "HEAD", check=False)).code:
+    head = await git(where, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    if head.code:
         raise GitError(f"{path} has no branch checked out; check out the branch the project should follow")
     await git(where, "config", "receive.denyCurrentBranch", "updateInstead")
     await git(where, "add", "-A")
     if own := [f for f in PIXI_FILES if (where / f).is_file()]:
         await git(where, "add", "-f", "--", *own)
-    born = (await git(where, "rev-parse", "-q", "--verify", "HEAD", check=False)).code == 0
-    if born and (await git(where, "diff", "--cached", "--quiet", check=False)).code == 0:
-        return
-    who = ("-c", f"user.name={AUTHOR[0]}", "-c", f"user.email={AUTHOR[1]}")
-    await git(where, *who, "commit", "-q", "--allow-empty", "-m", IMPORT)
+    if (await git(where, "diff", "--cached", "--quiet", check=False)).code:
+        who = ("-c", f"user.name={AUTHOR[0]}", "-c", f"user.email={AUTHOR[1]}")
+        await git(where, *who, "commit", "-q", "-m", IMPORT)
+    return head.out
+
+
+def git_folder(where: Path) -> bool:
+    """Whether where is a git repository's folder. One that cannot be looked
+    into — a system folder only root may read, a mount that has gone — is not
+    one, and the picker lists it like any other: opening it is what says it
+    cannot be read."""
+    try:
+        return (where / ".git").exists()
+    except OSError:
+        return False
 
 
 def folders(path: str = "") -> dict:
     """The folders in a folder on this machine, for picking one to open as a
     project (`path` as remote_url takes it; "" is the home folder): its path,
     its parent ("" at the top), and the folders in it, by name, each with its
-    path and whether it is a git repository's folder. Hidden folders are left out; a folder
-    that is not one, or cannot be read, is refused with the reason."""
+    path and whether it is a git repository's folder (git_folder). Hidden
+    folders are left out; a folder that is not one, or cannot be read, is
+    refused with the reason."""
     where = Path(remote_url(path) if path.strip() else Path.home().resolve())
     if not is_folder(str(where)):
         raise GitError(f"{path} is not a folder path; give its full path")
@@ -177,7 +191,7 @@ def folders(path: str = "") -> dict:
     except OSError as e:
         raise GitError(f"{where} cannot be read: {e.strerror}") from None
     return {"path": str(where), "parent": "" if where.parent == where else str(where.parent),
-            "entries": [{"name": n, "path": str(where / n), "git": (where / n / ".git").exists()} for n in names]}
+            "entries": [{"name": n, "path": str(where / n), "git": git_folder(where / n)} for n in names]}
 
 
 def worker_ref(ref: str, base: str) -> str:
@@ -194,6 +208,14 @@ def worker_ref(ref: str, base: str) -> str:
 def thread_refs(tid: str) -> list[str]:
     """A thread's refs in the hub; a worker sends the ones it has."""
     return [f"refs/heads/thread/{tid}", f"refs/snapshots/{tid}", f"refs/sessions/{tid}"]
+
+
+async def bare(path: Path) -> None:
+    """An empty repository at `path`, set up as every hub is."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await git(path.parent, "init", "-q", "--bare", str(path))
+    for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("gc.auto", "0")):
+        await git(path, "config", key, value)
 
 
 class Hub:
@@ -232,10 +254,7 @@ class Hub:
         new = self.path.with_name(self.path.name + ".new")
         if new.exists():
             shutil.rmtree(new)
-        new.parent.mkdir(parents=True, exist_ok=True)
-        await git(new.parent, "init", "-q", "--bare", str(new))
-        for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("gc.auto", "0")):
-            await git(new, "config", key, value)
+        await bare(new)
         base = "main"
         tree = await pixi_tree(new, None, self.name)
         commit = (await git(new, "commit-tree", tree, "-m", START)).out
@@ -249,7 +268,8 @@ class Hub:
         """Make `url` the project's remote, or leave it without one ("").
 
         The base and the remote's default branch become one line of history:
-        - a remote without commits gets the base, under the base's name;
+        - a remote without commits gets the base, under the base's name (a
+          folder's, under the name of the branch it has checked out);
         - a remote ahead of the base (or a base with nothing landed on it yet)
           gives the base its commits;
         - a base ahead of the remote is pushed there, as a landing would be;
@@ -262,10 +282,9 @@ class Hub:
         here; landings stay on this machine from then on."""
         async with self.lock:
             if url:
-                if is_folder(url):
-                    await folder(url)
+                branch = await folder(url) if is_folder(url) else None
                 env = self.auth(url)
-                await self._join(url, env)
+                await self._join(url, env, branch)
                 await self.git("config", "orchestrate.remote", url)
             else:
                 env = {}
@@ -295,11 +314,13 @@ class Hub:
             return
         raise GitError(f"{self.base} of {self.url} kept moving; {LAND_ATTEMPTS} pushes were rejected")
 
-    async def _join(self, url: str, env: dict) -> None:
+    async def _join(self, url: str, env: dict, branch: str | None) -> None:
         ours = (await self.git("rev-parse", f"refs/heads/{self.base}")).out
         name = await self.remote_base(url, env)
         if name is None:
-            await git(self.path, "push", "-q", url, f"{ours}:refs/heads/{self.base}", env=env)
+            name = branch or self.base
+            await git(self.path, "push", "-q", url, f"{ours}:refs/heads/{name}", env=env)
+            await self._rename(name, ours)
             return
         incoming = "refs/orchestrate/connecting"
         await git(self.path, "fetch", "-q", url, f"+refs/heads/{name}:{incoming}", env=env)
@@ -317,6 +338,10 @@ class Hub:
                                f"is empty or shares {self.base}'s history")
         finally:
             await self.git("update-ref", "-d", incoming)
+        await self._rename(name, tip)
+
+    async def _rename(self, name: str, tip: str) -> None:
+        """Make the base `name`, at `tip`: the remote's default branch."""
         await self.git("update-ref", f"refs/heads/{name}", tip)
         if name != self.base:
             await self.git("symbolic-ref", "HEAD", f"refs/heads/{name}")

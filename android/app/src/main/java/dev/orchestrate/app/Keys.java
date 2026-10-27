@@ -38,7 +38,10 @@ final class Keys {
     static final Key[] ALL = {
         new Key("DEEPSEEK_API_KEY", true, R.string.key_deepseek),
         new Key("SPRITES_TOKEN", true, R.string.key_sprites),
+        new Key("OPENGATEWAY_API_TOKEN", false, R.string.key_opengateway),
         new Key("GITHUB_TOKEN", false, R.string.key_github),
+        new Key("ORCHESTRATE_SYNC_URL", false, R.string.key_sync_url),
+        new Key("ORCHESTRATE_SYNC_SPACE", false, R.string.key_sync_space),
     };
 
     private static final String KEYSTORE = "AndroidKeyStore";

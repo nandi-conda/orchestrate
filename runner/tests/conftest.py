@@ -53,7 +53,7 @@ class Scripted(PrimeAgent):
     script, in the order threads start."""
 
     def __init__(self, *scripts: list):
-        super().__init__()
+        super().__init__(env={"DEEPSEEK_API_KEY": "faux", "OPENGATEWAY_API_TOKEN": "faux"})
         object.__setattr__(self, "scripts", list(scripts))
 
     async def start(self, place, *, model, append_prompt):

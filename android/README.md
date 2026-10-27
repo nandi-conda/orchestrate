@@ -13,6 +13,7 @@ as the desktop window runs it. Using it: [docs/guide/android.md](../docs/guide/a
 | `app/src/main/python/orchestrate_android.py` | the control plane's entry point on the phone: git on PATH, the session cookie, sprites |
 | `app/requirements.txt` | the control plane's Python packages, pinned as `orchestrator/pixi.lock` has them |
 | `git/build.sh` | cross-compiles git (with zlib, OpenSSL, curl) for arm64 Android |
+| `automerge/build.sh` | cross-compiles Automerge's Python package (Rust, for sync) into an arm64 Android wheel |
 
 The control plane is not copied: the build takes `orchestrator/control` and
 the built `orchestrator/ui/dist` as they are (the `controlPlane` task in
@@ -21,11 +22,14 @@ the built `orchestrator/ui/dist` as they are (the `controlPlane` task in
 ## Build
 
 You need JDK 17+, the Android SDK (`ANDROID_HOME`, or `sdk.dir` in
-`local.properties`), the Android NDK for git, and pixi.
+`local.properties`), the Android NDK for git and Automerge, rustup (Automerge
+is Rust), and pixi.
 
 ```sh
 cd orchestrator && pixi run build-ui && cd ..
 ANDROID_NDK_HOME=~/Android/Sdk/ndk/<version> android/git/build.sh android/git/out/arm64-v8a
+PATH="$PWD/orchestrator/.pixi/envs/default/bin:$PATH" \
+  ANDROID_NDK_HOME=~/Android/Sdk/ndk/<version> android/automerge/build.sh android/automerge/out
 cd android
 PATH="$PWD/../orchestrator/.pixi/envs/default/bin:$PATH" ./gradlew assembleRelease   # Chaquopy needs python3.12 on PATH
 ```

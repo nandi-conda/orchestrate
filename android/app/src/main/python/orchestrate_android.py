@@ -128,13 +128,15 @@ class ControlPlane:
             from control.providers import DEFAULT_REF, DEFAULT_SOURCE, Places, SpritesProvider
             from control.server import Server
             from control.store import store_from_url
+            from control.sync import Sync
 
             shutdown = asyncio.Event()
             # A phone runs no runner: it has neither pixi nor bubblewrap.
             places = Places({"sprites": SpritesProvider(source=DEFAULT_SOURCE, ref=DEFAULT_REF)},
                             {"local": "a phone cannot run workers (the runner needs pixi and bubblewrap); "
                                       "this app runs only the control plane"})
-            app = SessionGate(create_app(store=store_from_url(None), places=places, shutdown_event=shutdown),
+            app = SessionGate(create_app(store=store_from_url(None), places=places, shutdown_event=shutdown,
+                                         sync=Sync.from_env()),
                               self.secret)
             config = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="info",
                                     timeout_graceful_shutdown=5, loop="asyncio", http="h11")

@@ -14,21 +14,51 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .project-card { cursor: pointer; height: 100%; box-sizing: border-box; }
 .project-card .card-header { padding-right: 88px; }
 .project-archive { position: absolute; top: 12px; right: 12px; border: 1px solid var(--border); background: var(--background); color: var(--muted-foreground); border-radius: 6px; padding: 1px 8px; font: inherit; font-size: 12px; cursor: pointer; opacity: 0; }
-.project-item:hover .project-archive, .project-archive:focus-visible { opacity: 1; }
+.project-item:hover .project-archive, .project-archive:focus-visible, .project-archive.busy { opacity: 1; }
+.project-archive.busy { cursor: progress; }
 .project-archive:hover { color: var(--foreground); background: var(--muted); }
 @media (hover: none) { .project-archive { opacity: 1; } }
 .project-card .card-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .form { display: grid; gap: 8px; padding: 8px 0; }
 .form .help { margin: 0; font-size: 12px; color: var(--muted-foreground); }
 .repo-path { margin: 0; overflow-wrap: anywhere; }
+/* Project settings: one block per setting, spaced apart; inside a block, label,
+   control and help sit close. */
+.settings-form { gap: 18px; padding: 4px 0 8px; }
+.setting { display: grid; gap: 8px; min-width: 0; }
+.setting .help { line-height: 1.45; }
+.model-pick { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
+.model-pick .toggle { display: grid; gap: 2px; justify-items: center; height: auto; padding: 8px 6px; white-space: nowrap; }
+.model-name { font-size: 13px; font-weight: 500; }
+.model-via { font-size: 11px; color: var(--muted-foreground); }
+.setting .repo-path { padding: 8px 10px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); background: var(--muted); color: var(--muted-foreground); }
 
-.app { display: flex; flex-direction: column; height: 100vh; }
+.app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 .appbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
-.appbar h1 { font-size: 18px; margin: 0; }
+.appbar h1 { font-size: 18px; margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The project's remote is the longest thing in the bar; it gives way first. */
+.appbar > .muted.mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The project's name opens a menu of the live projects to switch to. */
+.proj-switch { position: relative; min-width: 0; display: flex; }
+.proj-switch-btn { display: inline-flex; align-items: center; gap: 6px; min-width: 0; border: 0; background: none; color: inherit; font: inherit; padding: 4px 8px; margin: 0 -8px; border-radius: 8px; cursor: pointer; }
+.proj-switch-btn:hover, .proj-switch-btn[aria-expanded="true"] { background: var(--muted); }
+.proj-switch-btn .icon { width: 16px; height: 16px; color: var(--muted-foreground); }
+.proj-scrim { position: fixed; inset: 0; z-index: 40; }
+.proj-menu { position: absolute; top: calc(100% + 6px); left: -8px; z-index: 41; width: 340px; max-width: calc(100vw - 32px); max-height: 60vh; overflow-y: auto; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--background); box-shadow: 0 8px 24px rgb(0 0 0 / .25); }
+.proj-menu-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; border: 0; background: none; color: inherit; font: inherit; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+.proj-menu-item:hover { background: var(--muted); }
+.proj-menu-item.active { background: var(--muted); }
+.proj-menu-item.active .proj-menu-name::after { content: " ✓"; color: var(--muted-foreground); }
+.proj-menu-name { font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-menu-remote { font-size: 12px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-menu-all { margin-top: 4px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; color: var(--muted-foreground); }
+.proj-menu-note { padding: 8px 10px; margin: 0; }
 .body { flex: 1; display: flex; min-height: 0; }
 
 .threads { width: 320px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px; }
 .threads-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px 10px; }
+/* A phone folds the list away (below); a desktop always shows it. */
+.threads-toggle { display: none; }
 .thread { display: block; width: 100%; text-align: left; border: 1px solid transparent; background: none; border-radius: 8px; padding: 8px 10px; margin-bottom: 4px; cursor: pointer; font: inherit; color: inherit; }
 .thread:hover { background: var(--muted); }
 .thread.active { background: var(--muted); border-color: var(--border); }
@@ -40,17 +70,21 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 @media (hover: none) { .thread-archive { opacity: 1; } }
 .thread-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .thread-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-label { font-weight: 500; overflow-wrap: anywhere; line-height: 1.3; }
+.thread-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 4px; }
+.thread-badges:empty { display: none; }
 .thread-summary { font-size: 13px; color: var(--muted-foreground); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .thread-activity { display: flex; align-items: center; gap: 6px; margin-top: 2px; min-width: 0; color: var(--foreground); }
 .thread-activity .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .thread-id { display: block; margin-top: 2px; color: var(--muted-foreground); }
 
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-.pane-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+.pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .pane-actions { display: flex; gap: 4px; flex-shrink: 0; }
-.pane-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pane-title { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; }
 .pane-title .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-title .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* What the selected thread is doing right now. */
 .now { display: flex; align-items: center; gap: 8px; padding: 6px 16px; border-bottom: 1px solid var(--border); font-size: 13px; min-width: 0;
@@ -61,8 +95,6 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .where { display: flex; align-items: center; gap: 8px; padding: 6px 16px; border-bottom: 1px solid var(--border); font-size: 13px; min-width: 0;
          background: color-mix(in oklch, var(--destructive) 8%, transparent); }
 .where:empty { display: none; }
-.badge.backed-up { border-color: color-mix(in oklch, var(--destructive) 50%, transparent);
-                   background: color-mix(in oklch, var(--destructive) 10%, transparent); }
 .where .muted { margin-left: auto; flex-shrink: 0; }
 .now-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 /* A dot that pulses a few times when it appears and then holds still. It is on
@@ -73,7 +105,11 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 @keyframes pulse { 50% { opacity: .3; } }
 @media (prefers-reduced-motion: reduce) { .activity-dot, .ev-live .ev-label::after { animation: none; } }
 
-.pane-tabs { padding: 8px 16px 0; }
+.pane-tabs { padding: 8px 16px 0; max-width: 100%; overflow: hidden; }
+/* Five tabs do not fit across a phone: the row scrolls rather than clips. */
+.pane-tabs .tabs-list { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.pane-tabs .tabs-list::-webkit-scrollbar { display: none; }
+.pane-tabs .tab { flex: 0 0 auto; }
 .tab-count { margin-left: 6px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--muted-foreground); }
 .events { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
 .events-tools { gap: 2px; }
@@ -148,6 +184,11 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .composer { border-top: 1px solid var(--border); padding: 10px 16px 14px; display: grid; gap: 8px; }
 .composer-row { display: flex; gap: 8px; align-items: center; }
 .grow { flex: 1; }
+/* The request box grows with its lines (pastes keep theirs) up to a cap, then scrolls. */
+.composer-row:has(.composer-box) { align-items: flex-end; }
+.composer-box { display: block; height: auto; min-height: 2.25rem; max-height: 40vh; field-sizing: content;
+                resize: none; overflow-y: auto; font: inherit; font-size: .875rem; line-height: 1.25rem;
+                padding: .45rem .75rem; }
 
 /* Images pasted into the request box, before they are sent. */
 .attachments { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -169,9 +210,31 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .route-label { font-weight: 600; margin-right: 6px; color: hsl(142 60% 35%); }
 
 @media (max-width: 720px) {
+  /* A phone: the page's actions wrap under its title, the thread list folds to
+     its header so the pane gets the screen, and the pane scrolls inside itself
+     so the request box stays at the bottom. */
+  .page { padding: 16px 12px; }
+  .topbar { flex-wrap: wrap; gap: 10px; }
+  .topbar-actions { flex-wrap: wrap; }
+  .appbar { gap: 8px; }
+  .appbar > .muted.mono { display: none; }  /* the remote, in Settings */
   .body { flex-direction: column; }
   .threads { width: auto; max-height: 35vh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .threads.collapsed { max-height: none; }
+  .threads.collapsed > :not(.threads-head) { display: none; }
+  .threads-toggle { display: inline-flex; }
+  .pane-head { flex-wrap: wrap; row-gap: 6px; }
+  .pane-title { flex: 1 1 100%; }
+  .pane-title .mono.muted { display: none; }  /* the thread id, for looking it up */
+  .pane-actions { margin-left: auto; }
+  /* Five tabs across a phone: tighten them so they fit, and scroll past that. */
+  .pane-tabs { padding: 8px 10px 0; }
+  .pane-tabs .tab { padding: .25rem .4rem; }
+  .events { padding: 10px 12px; }
+  .ev { max-width: 100%; }
+  .composer { padding: 8px 12px 10px; }
 }
+@media (hover: none) { .btn.sm { height: 2.25rem; } }  /* a thumb, not a cursor */
 
 /* Markdown in agent replies (ui/markdown.js). */
 .ev-text.md { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
@@ -199,8 +262,17 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .md blockquote { padding: .1em 0 .1em 1em; border-left: 3px solid var(--border); color: var(--muted-foreground); }
 .md code { font-family: var(--font-mono); font-size: .86em; padding: .12em .35em; border-radius: 4px;
            background: color-mix(in oklch, var(--muted) 80%, transparent); }
-.md .md-code { border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+.md .md-code { position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
                background: color-mix(in oklch, var(--muted) 60%, transparent); }
+/* Code copies in one click: a block by its icon (top right, clearer on hover),
+   a span by clicking it (a copy cursor, and green for a moment after). */
+.md .md-copy { position: absolute; top: 2px; right: 4px; z-index: 1; width: 24px; height: 24px; padding: 0;
+               color: var(--muted-foreground); opacity: .55; background: var(--background); }
+.md .md-code:hover .md-copy, .md .md-copy:focus-visible { opacity: 1; }
+.md .md-copy:has(.icon-check) { opacity: 1; color: hsl(142 60% 38%); }
+.md code.md-copyable { cursor: copy; transition: background-color .15s; }
+.md code.md-copyable:hover { background: color-mix(in oklch, var(--muted) 100%, var(--foreground) 8%); }
+.md code.md-copyable.copied { background: hsl(142 60% 45% / .28); }
 .md .md-lang { padding: 3px 12px; font: 11px var(--font-mono); color: var(--muted-foreground); border-bottom: 1px solid var(--border); }
 .md pre { margin: 0; padding: 10px 12px; overflow-x: auto; max-height: 480px; overflow-y: auto; }
 .md pre code { padding: 0; background: none; border-radius: 0; font-size: 12.5px; line-height: 1.5; white-space: pre; }
@@ -243,6 +315,7 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .icon-check { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E"); }
 .icon-reply { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 17-5-5 5-5'/%3E%3Cpath d='M20 18v-2a4 4 0 0 0-4-4H4'/%3E%3C/svg%3E"); }
 .icon-pencil { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z'/%3E%3Cpath d='m15 5 4 4'/%3E%3C/svg%3E"); }
+.icon-chevron-down { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
 .icon-x { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 6 6 18'/%3E%3Cpath d='m6 6 12 12'/%3E%3C/svg%3E"); }
 
 /* A reply's copy button, in its top-right corner. */
@@ -265,6 +338,11 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .quote-text { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
               white-space: pre-wrap; word-break: break-word; }
 .ev-user .md blockquote { color: inherit; opacity: .75; border-left-color: hsl(221 83% 53% / .5); }
+/* A reply's quote goes back to the message it was selected from, which flashes. */
+.md blockquote.quote-link { cursor: pointer; border-radius: 0 4px 4px 0; }
+.md blockquote.quote-link:hover { opacity: 1; background: hsl(221 83% 53% / .1); border-left-color: hsl(221 83% 53%); }
+.ev-flash { animation: ev-flash 2.4s ease-out; }
+@keyframes ev-flash { 0%, 50% { box-shadow: 0 0 0 3px hsl(221 83% 53% / .6); background-color: hsl(221 83% 53% / .14); } }
 
 /* Thinking tab: the thread's reasoning steps, each under its step number and local time */
 .thinking-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
@@ -280,3 +358,10 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .picker-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-list { max-height: 240px; overflow-y: auto; }
 .picker-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* The app's Settings (project list): long enough to scroll inside the dialog. */
+.app-settings { max-height: 65vh; overflow-y: auto; padding-right: 4px; }
+.app-settings > .label { margin-top: 8px; }
+.settings-list { display: grid; gap: 10px; }
+.settings-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-item { display: grid; gap: 4px; }

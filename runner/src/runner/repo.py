@@ -104,26 +104,36 @@ class Repo:
 
     async def open(self) -> None:
         """Make the repository on first use; learn the base branch the
-        orchestrator named, if it sent one yet."""
+        orchestrator named, if it sent one yet. Opening one that is there
+        only reads it, so asking a worker what it has (GET /repo) writes
+        nothing and answers at once even while its disk is slow to write."""
         async with self.opening:
             if self.opened:
                 return
             if not (self.path / ".git").exists():
-                self.path.mkdir(parents=True, exist_ok=True)
-                await self.git("init", "-q")
-            # Shared by every worktree, so threads' own commits work too and
-            # `git rebase --continue` never waits on an editor.
-            for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true"),
-                               ("gc.auto", "0")):
-                await self.git("config", key, value)
+                await self.make()
             self.base = (await self.git("config", "--get", "orchestrate.base", check=False)).out
             self.opened = True
+
+    async def make(self) -> None:
+        """A new repository, set up as every worker's is."""
+        self.path.mkdir(parents=True, exist_ok=True)
+        await self.git("init", "-q")
+        # Shared by every worktree, so threads' own commits work too and
+        # `git rebase --continue` never waits on an editor.
+        for key, value in (("user.name", AUTHOR[0]), ("user.email", AUTHOR[1]), ("core.editor", "true"),
+                           ("gc.auto", "0")):
+            await self.git("config", key, value)
 
     async def exists(self, ref: str) -> bool:
         return (await self.git("rev-parse", "-q", "--verify", f"{ref}^{{commit}}", check=False)).code == 0
 
     async def refs(self) -> dict[str, str]:
-        """Every ref, by name: what the orchestrator may leave out of the next bundle."""
+        """Every ref, by name: what the orchestrator may leave out of the next
+        bundle; none while the worker has no repository for the project (the
+        first bundle makes it)."""
+        if not (self.path / ".git").exists():
+            return {}
         await self.open()
         out = (await self.git("for-each-ref", "--format=%(refname) %(objectname)")).out
         return dict(line.split(" ", 1) for line in out.splitlines() if line)
@@ -253,6 +263,31 @@ class Repo:
             await self.git("checkout-index", "-a", "-f", cwd=directory, env=env)
             await self.git("update-ref", session_ref(tid), theirs)
 
+    async def in_hub(self, tid: str) -> float | None:
+        """When the hub has everything this worker has of the thread (its
+        branch, snapshot and session are what the orchestrator last brought
+        back), the time of its snapshot; else None: a turn whose save failed
+        left work only here."""
+        theirs = {f"refs/heads/thread/{tid}": f"refs/remotes/origin/thread/{tid}",
+                  snapshot_ref(tid): f"refs/remotes/origin-snapshots/{tid}",
+                  session_ref(tid): f"refs/remotes/origin-sessions/{tid}"}
+        for ours, hub in theirs.items():
+            mine = await self.git("rev-parse", "-q", "--verify", ours, check=False)
+            if mine.code:
+                continue
+            if (await self.git("merge-base", "--is-ancestor", ours, hub, check=False)).code:
+                return None
+        when = await self.git("log", "-1", "--format=%ct", snapshot_ref(tid), check=False)
+        return float(when.out) if when.code == 0 and when.out else 0.0
+
+    async def drop(self, path: str | os.PathLike, tid: str) -> None:
+        """Take a thread's worktree off this worker, and its session with it
+        (the agent directory goes with the thread's HOME): the next time the
+        thread starts here, both are made again from the hub's. The caller
+        holds the lock."""
+        await self.git("worktree", "remove", "--force", str(path))
+        await self.git("update-ref", "-d", session_ref(tid), check=False)
+
     async def worktree(self, path: str | os.PathLike, tid: str) -> "Workspace":
         """The thread's worktree at `path` on `thread/<tid>`. One this worker
         already has is kept as it is, with its uncommitted and ignored files,
@@ -275,7 +310,7 @@ class Repo:
                     return Workspace(self, path, branch, tid)
                 await self.git("worktree", "remove", "--force", str(path))
             if path.exists():  # a leftover directory git no longer knows as a worktree
-                shutil.rmtree(path)
+                await asyncio.to_thread(shutil.rmtree, path)  # may be large: not on the event loop
             await self.git("worktree", "add", "-q", "-B", branch, str(path),
                            theirs if known else f"refs/remotes/origin/{self.base}")
             ws = Workspace(self, path, branch, tid)

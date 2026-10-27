@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,7 +12,7 @@ import uvicorn
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
 from runner import ThreadHost, View
-from runner.sandbox import SandboxError, pixi, runner_checkout, worker_private
+from runner.sandbox import SandboxError, bwrap_args, pixi, runner_checkout, thread_env, worker_private
 from runner.server import create_app, serve
 
 
@@ -20,10 +21,26 @@ def host_with(*scripts, tmp_path, **kw):
 
 
 def view(tmp_path, **kw):
-    v = View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"), **kw)
-    for d in (v.root, v.home, v.tmp):
+    v = View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"),
+             cache=str(tmp_path / "cache"), **kw)
+    for d in (v.root, v.home, v.tmp, v.cache):
         os.makedirs(d, exist_ok=True)
     return v
+
+
+def test_threads_of_a_project_share_its_package_cache(tmp_path, monkeypatch):
+    """pixi keeps packages, and worktrees' environments, in the project's
+    cache on the worker, one mount, so every environment hard-links to one
+    copy of each package."""
+    monkeypatch.setenv("PIXI_EXE", sys.executable)  # any program: _place only names it
+    host = host_with(tmp_path=tmp_path)
+    a, b, other = host._place("t_a", "p_1").view, host._place("t_b", "p_1").view, host._place("t_c", "p_2").view
+    assert a.cache == b.cache == str((tmp_path / "threads" / ".cache" / "p_1").resolve())
+    assert other.cache != a.cache
+    env = thread_env(a)
+    assert env["PIXI_CACHE_DIR"] == a.cache
+    assert env["PIXI_CONFIG_FILE"] == str(Path(a.cache) / "config.toml")  # environments go in the cache too
+    assert ["--bind", a.cache, a.cache] == bwrap_args(a)[bwrap_args(a).index(a.cache) - 1:][:3]
 
 
 def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, monkeypatch):
@@ -147,6 +164,20 @@ async def test_thread_streams_deltas_before_the_final_events(tmp_path):
     content = [e for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content"]
     assert content[-1]["data"]["text"].endswith("done")
     assert any(e["type"] == "usage" for e in t.events)
+    await host.stop(t.id)
+
+
+async def test_blank_text_before_a_tool_call_is_no_reply(tmp_path):
+    """DeepSeek writes "\\n\\n" as text before a tool call: that is no reply,
+    so there is no `assistant` event and no content delta for it (each made
+    an empty Agent row)."""
+    host = host_with([py("print(1 + 1)", text="\n\n"), "all done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="add")
+    await host.wait_idle(t.id)
+    replies = [e["data"]["content"] for e in t.events if e["type"] == "assistant"]
+    assert replies == ["all done"]
+    content = "".join(e["data"]["text"] for e in t.events if e["type"] == "delta" and e["data"]["kind"] == "content")
+    assert content == "all done"
     await host.stop(t.id)
 
 
@@ -469,8 +500,13 @@ async def test_http_bringing_a_thread_back_needs_its_id_or_a_request(tmp_path):
         assert (await c.post("/threads", json={"title": "t", "project": "p"})).status_code == 400
         assert (await c.post("/threads", json={"id": "t_x", "title": "t"})).status_code == 400  # no project
         r = await c.post("/threads", json={"id": "t_x", "title": "t", "summary": "was here", "project": "p"})
-        assert r.status_code == 201 and r.json()["state"] == "idle" and r.json()["summary"] == "was here"
+        # It answers at once, queued; its worktree and session are made after (ThreadHost._prepare).
+        assert r.status_code == 201 and r.json()["state"] == "queued" and r.json()["summary"] == "was here"
         assert (await c.post("/threads", json={"id": "t_x", "project": "p"})).status_code == 409
+        t = host.threads["t_x"]
+        await until(lambda: any(e["type"] == "prepared" for e in t.events))
+        assert [e["data"] for e in t.events if e["type"] == "prepared"] == [{"resumed": False, "idle": True}]
+        assert {"state": "idle"} in [e["data"] for e in t.events if e["type"] == "state"]
     await host.stop("t_x")
 
 
@@ -528,3 +564,70 @@ def test_image_turns_go_to_a_model_that_takes_images(tmp_path):
     assert IMAGE_MODEL == "deepseek/deepseek-flash"
     assert images["deepseek-flash"] == "yes" and images["deepseek-v4-pro"] == "no"
     assert '"imageModel": "deepseek/deepseek-flash"' in (place.agent_dir / "settings.json").read_text()
+
+
+def test_a_model_runs_only_where_it_is_declared_and_its_key_was_given():
+    """POST /threads refuses (409) a model the binary would not know, or one
+    whose provider's key this runner has not got, before a thread is made."""
+    from runner.harness import PrimeAgent, provider_keys
+
+    assert provider_keys() == {"deepseek": "DEEPSEEK_API_KEY", "opengateway": "OPENGATEWAY_API_TOKEN"}
+    ultrafast = {"provider": "opengateway", "model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+    agent = PrimeAgent(env={"DEEPSEEK_API_KEY": "k"})
+    agent.check_model(None)
+    agent.check_model({"provider": "deepseek", "model": "deepseek-v4-pro"})
+    with pytest.raises(ValueError, match="needs OPENGATEWAY_API_TOKEN"):
+        agent.check_model(ultrafast)
+    PrimeAgent(env={"OPENGATEWAY_API_TOKEN": "t"}).check_model(ultrafast)
+    with pytest.raises(ValueError, match="no model 'gpt-9'"):
+        agent.check_model({"provider": "deepseek", "model": "gpt-9"})
+    with pytest.raises(ValueError, match="no model provider 'openai'"):
+        agent.check_model({"provider": "openai", "model": "gpt-4o"})
+
+
+def test_opengateway_calls_carry_its_token_from_the_environment(tmp_path):
+    """models.json names OPENGATEWAY_API_TOKEN as the provider's apiKey: the
+    binary sends that variable's value as the bearer token, to the chat
+    completions route, with the system prompt in a `system` message."""
+    import http.server
+    import json
+    import threading
+
+    from runner.harness import HARNESS, MODELS
+
+    seen = []
+
+    class Gateway(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            seen.append((self.path, self.headers["authorization"], body))
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error": {"message": "test"}}')
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Gateway)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    models = json.loads(MODELS.read_text())
+    assert models["providers"]["opengateway"]["baseUrl"] == "https://apis.opengateway.ai/v1"
+    models["providers"]["opengateway"]["baseUrl"] = f"http://127.0.0.1:{server.server_port}/v1"
+    agent_dir, home, cwd = tmp_path / "agent", tmp_path / "home", tmp_path / "cwd"
+    for d in (agent_dir, home, cwd):
+        d.mkdir()
+    (agent_dir / "models.json").write_text(json.dumps(models))
+    try:
+        subprocess.run([str(HARNESS / "prime-agent"), "--offline", "-p", "--no-session", "--no-skills",
+                        "--cwd", str(cwd), "--provider", "opengateway",
+                        "--model", "deepseek/deepseek-v4.1-flash-ultrafast", "say hi"],
+                       env={"PATH": os.environ["PATH"], "HOME": str(home), "DO_NOT_TRACK": "1",
+                            "PRIME_AGENT_CODING_AGENT_DIR": str(agent_dir), "PRIME_AGENT_KERNEL_PYTHON": "/bin/false",
+                            "OPENGATEWAY_API_TOKEN": "og-token"},
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    finally:
+        server.shutdown()
+    path, auth, body = seen[0]
+    assert (path, auth) == ("/v1/chat/completions", "Bearer og-token")
+    assert body["model"] == "deepseek/deepseek-v4.1-flash-ultrafast"
+    assert body["messages"][0]["role"] == "system" and "store" not in body

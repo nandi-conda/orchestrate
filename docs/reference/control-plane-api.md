@@ -14,14 +14,15 @@ provider call failed).
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/projects` | `?archived=1` for archived ones | list of projects; each has `repo_path` (its hub) and `repo_url` (its remote, `""` for none) |
+| GET | `/api/projects` | `?archived=1` for archived ones | list of projects; each has `repo_path` (its hub), `repo_url` (its remote, `""` for none), and, when projects are shared ([Projects on several computers](../guide/sync.md)), `driver_name` (the computer that drives it, `""` while none does) and `driven_here` (1 when it is this one) |
 | POST | `/api/projects` | `{name, model?}`, or `{folder, name?, model?}` to open a folder on disk (its full path; named after it unless `name` is given) | 201 + the project; a folder that cannot be opened is a 400 with the reason, and nothing is made |
 | GET | `/api/folders` | `?path=` a full path (`~` works), the home folder by default | `{path, parent, entries: [{name, path, git}]}`: the folders in it (hidden ones left out), for the folder picker; `parent` is `""` at the top. A path that is not a readable folder is a 400 |
 | GET | `/api/projects/{id}` | | the project |
 | POST | `/api/projects/{id}/settings` | any of `{name, model, repo_url}`; `repo_url: ""` removes the remote | the project; a remote the hub cannot join is a 400 with git's reason, and nothing changes |
 | GET | `/api/places` | | where threads' workers can run: `[{id, label, why}]`, `why` empty for a place this control plane runs workers in, else why not (for example no `SPRITES_TOKEN`). The router picks one per thread; each thread has `workers` (`""` until it is placed) |
-| POST | `/api/projects/{id}/archive` | | the project: running threads stopped, workers destroyed |
-| POST | `/api/projects/{id}/unarchive` | | the project |
+| POST | `/api/projects/{id}/archive` | | the project: this computer takes it over (drives it), then its running threads are stopped and it is taken off the workers; 502 with the reason when that fails |
+| POST | `/api/projects/{id}/unarchive` | | the project, driven by this computer |
+| POST | `/api/projects/{id}/drive` | | Take over: this computer drives the project from now on; the project |
 
 ## Requests and messages
 

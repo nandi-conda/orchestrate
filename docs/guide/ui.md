@@ -55,13 +55,20 @@ badge on a thread whose request said to run locally (the rest run on Sprites;
 see [where threads run](../architecture/routing.md#where-threads-run)). The right side is the pane for what
 you selected, with the request box under it.
 
+In a narrow window — a phone's browser, or the [Android app](android.md) — the
+thread list sits above the pane instead of beside it, and folds away to its
+header, **▸ Threads**, so the transcript gets the screen. Opening a thread folds
+it; tapping the header opens it again. The request box stays at the bottom of
+the window while the transcript scrolls under it.
+
 **Project orchestrator** shows the router's decisions and every thread's events,
 newest last (up to the newest 2,000), with a live line per working thread
 saying what it is doing.
 
 ### Sending a request
 
-Type in the request box and press Enter. The toggles above it decide where it
+Type in the request box and press Enter. Shift+Enter starts a new line, and
+pasted text keeps its lines (a log, a list); the box grows with them. The toggles above it decide where it
 goes:
 
 | Toggle | What happens |
@@ -91,8 +98,12 @@ image. Images show in transcripts and open enlarged on a click.
 ### Replying to a selection, copying
 
 Select text in a pane and a **Reply** button appears over it. The next message
-you send goes out as Markdown: the selection quoted, then your text. Every
-reply from an agent has a **Copy** button.
+you send goes out as Markdown: the selection quoted, then your text. Click the
+quote in your sent message to go back to the message it came from: the pane
+scrolls to it and flashes it, switching to its thread (or to Project
+orchestrator) when it is elsewhere. A message older than the pane's page says
+so instead. Every reply from an agent has a **Copy** button, and so does each
+code block in it; click a piece of inline code to copy just that.
 
 ### Editing your messages
 

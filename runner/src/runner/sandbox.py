@@ -30,6 +30,12 @@ class View:
     own paths, its own `home`, and its own `tmp` as /tmp. It has its own pid
     namespace, so the runner's processes (and their environments) are not in
     its /proc.
+    `cache` is pixi's cache for the thread's project on this worker, writable
+    and shared by every thread of the project: the packages pixi downloads,
+    and the worktrees' environments beside them (`pixi_config`), which pixi
+    hard-links to those packages. A hard link cannot cross a mount, so both
+    live in the one mount: an environment in the worktree, or packages in
+    the thread's HOME, made every environment a full copy, gigabytes each.
     `readonly` paths inside hidden ones are put back read-only (the kernel's
     Python environment, which lives in the runner's checkout). `tools` are
     programs of the worker's put back read-only at their own paths and on the
@@ -38,6 +44,7 @@ class View:
     root: str                         # the workspace: the project's worktree, where commands start
     home: str                         # the thread's HOME
     tmp: str                          # the thread's /tmp
+    cache: str                        # the project's package cache on this worker, shared by its threads
     writable: tuple[str, ...] = ()    # more of the worker the workspace needs (the clone's .git)
     hidden: tuple[str, ...] = ()
     readonly: tuple[str, ...] = ()
@@ -78,13 +85,25 @@ def thread_env(view: View) -> dict[str, str]:
     """The sandbox's environment, made afresh: none of the runner's variables
     (tokens, keys, RUNNER_*, the pixi environment's activation), and a PATH
     with the view's tools and without the directories the view hides. Tools
-    keep what they make in the thread's HOME (pixi its cache and global tools)."""
+    keep what they make in the thread's HOME (pixi its global tools), but for
+    pixi's cache and environments, which are the project's (`View.cache`)."""
     keep = {k: v for k, v in os.environ.items()
             if k in ("LANG", "TERM", "TZ", "USER", "LOGNAME", "SHELL") or k.startswith("LC_")}
     tools = list(dict.fromkeys(str(Path(t).parent) for t in view.tools))
     path = os.pathsep.join(tools + [p for p in os.environ.get("PATH", "").split(os.pathsep)
                                     if p and p not in tools and not _under(str(Path(p).resolve()), view.hidden)])
-    return {**keep, "PATH": path, "HOME": view.home, "TMPDIR": "/tmp"}
+    return {**keep, "PATH": path, "HOME": view.home, "TMPDIR": "/tmp",
+            "PIXI_CACHE_DIR": view.cache, "PIXI_CONFIG_FILE": pixi_config(view)}
+
+
+def pixi_config(view: View) -> str:
+    """The pixi configuration a thread's commands get, in its project's cache:
+    workspaces' environments go in the cache (`detached-environments`), so
+    they link to its packages (`View.cache`)."""
+    return str(Path(view.cache) / "config.toml")
+
+
+PIXI_CONFIG = "detached-environments = true\n"
 
 
 def bwrap_args(view: View) -> list[str]:
@@ -94,7 +113,7 @@ def bwrap_args(view: View) -> list[str]:
     # A hidden path inside another is hidden already; its own mount point would show.
     mounts = [(p, 0, ["--tmpfs", p]) for p in hidden if not _under(str(Path(p).parent), tuple(hidden))]
     mounts += [("/tmp", 1, ["--bind", view.tmp, "/tmp"])]
-    mounts += [(p, 1, ["--bind", p, p]) for p in (view.root, view.home, *view.writable)]
+    mounts += [(p, 1, ["--bind", p, p]) for p in (view.root, view.home, view.cache, *view.writable)]
     mounts += [(p, 1, ["--ro-bind", p, p]) for p in (*view.readonly, *view.tools)]
     mounts.sort(key=lambda m: (len(Path(m[0]).parts), m[1]))
     args = ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--die-with-parent"]
