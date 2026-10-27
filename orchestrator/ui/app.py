@@ -116,6 +116,9 @@ SPACE_COPY: Const[i32] = 89   # copy this computer's sync space key, to pair ano
 COPY_CODE: Const[i32] = 90    # arg: the code's id (code_put)
 CODE_COPIED: Const[i32] = 91
 CODE_COPIED_DONE: Const[i32] = 92
+SWITCH_SHOW: Const[i32] = 93   # the project switcher in a project's header; arg 0 closes it
+GOT_SWITCH: Const[i32] = 94
+SWITCH: Const[i32] = 95        # arg: the switcher's row
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -198,6 +201,8 @@ selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
 show_settings: i32 = 0   # the open project's settings dialog is up
+switching: i32 = 0       # the project switcher under the project's name is open
+switch_list: i32 = 0     # JSON handle: the live projects it lists
 saving_settings: i32 = 0
 show_app: i32 = 0        # the app's Settings dialog is up
 app: i32 = 0             # JSON handle: the app's settings (GET /api/settings)
@@ -402,7 +407,7 @@ def open_project(id: i32) -> None:
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
     global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived, editing
-    global show_settings, saving_settings, threads_open
+    global show_settings, saving_settings, threads_open, switching, switch_list
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -429,6 +434,8 @@ def leave_project() -> None:
     editing = 0
     show_settings = 0
     saving_settings = 0
+    switching = 0
+    switch_list = take_none(switch_list)
 
 
 def enter_project() -> None:
@@ -772,6 +779,7 @@ def update(msg: i32, arg: i32) -> None:
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, code_copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
+    global switching, switch_list
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -829,6 +837,24 @@ def update(msg: i32, arg: i32) -> None:
         jstr(e, "id", h_t1)
         j_free(e)
         open_project(h_t1)
+    elif msg == SWITCH_SHOW:
+        switching = arg
+        if switching == 1:
+            # Live projects only, fresh each time: others may have come or gone.
+            s_set(h_url, "/api/projects")
+            get(h_url, GOT_SWITCH)
+    elif msg == GOT_SWITCH:
+        if switching == 1:
+            switch_list = take(switch_list, arg)
+        else:
+            j_free(arg)
+    elif msg == SWITCH:
+        switching = 0
+        e = j_idx(switch_list, arg)
+        jstr(e, "id", h_t1)
+        j_free(e)
+        if s_eq(h_t1, h_pid) == 0:
+            open_project(h_t1)
     elif msg == PROJ_SHOW_ARCHIVED:
         proj_archived = arg
         loading = 1
@@ -3256,13 +3282,7 @@ def project_window() -> None:
     cls("sm")
     text("← All projects")
     end()
-    el("h1")
-    if project != 0:
-        jstr(project, "name", h_t1)
-        text_ref(h_t1)
-    else:
-        text("Project")
-    end()
+    project_switcher()
     if project != 0 and j_has(project, "archived_at") == 1:
         el("span")
         cls("badge")
@@ -3310,6 +3330,83 @@ def project_window() -> None:
     reply_button()
     if show_settings == 1:
         settings_dialog()
+    end()
+
+
+def project_switcher() -> None:
+    """The project's name, which opens a list of the live projects to switch to
+    in place; the open one is ticked."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    div("proj-switch")
+    el("button")
+    cls("proj-switch-btn")
+    on_click(SWITCH_SHOW, 1 - switching)
+    on_escape(SWITCH_SHOW, 0)
+    attr("title", "Switch project")
+    attr("aria-haspopup", "menu")
+    if switching == 1:
+        attr("aria-expanded", "true")
+    else:
+        attr("aria-expanded", "false")
+    el("h1")
+    if project != 0:
+        jstr(project, "name", h_t1)
+        text_ref(h_t1)
+    else:
+        text("Project")
+    end()
+    span("icon icon-chevron-down")
+    end()
+    end()
+    if switching == 1:
+        # Clicking anywhere off the menu closes it.
+        div("proj-scrim")
+        on_click(SWITCH_SHOW, 0)
+        end()
+        el("div")
+        cls("proj-menu")
+        attr("role", "menu")
+        if switch_list == 0:
+            el("p")
+            cls("muted")
+            cls("proj-menu-note")
+            text("Loading…")
+            end()
+        else:
+            n = j_len(switch_list, "")
+        for i in range(n):
+            e = j_idx(switch_list, i)
+            jstr(e, "id", h_t3)
+            el("button")
+            cls("proj-menu-item")
+            key(i + 1)
+            attr("role", "menuitem")
+            cls_if("active", s_eq(h_t3, h_pid) == 1)
+            on_click(SWITCH, i)
+            span("proj-menu-name")
+            jstr(e, "name", h_t1)
+            text_ref(h_t1)
+            end()
+            span("proj-menu-remote muted mono")
+            jstr(e, "repo_url", h_t2)
+            if s_len(h_t2) > 0:
+                text_ref(h_t2)
+            else:
+                text("no remote")
+            end()
+            end()
+            j_free(e)
+        el("button")
+        cls("proj-menu-item")
+        cls("proj-menu-all")
+        key(n + 1)
+        attr("role", "menuitem")
+        on_click(HOME, 0)
+        text("All projects")
+        end()
+        end()
     end()
 
 
