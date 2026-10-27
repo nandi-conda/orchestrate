@@ -16,6 +16,10 @@ import sys
 
 SERVICE = "orchestrate"
 
+# The names get_secret copied into os.environ from the keyring: their value
+# there came from the keyring, not from the environment the app started in.
+_COPIED: set[str] = set()
+
 # name -> (what it is for, how it is sent)
 KNOWN = {
     "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and every worker",
@@ -75,7 +79,40 @@ def get_secret(name: str) -> str | None:
     value = _from_keyring(name) or _from_keyring_label(name)
     if value:
         os.environ[name] = value
+        _COPIED.add(name)
     return value
+
+
+def source(name: str) -> str:
+    """Where get_secret finds `name`: "environment", "keyring", or "" when
+    neither has it. The environment wins, so a keyring entry under an
+    environment variable of the same name is never used."""
+    if os.environ.get(name) and name not in _COPIED:
+        return "environment"
+    if _from_keyring(name) or _from_keyring_label(name):
+        return "keyring"
+    return ""
+
+
+def store(name: str, value: str) -> None:
+    """Keep `value` in the keyring as `name` (service "orchestrate"), or
+    remove the entry when it is empty. What read it at startup (the router,
+    the Sprites provider, the sync server) keeps the old value until the next
+    start. Raises RuntimeError when there is no keyring backend."""
+    import keyring
+    from keyring.errors import KeyringError, PasswordDeleteError
+
+    if keyring_backend() is None:
+        raise RuntimeError("no keyring backend on this computer; set the key in the environment")
+    try:
+        if value:
+            keyring.set_password(SERVICE, name, value)
+        else:
+            keyring.delete_password(SERVICE, name)
+    except PasswordDeleteError:
+        pass  # nothing was kept under the name
+    except KeyringError as e:
+        raise RuntimeError(f"the keyring ({keyring_backend()}) did not take {name}: {e}") from e
 
 
 def keyring_backend() -> str | None:

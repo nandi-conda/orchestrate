@@ -14,6 +14,11 @@ both subprojects.
 pixi run set-key DEEPSEEK_API_KEY     # runs: keyring set orchestrate DEEPSEEK_API_KEY
 ```
 
+Or open **Settings** on the project list: it shows where each secret is found
+(environment, keyring, or not set) and keeps one in the keyring for you. A
+secret set in the environment wins, so it is changed there. Secrets are read
+at startup, so a new one is used from the app's next start.
+
 A password added by hand in a keyring GUI (Seahorse, KWallet, the macOS
 Keychain) works too when its **label is exactly the variable name** and its
 collection is unlocked.

@@ -22,7 +22,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import paths
+from . import paths, secrets
 from .providers import PLACES, Places, default_places
 from .gitio import GitError
 from .hub import folders, is_folder, remote_url
@@ -373,6 +373,40 @@ def create_app(store: Store | None = None, places: Places | None = None,
         router picks one per thread."""
         return JSONResponse(orch().places.offered())
 
+    async def app_settings(req: Request):
+        """This computer's control plane, for the Settings on the project
+        list: where its data is, the router's model, the sync server it shares
+        projects through (null when none), and each key it uses, with where
+        it is found (`source`: "environment", "keyring" or "" for nowhere).
+        `keyring` names the keyring backend, "" when there is none."""
+        def keys() -> list[dict]:
+            return [{"name": n, "what": what, "sent": sent, "source": secrets.source(n)}
+                    for n, (what, sent) in secrets.KNOWN.items()]
+
+        return JSONResponse({
+            "data_dir": str(paths.DATA),
+            "router_model": getattr(orch().router, "model", ""),
+            "sync": None if sync is None else {"url": sync.client.url, "computer": sync.name},
+            "keyring": secrets.keyring_backend() or "",
+            "keys": await asyncio.to_thread(keys),
+        })
+
+    async def app_key(req: Request):
+        """Keep a key in the keyring: {name, value}, "" removing it. One set
+        in the environment is refused, since the environment wins."""
+        b = await body(req)
+        name, value = str(b.get("name", "")), str(b.get("value", "")).strip()
+        if name not in secrets.KNOWN:
+            return JSONResponse({"error": f"no such key: {name!r}"}, 400)
+        if await asyncio.to_thread(secrets.source, name) == "environment":
+            return JSONResponse({"error": f"{name} is set in the environment, which wins over the keyring; "
+                                          f"change it there"}, 400)
+        try:
+            await asyncio.to_thread(secrets.store, name, value)
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return await app_settings(req)
+
     async def get_project(req: Request):
         p = await store.get_project(req.path_params["pid"])
         return JSONResponse(project_view(p)) if p else JSONResponse({"error": "no such project"}, 404)
@@ -683,6 +717,8 @@ def create_app(store: Store | None = None, places: Places | None = None,
         Route("/api/projects", create_project, methods=["POST"]),
         Route("/api/folders", list_folders, methods=["GET"]),
         Route("/api/places", list_places, methods=["GET"]),
+        Route("/api/settings", app_settings, methods=["GET"]),
+        Route("/api/settings/keys", app_key, methods=["POST"]),
         Route("/api/projects/{pid}", get_project, methods=["GET"]),
         Route("/api/projects/{pid}/settings", project_settings, methods=["POST"]),
         Route("/api/projects/{pid}/archive", project_archive, methods=["POST"]),

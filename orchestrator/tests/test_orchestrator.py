@@ -2502,3 +2502,63 @@ async def test_sprites_without_a_token_is_never_picked(tmp_path):
     await orch.close()
     await orch.places.close()
     await s.close()
+
+
+async def test_app_settings_show_keys_and_keep_them_in_the_keyring(tmp_path, monkeypatch):
+    """The project list's Settings: each key with where it is found, kept in
+    the keyring from there, except one the environment sets (it wins)."""
+    import keyring
+    from keyring.backend import KeyringBackend
+    from control import secrets
+
+    class Memory(KeyringBackend):
+        priority = 1
+
+        def __init__(self):
+            super().__init__()
+            self.kept = {}
+
+        def get_password(self, service, username):
+            return self.kept.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.kept[(service, username)] = password
+
+        def delete_password(self, service, username):
+            from keyring.errors import PasswordDeleteError
+            if self.kept.pop((service, username), None) is None:
+                raise PasswordDeleteError(username)
+
+    memory = Memory()
+    before = keyring.get_keyring()
+    keyring.set_keyring(memory)
+    try:
+        monkeypatch.setattr(secrets, "_COPIED", set())
+        monkeypatch.setattr(secrets, "_from_keyring_label", lambda n: None)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+        monkeypatch.delenv("SPRITES_TOKEN", raising=False)
+        app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                         local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
+                         HeuristicRouter(), repos=str(tmp_path / "repos"))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+                got = (await c.get("/api/settings")).json()
+                keys = {k["name"]: k["source"] for k in got["keys"]}
+                assert keys["DEEPSEEK_API_KEY"] == "environment" and keys["SPRITES_TOKEN"] == ""
+                assert got["sync"] is None and got["keyring"].endswith("Memory")
+
+                r = await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": " tok "})
+                assert r.status_code == 200
+                assert {k["name"]: k["source"] for k in r.json()["keys"]}["SPRITES_TOKEN"] == "keyring"
+                assert memory.kept[("orchestrate", "SPRITES_TOKEN")] == "tok"
+
+                r = await c.post("/api/settings/keys", json={"name": "DEEPSEEK_API_KEY", "value": "x"})
+                assert r.status_code == 400 and "environment" in r.json()["error"]
+                r = await c.post("/api/settings/keys", json={"name": "NOPE", "value": "x"})
+                assert r.status_code == 400
+
+                r = await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": ""})
+                assert r.status_code == 200 and ("orchestrate", "SPRITES_TOKEN") not in memory.kept
+                assert (await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": ""})).status_code == 200
+    finally:
+        keyring.set_keyring(before)

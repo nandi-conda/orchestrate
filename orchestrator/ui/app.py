@@ -105,6 +105,13 @@ JUMP: Const[i32] = 78         # arg: seq of your message whose quote was clicked
 JUMP_MISS: Const[i32] = 79
 TAKE_OVER: Const[i32] = 80    # drive the open project from this computer
 TOOK_OVER: Const[i32] = 81
+APP_SHOW: Const[i32] = 82     # the app's Settings, from the project list
+APP_HIDE: Const[i32] = 83
+GOT_APP: Const[i32] = 84
+KEY_EDIT: Const[i32] = 85     # arg: the key's index; -1 closes its field
+KEY_IN: Const[i32] = 86
+KEY_SAVE: Const[i32] = 87
+KEY_SAVED: Const[i32] = 88
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -185,6 +192,10 @@ editing: i32 = 0         # seq of the message of yours being edited, 0 when none
 edit_sent: i32 = 0       # seq of the edit last saved, reopened if the save fails
 show_settings: i32 = 0   # the open project's settings dialog is up
 saving_settings: i32 = 0
+show_app: i32 = 0        # the app's Settings dialog is up
+app: i32 = 0             # JSON handle: the app's settings (GET /api/settings)
+key_edit: i32 = -1       # index of the key whose field is open, -1 when none
+saving_key: i32 = 0
 
 h_pid: i32 = 0           # project id
 h_sel: i32 = 0           # selected thread id ("" = activity view)
@@ -242,6 +253,8 @@ h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 h_edit: i32 = 0          # the text of the message being edited
 h_img: i32 = 0           # scratch for an image's URL while it is drawn
+h_key: i32 = 0           # the value typed for the key being set ("" removes it)
+h_key_err: i32 = 0       # why the key could not be kept, or the settings read
 
 
 # LPython's wasm backend can't discard a call's result, so these wrappers
@@ -275,7 +288,7 @@ def init() -> None:
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_selsrc, h_qsrc, h_lastqsrc, h_evid
     global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
-    global h_img, h_when, h_when_full, host_picks
+    global h_img, h_when, h_when_full, host_picks, h_key, h_key_err
     h_pid = s_new()
     h_sel = s_new()
     h_name = s_new()
@@ -341,6 +354,8 @@ def init() -> None:
     h_act = s_new()
     h_edit = s_new()
     h_img = s_new()
+    h_key = s_new()
+    h_key_err = s_new()
     host_picks = host_folders()
     s_set(h_url, "/api/places")
     get(h_url, GOT_PLACES)
@@ -731,7 +746,7 @@ def update(msg: i32, arg: i32) -> None:
     global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
-    global picking, folders, folders_loading, threads_open
+    global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -741,6 +756,49 @@ def update(msg: i32, arg: i32) -> None:
         projects = take(projects, arg)
     elif msg == GOT_PLACES:
         places = take(places, arg)
+    elif msg == APP_SHOW:
+        show_app = 1
+        key_edit = -1
+        s_clear(h_key_err)
+        s_set(h_url, "/api/settings")
+        get(h_url, GOT_APP)
+    elif msg == APP_HIDE:
+        if saving_key == 0:
+            show_app = 0
+            key_edit = -1
+            s_clear(h_key)
+    elif msg == GOT_APP:
+        if j_ok(arg) == 1:
+            app = take(app, arg)
+        else:
+            j_err(arg, h_key_err)
+            j_free(arg)
+    elif msg == KEY_EDIT:
+        if saving_key == 0:
+            key_edit = arg
+            s_clear(h_key)
+            s_clear(h_key_err)
+    elif msg == KEY_IN:
+        s_copy(h_key, arg)
+    elif msg == KEY_SAVE:
+        if key_edit >= 0 and saving_key == 0 and app != 0:
+            saving_key = 1
+            s_clear(h_key_err)
+            o = o_new()
+            key_name(key_edit, h_t1)
+            o_str(o, "name", h_t1)
+            o_str(o, "value", h_key)
+            s_set(h_url, "/api/settings/keys")
+            post(h_url, o, KEY_SAVED)
+    elif msg == KEY_SAVED:
+        saving_key = 0
+        if j_ok(arg) == 1:
+            app = take(app, arg)
+            key_edit = -1
+            s_clear(h_key)
+        else:
+            j_err(arg, h_key_err)
+            j_free(arg)
     elif msg == OPEN:
         e = j_idx(projects, arg)
         jstr(e, "id", h_t1)
@@ -1330,6 +1388,7 @@ def project_list() -> None:
     if proj_archived == 1:
         btn("← Projects", "ghost", PROJ_SHOW_ARCHIVED, 0)
     else:
+        btn("Settings", "ghost", APP_SHOW, 0)
         btn("Archived", "ghost", PROJ_SHOW_ARCHIVED, 1)
         btn("Open folder", "outline", NEW_SHOW, 1)
         btn("New project", "", NEW_SHOW, 0)
@@ -1417,6 +1476,199 @@ def project_list() -> None:
         new_project_dialog()
     elif show_new == 2:
         open_folder_dialog()
+    if show_app == 1:
+        app_dialog()
+
+
+def key_name(i: i32, dst: i32) -> None:
+    """The name of the app settings' key i."""
+    ks: i32 = j_at(app, "keys")
+    e: i32 = j_idx(ks, i)
+    jstr(e, "name", dst)
+    j_free(e)
+    j_free(ks)
+
+
+def app_dialog() -> None:
+    """This computer's control plane: its router model, data folder, sync
+    server, where workers run and the keys it uses, each kept in the keyring
+    from here unless the environment sets it."""
+    i: i32
+    e: i32 = 0
+    ks: i32 = 0
+    n: i32 = 0
+    dialog_open("Settings", "This computer's orchestrator, for every project. "
+                "Each project has its own settings too.", APP_HIDE)
+    el("div")
+    cls("form")
+    cls("app-settings")
+    if app == 0:
+        if s_len(h_key_err) > 0:
+            el("div")
+            cls("alert")
+            cls("destructive")
+            attr("role", "alert")
+            text_ref(h_key_err)
+            end()
+        else:
+            el("p")
+            cls("muted")
+            text("Loading…")
+            end()
+    else:
+        label("Router model")
+        el("p")
+        cls("mono")
+        cls("repo-path")
+        jstr(app, "router_model", h_t1)
+        text_ref(h_t1)
+        end()
+        label("Data folder")
+        el("p")
+        cls("mono")
+        cls("repo-path")
+        jstr(app, "data_dir", h_t1)
+        text_ref(h_t1)
+        end()
+        label("Sync")
+        el("p")
+        cls("help")
+        if j_has(app, "sync.url") == 1:
+            text("Projects are shared with your other computers through ")
+            span("mono")
+            jstr(app, "sync.url", h_t1)
+            text_ref(h_t1)
+            end()
+            text(". This computer is ")
+            jstr(app, "sync.computer", h_t1)
+            text_ref(h_t1)
+            text(".")
+        else:
+            text("Off: projects stay on this computer. Set ORCHESTRATE_SYNC_URL and "
+                 "ORCHESTRATE_SYNC_TOKEN below to share them with your other computers.")
+        end()
+        label("Workers")
+        div("settings-list")
+        if places != 0:
+            n = j_len(places, "")
+        for i in range(n):
+            e = j_idx(places, i)
+            div("settings-item")
+            div("settings-row")
+            span("title")
+            jstr(e, "label", h_t1)
+            text_ref(h_t1)
+            end()
+            jstr(e, "why", h_t2)
+            if s_len(h_t2) == 0:
+                badge("available", "secondary")
+            else:
+                badge("off", "outline")
+            end()
+            if s_len(h_t2) > 0:
+                el("p")
+                cls("help")
+                text_ref(h_t2)
+                end()
+            end()
+            j_free(e)
+        end()
+        label("Keys")
+        el("p")
+        cls("help")
+        jstr(app, "keyring", h_t1)
+        if s_len(h_t1) > 0:
+            text("Read from the environment first, then the keyring. Keys kept here go to the keyring "
+                 "and are used from the app's next start.")
+        else:
+            text("This computer has no keyring: set keys in the environment the app starts in.")
+        end()
+        ks = j_at(app, "keys")
+        n = j_len(ks, "")
+        div("settings-list")
+        for i in range(n):
+            e = j_idx(ks, i)
+            key_row(e, i)
+            j_free(e)
+        end()
+        j_free(ks)
+        if key_edit < 0 and s_len(h_key_err) > 0:
+            key_error()
+    end()
+    dialog_footer_open()
+    btn("Close", "outline", APP_HIDE, 0)
+    end()
+    end()
+
+
+def key_row(e: i32, i: i32) -> None:
+    """A key: its name and where it is found, what it is for, and a field
+    to keep it in the keyring while it is open."""
+    div("settings-item")
+    div("settings-row")
+    span("mono")
+    jstr(e, "name", h_t1)
+    text_ref(h_t1)
+    end()
+    jstr(e, "source", h_t2)
+    if s_len(h_t2) == 0:
+        badge("not set", "outline")
+    else:
+        el("span")
+        cls("badge")
+        cls("secondary")
+        text_ref(h_t2)
+        end()
+    span("grow")
+    end()
+    # One the environment sets is changed there: it wins over the keyring.
+    jstr(app, "keyring", h_t1)
+    s_set(h_t3, "environment")
+    if key_edit != i and s_len(h_t1) > 0 and s_eq(h_t2, h_t3) == 0:
+        btn_open("ghost", KEY_EDIT, i)
+        cls("sm")
+        if s_len(h_t2) == 0:
+            text("Set…")
+        else:
+            text("Change…")
+        end()
+    end()
+    el("p")
+    cls("help")
+    jstr(e, "what", h_t1)
+    text_ref(h_t1)
+    text(". Sent as ")
+    jstr(e, "sent", h_t1)
+    text_ref(h_t1)
+    text(".")
+    end()
+    if key_edit == i:
+        div("field-row")
+        input_open("empty removes it from the keyring", h_key, KEY_IN)
+        attr("type", "password")
+        autofocus()
+        on_enter(KEY_SAVE, 0)
+        end()
+        btn("Cancel", "outline", KEY_EDIT, -1)
+        btn_open("", KEY_SAVE, 0)
+        if saving_key == 1:
+            text("Saving…")
+        else:
+            text("Save")
+        end()
+        end()
+        if s_len(h_key_err) > 0:
+            key_error()
+    end()
+
+
+def key_error() -> None:
+    el("div")
+    cls("alert")
+    cls("destructive")
+    attr("role", "alert")
+    text_ref(h_key_err)
+    end()
 
 
 def new_project_dialog() -> None:
