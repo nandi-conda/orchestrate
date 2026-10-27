@@ -81,6 +81,23 @@ async def test_no_worktree_before_the_orchestrator_sends_the_repository(tmp_path
         await repo.worktree(tmp_path / "T", "T")
 
 
+async def test_asking_what_a_worker_has_writes_nothing(tmp_path):
+    """GET /repo only reads: a project the worker has no repository for has
+    no refs (and gets none made), and one it has is not written to by a new
+    runner process opening it."""
+    source(tmp_path)
+    fresh = Repos(tmp_path / "fresh" / ".repos")
+    assert await fresh.get("p").refs() == {}
+    assert not (tmp_path / "fresh" / ".repos" / "p").exists()
+    await seeded_repos(tmp_path)
+    config = tmp_path / "threads" / ".repos" / "p" / ".git" / "config"
+    before = config.stat().st_ino  # git rewrites a config it sets anything in as a new file
+    again = Repos(tmp_path / "threads" / ".repos").get("p")
+    assert "refs/remotes/origin/main" in await again.refs()
+    assert again.base == "main"
+    assert config.stat().st_ino == before
+
+
 async def test_a_thread_sees_its_worktree_not_the_others(tmp_path):
     """Other threads' worktrees and the repository's checkout are hidden; the
     thread can still commit, since its worktree's git dir is in the view."""
