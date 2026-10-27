@@ -11,13 +11,13 @@ between all its projects. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit", "boot", "spec"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout); `boot` is random per runner process, so a control plane can tell the runner restarted (its threads are gone from memory, its event `seq` starts again at 1); `spec` is `$RUNNER_SPEC`, the control plane's fingerprint of how it started this runner ("" when unset) |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry + `"resumed"` (it resumes a turn cut short here, below); 400 without `project`; 409 if `id` is running here |
+| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry, `queued`, at once: the thread's worktree and session are made after (`preparing`, `prepared` events, below); 400 without `project`; 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
 | POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
-| GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first |
-| GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream` |
+| GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first; 409 while its worktree is being made |
+| GET | `/threads/{id}/files/raw` | `?path=<file>` | the file's bytes, `application/octet-stream`; 409 while its worktree is being made |
 | GET | `/projects/{project}/threads/{id}/repo` | `?have=<sha>,<sha>` | a git bundle of `thread/<id>`, its snapshot and its session; header `x-git-refs` (below) |
 | GET | `/projects/{project}/repo` | | `{"base", "refs": {"<refname>": "<sha>"}}`: the project's repository's refs on this worker |
 | POST | `/projects/{project}/repo` | a git bundle (may be empty); headers `x-git-base`, `x-git-refs` | `{"ok": true}`; 400 for a ref outside `refs/remotes/origin/`, `refs/remotes/origin-snapshots/` and `refs/remotes/origin-sessions/` |
@@ -56,6 +56,8 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | type | data |
 | --- | --- |
 | `created` | directory entry |
+| `preparing` | `{"step"}`: a step of making the thread's worktree and session after `POST /threads` answered ("making its worktree", "taking its session") |
+| `prepared` | `{"resumed", "idle"}`: its worktree and session are made; `resumed` when it resumes a turn cut short here (below), `idle` when it waits for its next message; else it works on its request. Messages posted before this wait and come after the request. A failure is an `error` and state `failed` instead |
 | `state` | `{"state"}` |
 | `message_in` | `{"from", "body"}` |
 | `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool, `python_repl`; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |
@@ -91,7 +93,7 @@ thread's `id`, `title`, `parent` and `summary`, and usually no `request`:
   contains `origin-sessions/<id>`; else it is checked out from
   `origin-sessions/<id>`. prime-agent resumes it (`--resume`), so the model
   sees its whole conversation, images included, as it last stood.
-- Without `request` the thread goes `idle` (a `state` event) and waits for
+- Without `request` the thread goes `idle` (a `state` event, after `prepared`) and waits for
   its next message; nothing runs until one is posted.
 
 ### Interrupted turns
@@ -105,7 +107,7 @@ from. Posting the thread to this worker again (any `request` is ignored)
 resumes the turn when that file is there and the thread's session is still
 that commit: the worktree and the session file are as the cut left them, and
 the model gets a `message_in` from `runner` saying the turn was cut short and
-to finish it. The response says `"resumed": true`. A thread that went on on
+to finish it. Its `prepared` event says `"resumed": true`. A thread that went on on
 another worker since has a newer session, and its stale file is dropped.
 
 ## Peer calls (collected by the orchestrator)

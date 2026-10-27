@@ -469,8 +469,13 @@ async def test_http_bringing_a_thread_back_needs_its_id_or_a_request(tmp_path):
         assert (await c.post("/threads", json={"title": "t", "project": "p"})).status_code == 400
         assert (await c.post("/threads", json={"id": "t_x", "title": "t"})).status_code == 400  # no project
         r = await c.post("/threads", json={"id": "t_x", "title": "t", "summary": "was here", "project": "p"})
-        assert r.status_code == 201 and r.json()["state"] == "idle" and r.json()["summary"] == "was here"
+        # It answers at once, queued; its worktree and session are made after (ThreadHost._prepare).
+        assert r.status_code == 201 and r.json()["state"] == "queued" and r.json()["summary"] == "was here"
         assert (await c.post("/threads", json={"id": "t_x", "project": "p"})).status_code == 409
+        t = host.threads["t_x"]
+        await until(lambda: any(e["type"] == "prepared" for e in t.events))
+        assert [e["data"] for e in t.events if e["type"] == "prepared"] == [{"resumed": False, "idle": True}]
+        assert {"state": "idle"} in [e["data"] for e in t.events if e["type"] == "state"]
     await host.stop("t_x")
 
 

@@ -68,8 +68,8 @@ async def test_worktree_per_thread_off_the_base_branch(tmp_path):
     h = await host(tmp_path, ["ok"], ["ok"])
     a = await h.start(project="p", title="a", request="x")
     b = await h.start(project="p", title="b", request="y")
-    assert a.root != b.root and a.branch == f"thread/{a.id}"
-    assert (await run(a, "git branch --show-current")).stdout.strip() == a.branch
+    assert (await run(a, "git branch --show-current")).stdout.strip() == a.branch == f"thread/{a.id}"
+    assert a.root != b.root
     assert (await run(a, "cat notes.txt")).stdout.startswith("one")
     await asyncio.gather(h.wait_idle(a.id), h.wait_idle(b.id))
     await stop_all(h)
@@ -246,6 +246,34 @@ async def test_the_orchestrator_takes_the_branch_and_lands_it_in_its_hub(tmp_pat
     assert (wt / "y.txt").exists() and (wt / "out" / "o").read_text() == "o\n"
 
 
+async def test_starting_a_thread_does_not_wait_for_its_worktree(tmp_path, monkeypatch):
+    """Making a worktree can take minutes (a snapshot of many files to write):
+    POST /threads answers at once, the thread queued, and the worktree and
+    session are made in its task, each step a `preparing` event."""
+    source(tmp_path)
+    h = await host(tmp_path, ["done"], ["done"])
+    repo = h.repos.get("p")
+    release = asyncio.Event()
+    made = repo.worktree
+
+    async def slow(path, tid):
+        await release.wait()
+        return await made(path, tid)
+
+    monkeypatch.setattr(repo, "worktree", slow)
+    t = await asyncio.wait_for(h.start(project="p", title="t", request="x"), 1)
+    assert t.state == "queued" and t.workspace is None
+    await until(lambda: any(e["type"] == "preparing" for e in t.events))
+    assert [e["data"] for e in t.events if e["type"] == "preparing"] == [{"step": "making its worktree"}]
+    t.deliver("and this too")  # a message posted meanwhile comes after the request
+    release.set()
+    await until(lambda: any(e["type"] == "turn_done" for e in t.events))
+    assert t.branch == f"thread/{t.id}"
+    assert [e["data"] for e in t.events if e["type"] == "prepared"] == [{"resumed": False, "idle": False}]
+    assert [e["data"]["body"] for e in t.events if e["type"] == "message_in"][0] == "x"
+    await stop_all(h)
+
+
 async def test_resumed_thread_continues_on_a_new_worker_with_its_files_and_session(tmp_path):
     source(tmp_path)
     first = await host(tmp_path, [sh("echo v1 > draft.txt; printf 'build/\\n' > .gitignore; mkdir build; "
@@ -258,7 +286,7 @@ async def test_resumed_thread_continues_on_a_new_worker_with_its_files_and_sessi
     second = await host(tmp_path, ["still here"], name="w2")
     await move(first.repos.get("p"), second.repos.get("p"), "t_resume")
     r = await second.start(project="p", title="t", id="t_resume")
-    assert r.state == "idle" and (await run(r, "cat draft.txt")).stdout == "v1\n"
+    assert (await run(r, "cat draft.txt")).stdout == "v1\n" and r.state == "idle"
     assert (await run(r, "cat build/app")).stdout == "bin\n"  # ignored, from the snapshot
     assert (await run(r, "git status --porcelain")).stdout == ""
     assert (await run(r, "git branch --show-current")).stdout.strip() == "thread/t_resume"

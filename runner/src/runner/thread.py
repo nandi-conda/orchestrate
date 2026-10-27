@@ -152,6 +152,8 @@ class AgentThread:
         self.spawned = 0
         self.events: list[dict] = []
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self.preparing = True  # its worktree and session are being made (ThreadHost._prepare)
+        self.first: dict | None = None  # the message its first turn takes, before its inbox's (ThreadHost._prepare)
         self.harness: Harness | None = None
         self.team = TeamServer(self, place.socket)
         self.task: asyncio.Task | None = None
@@ -190,12 +192,18 @@ class AgentThread:
         await self.harness.prompt(user_text(item["from"], item["body"]), item.get("images"))
         return True
 
-    async def run(self):
+    async def run(self, prepare: Callable[[], Any] | None = None):
+        """The thread's life: `prepare` (its worktree and session, which can
+        take minutes: ThreadHost.start returns before it), then its agent,
+        fed its messages one turn at a time."""
         try:
+            if prepare is not None:
+                await prepare()
             await self.team.start()
             self.harness = await self.agent.start(self.place, model=self.model, append_prompt=self.prompt())
             while True:
-                if await self._send(await self.inbox.get()):
+                item, self.first = self.first or await self.inbox.get(), None
+                if await self._send(item):
                     await self._turn()
         except asyncio.CancelledError:
             if not self.stopping:
@@ -440,6 +448,9 @@ class ThreadHost:
         continues its branch and its agent's session; with no `request` it
         waits idle for its next message. `images` belong to the request. An
         id whose thread here has ended (stopped or failed) is started afresh.
+        It returns at once, the thread `queued`: making its worktree and
+        session (_prepare) is the start of its task, since that can take
+        minutes (a snapshot with many files to write).
 
         A thread whose turn this worker's runner was cut off in resumes that
         turn ("Interrupted turns" above): its session has the turn's messages,
@@ -450,32 +461,44 @@ class ThreadHost:
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
         place = self._place(tid, project)
-        workspace = None
-        session = ""
-        if self.repos:
-            repo = self.repos.get(project)
-            Path(place.view.root).parent.mkdir(parents=True, exist_ok=True)
-            workspace = await repo.worktree(place.view.root, tid)
-            await repo.session(tid, place.agent_dir, SESSION)
-            session = await repo.session_commit(tid)
-        resumed = self._interrupted(place, session)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
-                        peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=workspace,
+                        peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=None,
                         emit=self._emit, summary=summary)
-        t.session, t.resumed, t.stopping = session, resumed, self.stopping
+        t.stopping = self.stopping
         if old is not None:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
         self.threads[tid] = t
         t.emit("created", t.directory_entry())
-        if resumed:
-            log.info("thread %s: resuming the turn the runner's restart cut short", tid)
-            t.deliver(RESUME, sender="runner")
+        t.task = asyncio.create_task(t.run(lambda: self._prepare(t, request, images)), name=tid)
+        return t
+
+    async def _prepare(self, t: AgentThread, request: str | None, images: list[dict] | None) -> None:
+        """Make the thread's worktree and session on this worker, then give it
+        its first message: RESUME for a turn cut short here, else its request,
+        else nothing (it goes idle). Messages posted meanwhile wait in its
+        inbox and come after it. Each step is a `preparing` event, and the end
+        a `prepared` one saying whether it resumes."""
+        if self.repos:
+            repo = self.repos.get(t.project)
+            Path(t.root).parent.mkdir(parents=True, exist_ok=True)
+            t.emit("preparing", {"step": "making its worktree"})
+            t.workspace = await repo.worktree(t.root, t.id)
+            t.branch = t.workspace.branch
+            t.emit("preparing", {"step": "taking its session"})
+            await repo.session(t.id, t.place.agent_dir, SESSION)
+            t.session = await repo.session_commit(t.id)
+        t.resumed = self._interrupted(t.place, t.session)
+        t.preparing = False
+        idle = not t.resumed and request is None
+        t.emit("prepared", {"resumed": t.resumed, "idle": idle})
+        if t.resumed:
+            log.info("thread %s: resuming the turn the runner's restart cut short", t.id)
+            t.first = {"from": "runner", "body": RESUME, "hops": 0, "images": []}
         elif request is not None:
-            t.deliver(request, sender="user" if parent is None else parent, images=images)
+            t.first = {"from": "user" if t.parent is None else t.parent, "body": request, "hops": 0,
+                       "images": images or []}
         else:
             t.set_state("idle")
-        t.task = asyncio.create_task(t.run(), name=tid)
-        return t
 
     async def prune(self, keep: set[str]) -> list[str]:
         """Take every project not in `keep` off this worker: its threads here
@@ -491,10 +514,10 @@ class ThreadHost:
             for tree in await self.repos.worktrees(project):
                 tid = tree.name
                 for path in (tree, self.workdir / ".home" / tid, self.workdir / ".tmp" / tid):
-                    shutil.rmtree(path, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
                 for leftover in (self.workdir / ".team").glob(f"{tid}.*"):
                     leftover.unlink(missing_ok=True)
-            self.repos.remove(project)
+            await asyncio.to_thread(self.repos.remove, project)
             log.info("project %s is no longer on this worker", project)
         return gone
 
@@ -534,7 +557,7 @@ class ThreadHost:
         """Wait until a thread has finished at least one turn and its inbox is empty (tests, CLI)."""
         t = self.threads[thread_id]
         async def _w():
-            while not (t.state in ("idle", "failed", "stopped") and t.inbox.empty()
+            while not (t.state in ("idle", "failed", "stopped") and t.first is None and t.inbox.empty()
                        and any(e["type"] in ("turn_done", "error") for e in t.events)):
                 await asyncio.sleep(0.02)
         await asyncio.wait_for(_w(), timeout)

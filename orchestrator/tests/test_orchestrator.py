@@ -48,6 +48,12 @@ async def binds(s, pid, tid):
             if e["type"] == "binding" and e["payload"]["to"] == "bound"]
 
 
+async def prepared(s, pid, tid):
+    """What the runner said each time it had made the thread's worktree and
+    session (its `prepared` event, after it answered the post)."""
+    return [e["payload"] for e in await s.list_events(pid, tid) if e["type"] == "prepared"]
+
+
 async def unbinds(s, pid, tid):
     return [e["payload"]["reason"] for e in await s.list_events(pid, tid)
             if e["type"] == "binding" and e["payload"]["to"] == "unbound"]
@@ -1313,7 +1319,8 @@ async def test_a_turn_a_runner_restart_cuts_short_resumes_on_that_worker(tmp_pat
     moves = [(e["payload"]["from"], e["payload"]["to"]) for e in events if e["type"] == "binding"]
     assert moves == [("unbound", "binding"), ("binding", "bound"), ("bound", "binding"), ("binding", "bound")]
     bound = await binds(s, p["id"], t["id"])
-    assert [b["worker"] for b in bound] == [w.id, w.id] and "resuming the turn" in bound[-1]["reason"]
+    assert [b["worker"] for b in bound] == [w.id, w.id]
+    assert (await prepared(s, p["id"], t["id"]))[-1] == {"resumed": True, "idle": False}
     await orch.close()
     await provider.close()
     await s.close()
@@ -1351,7 +1358,8 @@ async def test_a_turn_under_way_goes_on_after_a_control_plane_restart(tmp_path, 
     events = await s.list_events(p["id"], t["id"])
     assert "error" not in [e["type"] for e in events] and await unbinds(s, p["id"], t["id"]) == []
     bound = await binds(s, p["id"], t["id"])
-    assert [b["worker"] for b in bound] == [wid, wid] and "resuming the turn" in bound[-1]["reason"]
+    assert [b["worker"] for b in bound] == [wid, wid]
+    assert (await prepared(s, p["id"], t["id"]))[-1] == {"resumed": True, "idle": False}
     await orch.close()
     await provider.close()
     await s.close()
@@ -1603,7 +1611,7 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
     await wait_for(answered)
     events = await s.list_events(p["id"], t["id"])
     revived = await binds(s, p["id"], t["id"])
-    assert len(revived) == 1 and "working on its request" in revived[0]["reason"]
+    assert len(revived) == 1 and await prepared(s, p["id"], t["id"]) == [{"resumed": False, "idle": False}]
     assert "could not put it on a worker: RuntimeError: the sprite did not come up" in \
         (await unbinds(s, p["id"], t["id"]))[0]
     assert [e for e in events if e["type"] == "message_in"] == []  # the request's echo was expected

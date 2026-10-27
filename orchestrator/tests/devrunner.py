@@ -301,26 +301,40 @@ def create_app(host: Host, token: str) -> Starlette:
         t = {"id": tid, "project": b["project"], "title": b.get("title") or (b.get("request") or tid)[:40],
              "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
              "resumed": not (b.get("request") or b.get("images"))}
-        try:
-            repo = await host.repo(t["project"])
-            await repo.worktree(host.workdir / tid, tid)
-            await repo.session(tid, host.session_dir(t))
-            host.session_dir(t).mkdir(parents=True, exist_ok=True)
-        except GitError as e:
-            return JSONResponse({"error": str(e)}, 500)
         host.threads[tid] = t
         await host.emit(tid, "created", host.entry(t))
-        cut = host.turn_file(tid).exists()
-        if cut:  # the request, if any, is the cut turn's: the thread has it already
-            await host.emit(tid, "message_in", {"from": "runner", "body": RESUME, "images": []})
-            asyncio.create_task(host.turn(t, f"[from runner] {RESUME}"))
-        elif b.get("request") or b.get("images"):
-            await host.emit(tid, "message_in", {"from": "user", "body": b.get("request") or "",
-                                                "images": b.get("images") or []})
-            asyncio.create_task(host.turn(t, b.get("request") or "", b.get("images") or []))
-        else:  # resumed: idle until its next message (runner/API.md, "Resuming a thread")
-            await host.set_state(t, "idle")
-        return JSONResponse({**host.entry(t), "resumed": cut}, 201)
+
+        async def prepare():  # after the answer, as the runner's ThreadHost._prepare; messages wait for it
+            async with host.turn_locks.setdefault(tid, asyncio.Lock()):
+                await make_ready()
+
+        async def make_ready():
+            try:
+                repo = await host.repo(t["project"])
+                await host.emit(tid, "preparing", {"step": "making its worktree"})
+                await repo.worktree(host.workdir / tid, tid)
+                await host.emit(tid, "preparing", {"step": "taking its session"})
+                await repo.session(tid, host.session_dir(t))
+                host.session_dir(t).mkdir(parents=True, exist_ok=True)
+            except GitError as e:
+                await host.emit(tid, "error", {"error": str(e)})
+                await host.set_state(t, "failed")
+                return
+            cut = host.turn_file(tid).exists()
+            asked = bool(b.get("request") or b.get("images"))
+            await host.emit(tid, "prepared", {"resumed": cut, "idle": not cut and not asked})
+            if cut:  # the request, if any, is the cut turn's: the thread has it already
+                await host.emit(tid, "message_in", {"from": "runner", "body": RESUME, "images": []})
+                await host._turn(t, f"[from runner] {RESUME}")
+            elif asked:
+                await host.emit(tid, "message_in", {"from": "user", "body": b.get("request") or "",
+                                                    "images": b.get("images") or []})
+                await host._turn(t, b.get("request") or "", b.get("images") or [])
+            else:  # resumed: idle until its next message (runner/API.md, "Resuming a thread")
+                await host.set_state(t, "idle")
+
+        asyncio.create_task(prepare())
+        return JSONResponse(host.entry(t), 201)
 
     async def message(req: Request):
         if not authed(req):

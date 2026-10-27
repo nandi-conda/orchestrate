@@ -268,6 +268,22 @@ plane's checkout follows is the usual one); otherwise its runner is left
 running and the attach takes seconds. Respawn of a thread waiting on a
 worker being made calls that attach off too, and it starts again.
 
+### Posting a thread to its runner
+
+`POST /threads` answers at once: the runner registers the thread `queued`
+and makes its worktree and session afterwards, in the thread's own task. That
+can take minutes (a worktree made again from the hub writes every file of its
+snapshot, ignored build output included), and a request held open that long
+is cut off (the control plane's 30 s read timeout, and Fly's proxy). The
+thread is bound as soon as the runner answers. Each step of making it
+arrives as a `preparing` event (the thread's activity: "making its worktree",
+"taking its session"), and the end as `prepared`, which says whether it
+resumes a turn cut short there, goes idle, or works on its request; the
+Worker log tab shows that line. A message sent meanwhile waits behind the
+request. If making it fails, the thread reports the error and goes `failed`;
+Respawn starts it again. Until it is made, the Files tab says "its worktree
+is still being made".
+
 ### Waking a cold sprite
 
 A cold sprite's services API answers `500 services manager not started`

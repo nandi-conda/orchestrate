@@ -214,9 +214,9 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
                           HeuristicRouter(), tmp_path / "repos")
     await second.respawn(t["id"])
 
-    async def bound():
-        return (await s.get_thread(t["id"]))["binding"] == "bound" or None
-    await wait_for(bound)
+    async def ready():  # its worktree is made after the runner answered the post: the second `prepared`
+        return len([e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "prepared"]) == 2 or None
+    await wait_for(ready)
     listing = await second.list_files(t["id"], "build")
     assert [e["name"] for e in listing["entries"]] == ["app"]
     r = await second.open_file(t["id"], "src.txt")

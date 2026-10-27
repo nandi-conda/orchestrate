@@ -176,7 +176,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             return JSONResponse({"error": str(e)}, status_code=409)
         except Exception as e:
             return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
-        return JSONResponse({**t.directory_entry(), "resumed": t.resumed}, status_code=201)
+        return JSONResponse(t.directory_entry(), status_code=201)
 
     async def get_thread(req: Request):
         t = thread_or_404(req)
@@ -206,6 +206,8 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         t = thread_or_404(req)
         if not t:
             return JSONResponse({"error": "not found"}, status_code=404)
+        if t.preparing:
+            return JSONResponse({"error": "its worktree is still being made"}, status_code=409)
         try:
             return JSONResponse(files.listing(t.root, req.query_params.get("path", "")))
         except files.FileError as e:
@@ -215,6 +217,8 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         t = thread_or_404(req)
         if not t:
             return JSONResponse({"error": "not found"}, status_code=404)
+        if t.preparing:
+            return JSONResponse({"error": "its worktree is still being made"}, status_code=409)
         try:
             p = files.file_path(t.root, req.query_params.get("path", ""))
         except files.FileError as e:

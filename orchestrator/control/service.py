@@ -119,6 +119,16 @@ def image_title(images: list[dict] | None) -> str:
     return "Pasted image" if n == 1 else f"{n} pasted images"
 
 
+def prepared_text(data: dict) -> str:
+    """What a thread does once its worktree and session are made on its
+    worker (the runner's `prepared` event)."""
+    if data.get("resumed"):
+        return "its worktree and session are ready; resuming the turn its runner's restart cut short"
+    if data.get("idle"):
+        return "its worktree and session are ready; idle until its next message"
+    return "its worktree and session are ready; working on its request"
+
+
 def activity_of(typ: str, data: dict) -> str | None:
     """What a thread is doing now, given its latest event; None leaves it as it was.
 
@@ -138,6 +148,10 @@ def activity_of(typ: str, data: dict) -> str | None:
         return "thinking"
     if typ == "state":
         return "thinking" if data.get("state") == "working" else ""
+    if typ == "preparing":
+        return data.get("step") or ""
+    if typ == "prepared":
+        return ""
     return None
 
 
@@ -1044,6 +1058,11 @@ class Orchestrator:
             return  # the control plane already logged the thread
         if typ == "message_in" and self._echoed(tid, data.get("body")):
             return  # already logged when the control plane took it
+        if typ == "prepared":
+            if data.get("resumed"):
+                self._echoed(tid, t["request"])  # it resumes the turn that took its request: no echo comes
+            if tid in self.bind_steps:
+                self.bind_steps[tid].note(prepared_text(data))
         fields = {}
         activity = activity_of(typ, data)
         if activity is not None:
@@ -1177,12 +1196,8 @@ class Orchestrator:
         wid = lw.worker.id
         if found is not None:
             reason, state = f"found again on worker {wid}, which still runs it", found
-        elif posted.get("resumed"):
-            reason, state = f"on worker {wid}, resuming the turn its runner's restart cut short", None
-        elif posted.get("state") == "idle":
-            reason, state = f"on worker {wid}, idle until its next message", "idle"
-        else:
-            reason, state = f"on worker {wid}, working on its request", None
+        else:  # the runner answers at once and makes its worktree and session after (`prepared` says when)
+            reason, state = f"on worker {wid}, making its worktree and session there", posted["state"]
         steps.note(f"bound: {reason}")
         await self._bind_to(tid, "bound", reason, worker=wid, worker_id=wid, **({"state": state} if state else {}))
         return lw
@@ -1191,9 +1206,11 @@ class Orchestrator:
         """Ship the hub to a worker and post the thread to its runner (stopped
         there first when `again`). It is given its request when none of its
         turns was saved. Returns what the runner answered: the thread's
-        directory entry, `idle` when it waits for its next message, and
-        whether it resumes a turn cut short on that worker (runner/API.md,
-        "Interrupted turns"), which it does instead of taking the request."""
+        directory entry, `queued`. The runner answers before it makes the
+        thread's worktree and session, which can take minutes; its
+        `prepared` event says when they are, and whether it resumes a turn cut
+        short on that worker (runner/API.md, "Interrupted turns") instead of
+        taking the request (_ingest)."""
         tid, wid = t["id"], lw.worker.id
         await self._ship(lw, project, tid, steps)
         if again:  # its runner may still run it: a respawn of a bound thread
@@ -1217,8 +1234,6 @@ class Orchestrator:
             if request is not None:
                 self._echoed(tid, request)
             raise
-        if request is not None and entry.get("resumed"):
-            self._echoed(tid, request)  # it resumes the turn that took it: no echo comes
         return entry
 
     def _expect_echo(self, tid: str, body: str) -> None:

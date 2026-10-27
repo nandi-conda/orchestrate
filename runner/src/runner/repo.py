@@ -275,7 +275,7 @@ class Repo:
                     return Workspace(self, path, branch, tid)
                 await self.git("worktree", "remove", "--force", str(path))
             if path.exists():  # a leftover directory git no longer knows as a worktree
-                shutil.rmtree(path)
+                await asyncio.to_thread(shutil.rmtree, path)  # may be large: not on the event loop
             await self.git("worktree", "add", "-q", "-B", branch, str(path),
                            theirs if known else f"refs/remotes/origin/{self.base}")
             ws = Workspace(self, path, branch, tid)

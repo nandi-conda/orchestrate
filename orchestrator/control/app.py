@@ -29,7 +29,7 @@ from .hub import folders, is_folder, remote_url
 from .router import Router, default_router
 from .runner_client import FileError
 from .service import (ENDS_STREAM, ArchivedError, EditError, NotOnWorker, Orchestrator, describe, editable,
-                      image_title, tool_arg)
+                      image_title, prepared_text, tool_arg)
 from .store import Store, store_from_url
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
@@ -162,6 +162,10 @@ def display(ev: dict) -> dict:
             then = "working on its request again" if d.get("request") else "idle until its next message"
             text = f"back on worker {d.get('worker')}, {then}"
         kind, label = K_STATUS, "revived"
+    elif t == "preparing":
+        kind, label, text = K_STATE, "preparing", d.get("step", "")
+    elif t == "prepared":
+        kind, label, text = K_STATUS, "ready", prepared_text(d)
     elif t == "worker":
         kind, label, text = K_STATUS, "worker", f"{d.get('provider')} worker {d.get('id')} up"
     elif t == "saved":
