@@ -87,6 +87,40 @@ def get_secret(name: str) -> str | None:
     return value
 
 
+def not_found(name: str) -> str:
+    """Why get_secret finds no `name`, in a line naming what it looked in:
+    the environment, then the keyring (which backend, and what it said when
+    it failed), then the unlocked collections' labels (those locked are
+    skipped, never prompted for)."""
+    looked = [f"{name} is not in the environment"]
+    try:
+        import keyring
+        from keyring.backends.fail import Keyring as NoKeyring
+
+        backend = keyring.get_keyring()
+        if isinstance(backend, NoKeyring):
+            looked.append("this session has no keyring backend")
+        else:
+            label = f"{type(backend).__module__}.{type(backend).__qualname__}"
+            try:
+                keyring.get_password(SERVICE, name)
+                looked.append(f'the keyring ({label}) has no entry for service "{SERVICE}", username "{name}"')
+            except Exception as e:
+                looked.append(f"the keyring ({label}) failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        looked.append(f"the keyring could not be loaded: {type(e).__name__}: {e}")
+    try:
+        import secretstorage
+
+        bus = secretstorage.dbus_init()
+        locked = [c.get_label() or "unnamed" for c in secretstorage.get_all_collections(bus) if c.is_locked()]
+        if locked:
+            looked.append(f"locked collections were not searched for an item labeled {name}: {', '.join(locked)}")
+    except Exception:
+        pass  # not Linux, or no Secret Service: nothing more was looked in
+    return "; ".join(looked)
+
+
 def source(name: str) -> str:
     """Where get_secret finds `name`: "environment", "keyring", or "" when
     neither has it. The environment wins, so a keyring entry under an

@@ -954,14 +954,15 @@ class Places:
 
 
 SPRITES_MISSING = ("it needs SPRITES_TOKEN, a Fly Sprites organization token (sent as "
-                   "`Authorization: Bearer <token>` to https://api.sprites.dev/v1). Store it with "
-                   "`pixi run set-key SPRITES_TOKEN`, or set it in the environment, and start the app again")
+                   "`Authorization: Bearer <token>` to https://api.sprites.dev/v1), and found none when "
+                   "the app started ({looked}). Store it in Settings or with `pixi run set-key SPRITES_TOKEN`, "
+                   "or set it in the environment, and start the app again")
 
 
 def default_places() -> Places:
     """This computer, when it can run the runner (Linux, with ../runner and
     DEEPSEEK_API_KEY), and Sprites, when SPRITES_TOKEN is stored."""
-    from .secrets import get_secret
+    from .secrets import get_secret, not_found
 
     providers: dict[str, WorkerProvider] = {}
     refused: dict[str, str] = {}
@@ -976,5 +977,5 @@ def default_places() -> Places:
     if get_secret("SPRITES_TOKEN"):
         providers["sprites"] = SpritesProvider()
     else:
-        refused["sprites"] = SPRITES_MISSING
+        refused["sprites"] = SPRITES_MISSING.format(looked=not_found("SPRITES_TOKEN"))
     return Places(providers, refused)

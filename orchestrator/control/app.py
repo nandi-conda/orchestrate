@@ -313,6 +313,11 @@ def create_app(store: Store | None = None, places: Places | None = None,
             await store.open()
         async with starting("looking up where workers can run"):
             where = places or default_places()
+            for p in where.offered():
+                if p["why"]:
+                    log.warning("workers cannot run on %s: %s", p["label"], p["why"])
+                else:
+                    log.info("workers can run on %s", p["label"])
         async with starting("setting up the router"):
             routes_with = router or default_router()
         orch = Orchestrator(store, where, routes_with, repos, sync=sync)

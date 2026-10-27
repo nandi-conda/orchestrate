@@ -121,6 +121,34 @@ def test_without_a_token_sprites_are_refused_by_name(env):
     assert offered["sprites"]["label"] == "Sprites" and "SPRITES_TOKEN" in offered["sprites"]["why"]
 
 
+def test_sprites_refused_says_what_the_keyring_said(env):
+    """The reason names what was looked in, so a keyring that failed when
+    the app started is told apart from one without the entry."""
+    import keyring
+    from keyring.backend import KeyringBackend
+
+    class Locked(KeyringBackend):
+        priority = 1
+
+        def get_password(self, service, username):
+            raise keyring.errors.KeyringLocked("the collection is locked")
+
+        def set_password(self, service, username, password):
+            raise NotImplementedError
+
+        def delete_password(self, service, username):
+            raise NotImplementedError
+
+    before = keyring.get_keyring()
+    keyring.set_keyring(Locked())
+    try:
+        why = {p["id"]: p for p in providers.default_places().offered()}["sprites"]["why"]
+    finally:
+        keyring.set_keyring(before)
+    assert "SPRITES_TOKEN is not in the environment" in why
+    assert "failed: KeyringLocked: the collection is locked" in why
+
+
 def test_a_token_offers_sprites_and_this_computer(env):
     env.setattr(secrets, "get_secret", lambda name: {"SPRITES_TOKEN": "tok", "DEEPSEEK_API_KEY": "k"}.get(name))
     places = providers.default_places()
