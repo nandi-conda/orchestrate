@@ -178,24 +178,21 @@ def test_an_install_inside_another_repository_uses_the_public_repository(tmp_pat
     assert providers.repo_source_default(install) == (providers.DEFAULT_SOURCE, providers.DEFAULT_REF)
 
 
-def test_checkout_note_warns_when_the_branch_was_never_pushed(tmp_path):
-    root = _checkout(tmp_path)
-    assert "clone will fail" in providers.checkout_note(root, "feature/x")
-
-
-def test_checkout_note_is_quiet_when_the_branch_matches(tmp_path):
+def test_checkout_note_is_quiet_when_origin_names_this_checkouts_head(tmp_path):
+    """origin's commit is what remote_commit asked origin for: a missing or
+    stale remote-tracking ref here (none in this checkout) says nothing."""
     root = _checkout(tmp_path)
     _commit(root, "one")
-    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/feature/x", "HEAD"], check=True)
-    assert providers.checkout_note(root, "feature/x") == ""
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert providers.checkout_note(root, "feature/x", head) == ""
 
 
 def test_checkout_note_warns_about_unpushed_commits(tmp_path):
     root = _checkout(tmp_path)
     _commit(root, "one")
-    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/feature/x", "HEAD"], check=True)
+    pushed = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     _commit(root, "two")
-    assert "not this checkout's HEAD" in providers.checkout_note(root, "feature/x")
+    assert "not this checkout's HEAD" in providers.checkout_note(root, "feature/x", pushed)
 
 
 async def test_sprites_provider_takes_source_and_ref_and_names_sprites(env):
@@ -448,6 +445,40 @@ async def test_looking_for_the_runner_service_fails_on_an_api_error(env):
 
     with pytest.raises(RuntimeError, match="looking for sprite orch-w1's runner service failed: 502"):
         await _sprites_create(env, defined=True, fake=Broken(True))
+
+
+async def test_a_cold_sprites_services_manager_is_waited_for(env):
+    """A cold sprite's services API answers 500 "services manager not started"
+    until it has booted it: that is waited out, then the answer read."""
+    env.setattr(providers, "SERVICES_LOOK_EVERY", 0.0)
+
+    class Booting(FakeSprites):
+        booting = 2
+
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner") and self.booting:
+                self.booting -= 1
+                return httpx.Response(500, text="services manager not started - call Start() first",
+                                      request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    _, fake = await _sprites_create(env, defined=False, fake=Booting(False))
+    assert fake.booting == 0 and fake.bootstrap is not None  # then found no service, and installed
+
+
+async def test_a_services_manager_that_never_starts_is_an_error(env):
+    env.setattr(providers, "SERVICES_LOOK_EVERY", 0.0)
+    env.setattr(providers, "SERVICES_WAIT", 0.05)
+
+    class Stuck(FakeSprites):
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner"):
+                return httpx.Response(500, text="services manager not started - call Start() first",
+                                      request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    with pytest.raises(RuntimeError, match=r"services manager not started.*\(still, after 0s\)"):
+        await _sprites_create(env, defined=True, fake=Stuck(True))
 
 
 async def test_a_sprite_serving_other_code_is_refused(env):

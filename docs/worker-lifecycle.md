@@ -255,6 +255,13 @@ plane's checkout follows is the usual one); otherwise its runner is left
 running and the attach takes seconds. Respawn of a thread waiting on a
 worker being made calls that attach off too, and it starts again.
 
+### Waking a cold sprite
+
+A cold sprite's services API answers `500 services manager not started`
+until the sprite has booted it, so looking for its runner service waits that
+answer out, for up to 60 seconds, asking again every second. Any other
+answer, or that one after 60 seconds, is an error.
+
 ### Installing on a sprite
 
 The install (git fetch, `pixi install` of the runner's environments,

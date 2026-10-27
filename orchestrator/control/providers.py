@@ -121,6 +121,12 @@ FOLLOW_AGAIN = 1.0
 # How long SpritesProvider.serves waits for a defined runner service to answer
 # (a paused sprite wakes and starts it) before it restarts the service instead.
 SERVES_WAIT = 60.0
+# What a cold sprite's services API answers (a 500) until the sprite has
+# started its services manager; how long that is waited out, and how often
+# it is asked again meanwhile.
+SERVICES_BOOTING = "services manager not started"
+SERVICES_WAIT = 60.0
+SERVICES_LOOK_EVERY = 1.0
 
 
 def tail(data: bytes, lines: int) -> str:
@@ -201,16 +207,14 @@ def repo_source_default(root: Path | None = None) -> tuple[str, str]:
             branch or DEFAULT_REF)
 
 
-def checkout_note(root: Path, ref: str) -> str:
-    """What the sprite would run instead of this checkout, or "" when it would
-    run exactly it."""
+def checkout_note(root: Path, ref: str, commit: str) -> str:
+    """What the sprite runs instead of this checkout, or "" when it runs
+    exactly it. `commit` is what `ref` names on origin now (remote_commit asks
+    origin itself: a remote-tracking ref here may be missing or stale)."""
     head = _git(root, "rev-parse", "HEAD")
-    pushed = _git(root, "rev-parse", "--verify", "-q", f"origin/{ref}")
-    if not pushed:
-        return f"origin has no {ref!r} branch, so the sprite clone will fail; push it."
-    if head and head != pushed:
-        return (f"sprites clone origin/{ref}, not this checkout's HEAD; local commits and edits "
-                "are not in that commit.")
+    if head and head != commit:
+        return (f"sprites run origin/{ref} ({commit[:12]}), not this checkout's HEAD ({head[:12]}); "
+                "local commits and edits are not in it.")
     return ""
 
 
@@ -453,13 +457,11 @@ class SpritesProvider:
         default_source, default_ref = repo_source_default()
         self.source = source or default_source
         self.ref = ref or default_ref
+        # The checkout this control plane runs from, when sprites run its branch.
+        self.checkout = None if source or ref else Path(__file__).resolve().parents[2]
         if not self.source.startswith(("http://", "https://")):
             print(f"SpritesProvider: {self.source} is not an http(s) URL and a sprite has no git "
                   "credentials; the clone will fail unless the URL is publicly readable.", file=sys.stderr)
-        elif not source and not ref:
-            note = checkout_note(Path(__file__).resolve().parents[2], self.ref)
-            if note:
-                print(f"SpritesProvider: {note}", file=sys.stderr)
         self.prefix = prefix if prefix is not None else "orch-"
         self.http = httpx.AsyncClient(base_url=self.API, timeout=httpx.Timeout(60.0, read=600.0),
                                       headers={"authorization": f"Bearer {self.token}"})
@@ -517,6 +519,9 @@ class SpritesProvider:
         worker.token = spec.token or worker.token
         async with steps.step(f"resolving branch {self.ref} of {self.source}"):
             commit = await remote_commit(self.source, self.ref)
+        note = checkout_note(self.checkout, self.ref, commit) if self.checkout else ""
+        if note:
+            steps.note(note)
         env = {**passthrough_env(), **spec.env, "RUNNER_PORT": "8080", "RUNNER_HOST": "0.0.0.0",
                "RUNNER_TOKEN": worker.token, "RUNNER_WORKDIR": "/home/sprite/threads",
                "RUNNER_CAPACITY": str(spec.capacity), "PYTHONUNBUFFERED": "1"}
@@ -534,11 +539,9 @@ class SpritesProvider:
         # serving the worker is always this checkout's, with this control
         # plane's key and token; the turns that cuts short resume when their
         # threads are posted again (runner/API.md, "Interrupted turns").
-        async with steps.step("looking for its runner service"):
-            r = await self.http.get(f"/sprites/{name}/services/runner")
-            if r.status_code not in (200, 404):
-                raise RuntimeError(failure(f"looking for sprite {name}'s runner service", r))
-            defined = r.status_code == 200
+        async with steps.step(f"looking for its runner service (up to {SERVICES_WAIT:.0f}s: a cold sprite "
+                              "boots its services manager first)"):
+            defined = await self.runner_defined(name)
         if defined:
             async with steps.step(f"asking its runner whether it is orchestrate {commit[:12]} as this control "
                                   f"plane would start it (up to {SERVES_WAIT:.0f}s: a paused sprite wakes)"):
@@ -579,6 +582,23 @@ class SpritesProvider:
             raise RuntimeError(f"worker {name}'s runner does not accept the token it was started "
                                f"with; its log ends:\n{await self.logs(worker, 20)}")
         return worker
+
+    async def runner_defined(self, name: str) -> bool:
+        """Whether sprite `name` has a runner service. A cold sprite's services
+        API answers 500 "services manager not started" until the sprite has
+        booted it, so that answer is waited out (up to SERVICES_WAIT); a 404
+        is no service, and any other answer an error."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SERVICES_WAIT
+        while True:
+            r = await self.http.get(f"/sprites/{name}/services/runner")
+            if r.status_code in (200, 404):
+                return r.status_code == 200
+            booting = r.status_code == 500 and SERVICES_BOOTING in r.text
+            if not booting or loop.time() > deadline:
+                raise RuntimeError(failure(f"looking for sprite {name}'s runner service", r)
+                                   + (f" (still, after {SERVICES_WAIT:.0f}s)" if booting else ""))
+            await asyncio.sleep(SERVICES_LOOK_EVERY)
 
     async def serves(self, worker: Worker, want: str) -> bool:
         """Whether the runner serving the sprite now was started from the
