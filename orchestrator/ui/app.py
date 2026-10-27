@@ -100,6 +100,7 @@ PICK_OPEN: Const[i32] = 73     # arg: a folder of the listing; -1 its parent; -2
 PICK_USE: Const[i32] = 74
 PICKED: Const[i32] = 75       # arg: the field the desktop window's folder dialog picked for
 GOT_PLACES: Const[i32] = 76
+THREADS_TOGGLE: Const[i32] = 77
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -169,6 +170,7 @@ files_loading: i32 = 0
 fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({text}); 0 for an image
 fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
+threads_open: i32 = 1    # the thread list is unfolded on a phone (a desktop shows it always)
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
@@ -359,7 +361,7 @@ def open_project(id: i32) -> None:
 def leave_project() -> None:
     """Close the open project's stream and forget its state."""
     global stream, project, threads, transcript, plog, wlog, files, mode, pane_tab, sending, show_archived, editing
-    global show_settings, saving_settings
+    global show_settings, saving_settings, threads_open
     if stream != 0:
         sse_close(stream)
         stream = 0
@@ -381,6 +383,7 @@ def leave_project() -> None:
     pane_tab = DIALOG
     sending = 0
     show_archived = 0
+    threads_open = 1
     editing = 0
     show_settings = 0
     saving_settings = 0
@@ -633,7 +636,7 @@ def update(msg: i32, arg: i32) -> None:
     global projects, project, places, threads, transcript, plog, loading, show_new, creating, sending
     global mode, pending, threads_pending, pane_tab, wlog, wlog_loading, show_archived, files, files_loading, jump
     global copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
-    global picking, folders, folders_loading
+    global picking, folders, folders_loading, threads_open
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
@@ -772,6 +775,8 @@ def update(msg: i32, arg: i32) -> None:
         e = j_idx(threads, arg)
         jstr(e, "id", h_sel)
         j_free(e)
+        # The pane takes the room on a phone; its header brings the list back.
+        threads_open = 0
         if mode == AUTO and show_archived == 0:
             mode = TO_THREAD
         editing = 0
@@ -788,7 +793,13 @@ def update(msg: i32, arg: i32) -> None:
         if pane_tab == FILES:
             fetch_files()
     elif msg == ACTIVITY:
+        threads_open = 0
         show_activity()
+    elif msg == THREADS_TOGGLE:
+        if threads_open == 1:
+            threads_open = 0
+        else:
+            threads_open = 1
     elif msg == GOT_TRANSCRIPT:
         transcript = take(transcript, arg)
         if pane_tab != WLOG and pane_tab != FILES:
@@ -992,6 +1003,8 @@ def update(msg: i32, arg: i32) -> None:
     elif msg == SHOW_ARCHIVED:
         show_archived = arg
         threads = take_none(threads)
+        # The list that was just asked for is the one to read.
+        threads_open = 1
         show_activity()
         fetch_threads()
     elif msg == STOPPED:
@@ -1481,7 +1494,19 @@ def thread_list() -> None:
     e: i32 = 0
     el("aside")
     cls("threads")
+    cls_if("collapsed", threads_open == 0)
     div("threads-head")
+    btn_open("ghost", THREADS_TOGGLE, 0)
+    cls("sm")
+    cls("threads-toggle")
+    aria("aria-expanded", threads_open == 1)
+    attr("title", "Show or hide the thread list")
+    attr("aria-label", "Show or hide the thread list")
+    if threads_open == 1:
+        text("▾")
+    else:
+        text("▸")
+    end()
     span("title")
     if show_archived == 1:
         text("Archived")

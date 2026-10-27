@@ -55,6 +55,12 @@ badge on a thread whose request said to run locally (the rest run on Sprites;
 see [where threads run](../architecture/routing.md#where-threads-run)). The right side is the pane for what
 you selected, with the request box under it.
 
+In a narrow window — a phone's browser, or the [Android app](android.md) — the
+thread list sits above the pane instead of beside it, and folds away to its
+header, **▸ Threads**, so the transcript gets the screen. Opening a thread folds
+it; tapping the header opens it again. The request box stays at the bottom of
+the window while the transcript scrolls under it.
+
 **Project orchestrator** shows the router's decisions and every thread's events,
 newest last (up to the newest 2,000), with a live line per working thread
 saying what it is doing.
