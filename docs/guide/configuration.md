@@ -26,6 +26,7 @@ collection is unlocked.
 | Name | What it is | Sent as | Without it |
 | --- | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | A DeepSeek API key. The router uses it, and the control plane passes it to every worker, where prime-agent and the web tools use it. | `Authorization: Bearer <key>` to `https://api.deepseek.com` | Required: the control plane does not start, and says how to store it. |
+| `OPENGATEWAY_API_TOKEN` | An [OpenGateway](https://opengateway.ai) API key, for projects whose model is `deepseek/deepseek-v4.1-flash-ultrafast`. The control plane passes it to every worker, where it stays with the prime-agent binary. | `Authorization: Bearer <key>` to `https://apis.opengateway.ai/v1` | Projects cannot pick that model: Settings refuses it, naming the key. |
 | `SPRITES_TOKEN` | A Fly Sprites API token for the org your sprites go in. | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` | Sprites is off: the router is told why and puts every thread on this computer. |
 | `GITHUB_TOKEN` | A GitHub **fine-grained** personal access token with **Contents: Read and write** on the repositories you attach to projects. Used by the control plane only; workers never get it. | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` | Projects without a remote work as usual; attaching a private remote, or pushing to any remote, fails with git's error. |
 | `ORCHESTRATE_SYNC_URL` | The URL of your sync server, which `npx wrangler deploy` in `sync/` prints ([Projects on several computers](sync.md)). Set it together with `ORCHESTRATE_SYNC_TOKEN`, or neither. | The base of every request to the sync server | Projects stay on this computer. One of the two without the other stops the control plane, saying which is missing. |
@@ -38,7 +39,7 @@ searched.
 ### What reaches a worker
 
 The control plane gives each worker `DEEPSEEK_API_KEY` (and `DEEPSEEK_MODEL`,
-`DEEPSEEK_BASE_URL` when set), plus a fresh random `RUNNER_TOKEN` that the
+`DEEPSEEK_BASE_URL`, `OPENGATEWAY_API_TOKEN` when set), plus a fresh random `RUNNER_TOKEN` that the
 control plane then uses as `Authorization: Bearer <token>` on every call to that
 runner. Inside the worker, the key stays with the prime-agent binary; the
 sandboxed kernel where the model's code runs gets no token, key or `RUNNER_*`
@@ -51,7 +52,7 @@ variable (see [The runner and prime-agent](../architecture/runner.md#the-sandbox
 | Where workers run | The router decides per thread: Sprites, unless the request asks to run locally ("run it locally"), then this computer. This computer needs Linux and `../runner`; Sprites needs `SPRITES_TOKEN`; the router never picks a place the control plane cannot run workers in. Each place has its own pool of 3. Threads from before this get the place their worker was in. |
 | What a sprite runs | This checkout's `origin` remote at its current branch, cloned to `/opt/orchestrate` on the sprite. A warning is printed when that is not your exact `HEAD`. |
 | Which router | `ModelRouter` with `deepseek-flash`. A request it cannot plan (the model unreachable, an answer that is no plan) shows as an error in the project. |
-| Which model threads use | prime-agent's `deepseek` provider with `deepseek-flash` by default; a project's model is set in its **Settings**. Image turns on a text-only model go to `deepseek/deepseek-flash`. |
+| Which model threads use | prime-agent's `deepseek` provider with `deepseek-flash` by default. A project's **Settings** pick one of `deepseek-flash`, `deepseek-v4-pro`, or `deepseek/deepseek-v4.1-flash-ultrafast` through OpenGateway (`orchestrator/control/models.py`; it needs `OPENGATEWAY_API_TOKEN`). Image turns on a text-only model go to `deepseek/deepseek-flash`. |
 | Where its data lives | `~/.orchestrate/`, one directory per user, whichever checkout or directory the control plane runs from (below). |
 | Storage | SQLite in `~/.orchestrate/orchestrator.db`, or `--db postgresql://…`. |
 | Project repos | Bare git repositories in `~/.orchestrate/repos/<project id>.git`. |

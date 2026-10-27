@@ -50,6 +50,10 @@ TEAM_SKILL = RUNNER / "skills" / "team"
 # turn that attaches images when the thread's model accepts text only.
 MODELS = RUNNER / "models.json"
 IMAGE_MODEL = "deepseek/deepseek-flash"
+DEFAULT_PROVIDER = "deepseek"
+# prime-agent's built-in providers' keys; one models.json declares names its
+# env var as its `apiKey` (OpenGateway's OPENGATEWAY_API_TOKEN).
+BUILTIN_KEYS = {"deepseek": "DEEPSEEK_API_KEY"}
 # prime-agent's bundled skills threads do without: they need its daemon
 # (messaging and observing sessions, factories, heartbeats), a Serper key
 # (websearch), or accounts a worker has none of (MCP connections, Prime
@@ -68,6 +72,29 @@ LINE_LIMIT = 256 * 1024 * 1024  # a message_update line carries the whole messag
 
 class HarnessError(RuntimeError):
     pass
+
+
+def provider_keys() -> dict[str, str]:
+    """Each provider models.json declares: the env var its API key is in."""
+    declared = json.loads(MODELS.read_text())["providers"]
+    return {p: v.get("apiKey") or BUILTIN_KEYS[p] for p, v in declared.items()}
+
+
+def model_env() -> dict[str, str]:
+    """The providers' API keys that are stored (env or keyring), for the
+    binary's environment."""
+    from .secrets import get_secret
+
+    found = {name: get_secret(name) for name in set(provider_keys().values())}
+    return {k: v for k, v in found.items() if v}
+
+
+def model_of(spec: dict | None) -> tuple[str, str]:
+    """A thread's (provider, model): its spec's, else deepseek with
+    $DEEPSEEK_MODEL (deepseek-flash when unset)."""
+    spec = spec or {}
+    return (spec.get("provider") or DEFAULT_PROVIDER,
+            spec.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
 
 
 def exit_reason(code: int | None) -> str:
@@ -111,8 +138,9 @@ class Place:
 @dataclass(frozen=True)
 class PrimeAgent:
     """How threads' prime-agent processes start. `env` goes to the binary on
-    top of the runner's environment: the model provider's API key (prime-agent
-    reads DEEPSEEK_API_KEY for its `deepseek` provider)."""
+    top of the runner's environment: the model providers' API keys
+    (`model_env`; prime-agent reads DEEPSEEK_API_KEY for its `deepseek`
+    provider, and the env var models.json names for a declared one)."""
     env: Mapping[str, str] = field(default_factory=dict)
     binary: Path = HARNESS / "prime-agent"
     kernel: Path = KERNEL
@@ -123,6 +151,24 @@ class PrimeAgent:
         if not (self.kernel / "bin" / "python").exists():
             raise HarnessError(f"the kernel environment is not installed at {self.kernel}: "
                                "run `pixi install -e kernel`")
+
+    def check_model(self, spec: dict | None) -> None:
+        """ValueError unless a thread can run on `spec` here: a model
+        models.json declares (prime-agent runs --offline, so it knows no
+        other), whose provider's key this worker was given."""
+        provider, model = model_of(spec)
+        declared = json.loads(MODELS.read_text())["providers"]
+        if provider not in declared:
+            raise ValueError(f"no model provider {provider!r} on this worker; runner/models.json declares "
+                             + ", ".join(sorted(declared)))
+        ids = [m["id"] for m in declared[provider]["models"]]
+        if model not in ids:
+            raise ValueError(f"provider {provider} has no model {model!r} in runner/models.json: "
+                             + ", ".join(ids))
+        key = provider_keys()[provider]
+        if not self.env.get(key):
+            raise ValueError(f"model {provider}/{model} needs {key}, which this runner does not have (env or "
+                             "keyring; the control plane passes it to the workers it starts when it has it)")
 
     def prepare(self, place: Place) -> None:
         """The thread's agent dir (settings, models, the team skill), its venv and its
@@ -150,9 +196,8 @@ class PrimeAgent:
         session = place.session_file()
         if session is not None:
             args += ["--resume", str(session)]
-        spec = model or {}
-        args += ["--provider", spec.get("provider") or "deepseek",
-                 "--model", spec.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")]
+        provider, name = model_of(model)
+        args += ["--provider", provider, "--model", name]
         env = {**os.environ, **self.env, "HOME": place.view.home, "TMPDIR": place.view.tmp,
                "PRIME_AGENT_CODING_AGENT_DIR": str(place.agent_dir), "PRIME_AGENT_KERNEL_PYTHON": place.kernel,
                "DO_NOT_TRACK": "1"}

@@ -8,9 +8,9 @@ import json
 import tempfile
 
 from . import sandbox
-from .harness import PrimeAgent
+from .harness import PrimeAgent, model_env
 from .repo import Repos
-from .secrets import get_secret, require
+from .secrets import require
 from .thread import ThreadHost
 from .web import deepseek_web
 
@@ -35,10 +35,10 @@ async def amain(args):
         repos = Repos(f"{workdir}/.repos")
         repo = repos.get(args.project)
         await repo.seed(args.repo)
-    host = ThreadHost(agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
+    host = ThreadHost(agent=PrimeAgent(env=model_env()),
                       web=deepseek_web(), repos=repos, workdir=workdir)
     q = host.subscribe(None)
-    spec = {"provider": "deepseek", "model": args.model} if args.model else None
+    spec = {"provider": args.provider, "model": args.model} if args.model else None
     t = await host.start(project=args.project, title=args.request[:60], request=args.request, model=spec)
 
     async def pump():
@@ -66,7 +66,9 @@ def main():
                     "they land on its default branch in the workdir's repository, never on the source")
     ap.add_argument("--workdir")
     ap.add_argument("--project", default="local")
-    ap.add_argument("--model", help="DeepSeek model name (default $DEEPSEEK_MODEL or deepseek-flash)")
+    ap.add_argument("--model", help="a model models.json declares (default $DEEPSEEK_MODEL or deepseek-flash)")
+    ap.add_argument("--provider", default="deepseek", help="its provider: deepseek, or opengateway "
+                    "(needs OPENGATEWAY_API_TOKEN)")
     ap.add_argument("--timeout", type=float, default=1800)
     args = ap.parse_args()
     require(["DEEPSEEK_API_KEY"])

@@ -34,6 +34,9 @@ for line in sys.stdin:
 class Forever(PrimeAgent):
     """prime-agent whose every turn runs until its process is killed."""
 
+    def __init__(self):
+        super().__init__(env={"DEEPSEEK_API_KEY": "faux"})
+
     async def start(self, place, *, model, append_prompt):
         for d in (place.view.root, place.view.home, place.view.tmp):
             Path(d).mkdir(parents=True, exist_ok=True)

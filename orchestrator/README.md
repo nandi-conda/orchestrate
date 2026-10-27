@@ -138,6 +138,7 @@ worked out at runtime.
 | Secret | What | Sent as |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | **required**: router model, and passed to every worker. Without it the control plane does not start | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
+| `OPENGATEWAY_API_TOKEN` | for projects on `deepseek/deepseek-v4.1-flash-ultrafast` (Settings, Model), passed to every worker; without it Settings refuses that model | `Authorization: Bearer <key>` to `https://apis.opengateway.ai/v1` |
 | `SPRITES_TOKEN` | lets threads run on Sprites; without it the router is told Sprites is off and why, and puts every thread on this computer | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
 | `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: for a project with a remote (`repo_url`, set in its settings) it fetches the remote's default branch into the project's hub (`~/.orchestrate/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 

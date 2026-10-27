@@ -24,6 +24,9 @@ _COPIED: set[str] = set()
 KNOWN = {
     "DEEPSEEK_API_KEY": ("DeepSeek API key for the router and every worker",
                          "Authorization: Bearer <key> to https://api.deepseek.com"),
+    "OPENGATEWAY_API_TOKEN": ("OpenGateway API key, for projects whose model is "
+                              "deepseek/deepseek-v4.1-flash-ultrafast; passed to every worker",
+                              "Authorization: Bearer <key> to https://apis.opengateway.ai/v1"),
     "SPRITES_TOKEN": ("Fly Sprites org token, for threads the router puts on Sprites",
                       "Authorization: Bearer <token> to https://api.sprites.dev/v1"),
     "GITHUB_TOKEN": ("GitHub fine-grained token, Contents: Read and write on the project repos; "

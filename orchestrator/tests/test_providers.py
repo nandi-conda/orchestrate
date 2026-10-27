@@ -137,6 +137,27 @@ def test_passthrough_env_reads_a_keyring_only_secret(env):
     assert providers.passthrough_env() == {"DEEPSEEK_API_KEY": "deepseek"}
 
 
+def test_passthrough_env_gives_workers_the_opengateway_token(env):
+    keys = {"DEEPSEEK_API_KEY": "deepseek", "OPENGATEWAY_API_TOKEN": "og"}
+    env.setattr(secrets, "get_secret", keys.get)
+    assert providers.passthrough_env() == keys
+
+
+def test_a_project_model_names_its_provider_to_the_runner():
+    from control.models import MODELS, worker_model
+
+    assert worker_model("") is None
+    assert worker_model("deepseek-v4-pro") == {"provider": "deepseek", "model": "deepseek-v4-pro"}
+    assert worker_model("deepseek/deepseek-v4.1-flash-ultrafast") == {
+        "provider": "opengateway", "model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+    with pytest.raises(ValueError, match="no model 'gpt-4o'"):
+        worker_model("gpt-4o")
+    # Each is one runner/models.json declares under that provider.
+    declared = json.loads((Path(__file__).resolve().parents[2] / "runner" / "models.json").read_text())["providers"]
+    for name, (provider, _) in MODELS.items():
+        assert name in [m["id"] for m in declared[provider]["models"]]
+
+
 def test_passthrough_env_never_includes_the_sprites_token(env):
     env.setattr(secrets, "get_secret", lambda name: f"value-{name}")
     kept = providers.passthrough_env()

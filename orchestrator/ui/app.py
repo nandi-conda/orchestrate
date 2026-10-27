@@ -80,7 +80,7 @@ EDITED: Const[i32] = 53
 SETTINGS_SHOW: Const[i32] = 54
 SETTINGS_HIDE: Const[i32] = 55
 SET_NAME_IN: Const[i32] = 56
-SET_MODEL_IN: Const[i32] = 57
+SET_MODEL: Const[i32] = 57      # arg: the model's index (model_id)
 SETTINGS_SAVE: Const[i32] = 58
 SETTINGS_SAVED: Const[i32] = 59
 PASTED: Const[i32] = 60
@@ -727,6 +727,17 @@ def land() -> None:
         scroll_follow("pane")
 
 
+def model_id(i: i32, dst: i32) -> None:
+    """The model a project runs on, by its index in the settings' choice, in
+    dst: control/models.py MODELS, "" being the runner's default (deepseek-flash)."""
+    if i == 1:
+        s_set(dst, "deepseek-v4-pro")
+    elif i == 2:
+        s_set(dst, "deepseek/deepseek-v4.1-flash-ultrafast")
+    else:
+        s_clear(dst)
+
+
 def place_label(id: i32, dst: i32) -> None:
     """The name the UI gives the place `id` ("This computer", "Sprites") in dst."""
     i: i32
@@ -1256,8 +1267,8 @@ def update(msg: i32, arg: i32) -> None:
             picking = 0
     elif msg == SET_NAME_IN:
         s_copy(h_set_name, arg)
-    elif msg == SET_MODEL_IN:
-        s_copy(h_set_model, arg)
+    elif msg == SET_MODEL:
+        model_id(arg, h_set_model)
     elif msg == REPO_IN:
         s_copy(h_repo, arg)
     elif msg == SETTINGS_SAVE:
@@ -3171,9 +3182,19 @@ def settings_dialog() -> None:
     autofocus()
     on_enter(SETTINGS_SAVE, 0)
     end()
-    label("Model (optional)")
-    input_open("the runner's default", h_set_model, SET_MODEL_IN)
-    on_enter(SETTINGS_SAVE, 0)
+    label("Model")
+    toggle_group_open()
+    model_id(0, h_t3)
+    toggle("deepseek-flash", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 0)
+    model_id(1, h_t3)
+    toggle("deepseek-v4-pro", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 1)
+    model_id(2, h_t3)
+    toggle("V4.1 Flash UltraFast (OpenGateway)", s_eq(h_set_model, h_t3) == 1, SET_MODEL, 2)
+    end()
+    el("p")
+    cls("help")
+    text("What the project's threads run on. UltraFast goes through OpenGateway and needs "
+         "OPENGATEWAY_API_TOKEN (Settings on the project list, Keys).")
     end()
     label("Remote (optional)")
     div("field-row")

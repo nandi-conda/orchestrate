@@ -31,6 +31,7 @@ import httpx
 from .hub import Hub, is_folder, remote_url
 from .load import load_of, running
 from .providers import PLACES, Places, Worker, WorkerProvider, WorkerSpec, wait_healthy
+from .models import check_key, check_name, worker_model
 from .router import Router
 from .runner_client import RunnerClient
 from .secrets import get_secret
@@ -999,6 +1000,7 @@ class Orchestrator:
         """A new project; with `repo_url` (a project opened from a folder on
         disk), its hub is made and joined to that remote before the project
         exists (Hub.connect), so one that cannot be leaves nothing behind."""
+        check_key(model)
         if not repo_url:
             return await self.store.create_project(name, model)
         repo_url, pid = remote_url(repo_url), new_id("p")
@@ -1024,8 +1026,11 @@ class Orchestrator:
             raise KeyError(project_id)
         if "repo_url" in fields:
             fields["repo_url"] = remote_url(fields["repo_url"])
+        check_name(fields.get("model") or "")
         if await self._elsewhere(project_id, "update_project", {"fields": fields}):
             return project
+        if fields.get("model", project["model"]) != project["model"]:
+            check_key(fields["model"])  # here: this computer starts the project's workers
         if "repo_url" in fields and fields["repo_url"] != project["repo_url"]:
             hub = await self.hub(project)
             await hub.connect(fields["repo_url"])
@@ -1260,7 +1265,7 @@ class Orchestrator:
             created = (await self.store.list_events(project["id"], tid, 0, limit=1) or [{}])[0]
             images = (created.get("payload") or {}).get("images") if created.get("type") == "created" else None
             self._expect_echo(tid, request)
-        model = {"provider": "deepseek", "model": project["model"]} if project.get("model") else None
+        model = worker_model(project.get("model") or "")
         try:
             async with steps.step(f"posting it to worker {wid}'s runner"
                                   + (" with its request" if request is not None else "")):

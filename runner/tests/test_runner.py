@@ -533,3 +533,70 @@ def test_image_turns_go_to_a_model_that_takes_images(tmp_path):
     assert IMAGE_MODEL == "deepseek/deepseek-flash"
     assert images["deepseek-flash"] == "yes" and images["deepseek-v4-pro"] == "no"
     assert '"imageModel": "deepseek/deepseek-flash"' in (place.agent_dir / "settings.json").read_text()
+
+
+def test_a_model_runs_only_where_it_is_declared_and_its_key_was_given():
+    """POST /threads refuses (409) a model the binary would not know, or one
+    whose provider's key this runner has not got, before a thread is made."""
+    from runner.harness import PrimeAgent, provider_keys
+
+    assert provider_keys() == {"deepseek": "DEEPSEEK_API_KEY", "opengateway": "OPENGATEWAY_API_TOKEN"}
+    ultrafast = {"provider": "opengateway", "model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+    agent = PrimeAgent(env={"DEEPSEEK_API_KEY": "k"})
+    agent.check_model(None)
+    agent.check_model({"provider": "deepseek", "model": "deepseek-v4-pro"})
+    with pytest.raises(ValueError, match="needs OPENGATEWAY_API_TOKEN"):
+        agent.check_model(ultrafast)
+    PrimeAgent(env={"OPENGATEWAY_API_TOKEN": "t"}).check_model(ultrafast)
+    with pytest.raises(ValueError, match="no model 'gpt-9'"):
+        agent.check_model({"provider": "deepseek", "model": "gpt-9"})
+    with pytest.raises(ValueError, match="no model provider 'openai'"):
+        agent.check_model({"provider": "openai", "model": "gpt-4o"})
+
+
+def test_opengateway_calls_carry_its_token_from_the_environment(tmp_path):
+    """models.json names OPENGATEWAY_API_TOKEN as the provider's apiKey: the
+    binary sends that variable's value as the bearer token, to the chat
+    completions route, with the system prompt in a `system` message."""
+    import http.server
+    import json
+    import threading
+
+    from runner.harness import HARNESS, MODELS
+
+    seen = []
+
+    class Gateway(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            seen.append((self.path, self.headers["authorization"], body))
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error": {"message": "test"}}')
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Gateway)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    models = json.loads(MODELS.read_text())
+    assert models["providers"]["opengateway"]["baseUrl"] == "https://apis.opengateway.ai/v1"
+    models["providers"]["opengateway"]["baseUrl"] = f"http://127.0.0.1:{server.server_port}/v1"
+    agent_dir, home, cwd = tmp_path / "agent", tmp_path / "home", tmp_path / "cwd"
+    for d in (agent_dir, home, cwd):
+        d.mkdir()
+    (agent_dir / "models.json").write_text(json.dumps(models))
+    try:
+        subprocess.run([str(HARNESS / "prime-agent"), "--offline", "-p", "--no-session", "--no-skills",
+                        "--cwd", str(cwd), "--provider", "opengateway",
+                        "--model", "deepseek/deepseek-v4.1-flash-ultrafast", "say hi"],
+                       env={"PATH": os.environ["PATH"], "HOME": str(home), "DO_NOT_TRACK": "1",
+                            "PRIME_AGENT_CODING_AGENT_DIR": str(agent_dir), "PRIME_AGENT_KERNEL_PYTHON": "/bin/false",
+                            "OPENGATEWAY_API_TOKEN": "og-token"},
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    finally:
+        server.shutdown()
+    path, auth, body = seen[0]
+    assert (path, auth) == ("/v1/chat/completions", "Bearer og-token")
+    assert body["model"] == "deepseek/deepseek-v4.1-flash-ultrafast"
+    assert body["messages"][0]["role"] == "system" and "store" not in body

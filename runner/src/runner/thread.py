@@ -460,6 +460,7 @@ class ThreadHost:
         old = self.threads.get(tid)
         if old is not None and old.task is not None and not old.task.done():
             raise ValueError(f"thread {tid} exists")
+        self.agent.check_model(model)
         place = self._place(tid, project)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
                         peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=None,

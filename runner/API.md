@@ -29,7 +29,7 @@ between all its projects. Default port 8080. Every route except `/health` needs
 - `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
 - `request`, `id` or `images` is required. An `id` with no `request` brings a thread back: see [Resuming a thread](#resuming-a-thread).
 - `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads; on a thread whose model takes text only (`deepseek-v4-pro`), prime-agent sends that turn to its `imageModel`, `deepseek/deepseek-flash` (`IMAGE_MODEL` in `src/runner/harness.py`). They need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
-- `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model` (the runner gives it `DEEPSEEK_API_KEY` only; it runs `--offline`, so the models it knows are the ones `runner/models.json` declares). Omitted: `deepseek` with `$DEEPSEEK_MODEL` (`deepseek-flash` when unset).
+- `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model`. It runs `--offline`, so the models it knows are the ones `runner/models.json` declares: `deepseek` (`deepseek-flash`, `deepseek-v4-pro`, key `DEEPSEEK_API_KEY`) and `opengateway` (`deepseek/deepseek-v4.1-flash-ultrafast` at `https://apis.opengateway.ai/v1`, key `OPENGATEWAY_API_TOKEN`, the provider's `apiKey`). A model it does not declare, or whose key the runner has not got, is refused with 409 before a thread is made. Omitted: `deepseek` with `$DEEPSEEK_MODEL` (`deepseek-flash` when unset).
 - A message (or `request`) starting with `/` is a prime-agent slash command.
 - `files` paths are relative to the thread's worktree. A path that leaves it (`..`, a symlink out) or names `.git` is 400, as is a file listed as a directory or the reverse; a missing one is 404. `.git` is never listed.
 - `from` on a message is `"user"` or the sending thread id; non-user messages reach the model as `[from <id>] <body>`. A message posted while a turn runs steers it: the model reads it before its next call.
@@ -157,11 +157,12 @@ A thread also calls `set_summary` after each turn, and when it has a `parent`, s
 
 ## Environment
 
-Secrets (`DEEPSEEK_API_KEY`, `RUNNER_TOKEN`) are read from the environment first, then from the system keyring under service `orchestrate` with the variable name as the username (`pixi run set-key DEEPSEEK_API_KEY`). An item added by hand in a keyring GUI is found too when its label is the variable name; only unlocked collections are searched. `serve` and `run` print the missing ones, with the keyring backend in use, and exit if a required secret is in neither place.
+Secrets (`DEEPSEEK_API_KEY`, `OPENGATEWAY_API_TOKEN`, `RUNNER_TOKEN`) are read from the environment first, then from the system keyring under service `orchestrate` with the variable name as the username (`pixi run set-key DEEPSEEK_API_KEY`). An item added by hand in a keyring GUI is found too when its label is the variable name; only unlocked collections are searched. `serve` and `run` print the missing ones, with the keyring backend in use, and exit if a required secret is in neither place.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | | required: prime-agent's `deepseek` provider and the web calls send it as `Authorization: Bearer` |
+| `OPENGATEWAY_API_TOKEN` | | for threads on the `opengateway` provider: prime-agent sends it as `Authorization: Bearer` to `https://apis.opengateway.ai/v1` |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | default model |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | for web search and fetch |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |

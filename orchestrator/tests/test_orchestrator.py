@@ -17,7 +17,7 @@ import pytest
 import uvicorn
 
 from control import app as app_mod
-from control import service
+from control import secrets, service
 from control.service import NotOnWorker
 from control.app import create_app
 from control.providers import LocalProvider
@@ -826,7 +826,11 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
             assert (await c.get("/api/threads/t_nope/files")).status_code == 404
 
 
-async def test_project_settings_change_name_model_and_remote(tmp_path):
+async def test_project_settings_change_name_model_and_remote(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+    monkeypatch.delenv("OPENGATEWAY_API_TOKEN", raising=False)
+    monkeypatch.setattr(secrets, "_from_keyring", lambda name: None)
+    monkeypatch.setattr(secrets, "_from_keyring_label", lambda name: None)
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
                      local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
@@ -838,8 +842,19 @@ async def test_project_settings_change_name_model_and_remote(tmp_path):
             pid = p["id"]
             assert p["repo_url"] == "" and p["repo_path"].endswith(f"{pid}.git")
 
-            r = await c.post(f"/api/projects/{pid}/settings", json={"name": " renamed ", "model": "m"})
-            assert r.status_code == 200 and (r.json()["name"], r.json()["model"]) == ("renamed", "m")
+            r = await c.post(f"/api/projects/{pid}/settings", json={"name": " renamed ", "model": "deepseek-v4-pro"})
+            assert r.status_code == 200 and (r.json()["name"], r.json()["model"]) == ("renamed", "deepseek-v4-pro")
+            # A model is one of control/models.py's, and this computer has its provider's key.
+            r = await c.post(f"/api/projects/{pid}/settings", json={"model": "m"})
+            assert r.status_code == 400 and "no model 'm'" in r.json()["error"]
+            ultrafast = {"model": "deepseek/deepseek-v4.1-flash-ultrafast"}
+            r = await c.post(f"/api/projects/{pid}/settings", json=ultrafast)
+            assert r.status_code == 400 and "OPENGATEWAY_API_TOKEN" in r.json()["error"]
+            assert (await c.get(f"/api/projects/{pid}")).json()["model"] == "deepseek-v4-pro"
+            monkeypatch.setenv("OPENGATEWAY_API_TOKEN", "og")
+            r = await c.post(f"/api/projects/{pid}/settings", json=ultrafast)
+            assert r.status_code == 200 and r.json()["model"] == ultrafast["model"]
+            assert (await c.post(f"/api/projects/{pid}/settings", json={"model": ""})).json()["model"] == ""
             assert (await c.post(f"/api/projects/{pid}/settings", json={"name": ""})).status_code == 400
 
             empty = tmp_path / "remote.git"

@@ -18,7 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from . import files, sandbox
-from .harness import RUNNER, PrimeAgent
+from .harness import RUNNER, PrimeAgent, model_env
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repos, refs_header
 from .secrets import get_secret, require
@@ -337,7 +337,7 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
 def host_from_env() -> ThreadHost:
     workdir = os.environ.get("RUNNER_WORKDIR", "/work/threads")
     return ThreadHost(
-        agent=PrimeAgent(env={"DEEPSEEK_API_KEY": get_secret("DEEPSEEK_API_KEY")}),
+        agent=PrimeAgent(env=model_env()),
         web=deepseek_web(),
         peers=OrchestratorPeers(),  # the orchestrator collects these from /peer/calls
         # The orchestrator brings each project's commits (POST /projects/{project}/repo).

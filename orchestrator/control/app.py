@@ -340,7 +340,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": "name is required"}, 400)
         try:
             p = await orch().create_project(name, str(b.get("model", "")).strip(), folder)
-        except GitError as e:
+        except (GitError, ValueError) as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p), 201)
 
@@ -353,8 +353,10 @@ def create_app(store: Store | None = None, places: Places | None = None,
             return JSONResponse({"error": str(e)}, 400)
 
     async def project_settings(req: Request):
-        """Change any of a project's name, model and remote (`repo_url`, "" to
-        remove it). A remote the hub cannot join is refused with git's reason."""
+        """Change any of a project's name, model (one of models.MODELS, "" for
+        the runner's default) and remote (`repo_url`, "" to remove it). A
+        remote the hub cannot join is refused with git's reason, a model this
+        computer has not got the key for with the key's name."""
         b = await body(req)
         fields = {k: str(b[k]).strip() for k in ("name", "model", "repo_url") if k in b}
         if fields.get("name") == "":
@@ -363,7 +365,7 @@ def create_app(store: Store | None = None, places: Places | None = None,
             p = await orch().update_project(req.path_params["pid"], **fields)
         except KeyError:
             return JSONResponse({"error": "no such project"}, 404)
-        except GitError as e:
+        except (GitError, ValueError) as e:
             return JSONResponse({"error": str(e)}, 400)
         return JSONResponse(project_view(p))
 
