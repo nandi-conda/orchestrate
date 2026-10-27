@@ -6,7 +6,6 @@
     <string name="no_reason">no error was given; its log is in logcat (python.stderr).</string>
     <string name="retry">Retry</string>
     <string name="keys">Keys</string>
-    <string name="reload">Reload</string>
     <string name="keys_title">Keys for the control plane</string>
     <string name="optional">(optional)</string>
     <string name="required">Required</string>

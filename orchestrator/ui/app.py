@@ -17,7 +17,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
+                  nav_push, on_nav, host_keys, open_host_keys, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, newline_keys, j_put_row,
@@ -119,6 +119,8 @@ CODE_COPIED_DONE: Const[i32] = 92
 SWITCH_SHOW: Const[i32] = 93   # the project switcher in a project's header; arg 0 closes it
 GOT_SWITCH: Const[i32] = 94
 SWITCH: Const[i32] = 95        # arg: the switcher's row
+ACTIONS_SHOW: Const[i32] = 96  # a phone's menu of the open thread's actions; arg 0 closes it
+HOST_KEYS: Const[i32] = 97     # the Android app's Keys screen
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -189,6 +191,7 @@ fview: i32 = 0           # JSON handle: the markdown file the Files tab shows ({
 fview_req: i32 = 0       # the handle its read will land in, 0 when none is pending
 show_archived: i32 = 0   # the thread list shows archived threads instead of live ones
 threads_open: i32 = 1    # the thread list is unfolded on a phone (a desktop shows it always)
+actions_open: i32 = 0    # a phone's menu of the thread's actions is open (a desktop shows them in a row)
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
 proj_busy: i32 = 0       # 1 + the card being archived or unarchived, 0 when none is
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
@@ -781,10 +784,13 @@ def update(msg: i32, arg: i32) -> None:
     global copied, code_copied, selecting, fview_req, editing, edit_sent, show_settings, saving_settings, proj_archived
     global proj_busy
     global picking, folders, folders_loading, threads_open, show_app, app, key_edit, saving_key
-    global switching, switch_list
+    global switching, switch_list, actions_open
     e: i32 = 0
     k: i32 = 0
     o: i32 = 0
+    # Picking one of the thread's actions closes a phone's menu of them.
+    if msg == STOP or msg == RESPAWN or msg == ARCHIVE or msg == UNARCHIVE:
+        actions_open = 0
     if msg == GOT_PROJECTS:
         if screen == 0:
             loading = 0
@@ -839,6 +845,10 @@ def update(msg: i32, arg: i32) -> None:
         jstr(e, "id", h_t1)
         j_free(e)
         open_project(h_t1)
+    elif msg == ACTIONS_SHOW:
+        actions_open = arg
+    elif msg == HOST_KEYS:
+        open_host_keys()
     elif msg == SWITCH_SHOW:
         switching = arg
         if switching == 1:
@@ -1693,7 +1703,9 @@ def app_dialog() -> None:
         el("p")
         cls("help")
         jstr(app, "keyring", h_t1)
-        if s_len(h_t1) > 0:
+        if host_keys() == 1:
+            text("This phone keeps them in the app's Keys screen; saving there restarts the orchestrator.")
+        elif s_len(h_t1) > 0:
             text("Read from the environment first, then the keyring. Keys kept here go to the keyring "
                  "and are used from the app's next start.")
         else:
@@ -1708,6 +1720,10 @@ def app_dialog() -> None:
             j_free(e)
         end()
         j_free(ks)
+        if host_keys() == 1:
+            div("settings-row")
+            btn("Edit keys…", "outline", HOST_KEYS, 0)
+            end()
         if key_edit < 0 and s_len(h_key_err) > 0:
             key_error()
     end()
@@ -2741,7 +2757,26 @@ def thread_head(t: i32) -> None:
     text_ref(h_sel)
     end()
     end()
+    # A desktop shows the actions in a row; a phone folds them under a "more"
+    # button (app.css). The scrim and menu are always there, shown by CSS.
     div("pane-actions")
+    cls("thread-actions")
+    cls_if("open", actions_open == 1)
+    btn_open("ghost", ACTIONS_SHOW, 1 - actions_open)
+    cls("sm")
+    cls("pane-more")
+    on_escape(ACTIONS_SHOW, 0)
+    attr("title", "Thread actions")
+    attr("aria-label", "Thread actions")
+    attr("aria-haspopup", "menu")
+    aria("aria-expanded", actions_open == 1)
+    span("icon icon-more")
+    end()
+    end()
+    div("pane-scrim")
+    on_click(ACTIONS_SHOW, 0)
+    end()
+    div("pane-menu")
     if t != 0 and j_has(t, "archived_at") == 1:
         btn_open("ghost", UNARCHIVE, 0)
         cls("sm")
@@ -2763,6 +2798,7 @@ def thread_head(t: i32) -> None:
         attr("title", "Stops the thread if it is running and hides it from the list")
         text("Archive")
         end()
+    end()
     end()
     end()
     # Always there (empty, hidden by CSS, while idle): the pane's children
@@ -3251,6 +3287,7 @@ def request_box() -> None:
     attachments()
     div("composer-row")
     toggle_group_open()
+    cls("modes")
     toggle("Router decides", mode == AUTO, MODE, AUTO)
     if s_len(h_sel) > 0 and show_archived == 0:
         toggle("This thread", mode == TO_THREAD, MODE, TO_THREAD)
@@ -3299,7 +3336,11 @@ def project_window() -> None:
     cls("appbar")
     btn_open("ghost", HOME, 0)
     cls("sm")
-    text("← All projects")
+    attr("title", "All projects")
+    text("←")
+    span("wide-only")
+    text(" All projects")
+    end()
     end()
     project_switcher()
     if project != 0 and j_has(project, "archived_at") == 1:

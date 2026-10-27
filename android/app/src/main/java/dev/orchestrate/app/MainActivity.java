@@ -13,12 +13,11 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
-import android.view.Menu;
-import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -30,7 +29,6 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.widget.Toolbar;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
@@ -86,17 +84,14 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Shows `content` under the app's toolbar. Android draws apps edge to
-     *  edge, under the status and navigation bars, and no longer resizes them
-     *  for the keyboard, so the window pads itself clear of all three; the
-     *  toolbar is part of the layout, so nothing lies under it. */
+    /** Shows `content` as the whole window, with no toolbar: the UI has its
+     *  own header, and a phone's screen is better spent on content. Android
+     *  draws apps edge to edge, under the status and navigation bars, and no
+     *  longer resizes them for the keyboard, so the window pads itself clear
+     *  of all three. */
     private void show(View content) {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        Toolbar bar = new Toolbar(this);
-        bar.setTitle(R.string.app_name);
-        root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime()
@@ -105,7 +100,6 @@ public class MainActivity extends Activity {
             return WindowInsets.CONSUMED;
         });
         setContentView(root);
-        setActionBar(bar);
     }
 
     private void start() {
@@ -208,6 +202,9 @@ public class MainActivity extends Activity {
         cookies.setCookie(ControlPlane.BASE_URL,
                 ControlPlane.COOKIE + "=" + ControlPlane.get().secret + "; Path=/; HttpOnly; SameSite=Strict");
         web = new WebView(this);
+        // The UI's Settings opens the Keys screen through this; only the
+        // control plane's own pages load here (links out go to the browser).
+        web.addJavascriptInterface(new Host(), "orchestrateApp");
         show(web);
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
@@ -300,27 +297,12 @@ public class MainActivity extends Activity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
-    @Override
-    public boolean onCreateOptionsMenu(Menu menu) {
-        getMenuInflater().inflate(R.menu.main, menu);
-        return true;
-    }
-
-    @Override
-    public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.reload) {
-            if (web != null) {
-                web.reload();
-            } else {
-                start();
-            }
-            return true;
+    /** What the UI can ask of the app, as window.orchestrateApp (imports.js). */
+    private final class Host {
+        @JavascriptInterface
+        public void keys() {
+            main.post(MainActivity.this::showKeysForm);
         }
-        if (item.getItemId() == R.id.keys) {
-            showKeysForm();
-            return true;
-        }
-        return super.onOptionsItemSelected(item);
     }
 
     @Override

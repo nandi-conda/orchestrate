@@ -82,6 +82,10 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .pane-actions { display: flex; gap: 4px; flex-shrink: 0; }
+/* The open thread's actions: a row on a desktop, a menu under "more" on a phone. */
+.thread-actions { position: relative; }
+.pane-menu { display: flex; gap: 4px; }
+.pane-more, .pane-scrim { display: none; }
 .pane-title { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; }
 .pane-title .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane-title .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -212,27 +216,45 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 @media (max-width: 720px) {
   /* A phone: the page's actions wrap under its title, the thread list folds to
      its header so the pane gets the screen, and the pane scrolls inside itself
-     so the request box stays at the bottom. */
+     so the request box stays at the bottom. Every bar above and below the
+     content is one tight row, so the content keeps most of the screen. */
   .page { padding: 16px 12px; }
   .topbar { flex-wrap: wrap; gap: 10px; }
   .topbar-actions { flex-wrap: wrap; }
-  .appbar { gap: 8px; }
+  .wide-only { display: none; }
+  .appbar { gap: 6px; padding: 4px 8px; }
+  .appbar h1 { font-size: 16px; }
   .appbar > .muted.mono { display: none; }  /* the remote, in Settings */
   .body { flex-direction: column; }
-  .threads { width: auto; max-height: 35vh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .threads { width: auto; max-height: 35vh; border-right: 0; border-bottom: 1px solid var(--border); padding: 2px 8px; }
   .threads.collapsed { max-height: none; }
   .threads.collapsed > :not(.threads-head) { display: none; }
+  .threads-head { padding: 0; gap: 4px; }
   .threads-toggle { display: inline-flex; }
-  .pane-head { flex-wrap: wrap; row-gap: 6px; }
-  .pane-title { flex: 1 1 100%; }
+  .pane-head { padding: 4px 4px 4px 12px; }
   .pane-title .mono.muted { display: none; }  /* the thread id, for looking it up */
-  .pane-actions { margin-left: auto; }
+  .pane-more { display: inline-flex; }
+  .pane-menu { display: none; }
+  .thread-actions.open .pane-scrim { display: block; position: fixed; inset: 0; z-index: 40; }
+  .thread-actions.open .pane-menu { display: flex; flex-direction: column; align-items: stretch; position: absolute;
+    top: calc(100% + 4px); right: 0; z-index: 41; min-width: 160px; padding: 4px; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--background); box-shadow: 0 8px 24px rgb(0 0 0 / .25); }
+  .pane-menu .btn { justify-content: flex-start; }
+  .now, .where { padding: 4px 12px; font-size: 12px; }
   /* Five tabs across a phone: tighten them so they fit, and scroll past that. */
-  .pane-tabs { padding: 8px 10px 0; }
-  .pane-tabs .tab { padding: .25rem .4rem; }
-  .events { padding: 10px 12px; }
-  .ev { max-width: 100%; }
-  .composer { padding: 8px 12px 10px; }
+  .pane-tabs { padding: 4px 8px 0; }
+  .pane-tabs .tabs-list { height: auto; padding: 2px; }
+  .pane-tabs .tab { padding: .2rem .45rem; font-size: 13px; }
+  .tab-count { margin-left: 3px; }
+  .events { padding: 8px; gap: 6px; }
+  .ev { max-width: 100%; padding: 6px 10px; }
+  .wlog-bar { font-size: 12px; }
+  .wlog { padding: 6px 8px; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; word-break: normal; }
+  .composer { padding: 6px 8px 8px; gap: 6px; }
+  .route { font-size: 11px; }
+  /* The three routing modes share the row evenly, at a smaller size. */
+  .modes { display: flex; width: 100%; }
+  .modes .toggle { flex: 1 1 0; min-width: 0; height: 1.9rem; padding: 0 .4rem; font-size: 12px; white-space: nowrap; }
 }
 @media (hover: none) { .btn.sm { height: 2.25rem; } }  /* a thumb, not a cursor */
 
@@ -316,6 +338,7 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .icon-reply { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 17-5-5 5-5'/%3E%3Cpath d='M20 18v-2a4 4 0 0 0-4-4H4'/%3E%3C/svg%3E"); }
 .icon-pencil { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z'/%3E%3Cpath d='m15 5 4 4'/%3E%3C/svg%3E"); }
 .icon-chevron-down { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
+.icon-more { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='1'/%3E%3Ccircle cx='12' cy='5' r='1'/%3E%3Ccircle cx='12' cy='19' r='1'/%3E%3C/svg%3E"); }
 .icon-x { --i: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 6 6 18'/%3E%3Cpath d='m6 6 12 12'/%3E%3C/svg%3E"); }
 
 /* A reply's copy button, in its top-right corner. */
