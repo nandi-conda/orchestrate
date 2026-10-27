@@ -11,7 +11,7 @@ from . import sandbox
 from .harness import PrimeAgent, model_env
 from .repo import Repos
 from .secrets import require
-from .thread import ThreadHost
+from .thread import ThreadHost, WorkdirTaken, claim_workdir
 from .web import deepseek_web
 
 
@@ -30,6 +30,10 @@ def _print(ev: dict):
 
 async def amain(args):
     workdir = args.workdir or tempfile.mkdtemp(prefix="runner-")
+    try:
+        claim_workdir(workdir)  # held until the process ends
+    except WorkdirTaken as e:
+        raise SystemExit(f"runner: {e}") from None
     repos, repo = None, None
     if args.repo:
         repos = Repos(f"{workdir}/.repos")

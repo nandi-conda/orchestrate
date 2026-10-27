@@ -30,6 +30,7 @@ peer calls. So a provider only has to hand back a URL the control plane can reac
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -38,6 +39,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -170,6 +172,33 @@ def free_port() -> int:
 # streams and peer long polls end with the connections the control plane closes
 # first, so this is only for one that is stuck.
 STOP_GRACE = 5.0
+# How long a local runner gets after SIGTERM to end its threads' turns (each
+# prime-agent gets 5s to exit, its /events streams as long) before it is killed.
+# A kill is safe: its prime-agents die with it (runner/src/runner/harness.py,
+# owned_by) and the turns it cut resume on its next start.
+RUNNER_STOP_GRACE = 15.0
+# A runner holds this lock on its workdir while it lives, its pid in it
+# (runner/src/runner/thread.py, RUNNER_LOCK).
+RUNNER_LOCK = ".runner.lock"
+
+
+def runner_holding(workdir: Path) -> int | None:
+    """The pid of the runner that holds `workdir`, or None when none does."""
+    import fcntl
+
+    try:
+        fd = os.open(workdir / RUNNER_LOCK, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return int(os.read(fd, 32).decode().strip())
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
 
 
 def passthrough_env() -> dict:
@@ -253,10 +282,10 @@ class LocalProvider:
     async def create(self, spec: WorkerSpec) -> Worker:
         port = free_port()
         wid = self.worker_name(spec.index)
-        old = self.procs.pop(wid, None)
-        if old is not None and old.returncode is None:  # its runner, started again as a sprite's service is
-            old.kill()
-            await old.wait()
+        # Its runner, started again as a sprite's service is: the one before
+        # goes first, whether this provider started it or an earlier control
+        # plane that is gone left it (one runner per worker directory).
+        await self._stop(wid)
         worker = Worker(id=wid, provider=self.name, handle="",
                         url=f"http://127.0.0.1:{port}", capacity=spec.capacity, index=spec.index)
         worker.token = spec.token or worker.token
@@ -339,24 +368,48 @@ class LocalProvider:
                     yield line.decode(errors="replace")
 
     async def destroy(self, worker: Worker) -> None:
-        proc = self.procs.pop(worker.id, None)
+        await self._stop(worker.id)
+
+    async def close(self) -> None:
+        """Stop every runner this provider started, as destroy() does."""
+        await asyncio.gather(*(self._stop(wid) for wid in list(self.procs)))
+
+    async def _stop(self, wid: str) -> None:
+        """Stop worker `wid`'s runner: the process holding its directory's
+        runner lock, then the process this provider started it with. The
+        runner is signalled itself, not through what started it: `pixi run`
+        does not pass a SIGTERM on to it, and a runner left serving the
+        directory keeps its threads' sessions from the next."""
+        wdir = (self.workdir / wid).resolve()
+        holder = runner_holding(wdir)
+        if holder is not None:
+            with contextlib.suppress(ProcessLookupError):  # it may have just ended
+                os.kill(holder, signal.SIGTERM)
+                os.kill(holder, signal.SIGCONT)  # a stopped one handles it too (as systemd does)
+            if not await self._released(wdir, RUNNER_STOP_GRACE):
+                log.warning("worker %s's runner (pid %s) did not stop in %ss after SIGTERM: killing it",
+                            wid, holder, RUNNER_STOP_GRACE)
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(holder, signal.SIGKILL)
+                await self._released(wdir, STOP_GRACE)
+        proc = self.procs.pop(wid, None)
         if proc and proc.returncode is None:
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), STOP_GRACE)
             except asyncio.TimeoutError:
                 proc.kill()
+                await proc.wait()
 
-    async def close(self) -> None:
-        """Stop every runner this provider started, as destroy() does."""
-        for wid in list(self.procs):
-            proc = self.procs.pop(wid)
-            if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), STOP_GRACE)
-                except asyncio.TimeoutError:
-                    proc.kill()
+    @staticmethod
+    async def _released(wdir: Path, within: float) -> bool:
+        loop = asyncio.get_running_loop()
+        end = loop.time() + within
+        while runner_holding(wdir) is not None:
+            if loop.time() >= end:
+                return False
+            await asyncio.sleep(0.1)
+        return True
 
 
 # Put the monorepo at exactly $ORCHESTRATE_COMMIT on the sprite, then let

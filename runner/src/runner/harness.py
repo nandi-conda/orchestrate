@@ -208,8 +208,35 @@ class PrimeAgent:
                "DO_NOT_TRACK": "1"}
         proc = await asyncio.create_subprocess_exec(
             *args, env=env, cwd=place.view.root, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, limit=LINE_LIMIT, start_new_session=True, preexec_fn=no_capabilities)
+            stderr=asyncio.subprocess.PIPE, limit=LINE_LIMIT, start_new_session=True,
+            preexec_fn=owned_by(os.getpid()))
         return Harness(proc)
+
+
+def owned_by(runner: int):
+    """The preexec_fn of a thread's prime-agent: no ambient capabilities
+    (no_capabilities), and the kernel kills it the moment the runner `runner`
+    ends, however it ends. prime-agent holds its session file's lease while it
+    lives, so one that outlived its runner (killed, crashed, its service
+    restarted) kept the thread's session from the next runner on the worker:
+    the cut turn's resume failed with "this session is currently open in
+    another ... Prime Agent". Its own session (start_new_session) keeps it from
+    the signals the runner's process group gets; this is what ties it to the
+    runner instead.
+
+    PR_SET_PDEATHSIG fires when the thread that forked the child ends: asyncio
+    forks in the event loop's thread, the runner's main thread. A runner that
+    ended before the prctl took is caught by the parent check."""
+    def preexec() -> None:
+        import ctypes
+
+        no_capabilities()
+        PR_SET_PDEATHSIG = 1
+        if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0):
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != runner:
+            raise OSError(f"the runner (pid {runner}) ended before its prime-agent started")
+    return preexec
 
 
 def write_kernel(place: Place, kernel: Path) -> None:

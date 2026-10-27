@@ -143,6 +143,14 @@ when it has to be:
   resumes the same way; a prime-agent that dies while its runner goes on
   fails the thread, with the signal named (`prime-agent was terminated by
   SIGTERM (exit 143)`).
+- **Nothing of an old runner stays to hold a resumed turn's session.** Each
+  prime-agent dies with the runner that started it, however that runner ends
+  (the kernel kills it: `PR_SET_PDEATHSIG`), so none is left holding its
+  session file's lease. A runner holds `<workdir>/.runner.lock` while it
+  lives and refuses to start on a workdir another runner holds; on this
+  computer the control plane stops the runner holding a worker's directory
+  (one an earlier control plane left behind included) before it starts
+  another there.
 - **A control plane restart goes on with turns under way.** Taking over a
   project, a new control plane puts its mid-turn threads back on their
   workers at once: one whose runner still runs it is found again there; one

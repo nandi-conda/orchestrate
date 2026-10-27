@@ -881,3 +881,36 @@ async def test_a_worker_of_the_shared_pool_is_lost_before_any_thread_can_use_it(
     assert local.swept == [name] and sprites.swept == [name]
     await orch.close()
     await store.close()
+
+
+async def test_a_local_runner_left_serving_its_worker_directory_is_stopped_before_another_starts(tmp_path):
+    """A runner an earlier control plane left behind (killed before it could
+    stop its workers, or `pixi run` not passing its SIGTERM on) still holds
+    the worker's directory, and with it its threads' sessions. Starting the
+    worker again stops that runner first, by the lock it holds there
+    (runner/src/runner/thread.py, claim_workdir), so the new one is the only
+    runner on the directory."""
+    wdir = tmp_path / "w1"
+    left = subprocess.Popen(ECHO_RUNNER, cwd=str(Path(providers.__file__).resolve().parents[1]),
+                            start_new_session=True,  # not a child the new provider knows of
+                            env={**os.environ, "RUNNER_PORT": str(providers.free_port()),
+                                 "RUNNER_WORKDIR": str(wdir)})
+    try:
+        for _ in range(200):
+            if providers.runner_holding(wdir) == left.pid:
+                break
+            time.sleep(0.05)
+        assert providers.runner_holding(wdir) == left.pid
+        p = providers.LocalProvider(workdir=str(tmp_path), command=ECHO_RUNNER)
+        w = await p.create(providers.WorkerSpec(index=1, pool="ab12"))
+        try:
+            assert left.wait(5) is not None
+            assert providers.runner_holding(wdir) not in (None, left.pid)
+            async with httpx.AsyncClient() as c:
+                assert (await c.get(f"{w.url}/health")).status_code == 200
+        finally:
+            await p.close()
+        assert providers.runner_holding(wdir) is None
+    finally:
+        if left.poll() is None:
+            left.kill()

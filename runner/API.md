@@ -110,6 +110,15 @@ the model gets a `message_in` from `runner` saying the turn was cut short and
 to finish it. Its `prepared` event says `"resumed": true`. A thread that went on on
 another worker since has a newer session, and its stale file is dropped.
 
+A runner owns its workdir and its threads' prime-agents. It holds an
+exclusive flock on `<workdir>/.runner.lock` (its pid written in it) while it
+lives, and refuses to start when another runner holds it; whoever restarts a
+worker's runner stops the holder first (the control plane's LocalProvider
+sends it SIGTERM, then SIGKILL after 15s). Each prime-agent is killed by the
+kernel the moment its runner ends, however it ends (PR_SET_PDEATHSIG), so no
+prime-agent outlives its runner holding a session's lease: a resumed turn's
+prime-agent always gets its session.
+
 ## Peer calls (collected by the orchestrator)
 
 The orchestrator is never reachable from a worker, by design: it may run on a

@@ -9,6 +9,7 @@ session to the orchestrator (repo.py).
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -79,6 +80,37 @@ RESUME = ("Your last turn was cut short: the runner restarted while it ran. Your
 # A thread's team socket is a file under the worker's workdir, so the workdir's
 # depth is bounded by the socket's address: sun_path is 108 bytes, NUL included.
 SOCKET_ADDRESS_MAX = 108
+
+# One runner per workdir. A runner process (server.py, cli.py) holds an
+# exclusive flock on `<workdir>/.runner.lock`, its pid written in it, for as
+# long as it lives. Its threads' sessions, turn markers and team sockets are
+# in the workdir, so a second runner there would start a thread's prime-agent
+# on a session the first one's still holds (prime-agent refuses: "this session
+# is currently open in another ... Prime Agent"). The control plane stops the
+# holder before it starts a worker's runner (LocalProvider); a runner that
+# finds the lock held refuses to start, naming the holder.
+RUNNER_LOCK = ".runner.lock"
+
+
+class WorkdirTaken(RuntimeError):
+    pass
+
+
+def claim_workdir(workdir: str | os.PathLike) -> int:
+    """Take this process's lock on `workdir` (RUNNER_LOCK above): its fd,
+    kept open while the process lives. WorkdirTaken when another runner holds it."""
+    path = Path(workdir) / RUNNER_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = os.read(fd, 32).decode(errors="replace").strip() or "unknown"
+        os.close(fd)
+        raise WorkdirTaken(f"another runner (pid {holder}) serves {workdir}: stop it first") from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
 
 
 @dataclass

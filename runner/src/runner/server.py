@@ -22,7 +22,7 @@ from .harness import RUNNER, PrimeAgent, model_env
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repos, refs_header
 from .secrets import get_secret, require
-from .thread import ThreadHost, dumps
+from .thread import ThreadHost, WorkdirTaken, claim_workdir, dumps
 from .web import deepseek_web
 
 # The two requests that keep coming for as long as a worker lives: the control
@@ -379,6 +379,10 @@ def main():
     token = get_secret("RUNNER_TOKEN")
     if not token:
         print("warning: RUNNER_TOKEN is not set (env or keyring); the API is open to anyone who can reach it", file=sys.stderr)
+    try:
+        claim_workdir(os.environ.get("RUNNER_WORKDIR", "/work/threads"))  # held until the process ends
+    except WorkdirTaken as e:
+        raise SystemExit(f"runner: {e}") from None
     host = host_from_env()
     # /events streams stay open for subscribers (the control plane's relay), so
     # bound the wait for them; otherwise Ctrl+C never completes.

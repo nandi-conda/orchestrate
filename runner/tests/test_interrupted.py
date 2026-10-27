@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -121,3 +124,73 @@ def test_exit_reasons_name_the_signal():
     assert exit_reason(-15) == "was terminated by SIGTERM (exit -15)"
     assert exit_reason(-9) == "was terminated by SIGKILL (exit -9)"
     assert exit_reason(1) == "exited (1)"
+
+
+SRC = str(Path(__file__).resolve().parents[1] / "src")
+
+
+def _gone(pid: int, patience: float = 10.0) -> bool:
+    end = time.monotonic() + patience
+    while time.monotonic() < end:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_prime_agent_does_not_outlive_its_runner(tmp_path):
+    """A runner killed outright (SIGKILL, a crash: no shutdown of its own)
+    takes its threads' prime-agents with it, so none is left holding a
+    session's lease for the next runner on the worker to trip over
+    (harness.py, owned_by). The agent is in a session of its own, so this is
+    not the process group's signal reaching it."""
+    pidfile = tmp_path / "agent.pid"
+    runner = subprocess.Popen([sys.executable, "-c",
+                               "import os, subprocess, sys, time\n"
+                               "from runner.harness import owned_by\n"
+                               "p = subprocess.Popen(['sleep', '60'], start_new_session=True,"
+                               " preexec_fn=owned_by(os.getpid()))\n"
+                               f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+                               "time.sleep(60)\n"],
+                              env={**os.environ, "PYTHONPATH": SRC})
+    try:
+        for _ in range(200):
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.05)
+        agent = int(pidfile.read_text())
+        assert not _gone(agent, 0.2)
+        runner.kill()
+        runner.wait(10)
+        assert _gone(agent), "the agent outlived its runner"
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+
+
+def test_one_runner_per_workdir(tmp_path):
+    """A second runner on a workdir refuses, naming the one that holds it, so
+    two never start prime-agents on the same sessions; the workdir is free
+    again the moment its holder ends."""
+    from runner.thread import WorkdirTaken, claim_workdir
+
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import sys, time\n"
+                               "from runner.thread import claim_workdir\n"
+                               f"claim_workdir({str(tmp_path)!r}); print('held', flush=True); time.sleep(60)\n"],
+                              stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "PYTHONPATH": SRC})
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(WorkdirTaken, match=f"another runner \\(pid {holder.pid}\\) serves"):
+            claim_workdir(tmp_path)
+        holder.kill()
+        holder.wait(10)
+        fd = claim_workdir(tmp_path)
+        assert (tmp_path / ".runner.lock").read_text().strip() == str(os.getpid())
+        os.close(fd)
+    finally:
+        if holder.poll() is None:
+            holder.kill()

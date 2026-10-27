@@ -526,12 +526,31 @@ def watch_parent(every: float = 1.0) -> None:
             return
 
 
+def claim_workdir(workdir: str) -> int:
+    """Hold the workdir's runner lock while this process lives, as the real
+    runner does (runner/src/runner/thread.py, claim_workdir): one runner per
+    workdir, and LocalProvider stops the holder before it starts another."""
+    import fcntl
+
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    fd = os.open(Path(workdir) / ".runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"devrunner: another runner (pid {os.read(fd, 32).decode().strip()}) serves {workdir}")
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=int(os.environ.get("RUNNER_PORT", "8080")))
     a = p.parse_args()
+    workdir = os.environ.get("RUNNER_WORKDIR") or tempfile.mkdtemp(prefix="devrunner-")
+    claim_workdir(workdir)
     host = Host(int(os.environ.get("RUNNER_CAPACITY", "16")), float(os.environ.get("DEVRUNNER_DELAY", "0.3")),
-                os.environ.get("RUNNER_WORKDIR") or tempfile.mkdtemp(prefix="devrunner-"))
+                workdir)
     print(f"devrunner: echo runner on port {a.port}", file=sys.stderr, flush=True)
     # /events streams stay open for subscribers (the control plane's relay), and
     # so does the peer long poll, so bound the wait for them; otherwise Ctrl+C
