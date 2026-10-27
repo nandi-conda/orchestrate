@@ -31,7 +31,7 @@ def said(workers: str) -> str:
 
 
 class HeuristicRouter:
-    """No model: `@t_xxx` sends to that thread, a bulleted or numbered list
+    """No model: `@t_xxx` sends that thread work, a bulleted or numbered list
     fans out one thread per item, anything else spawns one thread. "run
     locally" puts the request's threads on this computer (moves a thread a
     message goes to), "on sprites" on Sprites; `place` picks Sprites when it
@@ -43,7 +43,7 @@ class HeuristicRouter:
         targets = [m for m in MENTION.findall(request) if m in known]
         if targets:
             body = MENTION.sub("", request).strip()
-            return {"spawn": [], "send": [{"thread": t, "message": body, "workers": workers,
+            return {"spawn": [], "send": [{"thread": t, "message": body, "kind": "work", "workers": workers,
                                            "where": said(workers)} for t in targets],
                     "why": "the request names existing threads"}
         items = [m.group(1) for line in request.splitlines() if (m := ITEM.match(line))]
@@ -54,6 +54,12 @@ class HeuristicRouter:
         return {"spawn": [{"title": title_for(request), "request": request, "workers": workers,
                            "where": said(workers)}], "send": [],
                 "why": "new work gets a new thread"}
+
+    async def kind(self, message: str, sender: str, thread: dict) -> dict:
+        """New work only when the message says so ("new job: ..."); else it steers."""
+        if message.lower().startswith("new job:"):
+            return {"kind": "work", "why": "it says it is a new job"}
+        return {"kind": "steer", "why": "it is about the job the thread is on"}
 
     async def place(self, request: str, places: list[dict]) -> dict:
         can = [p["id"] for p in places if not p["why"]]

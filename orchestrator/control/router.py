@@ -3,7 +3,7 @@
 A plan spawns new threads, sends messages to existing ones, or both:
 
     {"spawn": [{"title": "...", "request": "...", "workers": "sprites", "where": "..."}],
-     "send":  [{"thread": "t_42", "message": "...", "workers": "local", "where": "..."}],
+     "send":  [{"thread": "t_42", "message": "...", "kind": "steer", "workers": "local", "where": "..."}],
      "why": "..."}
 
 The router also decides where each thread's workers run (providers.PLACES),
@@ -26,8 +26,11 @@ threads about what changed for them. An empty revision is a fine answer.
 `ModelRouter` asks a fast OpenAI-compatible model (deepseek-flash by default)
 to call a function whose schema is the plan, with the thread directory as
 context, each thread with its load (load.py). A thread does one job at a
-time: only idle threads can be sent anything, and work for any other goes to
-a new thread. It leans toward spawning. A request
+time: each send is "steer" (about the job the thread is on: a correction,
+guidance, something it needs; a busy thread takes it mid-turn) or "work" (a
+new job: only an idle thread takes it; the control plane gives work for a
+busy one to a new thread). `kind` decides the same for a message sent
+straight to a busy thread, by the person or by another thread. It leans toward spawning. A request
 it cannot plan (the model unreachable or refusing the call, an answer that is
 not one call of that function, a plan that does nothing) is an error the
 project shows, with what the model said; there is no
@@ -43,13 +46,14 @@ from typing import Protocol
 import httpx
 
 LOAD = """Each thread has a `load` (how much it already has on its plate):
-`level` is "idle" (between turns, nothing waiting: it takes work at once),
-"busy" (in a turn), "backed_up" (`backlog` messages it has not got to are
-waiting on it) or "stalled" (its worker is not answering); `busy_for` is
+`level` is "idle" (between turns: it takes a new job at once), "busy" (in a
+turn) or "stalled" (its worker is not answering); `busy_for` is
 seconds into its current turn. A thread does one job at a time and work never
-waits: only idle threads can be sent anything (`send` names only them), and
-anything for a thread that is not idle, even about its current work, goes to
-a new thread instead.
+waits. Each send has a `kind`: "steer" is about the job the thread is on now (a
+correction, guidance, an answer it needs), and a thread in a turn takes it at
+once, mid-turn; "work" is a new job, even one that follows on from its work,
+and only an idle thread can take it: new work for any other thread goes to a
+new thread (spawn it).
 """
 
 WHERE = """Each thread's work runs on workers in one of `places`; `reaches` says what
@@ -67,7 +71,7 @@ there. Say in "where", in one sentence, what in the work decided its place.
 
 PLACES = WHERE + """Each thread has its `workers` in the directory. Give every spawned thread
 "workers". A thread spawned to continue, follow on from or help with an
-existing thread's work (that thread busy, backed_up or stalled, say) runs where
+existing thread's work (that thread busy or stalled, say) runs where
 that thread runs: its `workers`, unless its work needs the other place.
 A send's "workers" is "" unless the request means that thread's work now needs
 the other place (its "where" says why; "" when it stays).
@@ -82,6 +86,17 @@ workers run.
 """ + WHERE + """Answer by calling `place` once, with "workers" and "where"."""
 
 WHERE_FIELD = "one sentence: what in its work decided where it runs"
+KIND_FIELD = "steer: about the job it is on now; work: a new job"
+
+KIND = """A message was sent to an agent thread that is in a turn, working on a job.
+A thread does one job at a time: it can be steered, but not given more work.
+Decide whether the message steers the job the thread is on now ("steer": a
+correction, guidance, a change to what it was asked, an answer or result it is
+waiting for, something it needs to finish) or is a new job ("work": anything it
+would do after its current job, even work that follows on from it). New work
+goes to a new thread. `thread` is the busy thread (its title, the request that
+started it, its summary); `message` is what was sent and `from` who sent it.
+Answer by calling `kind` once."""
 
 SYSTEM = """You route requests in a software project to agent threads.
 Each thread is a long-lived agent working in its own git worktree.
@@ -119,6 +134,10 @@ class Router(Protocol):
         """Where a new thread with this request runs: {"workers": an
         available place's id, "where": why there}."""
 
+    async def kind(self, message: str, sender: str, thread: dict) -> dict:
+        """Whether a message to a busy thread steers its job or is new work:
+        {"kind": "steer" | "work", "why"}."""
+
 
 def title_for(text: str) -> str:
     words = re.sub(r"\s+", " ", text).strip().split(" ")
@@ -130,17 +149,15 @@ def available(places: list[dict]) -> set[str]:
     return {p["id"] for p in places if not p["why"]}
 
 
-def idle(directory: list[dict]) -> list[str]:
-    """The threads a plan can send to: those whose load (load.py) is idle. A
-    thread does one job at a time, so nothing is queued on a busy one."""
-    return [t["id"] for t in directory if (t.get("load") or {}).get("level") == "idle"]
+KINDS = ("steer", "work")
 
 
 def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
-    """Keep only well-formed entries that point at real, idle threads, each
-    with `workers` an available place, or "" (spawn: asked with `place` when
-    it is first put on a worker; send: not moved), and `where` why there."""
-    known, can = set(idle(directory)), available(places)
+    """Keep only well-formed entries that point at real threads, each with
+    `workers` an available place, or "" (spawn: asked with `place` when it
+    is first put on a worker; send: not moved), and `where` why there. A
+    send's `kind` is "steer" or else "work"."""
+    known, can = {t["id"] for t in directory}, available(places)
 
     def placed(s: dict) -> dict:
         workers = s["workers"] if s.get("workers") in can else ""
@@ -148,7 +165,8 @@ def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
     spawn = [{"title": str(s.get("title") or title_for(str(s.get("request", ""))))[:80],
               "request": str(s["request"]), **placed(s)}
              for s in plan.get("spawn") or [] if isinstance(s, dict) and s.get("request")]
-    send = [{"thread": s["thread"], "message": str(s["message"]), **placed(s)}
+    send = [{"thread": s["thread"], "message": str(s["message"]),
+             "kind": "steer" if s.get("kind") == "steer" else "work", **placed(s)}
             for s in plan.get("send") or []
             if isinstance(s, dict) and s.get("thread") in known and s.get("message")]
     return {"spawn": spawn, "send": send, "why": str(plan.get("why", ""))}
@@ -158,8 +176,8 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
     """The `route` function the model must call: its schema is the plan's, so
     the answer has the plan's shape (strict mode). A spawn's `workers` is an
     available place; a send's is one, or "" to leave the thread where it is.
-    `send` is offered only when there are idle threads to send to, and
-    names one of them. `where` is why a thread runs (or moves) where it does."""
+    `send` is offered only when there are threads to send to, and names
+    one of them, with its `kind`. `where` is why a thread runs (or moves) where it does."""
     can = sorted(available(places))
     # Nowhere to run: the thread is refused when it is first put on a worker.
     spawn = {"type": "object", "additionalProperties": False,
@@ -170,18 +188,26 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
                             "where": {"type": "string", "description": WHERE_FIELD}}}
     props = {"spawn": {"type": "array", "items": spawn},
              "why": {"type": "string", "description": "one sentence"}}
-    if idle(directory):
+    if directory:
         props["send"] = {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "required": ["thread", "message", "workers", "where"],
-            "properties": {"thread": {"type": "string", "enum": idle(directory)},
+            "required": ["thread", "message", "kind", "workers", "where"],
+            "properties": {"thread": {"type": "string", "enum": [t["id"] for t in directory]},
                            "message": {"type": "string", "description": "what to tell it"},
+                           "kind": {"type": "string", "enum": list(KINDS), "description": KIND_FIELD},
                            "workers": {"type": "string", "enum": [""] + can,
                                        "description": "\"\" unless its work now needs the other place"},
                            "where": {"type": "string", "description": "why it moves; \"\" when it stays"}}}}
     return {"name": "route", "description": "Route the request: the threads to spawn and the messages to send.",
             "parameters": {"type": "object", "additionalProperties": False,
                            "required": list(props), "properties": props}}
+
+
+def kind_tool() -> dict:
+    return {"name": "kind", "description": "Say whether the message steers the thread's current job or is new work.",
+            "parameters": {"type": "object", "additionalProperties": False, "required": ["kind", "why"],
+                           "properties": {"kind": {"type": "string", "enum": list(KINDS), "description": KIND_FIELD},
+                                          "why": {"type": "string", "description": "one sentence"}}}}
 
 
 def place_tool(places: list[dict]) -> dict:
@@ -242,6 +268,13 @@ class ModelRouter:
                      places: list[dict]) -> dict:
         return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
                                directory, places)
+
+    async def kind(self, message: str, sender: str, thread: dict) -> dict:
+        about = {k: thread.get(k) for k in ("id", "title", "request", "summary")}
+        got = await self._call(KIND, {"thread": about, "message": message, "from": sender}, kind_tool())
+        if got.get("kind") not in KINDS:
+            raise ValueError(f"the router model ({self.model}) said neither steer nor work: {got.get('kind')!r}")
+        return {"kind": got["kind"], "why": str(got.get("why") or "")}
 
     async def place(self, request: str, places: list[dict]) -> dict:
         got = await self._call(PLACE, {"request": request, "places": places}, place_tool(places))

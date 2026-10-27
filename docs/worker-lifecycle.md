@@ -279,8 +279,9 @@ thread is bound as soon as the runner answers. Each step of making it
 arrives as a `preparing` event (the thread's activity: "making its worktree",
 "taking its session"), and the end as `prepared`, which says whether it
 resumes a turn cut short there, goes idle, or works on its request; the
-Worker log tab shows that line. A message sent meanwhile waits behind the
-request. If making it fails, the thread reports the error and goes `failed`;
+Worker log tab shows that line. The thread is on a job from the start
+(busy), so it is sent only steering meanwhile, and that steers its first turn
+from the moment the turn begins; new work goes to a new thread. If making it fails, the thread reports the error and goes `failed`;
 Respawn starts it again. Until it is made, the Files tab says "its worktree
 is still being made".
 

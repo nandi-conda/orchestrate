@@ -339,21 +339,22 @@ async def test_heuristic_router():
     many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [], HERE)
     assert [s["request"] for s in many["spawn"]] == ["login page", "export bug", "docs"]
     sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}], HERE)
-    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "workers": "",
+    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "kind": "work", "workers": "",
                               "where": ""}]
     assert (await r.plan("fix it locally", [], HERE))["spawn"][0]["workers"] == "local"
     assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
 
-def test_clean_plan_drops_unknown_and_busy_threads():
-    idle, busy = {"level": "idle", "backlog": 0, "busy_for": 0}, {"level": "busy", "backlog": 0, "busy_for": 3}
+def test_clean_plan_drops_unknown_threads():
     plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
-                       "send": [{"thread": "t_nope", "message": "m"}, {"thread": "t_2", "message": "m"},
-                                {"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]},
-                      [{"id": "t_1", "load": idle}, {"id": "t_2", "load": busy}], HERE)
+                       "send": [{"thread": "t_nope", "message": "m"},
+                                {"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
+                                 "where": "its logs are here"}]},
+                      [{"id": "t_1"}], HERE)
     # Sprites is not available here: that thread is placed when it is put on a worker.
     assert [(s["workers"], s["where"]) for s in plan["spawn"]] == [("", "")]
-    assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local", "where": "its logs are here"}]
+    assert plan["send"] == [{"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
+                             "where": "its logs are here"}]
 
 
 def free_port() -> int:
@@ -2170,22 +2171,21 @@ async def test_a_thread_that_never_started_says_why(tmp_path):
 
 
 def test_a_threads_load_comes_to_one_level():
-    from control.load import BACKLOG, load_of
+    from control.load import load_of
 
     t = {"state": "idle", "binding": "bound", "busy_since": None}
-    assert load_of(t, 0, "ready", 100.0) == {"level": "idle", "backlog": 0, "busy_for": 0}
-    # A message on its way to an idle thread: it is about to be busy.
-    assert load_of(t, 1, "ready", 100.0)["level"] == "busy"
+    assert load_of(t, "ready", 100.0) == {"level": "idle", "busy_for": 0}
+    # Just handed a job: it is on it before the store shows its turn.
+    assert load_of(t, "ready", 100.0, taken=True)["level"] == "busy"
     working = {**t, "state": "working", "busy_since": 40.0}
-    assert load_of(working, 0, "ready", 100.0) == {"level": "busy", "backlog": 0, "busy_for": 60}
-    assert load_of(working, BACKLOG, "ready", 100.0) == {"level": "backed_up", "backlog": BACKLOG, "busy_for": 60}
-    # Being put on a worker counts as busy; whatever it is sent waits on a worker that is away.
-    assert load_of({**t, "binding": "binding"}, 0, "", 100.0)["level"] == "busy"
-    assert load_of(working, BACKLOG, "unreachable", 100.0)["level"] == "stalled"
-    assert load_of(t, 0, "reattaching", 100.0)["level"] == "stalled"
+    assert load_of(working, "ready", 100.0) == {"level": "busy", "busy_for": 60}
+    # Being put on a worker counts as busy; a worker that is away stalls it.
+    assert load_of({**t, "binding": "binding"}, "", 100.0)["level"] == "busy"
+    assert load_of(working, "unreachable", 100.0)["level"] == "stalled"
+    assert load_of(t, "reattaching", 100.0)["level"] == "stalled"
 
 
-async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tmp_path, monkeypatch):
+async def test_store_keeps_when_a_turn_began(tmp_path, monkeypatch):
     from control import store as store_mod
 
     clock = iter(range(1, 1000))
@@ -2197,20 +2197,9 @@ async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tm
     assert t["busy_since"] is not None  # a new thread is queued: its first turn has begun
     idle = await s.update_thread(t["id"], state="idle")
     assert idle["busy_since"] is None
-    first = await s.add_message(p["id"], "user", t["id"], "go")  # the message that starts its turn
-    await s.mark_read([first["id"]])
     began = (await s.update_thread(t["id"], state="queued"))["busy_since"]
-    assert began > first["created_at"]
     assert (await s.update_thread(t["id"], state="working"))["busy_since"] == began  # the same turn
-    assert await s.backlog(p["id"]) == {}
-    steer = await s.add_message(p["id"], "user", t["id"], "also this")  # delivered mid-turn: still to do
-    await s.mark_read([steer["id"]])
-    await s.add_message(p["id"], "router", t["id"], "and this")  # not delivered yet
-    assert await s.backlog(p["id"]) == {t["id"]: 2}
-    await s.update_thread(t["id"], state="idle")
-    assert await s.backlog(p["id"]) == {t["id"]: 1}  # the turn took what it was sent; one is still on its way
-    await s.update_thread(t["id"], archived_at=1.0)
-    assert await s.backlog(p["id"]) == {}
+    assert (await s.update_thread(t["id"], state="idle"))["busy_since"] is None
     await s.close()
 
 
@@ -2239,18 +2228,52 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
     async def working():
         return (await s.get_thread(t["id"]))["state"] == "working"
     await wait_for(working)
-    await orch.send(t["id"], "second")
-    await orch.send(t["id"], "third")
     await orch.handle_request(p["id"], "something else", "auto")
     seen = {d["id"]: d["load"] for d in router.directories[-1]}[t["id"]]
-    assert (seen["level"], seen["backlog"]) == ("backed_up", 2)
+    assert seen["level"] == "busy" and seen["busy_for"] >= 0
     new = next(d for d in await orch.directory(p["id"]) if d["id"] != t["id"])
     assert new["load"]["level"] == "busy"  # a new thread starts on its request
 
     async def idle():
         load = {d["id"]: d["load"] for d in await orch.directory(p["id"])}[t["id"]]
-        return load == {"level": "idle", "backlog": 0, "busy_for": 0}
+        return load == {"level": "idle", "busy_for": 0}
     await wait_for(idle, timeout=30)
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
+async def test_a_busy_thread_is_steered_but_new_work_for_it_goes_to_a_new_thread(tmp_path, monkeypatch):
+    """One job per thread, nothing queued: a message about its job reaches a
+    busy thread's turn; new work sent to it (the router says which) starts a
+    new thread where it runs, with its job as context, and its log says so."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "1.5")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
+                        HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "first")
+
+    async def working():
+        return (await s.get_thread(t["id"]))["state"] == "working" or None
+    await wait_for(working)
+    await orch.send(t["id"], "use tabs, not spaces")
+    await orch.send(t["id"], "new job: write the docs")
+
+    async def handed():
+        return next((e for e in await s.list_events(p["id"], t["id"]) if e["type"] == "handed_off"), None)
+    ev = await wait_for(handed)
+    new = await s.get_thread(ev["payload"]["to"])
+    assert new["workers"] == "local" and new["parent_id"] is None
+    assert new["request"].startswith("new job: write the docs") and "“T”" in new["request"]
+    await wait_for(lambda: idle_of(s, t["id"]))
+    bodies = [e["payload"]["body"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "message_in"]
+    assert "use tabs, not spaces" in bodies
+    echoes = [e["payload"]["content"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "assistant"]
+    assert not any("write the docs" in c for c in echoes)
     await orch.close()
     await orch.places.close()
     await s.close()

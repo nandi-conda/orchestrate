@@ -25,7 +25,7 @@ from pathlib import Path
 import httpx
 
 from .hub import Hub, remote_url
-from .load import load_of
+from .load import load_of, running
 from .providers import PLACES, Places, Worker, WorkerProvider, WorkerSpec, wait_healthy
 from .router import Router
 from .runner_client import RunnerClient
@@ -280,11 +280,15 @@ class Orchestrator:
         # (a spawned thread's request as "created", the rest as "message_in")
         # and the runner has yet to echo back as message_in; the echo is dropped.
         self.unechoed: dict[str, list[str]] = {}
-        # Work runs in the background, in order per key: a project's requests
-        # (routing them may ask a model) and a thread's deliveries. The API
-        # only logs and queues.
-        self.request_chain: dict[str, asyncio.Task] = {}
-        self.thread_chain: dict[str, asyncio.Task] = {}
+        # Work runs in the background, all of it side by side: nothing waits
+        # behind anything else. The API only logs and starts it. Routing a
+        # request (it may ask a model) is kept by the request's seq, so an
+        # edit of it is re-assessed once its own routing has run.
+        self.routing: dict[int, asyncio.Task] = {}
+        # Threads handed a job (a message they take as new work) whose turn
+        # the store does not show yet: they count as on a job (load.running),
+        # so a second job sent meanwhile goes to a new thread.
+        self.taken: set[str] = set()
         # Per thread, the task putting it on a worker while its binding is
         # "binding" (_begin_binding); deliveries wait for it.
         self.binding: dict[str, asyncio.Task] = {}
@@ -301,21 +305,12 @@ class Orchestrator:
         # Every chained task, not only each chain's last: close() ends them all.
         self.background: set[asyncio.Task] = set()
 
-    def _chain(self, chains: dict[str, asyncio.Task], key: str, work) -> asyncio.Task:
-        """Run `work()` once the work queued before it under `key` has ended,
-        however that ended. `work` reports its own failures as events."""
-        prev = chains.get(key)
-
-        async def run() -> None:
-            if prev is not None:
-                await asyncio.wait({prev})
-            await work()
-
-        task = asyncio.create_task(run())
-        chains[key] = task
+    def _background(self, work) -> asyncio.Task:
+        """Run the coroutine `work` in the background, beside everything
+        else. It reports its own failures as events."""
+        task = asyncio.create_task(work)
         self.background.add(task)
         task.add_done_callback(self.background.discard)
-        task.add_done_callback(lambda t: chains.pop(key) if chains.get(key) is t else None)
         return task
 
     async def close(self) -> None:
@@ -1056,6 +1051,12 @@ class Orchestrator:
         project_id = t["project_id"]
         if typ == "created":
             return  # the control plane already logged the thread
+        if typ == "message_in" and tid in self.taken:
+            # The runner has the job it was handed: the store shows the turn from now on.
+            await self.store.update_thread(tid, state="queued")
+            self.taken.discard(tid)
+        elif typ == "dropped":
+            self.taken.discard(tid)
         if typ == "message_in" and self._echoed(tid, data.get("body")):
             return  # already logged when the control plane took it
         if typ == "prepared":
@@ -1252,10 +1253,15 @@ class Orchestrator:
 
     async def send(self, to: str, body: str, sender: str = "user", hops: int = 0,
                    reply_to: str | None = None, edit: int | None = None,
-                   images: list[dict] | None = None, quote: dict | None = None) -> dict:
-        """Log a message to a thread and queue its delivery. `edit` is the seq
-        of the person's message this one corrects, when it is an edit's correction;
-        `quote` names the event a reply to a selection quotes (quote_source)."""
+                   images: list[dict] | None = None, quote: dict | None = None,
+                   kind: str | None = None) -> dict:
+        """Log a message to a thread and deliver it in the background
+        (_deliver). `kind` is "steer" (about the job the thread is on) or
+        "work" (a new job), when the sender knows; None has the router say,
+        if the thread is on a job when it is delivered. `edit` is the seq of
+        the person's message this one corrects, when it is an edit's
+        correction; `quote` names the event a reply to a selection quotes
+        (quote_source)."""
         thread = await self.store.get_thread(to)
         if thread is None:
             raise KeyError(to)
@@ -1279,25 +1285,63 @@ class Orchestrator:
         peer = sender if src and src["project_id"] == thread["project_id"] else None
         await self.store.append_event(thread["project_id"], to, "message_in", payload, peer)
         self._expect_echo(to, body)
-        self._chain(self.thread_chain, to,
-                    lambda: self._deliver(thread["project_id"], msg, hops, images))
+        self._background(self._deliver(thread["project_id"], msg, hops, images, kind))
         return msg
 
     async def _deliver(self, project_id: str, msg: dict, hops: int,
-                       images: list[dict] | None = None) -> None:
-        """Hand a logged message to the thread's runner, after the thread's start
-        and the messages before it. A thread on no live worker is brought back
+                       images: list[dict] | None = None, kind: str | None = None) -> None:
+        """Hand a logged message to the thread's runner, at once. A thread
+        does one job at a time and nothing queues behind it: a thread on a
+        job (load.running) takes a message only to steer that job, mid-turn;
+        new work for it goes to a new thread (_hand_off). A message whose
+        kind the sender did not say is put to the router (Router.kind) when
+        the thread is on a job. A thread on no live worker is brought back
         on one first."""
         to, body = msg["to_thread"], msg["body"]
+        t = await self.store.get_thread(to)
+        why = ""
+        took = False
         try:
+            if kind != "steer" and running(t, to in self.taken):
+                if kind is None:
+                    said = await self.router.kind(body, msg["sender"], t)
+                    kind, why = said["kind"], said["why"]
+                if kind == "work":
+                    self._echoed(to, body)
+                    await self._hand_off(t, msg, images, why)
+                    return
+            elif to not in self.taken and not running(t):
+                self.taken.add(to)  # nothing awaited since the look: no other job got in between
+                took = True
             lw = await self.live_worker(to)
             await lw.client.post_message(to, body, msg["sender"], hops,
                                          images=await self._inline_images(images) or None)
         except Exception as e:
+            if took:
+                self.taken.discard(to)
             self._echoed(to, body)
             await self.store.append_event(project_id, to, "error",
                                           {"error": f"message not delivered: {describe(e)}"})
             return
+        await self.store.mark_read([msg["id"]])
+
+    async def _hand_off(self, t: dict, msg: dict, images: list[dict] | None, why: str) -> None:
+        """New work sent to a thread that is on a job goes to a new thread,
+        where that one runs, with what it is doing as context. A thread that
+        sent it is the new thread's parent, so it hears when it is done. The
+        busy thread's log says where its message went."""
+        from .router import title_for
+        sender, body = msg["sender"], msg["body"]
+        src = await self.store.get_thread(sender)
+        parent = sender if src and src["project_id"] == t["project_id"] else None
+        doing = t["summary"] or t["request"]
+        request = (f"{body}\n\n(This was sent to thread {t['id']} “{t['title']}” while it was on its own job, "
+                   f"so it is a new job, and yours. That thread's job: {doing})")
+        new = await self.spawn(t["project_id"], title_for(body), request, parent, images=images,
+                               workers=t["workers"],
+                               where=f"new work sent to “{t['title']}”, which was busy, runs where it runs")
+        await self.store.append_event(t["project_id"], t["id"], "handed_off",
+                                      {"to": new["id"], "title": new["title"], "message": msg["id"], "why": why})
         await self.store.mark_read([msg["id"]])
 
     async def live_worker(self, thread_id: str) -> LiveWorker:
@@ -1378,13 +1422,12 @@ class Orchestrator:
         """The project's live threads (or archived ones), each with its "load"
         (load.py): what the router, the UI and peers see."""
         threads = await self.store.list_threads(project_id, archived)
-        backlog, at = await self.store.backlog(project_id), time.time()
-        return [{**t, "load": load_of(t, backlog.get(t["id"], 0), self.worker_state(t)[0], at)} for t in threads]
+        at = time.time()
+        return [{**t, "load": load_of(t, self.worker_state(t)[0], at, t["id"] in self.taken)} for t in threads]
 
     async def with_load(self, t: dict) -> dict:
         """One thread with its "load" (load.py)."""
-        backlog = await self.store.backlog(t["project_id"])
-        return {**t, "load": load_of(t, backlog.get(t["id"], 0), self.worker_state(t)[0], time.time())}
+        return {**t, "load": load_of(t, self.worker_state(t)[0], time.time(), t["id"] in self.taken)}
 
     def worker_state(self, t: dict) -> tuple[str, str]:
         """The state of the worker a thread is bound to and why, ("", "") when
@@ -1599,8 +1642,8 @@ class Orchestrator:
         Sending to a thread or forcing a new one only logs and queues (a
         thread's start and deliveries run in the background). Letting the
         router decide may ask a model, so the request is logged and routed in
-        the background, in the order requests came in; its plan arrives as the
-        "route" event. A request that is only images needs no router: there is
+        the background, beside any other being routed; its plan arrives as
+        the "route" event. A request that is only images needs no router: there is
         no text to route, so it starts one thread.
 
         `quote_of` is the seq of the event a reply to a selection quotes; the
@@ -1621,8 +1664,10 @@ class Orchestrator:
         ev = await self.store.append_event(project_id, None, "request", payload)
         if images and not text:
             return await self.handle_request(project_id, text, "new", None, images, of=ev["seq"])
-        self._chain(self.request_chain, project_id,
-                    lambda: self._route(project_id, text, ev["seq"], images))
+        seq = ev["seq"]
+        task = self._background(self._route(project_id, text, seq, images))
+        self.routing[seq] = task
+        task.add_done_callback(lambda _: self.routing.pop(seq, None))
         return {"request": text, "mode": mode, "queued": True, "seq": ev["seq"]}
 
     async def quote_source(self, project_id: str, seq: int) -> dict:
@@ -1667,8 +1712,9 @@ class Orchestrator:
         for s in plan["send"]:
             if s.get("workers"):
                 await self.move(s["thread"], s["workers"], s.get("where", ""))
+            # The router says what its sends are; one sent directly is asked about if the thread is busy.
             await self.send(s["thread"], s["message"], sender, images=images,
-                            quote=quote if sender == "user" else None)
+                            quote=quote if sender == "user" else None, kind=s.get("kind"))
             sent.append(s["thread"])
         # The summary names threads by title; the ids stay in spawned and sent.
         titles = {t["id"]: t["title"] for t in directory}
@@ -1689,8 +1735,8 @@ class Orchestrator:
     # The person can edit a message they sent: a request typed in the project
     # or a message sent straight to a thread. The edit is logged at once (the
     # UI shows the new text on the message, marked edited) and re-assessed in
-    # the background, after any routing queued before it, so the original's
-    # own routing has always run first:
+    # the background, once the original's own routing has run (it says which
+    # threads the message reached):
     #
     # - every live thread the message reached (the threads its routes, and
     #   earlier edits' routes, spawned or told; the thread a direct message
@@ -1718,7 +1764,7 @@ class Orchestrator:
             return {"seq": seq, "text": text, "changed": False}
         await self.store.append_event(project_id, ev["thread_id"], "edited",
                                       {"of": seq, "text": text, "previous": previous})
-        self._chain(self.request_chain, project_id, lambda: self._reassess(ev, previous, text))
+        self._background(self._reassess(ev, previous, text))
         return {"seq": seq, "text": text, "changed": True, "queued": True}
 
     async def current_text(self, ev: dict) -> str:
@@ -1747,6 +1793,9 @@ class Orchestrator:
 
     async def _reassess(self, ev: dict, previous: str, text: str) -> None:
         project_id, seq = ev["project_id"], ev["seq"]
+        routing = self.routing.get(seq)
+        if routing is not None:  # the request's own routing first: it says which threads it reached
+            await asyncio.wait({routing})
         try:
             await self._revise(ev, previous, text)
         except Exception as e:
@@ -1761,8 +1810,8 @@ class Orchestrator:
         reached = [tid for tid in await self.reached(ev) if tid in live]
         plan = await self.router.revise(text, previous, reached, directory, self.places.offered())
         body = correction(ev["type"], previous, text)
-        for tid in reached:
-            await self.send(tid, body, "user", edit=seq)
+        for tid in reached:  # a correction steers the job it changes
+            await self.send(tid, body, "user", edit=seq, kind="steer")
         spawned, told = [], []
         for s in plan["spawn"]:
             t = await self.spawn(project_id, s["title"], s["request"],
@@ -1771,7 +1820,7 @@ class Orchestrator:
         for s in plan["send"]:
             if s.get("workers"):
                 await self.move(s["thread"], s["workers"], s.get("where", ""))
-            await self.send(s["thread"], s["message"], "router")
+            await self.send(s["thread"], s["message"], "router", kind=s.get("kind", "work"))
             told.append(s["thread"])
         titles = {t["id"]: t["title"] for t in directory}
         parts = []

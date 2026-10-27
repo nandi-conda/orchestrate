@@ -140,6 +140,10 @@ def display(ev: dict) -> dict:
     elif t in ("project_archived", "project_unarchived"):
         kind, label = K_STATUS, t.removeprefix("project_")
         text = f"project {label}"
+    elif t == "handed_off":
+        kind, label = K_STATUS, "handed off"
+        text = f"a message to it was new work while it was on its own job, so “{d.get('title', '')}” took it" + \
+            (f": {d['why']}" if d.get("why") else "")
     elif t == "moved":
         kind, label = K_STATUS, "moved"
         text = f"its workers run on {PLACES.get(d.get('to', ''), d.get('to', ''))} now" + \

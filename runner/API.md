@@ -57,7 +57,7 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | --- | --- |
 | `created` | directory entry |
 | `preparing` | `{"step"}`: a step of making the thread's worktree and session after `POST /threads` answered ("making its worktree", "taking its session") |
-| `prepared` | `{"resumed", "idle"}`: its worktree and session are made; `resumed` when it resumes a turn cut short here (below), `idle` when it waits for its next message; else it works on its request. Messages posted before this wait and come after the request. A failure is an `error` and state `failed` instead |
+| `prepared` | `{"resumed", "idle"}`: its worktree and session are made; `resumed` when it resumes a turn cut short here (below), `idle` when it waits for its next message; else it works on its request. Messages posted before this steer the first turn from its start (the control plane sends a thread on a job only steering). A failure is an `error` and state `failed` instead |
 | `state` | `{"state"}` |
 | `message_in` | `{"from", "body"}` |
 | `delta` | `{"kind", "text", "name"?}`: the model's reply while it streams. `kind` is `reasoning`, `content` or `tool` (`name` is the tool, `python_repl`; `text` is a piece of its JSON arguments, empty when the call starts). Batched about every 0.25 s. |

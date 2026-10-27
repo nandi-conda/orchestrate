@@ -475,8 +475,9 @@ class ThreadHost:
     async def _prepare(self, t: AgentThread, request: str | None, images: list[dict] | None) -> None:
         """Make the thread's worktree and session on this worker, then give it
         its first message: RESUME for a turn cut short here, else its request,
-        else nothing (it goes idle). Messages posted meanwhile wait in its
-        inbox and come after it. Each step is a `preparing` event, and the end
+        else nothing (it goes idle). Messages posted meanwhile (the control
+        plane sends a thread on a job only steering) steer that first turn
+        from its start. Each step is a `preparing` event, and the end
         a `prepared` one saying whether it resumes."""
         if self.repos:
             repo = self.repos.get(t.project)

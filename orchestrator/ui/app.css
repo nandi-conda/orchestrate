@@ -69,8 +69,6 @@ body { margin: 0; background: var(--background); font-family: var(--font-sans); 
 .where { display: flex; align-items: center; gap: 8px; padding: 6px 16px; border-bottom: 1px solid var(--border); font-size: 13px; min-width: 0;
          background: color-mix(in oklch, var(--destructive) 8%, transparent); }
 .where:empty { display: none; }
-.badge.backed-up { border-color: color-mix(in oklch, var(--destructive) 50%, transparent);
-                   background: color-mix(in oklch, var(--destructive) 10%, transparent); }
 .where .muted { margin-left: auto; flex-shrink: 0; }
 .now-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 /* A dot that pulses a few times when it appears and then holds still. It is on

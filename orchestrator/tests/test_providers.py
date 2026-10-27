@@ -255,16 +255,15 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     seen: list = []
     r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
                                                 "where": "Sprites are not available"}],
-                                     "send": [{"thread": "t_1", "message": "heads up", "workers": "",
-                                               "where": "it stays"}],
+                                     "send": [{"thread": "t_1", "message": "heads up", "kind": "steer",
+                                               "workers": "", "where": "it stays"}],
                                      "why": "new work"}), seen)
-    idle, busy = {"level": "idle", "backlog": 0, "busy_for": 0}, {"level": "busy", "backlog": 0, "busy_for": 9}
-    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old", "load": idle},
-                                   {"id": "t_2", "title": "Busy", "load": busy}], places)
+    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old", "load": {"level": "busy", "busy_for": 9}}],
+                        places)
     # A send that moves nothing keeps no reason for a move.
     assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
                                "where": "Sprites are not available"}],
-                    "send": [{"thread": "t_1", "message": "heads up", "workers": "", "where": ""}],
+                    "send": [{"thread": "t_1", "message": "heads up", "kind": "steer", "workers": "", "where": ""}],
                     "why": "new work"}
     body = seen[0]
     assert body["thinking"] == {"type": "disabled"}
@@ -274,12 +273,27 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     props = fn["parameters"]["properties"]
     assert props["spawn"]["items"]["properties"]["workers"]["enum"] == ["local"]
     assert "where" in props["spawn"]["items"]["required"] and "where" in props["send"]["items"]["required"]
-    # One job per thread: only the idle thread can be sent anything.
     assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
+    assert props["send"]["items"]["properties"]["kind"]["enum"] == ["steer", "work"]
     assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
-    # With no idle threads there is nothing to send to, so the schema has no send.
-    await r.plan("fix it", [{"id": "t_2", "title": "Busy", "load": busy}], places)
+    # With no threads there is nothing to send to, so the schema has no send.
+    await r.plan("fix it", [], places)
     assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
+
+
+async def test_the_router_model_says_whether_a_message_steers_a_busy_thread_or_is_new_work():
+    seen: list = []
+    call = {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "kind", "arguments": json.dumps({"kind": "work", "why": "a new job"})}}]}
+    r = router_answering(call, seen)
+    got = await r.kind("now write the docs", "user", {"id": "t_1", "title": "Fix login", "request": "fix login",
+                                                       "summary": "", "state": "working"})
+    assert got == {"kind": "work", "why": "a new job"}
+    fn = seen[0]["tools"][0]["function"]
+    assert fn["name"] == "kind" and fn["parameters"]["properties"]["kind"]["enum"] == ["steer", "work"]
+    content = json.loads(seen[0]["messages"][1]["content"])
+    assert content["message"] == "now write the docs" and content["thread"]["title"] == "Fix login"
 
 
 async def test_a_router_answer_that_is_not_a_route_call_is_an_error_saying_what_came_back():

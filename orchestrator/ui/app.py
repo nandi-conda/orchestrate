@@ -213,7 +213,6 @@ h_stopped: i32 = 0
 h_bound: i32 = 0
 h_unbound: i32 = 0
 h_ready: i32 = 0
-h_backed_up: i32 = 0
 h_local: i32 = 0         # "local", the place a thread is badged for
 h_place: i32 = 0         # scratch for a place id while finding its label
 h_plabel: i32 = 0        # a place's label, for a thread's badge
@@ -268,7 +267,7 @@ def get_text(url: i32, msg: i32) -> None:
 
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
-    global h_bound, h_unbound, h_ready, h_backed_up, h_local, h_place, h_plabel
+    global h_bound, h_unbound, h_ready, h_local, h_place, h_plabel
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
@@ -312,8 +311,6 @@ def init() -> None:
     s_set(h_unbound, "unbound")
     h_ready = s_new()
     s_set(h_ready, "ready")
-    h_backed_up = s_new()
-    s_set(h_backed_up, "backed_up")
     h_local = s_new()
     s_set(h_local, "local")
     h_place = s_new()
@@ -1271,7 +1268,6 @@ def thread_badges(t: i32) -> None:
         jstr(t, "state", h_t2)
         if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1:
             state_badge(h_t2)
-    backlog_badge(t)
     jstr(t, "workers", h_t2)
     if s_eq(h_t2, h_local) == 1:
         place_label(h_t2, h_plabel)
@@ -1285,28 +1281,6 @@ def thread_badges(t: i32) -> None:
         attr_ref("title", h_t3)
         text_ref(h_plabel)
         end()
-
-
-def backlog_badge(t: i32) -> None:
-    """How many messages the thread has not got to (load.py in the control
-    plane), when any; marked once it is backed up, when the router gives
-    new work to a new thread rather than it."""
-    n: i32
-    n = j_int(t, "load.backlog")
-    if n == 0:
-        return
-    jstr(t, "load.level", h_t2)
-    el("span")
-    cls("badge")
-    cls("outline")
-    cls_if("backed-up", s_eq(h_t2, h_backed_up) == 1)
-    if s_eq(h_t2, h_backed_up) == 1:
-        attr("title", "Backed up: new work goes to a new thread")
-    else:
-        attr("title", "Messages it has not got to yet")
-    num(n)
-    text(" waiting")
-    end()
 
 
 def error_banner() -> None:

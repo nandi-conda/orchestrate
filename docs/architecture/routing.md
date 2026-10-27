@@ -52,7 +52,7 @@ image-only request also skips it and spawns one thread.
 
 | Router | When | How it decides |
 | --- | --- | --- |
-| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. One job per thread: the `route` schema lets it send only to idle threads (`router.idle`; `clean_plan` drops any other send), so anything for a busy, backed-up or stalled thread, even about its current work, goes to a new thread. |
+| `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. One job per thread: every send has a `kind`, `steer` (about the job the thread is on; a busy thread takes it mid-turn) or `work` (a new job, which only an idle thread takes). See [Steer or new work](#steer-or-new-work). |
 
 The model answers by calling one function, `route` (`place` when a new thread
 is put on a worker), whose JSON schema is the plan: `tool_choice` names it and
@@ -80,13 +80,9 @@ Each thread in the directory carries a `load`, made by `control/load.py` from
 what the control plane already knows:
 
 ```json
-{"level": "backed_up", "backlog": 2, "busy_for": 312}
+{"level": "busy", "busy_for": 312}
 ```
 
-- `backlog` is the messages to the thread it has not got to
-  (`Store.backlog`): those not yet delivered to its runner, and those that
-  came in during its current turn (they steer that turn, so they are still on
-  its plate). The message that started the turn is not counted.
 - `busy_for` is seconds since its current turn began (`threads.busy_since`,
   set when its state enters queued, working or waiting and cleared when it
   leaves them), 0 between turns.
@@ -94,17 +90,33 @@ what the control plane already knows:
 
 | Level | When |
 | --- | --- |
-| `idle` | not in a turn, nothing waiting: takes new work at once |
-| `busy` | in a turn, being put on a worker, or one message on its way |
-| `backed_up` | `backlog` is 2 (`load.BACKLOG`) or more: what it is sent now waits behind them |
-| `stalled` | its worker is unreachable or being reattached: a message to it (typed straight to it) moves it to a ready worker |
-
-The router sends only to `idle` threads; the other levels say why a thread
-is skipped.
+| `idle` | not in a turn: takes a new job at once |
+| `busy` | in a turn, being put on a worker, or just handed a job (`Orchestrator.taken`) |
+| `stalled` | its worker is unreachable or being reattached: a message to it moves it to a ready worker |
 
 The thread list API (`GET /api/projects/{id}/threads`, `GET /api/threads/{id}`)
-returns the same `load`, and the UI shows the backlog as an "N waiting" badge
-beside the thread's state, marked once the thread is backed up.
+returns the same `load`.
+
+### Steer or new work
+
+A thread does one job at a time, and nothing queues behind it: it can be
+steered, but not given more work. Every message to a thread is delivered at
+once (`Orchestrator._deliver`), as one of:
+
+- **steer**: about the job the thread is on (a correction, guidance, an
+  answer or result it needs, a course correction from another thread). A
+  busy thread takes it mid-turn: the model reads it before its next call.
+- **work**: a new job, even one that follows on from the thread's. An idle
+  thread takes it and starts a turn. For a busy thread it goes to a **new
+  thread** instead (`_hand_off`): it runs where the busy thread runs, its
+  request is the message with the busy thread's job as context, a thread
+  that sent it is its parent, and the busy thread's log shows `handed off`.
+
+Who says which: the router's own sends carry `kind` in the plan; an edit's
+correction always steers; a message typed straight to a thread, or sent by
+another thread, is put to the router (`Router.kind`, a forced `kind` tool
+call) only when the thread is busy. A thread just handed a job counts as busy
+until the runner takes it, so two jobs sent at once never both land on it.
 
 ### Where threads run
 
@@ -136,7 +148,7 @@ run on This computer: ...", and its "This computer" badge shows it on hover.
 - A thread a peer spawns runs where its parent runs, so a local thread that
   needs help gets local helpers.
 - A thread the router spawns to carry on or help with an existing thread's
-  work (that thread busy, backed up or stalled) runs where that thread runs,
+  work (that thread busy or stalled) runs where that thread runs,
   unless the request asks for the other place. The router sees each thread's
   `workers` in the directory.
 - A `send` entry with `workers` moves that thread (`Orchestrator.move`), when
@@ -150,12 +162,17 @@ No API handler awaits the router model, a provider creating a worker, or a
 runner call. That is why Enter clears the box at once even when a new sprite
 takes a minute to boot.
 
-- `POST /requests` with `mode: auto` answers 202 and routes on `request_chain`.
+Nothing runs one after another: every request is routed, and every message
+delivered, in its own background task, beside the rest.
+
+- `POST /requests` with `mode: auto` answers 202 and routes in the background.
+  An edit of a request is re-assessed once that request's own routing has
+  run, since it says which threads the request reached.
 - `spawn` returns the thread at once, already in the `binding` state ("starting
   on a worker"); binding runs as a background task.
-- `send` logs `message_in` itself and delivers on the thread's `thread_chain`
-  once its binding is done, so messages to a thread still starting arrive, in
-  order, when it starts. A message from another thread is that one event,
+- `send` logs `message_in` itself and delivers in the background once the
+  thread's binding is done; a thread still starting is on its job, so it is
+  sent only steering (see above). A message from another thread is that one event,
   with the sender as its `peer_id`, so both threads' logs list it and the UI
   shows it once, as "sender → recipient".
 

@@ -17,8 +17,7 @@ starts and back when it ends, and nothing else reshuffles.
 
 A thread's `busy_since` is when the turn it is in began (its state queued,
 working or waiting), NULL between turns; `update_thread` keeps it as the state
-changes. With `backlog` (the messages to a thread it has not got to) it is
-what load.py makes a thread's load from.
+changes; load.py makes a thread's `busy_for` from it.
 
 Events carry a project-wide sequence number (`seq`), so a client can resume a
 project or thread stream from `?after=seq`.
@@ -104,11 +103,6 @@ class Store(Protocol):
                           reply_to: str | None = None, hops: int = 0) -> dict: ...
     async def list_messages(self, thread_id: str, unread_only: bool = False) -> list[dict]: ...
     async def mark_read(self, message_ids: list[str]) -> None: ...
-    async def backlog(self, project_id: str) -> dict[str, int]:
-        """Per live thread of the project, the messages to it it has not got
-        to: those not yet delivered to its runner, and those that came in
-        during the turn it is in (they steer that turn, so they are still on
-        its plate). Threads with none are left out."""
 
     async def add_image(self, project_id: str, media_type: str, data: bytes, name: str = "") -> dict:
         """Store an image's bytes; returns its reference for an event or message."""
@@ -403,14 +397,6 @@ class _SqlStore:
         if unread_only:
             sql += " AND read_at IS NULL"
         return await self._fetch(self._q(sql + " ORDER BY created_at"), thread_id)
-
-    async def backlog(self, project_id: str) -> dict[str, int]:
-        rows = await self._fetch(self._q(
-            "SELECT m.to_thread AS id, COUNT(*) AS n FROM messages m JOIN threads t ON t.id = m.to_thread "
-            "WHERE t.project_id = ? AND t.archived_at IS NULL "
-            "AND (m.read_at IS NULL OR (t.busy_since IS NOT NULL AND m.created_at >= t.busy_since)) "
-            "GROUP BY m.to_thread"), project_id)
-        return {r["id"]: int(r["n"]) for r in rows}
 
     async def mark_read(self, message_ids: list[str]) -> None:
         t = now()
