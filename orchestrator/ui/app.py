@@ -18,7 +18,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 toggle_group_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
                   nav_push, on_nav, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
-                  clip_copy, on_select, sel_clear, s_quote, j_when, focus_end, is_md, is_img, path_join, path_dir,
+                  clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, j_put_row,
                   host_folders, host_pick_folder)
@@ -101,6 +101,8 @@ PICK_USE: Const[i32] = 74
 PICKED: Const[i32] = 75       # arg: the field the desktop window's folder dialog picked for
 GOT_PLACES: Const[i32] = 76
 THREADS_TOGGLE: Const[i32] = 77
+JUMP: Const[i32] = 78         # arg: seq of your message whose quote was clicked
+JUMP_MISS: Const[i32] = 79
 
 # pane tabs
 DIALOG: Const[i32] = 0
@@ -173,6 +175,8 @@ show_archived: i32 = 0   # the thread list shows archived threads instead of liv
 threads_open: i32 = 1    # the thread list is unfolded on a phone (a desktop shows it always)
 proj_archived: i32 = 0   # the project list shows archived projects instead of live ones
 jump: i32 = 0            # the pane's next content was asked for by navigation: open it at the bottom
+jump_seq: i32 = 0        # or at this event instead, the one a clicked quote came from (0 = none)
+md_quote: i32 = 0        # seq of the message whose first block quote md() links to its source (0 = none)
 copied: i32 = -1         # seq of the reply just copied (shows a check), -1 when none
 selecting: i32 = 0       # text is selected in the pane (the Reply button shows)
 editing: i32 = 0         # seq of the message of yours being edited, 0 when none
@@ -229,6 +233,10 @@ h_seltext: i32 = 0       # the text selected in the pane
 h_selpos: i32 = 0        # style placing the Reply button over the selection
 h_quote: i32 = 0         # the selection the next request replies to ("" = none)
 h_lastq: i32 = 0         # the quote being sent, put back if the send fails
+h_selsrc: i32 = 0        # seq of the event the pane's selection is in ("" = none, e.g. a reply still streaming)
+h_qsrc: i32 = 0          # seq of the event the quote came from ("" = none)
+h_lastqsrc: i32 = 0      # and of the quote being sent
+h_evid: i32 = 0          # scratch for a row's element id
 h_act: i32 = 0           # the thread being archived or unarchived
 h_body: i32 = 0          # the request's text as sent: the quote, then the reply
 h_edit: i32 = 0          # the text of the message being edited
@@ -264,6 +272,7 @@ def init() -> None:
     global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
+    global h_selsrc, h_qsrc, h_lastqsrc, h_evid
     global h_set_name, h_set_model, h_set_err, h_folder, h_new_err, h_pick, h_pick_err
     global h_img, h_when, h_when_full, host_picks
     h_pid = s_new()
@@ -325,6 +334,10 @@ def init() -> None:
     h_selpos = s_new()
     h_quote = s_new()
     h_lastq = s_new()
+    h_selsrc = s_new()
+    h_qsrc = s_new()
+    h_lastqsrc = s_new()
+    h_evid = s_new()
     h_body = s_new()
     h_act = s_new()
     h_edit = s_new()
@@ -333,7 +346,7 @@ def init() -> None:
     s_set(h_url, "/api/places")
     get(h_url, GOT_PLACES)
     on_nav(NAV)
-    on_select(h_seltext, h_selpos, SELECTED)
+    on_select(h_seltext, h_selpos, h_selsrc, SELECTED)
     on_paste(PASTED)
     on_zoom()
     show_address()
@@ -379,6 +392,7 @@ def leave_project() -> None:
     s_clear(h_err)
     s_clear(h_wlog_err)
     s_clear(h_quote)
+    s_clear(h_qsrc)
     mode = AUTO
     pane_tab = DIALOG
     sending = 0
@@ -455,6 +469,80 @@ def row_id(i: i32, id: i32) -> None:
     e = j_idx(threads, i)
     jstr(e, "id", id)
     j_free(e)
+
+
+def open_thread() -> None:
+    """Show thread h_sel in the pane, at its newest events."""
+    global threads_open, mode, editing, jump, wlog, files
+    # The pane takes the room on a phone; its header brings the list back.
+    threads_open = 0
+    if mode == AUTO and show_archived == 0:
+        mode = TO_THREAD
+    editing = 0
+    jump = 1
+    fetch_transcript()
+    wlog = take_none(wlog)
+    s_clear(h_wlog_err)
+    if pane_tab == WLOG:
+        fetch_wlog()
+    files = take_none(files)
+    s_clear(h_fpath)
+    s_clear(h_files_err)
+    close_fview()
+    if pane_tab == FILES:
+        fetch_files()
+
+
+def go_to_quoted(seq: i32) -> None:
+    """Show the event the quote in your message seq came from, highlighted: in
+    the pane if it is there, else in its thread (or the project's activity,
+    for the project's own events), opened at it rather than at the bottom."""
+    global jump_seq, pane_tab
+    src: i32 = plog
+    n: i32 = 0
+    i: i32
+    e: i32
+    of: i32 = 0
+    if s_len(h_sel) > 0:
+        src = transcript
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        if j_int(e, "seq") == seq and j_has(e, "quote_of") == 1:
+            of = j_int(e, "quote_of")
+            jstr(e, "quote_thread", h_tid)
+        j_free(e)
+    if of == 0:
+        return
+    if shows_seq(src, of) == 1:
+        jump_to(of, JUMP_MISS)
+    elif s_len(h_tid) > 0 and s_eq(h_tid, h_sel) == 0:
+        jump_seq = of
+        s_copy(h_sel, h_tid)
+        pane_tab = DIALOG
+        open_thread()
+    elif s_len(h_tid) == 0 and s_len(h_sel) > 0:
+        jump_seq = of
+        show_activity()
+    else:
+        s_set(h_err, "The quoted message is older than this view shows.")
+
+
+def shows_seq(src: i32, seq: i32) -> i32:
+    """1 if the events src (the transcript or project orchestrator) have this seq."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    found: i32 = 0
+    if src != 0:
+        n = j_len(src, "")
+    for i in range(n):
+        e = j_idx(src, i)
+        if j_int(e, "seq") == seq:
+            found = 1
+        j_free(e)
+    return found
 
 
 def show_activity() -> None:
@@ -609,8 +697,12 @@ def land() -> None:
     """New pane content has arrived. Content navigation asked for opens at the
     bottom; content that streamed in keeps the bottom in view only if the
     reader was already there, so scrolling up to read is left alone."""
-    global jump
-    if jump == 1:
+    global jump, jump_seq
+    if jump_seq != 0:
+        jump = 0
+        jump_to(jump_seq, JUMP_MISS)
+        jump_seq = 0
+    elif jump == 1:
         jump = 0
         scroll_end("pane")
     else:
@@ -775,23 +867,7 @@ def update(msg: i32, arg: i32) -> None:
         e = j_idx(threads, arg)
         jstr(e, "id", h_sel)
         j_free(e)
-        # The pane takes the room on a phone; its header brings the list back.
-        threads_open = 0
-        if mode == AUTO and show_archived == 0:
-            mode = TO_THREAD
-        editing = 0
-        jump = 1
-        fetch_transcript()
-        wlog = take_none(wlog)
-        s_clear(h_wlog_err)
-        if pane_tab == WLOG:
-            fetch_wlog()
-        files = take_none(files)
-        s_clear(h_fpath)
-        s_clear(h_files_err)
-        close_fview()
-        if pane_tab == FILES:
-            fetch_files()
+        open_thread()
     elif msg == ACTIVITY:
         threads_open = 0
         show_activity()
@@ -816,8 +892,10 @@ def update(msg: i32, arg: i32) -> None:
             sending = 1
             s_copy(h_last, h_req)
             s_copy(h_lastq, h_quote)
+            s_copy(h_lastqsrc, h_qsrc)
             s_clear(h_req)
             s_clear(h_quote)
+            s_clear(h_qsrc)
             s_clear(h_err)
             # A reply to a selection goes out as markdown: the quote, then the reply.
             s_clear(h_body)
@@ -827,6 +905,8 @@ def update(msg: i32, arg: i32) -> None:
             s_add_ref(h_body, h_last)
             o = o_new()
             o_str(o, "text", h_body)
+            if s_len(h_lastq) > 0 and s_len(h_lastqsrc) > 0:
+                o_int(o, "quote_of", h_lastqsrc)
             if img_count() > 0:
                 o_images(o, "images")
                 img_stash()
@@ -853,6 +933,7 @@ def update(msg: i32, arg: i32) -> None:
                 s_copy(h_req, h_last)
             if s_len(h_quote) == 0:
                 s_copy(h_quote, h_lastq)
+                s_copy(h_qsrc, h_lastqsrc)
             img_restore()
         else:
             img_clear()
@@ -876,13 +957,19 @@ def update(msg: i32, arg: i32) -> None:
         selecting = arg
     elif msg == QUOTE:
         s_copy(h_quote, h_seltext)
+        s_copy(h_qsrc, h_selsrc)
         if s_len(h_sel) > 0 and show_archived == 0:
             mode = TO_THREAD
         sel_clear()
         focus_end("req")
     elif msg == UNQUOTE:
         s_clear(h_quote)
+        s_clear(h_qsrc)
         focus_end("req")
+    elif msg == JUMP:
+        go_to_quoted(arg)
+    elif msg == JUMP_MISS:
+        s_set(h_err, "The quoted message is older than this view shows.")
     elif msg == EDIT:
         # arg is the seq of one of your messages; it opens for editing in place.
         if find_text(arg, h_edit) == 1:
@@ -1762,6 +1849,7 @@ def event_images(e: i32) -> None:
 def event_row(e: i32, show_thread: i32) -> None:
     """One dialog entry. While the model streams, its reasoning and reply show
     as they grow; finished reasoning is grouped by thinking_group."""
+    global md_quote
     k: i32
     live: i32
     k = j_int(e, "kind")
@@ -1769,6 +1857,10 @@ def event_row(e: i32, show_thread: i32) -> None:
     el("div")
     cls("ev")
     key(j_int(e, "seq"))
+    # a quote's way back to the row it was selected from (jump_to)
+    s_set(h_evid, "ev-")
+    s_add_num(h_evid, j_int(e, "seq"))
+    attr_ref("id", h_evid)
     cls_if("ev-user", k == K_USER)
     cls_if("ev-request", k == K_REQUEST)
     cls_if("ev-assistant", k == K_ASSISTANT)
@@ -1810,7 +1902,10 @@ def event_row(e: i32, show_thread: i32) -> None:
         el("div")
         cls("ev-text")
         cls("md")
+        if k == K_USER and j_has(e, "quote_of") == 1:
+            md_quote = j_int(e, "seq")
         md(h_t1)
+        md_quote = 0
         end()
     else:
         el("div")
@@ -1960,7 +2055,9 @@ def md(h: i32) -> None:
 
 
 def md_open(op: i32) -> None:
-    """Open the element for markdown op code op (TAGS in ui/markdown.js)."""
+    """Open the element for markdown op code op (TAGS in ui/markdown.js). The
+    first block quote of a reply to a selection goes back to where it came from."""
+    global md_quote
     if op == 10:
         el("p")
     elif op == 11:
@@ -1987,6 +2084,11 @@ def md_open(op: i32) -> None:
         el("code")
     elif op == 22:
         el("blockquote")
+        if md_quote != 0:
+            cls("quote-link")
+            attr("title", "Go to the quoted message")
+            on_click(JUMP, md_quote)
+            md_quote = 0
     elif op == 23:
         el("hr")
     elif op == 24:

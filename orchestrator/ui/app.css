@@ -299,6 +299,11 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .quote-text { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
               white-space: pre-wrap; word-break: break-word; }
 .ev-user .md blockquote { color: inherit; opacity: .75; border-left-color: hsl(221 83% 53% / .5); }
+/* A reply's quote goes back to the message it was selected from, which flashes. */
+.md blockquote.quote-link { cursor: pointer; border-radius: 0 4px 4px 0; }
+.md blockquote.quote-link:hover { opacity: 1; background: hsl(221 83% 53% / .1); border-left-color: hsl(221 83% 53%); }
+.ev-flash { animation: ev-flash 2.4s ease-out; }
+@keyframes ev-flash { 0%, 50% { box-shadow: 0 0 0 3px hsl(221 83% 53% / .6); background-color: hsl(221 83% 53% / .14); } }
 
 /* Thinking tab: the thread's reasoning steps, each under its step number and local time */
 .thinking-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }

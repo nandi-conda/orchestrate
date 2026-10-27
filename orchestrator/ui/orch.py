@@ -19,6 +19,11 @@ def o_lit(o: i32, k: str, v: str) -> None:
     pass
 
 @jscall
+def o_int(o: i32, k: str, h: i32) -> None:
+    """Set key k of object o to the whole number written in handle h."""
+    pass
+
+@jscall
 def o_images(o: i32, k: str) -> None:
     """Set key k of object o to the images attached to the request being composed."""
     pass
@@ -132,10 +137,18 @@ def clip_copy(h: i32, ok: i32, arg: i32, fail: i32) -> None:
     pass
 
 @jscall
-def on_select(text: i32, style: i32, msg: i32) -> None:
+def on_select(text: i32, style: i32, src: i32, msg: i32) -> None:
     """Follow the text selection in the pane (#pane): while there is one, its
     text is in handle text, a style placing a button over it in handle style,
-    and update(msg, 1) runs whenever either changes; update(msg, 0) when it ends."""
+    the seq of the event row it starts in in handle src ("" when that row is
+    still streaming), and update(msg, 1) runs whenever any changes;
+    update(msg, 0) when it ends."""
+    pass
+
+@jscall
+def jump_to(seq: i32, miss: i32) -> None:
+    """After the next render, scroll the pane's row for event seq into view and
+    flash it; update(miss, seq) if the pane has no such row."""
     pass
 
 @jscall

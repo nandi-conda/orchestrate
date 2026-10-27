@@ -97,8 +97,11 @@ image. Images show in transcripts and open enlarged on a click.
 ### Replying to a selection, copying
 
 Select text in a pane and a **Reply** button appears over it. The next message
-you send goes out as Markdown: the selection quoted, then your text. Every
-reply from an agent has a **Copy** button.
+you send goes out as Markdown: the selection quoted, then your text. Click the
+quote in your sent message to go back to the message it came from: the pane
+scrolls to it and flashes it, switching to its thread (or to Project
+orchestrator) when it is elsewhere. A message older than the pane's page says
+so instead. Every reply from an agent has a **Copy** button.
 
 ### Editing your messages
 

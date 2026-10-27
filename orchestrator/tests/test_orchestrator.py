@@ -2058,6 +2058,46 @@ async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monke
             assert [e["text"] for e in tr if e["seq"] == msg["seq"]] == ["use passkeys"]
 
 
+async def test_a_reply_to_a_selection_names_where_its_quote_came_from(tmp_path, monkeypatch):
+    """A reply to selected text records the event the quote was selected from,
+    with its thread, so the UI can go back to it; a quote of no event in the
+    project is refused."""
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), GatedRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            tid = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": "say IFn.invoke", "mode": "new"})).json()["spawned"][0]["id"]
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            src = tr[0]["seq"]
+
+            # Sent straight to the thread: its message carries the quote's source.
+            r = await c.post(f"/api/projects/{pid}/requests", json={
+                "text": "> IFn.invoke\n\nwhat does this do?", "mode": "thread", "target": tid, "quote_of": src})
+            assert r.status_code == 200
+            tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
+            mine = [e for e in tr if e["type"] == "message_in" and e["text"].startswith("> IFn.invoke")][0]
+            assert (mine["quote_of"], mine["quote_thread"]) == (src, tid)
+
+            # Left to the router: the request in the project's log carries it.
+            seq = (await c.post(f"/api/projects/{pid}/requests",
+                                json={"text": "> IFn.invoke\n\nand this?", "quote_of": src})).json()["seq"]
+            log = (await c.get(f"/api/projects/{pid}/log")).json()
+            req = [e for e in log if e["seq"] == seq][0]
+            assert (req["quote_of"], req["quote_thread"]) == (src, tid)
+
+            # A message without a quote has none; a quote of nothing is refused.
+            assert all("quote_of" not in e for e in log if e["type"] == "created")
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "x", "quote_of": 999999})
+            assert r.status_code == 404
+            r = await c.post(f"/api/projects/{pid}/requests", json={"text": "x", "quote_of": "7"})
+            assert r.status_code == 400
+
+
 async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, monkeypatch, capsys):
     """Each worker's runner log is printed as it is written, tagged with the
     worker. Once the worker is lost, its thread's worker log says which worker

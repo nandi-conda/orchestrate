@@ -1237,9 +1237,10 @@ class Orchestrator:
 
     async def send(self, to: str, body: str, sender: str = "user", hops: int = 0,
                    reply_to: str | None = None, edit: int | None = None,
-                   images: list[dict] | None = None) -> dict:
+                   images: list[dict] | None = None, quote: dict | None = None) -> dict:
         """Log a message to a thread and queue its delivery. `edit` is the seq
-        of the person's message this one corrects, when it is an edit's correction."""
+        of the person's message this one corrects, when it is an edit's correction;
+        `quote` names the event a reply to a selection quotes (quote_source)."""
         thread = await self.store.get_thread(to)
         if thread is None:
             raise KeyError(to)
@@ -1256,6 +1257,8 @@ class Orchestrator:
             payload["edit"] = edit
         if images:
             payload["images"] = images
+        if quote:
+            payload["quote"] = quote
         # A message from another thread is one event, which the sender lists too.
         src = await self.store.get_thread(sender)
         peer = sender if src and src["project_id"] == thread["project_id"] else None
@@ -1574,7 +1577,8 @@ class Orchestrator:
     # ---------------------------------------------------------------- requests
 
     async def submit(self, project_id: str, text: str, mode: str = "auto",
-                     target: str | None = None, images: list[dict] | None = None) -> dict:
+                     target: str | None = None, images: list[dict] | None = None,
+                     quote_of: int | None = None) -> dict:
         """Take a request typed in a project's main window; it returns at once.
 
         Sending to a thread or forcing a new one only logs and queues (a
@@ -1582,23 +1586,37 @@ class Orchestrator:
         router decide may ask a model, so the request is logged and routed in
         the background, in the order requests came in; its plan arrives as the
         "route" event. A request that is only images needs no router: there is
-        no text to route, so it starts one thread."""
+        no text to route, so it starts one thread.
+
+        `quote_of` is the seq of the event a reply to a selection quotes; the
+        message logged for the person carries it, so the UI can go back to it."""
         await self.open_project(project_id)
+        quote = await self.quote_source(project_id, quote_of) if quote_of is not None else None
         if mode == "thread":
             t = await self.store.get_thread(target) if target else None
             if t is None or t["project_id"] != project_id:
                 raise KeyError(f"no thread {target} in this project")
         if mode != "auto":
-            return await self.handle_request(project_id, text, mode, target, images)
+            return await self.handle_request(project_id, text, mode, target, images, quote=quote)
         payload = {"text": text}
         if images:
             payload["images"] = images
+        if quote:
+            payload["quote"] = quote
         ev = await self.store.append_event(project_id, None, "request", payload)
         if images and not text:
             return await self.handle_request(project_id, text, "new", None, images, of=ev["seq"])
         self._chain(self.request_chain, project_id,
                     lambda: self._route(project_id, text, ev["seq"], images))
         return {"request": text, "mode": mode, "queued": True, "seq": ev["seq"]}
+
+    async def quote_source(self, project_id: str, seq: int) -> dict:
+        """What a quote records of the event it was selected from: its seq, and
+        the thread it is in ("" for the project's own events)."""
+        ev = await self.store.get_event(seq)
+        if ev is None or ev["project_id"] != project_id:
+            raise KeyError(f"no event {seq} in this project to quote")
+        return {"of": seq, "thread": ev["thread_id"] or ""}
 
     async def _route(self, project_id: str, text: str, of: int,
                      images: list[dict] | None = None) -> None:
@@ -1611,7 +1629,7 @@ class Orchestrator:
 
     async def handle_request(self, project_id: str, text: str, mode: str = "auto",
                              target: str | None = None, images: list[dict] | None = None,
-                             of: int | None = None) -> dict:
+                             of: int | None = None, quote: dict | None = None) -> dict:
         """mode: auto (router decides), thread (send to target), new (force a new thread).
         `of` is the seq of the request event it routes; the route event names it,
         so an edit of the request knows which threads it reached."""
@@ -1634,7 +1652,8 @@ class Orchestrator:
         for s in plan["send"]:
             if s.get("workers"):
                 await self.move(s["thread"], s["workers"], s.get("where", ""))
-            await self.send(s["thread"], s["message"], sender, images=images)
+            await self.send(s["thread"], s["message"], sender, images=images,
+                            quote=quote if sender == "user" else None)
             sent.append(s["thread"])
         # The summary names threads by title; the ids stay in spawned and sent.
         titles = {t["id"]: t["title"] for t in directory}

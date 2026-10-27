@@ -181,6 +181,9 @@ def display(ev: dict) -> dict:
     images = d.get("images") or []
     if images:
         out["images"] = images
+    if kind == K_USER and d.get("quote"):
+        # a reply to a selection: the event its quote came from, to go back to
+        out["quote_of"], out["quote_thread"] = d["quote"]["of"], d["quote"]["thread"]
     return out
 
 
@@ -386,8 +389,11 @@ def create_app(store: Store | None = None, places: Places | None = None,
         mode = b.get("mode", "auto")
         if mode not in ("auto", "thread", "new"):
             return JSONResponse({"error": "mode is auto, thread or new"}, 400)
+        quote_of = b.get("quote_of")
+        if quote_of is not None and (not isinstance(quote_of, int) or isinstance(quote_of, bool)):
+            return JSONResponse({"error": "quote_of is the seq of the event quoted"}, 400)
         try:
-            result = await orch().submit(pid, text, mode, b.get("target") or None, images)
+            result = await orch().submit(pid, text, mode, b.get("target") or None, images, quote_of)
         except KeyError as e:
             return JSONResponse({"error": str(e.args[0])}, 404)
         except (RuntimeError, ArchivedError) as e:

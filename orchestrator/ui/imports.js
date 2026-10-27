@@ -61,6 +61,7 @@ export function imports({ str, strs, vals, dispatch }) {
     o_new: () => put({}),
     o_str: (o, k, h) => { vals[o][str(k)] = strs[h] ?? ""; },
     o_lit: (o, k, v) => { vals[o][str(k)] = str(v); },
+    o_int: (o, k, h) => { vals[o][str(k)] = parseInt(strs[h], 10); },
     o_images: (o, k) => { if (images.length) vals[o][str(k)] = images.slice(); },
     http_post: (u, o, msg) => {
       const h = put(null);
@@ -173,15 +174,17 @@ export function imports({ str, strs, vals, dispatch }) {
         (e) => { strs[h] = String(e && e.message || e); dispatch(fail, h); });
     },
     // Text selected inside the pane (#pane): its text goes to th, a style
-    // that puts the Reply button over it to sh, and update(msg, 1). When the
-    // selection goes away (or leaves the pane), update(msg, 0).
-    on_select: (th, sh, msg) => {
+    // that puts the Reply button over it to sh, the seq of the event row it
+    // starts in to qh ("" for a row still streaming, whose seq won't last),
+    // and update(msg, 1). When the selection goes away (or leaves the pane),
+    // update(msg, 0).
+    on_select: (th, sh, qh, msg) => {
       let last = "", queued = false;
       const inPane = (n) => !!(n && (n.nodeType === 1 ? n : n.parentElement)?.closest("#pane"));
       const check = () => {
         queued = false;
         const sel = getSelection();
-        let txt = "", style = "";
+        let txt = "", style = "", src = "";
         if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
           const r = sel.getRangeAt(0);
           if (inPane(r.startContainer) && inPane(r.endContainer)) {
@@ -193,13 +196,17 @@ export function imports({ str, strs, vals, dispatch }) {
             const above = b.top - 40 >= pane.top;
             const y = Math.round(above ? b.top - 40 : Math.min(b.bottom + 6, pane.bottom - 36));
             style = `top:${y}px;left:${x}px`;
+            const n = r.startContainer;
+            const row = (n.nodeType === 1 ? n : n.parentElement).closest(".ev[id^='ev-']");
+            if (row && !row.classList.contains("ev-live")) src = row.id.slice(3);
           }
         }
-        const k = txt ? txt + "\u0000" + style : "";
+        const k = txt ? txt + "\u0000" + style + "\u0000" + src : "";
         if (k === last) return;
         last = k;
         strs[th] = txt;
         strs[sh] = style;
+        strs[qh] = src;
         dispatch(msg, txt ? 1 : 0);
       };
       const soon = () => { if (!queued) { queued = true; requestAnimationFrame(check); } };
@@ -210,6 +217,21 @@ export function imports({ str, strs, vals, dispatch }) {
       document.addEventListener("mousedown", (e) => {
         if (e.target.closest && e.target.closest(".sel-reply")) e.preventDefault();
       }, true);
+    },
+    // Bring the pane's row for event seq into view after the next render and
+    // flash it; update(miss, seq) if the pane doesn't have it. Scrolling it
+    // into view leaves the bottom, so the pane stops following new events
+    // until the reader scrolls back down.
+    jump_to: (seq, miss) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const row = document.getElementById("ev-" + seq);
+        if (!row || !row.closest("#pane")) { dispatch(miss, seq); return; }
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+        row.classList.remove("ev-flash");
+        void row.offsetWidth; // restart the flash when it is already on
+        row.classList.add("ev-flash");
+        row.addEventListener("animationend", () => row.classList.remove("ev-flash"), { once: true });
+      }));
     },
     sel_clear: () => { getSelection().removeAllRanges(); },
     // dst = each line of src as a markdown quote ("> line").
