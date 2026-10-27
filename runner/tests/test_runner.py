@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,7 +12,7 @@ import uvicorn
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
 from runner import ThreadHost, View
-from runner.sandbox import SandboxError, pixi, runner_checkout, worker_private
+from runner.sandbox import SandboxError, bwrap_args, pixi, runner_checkout, thread_env, worker_private
 from runner.server import create_app, serve
 
 
@@ -20,10 +21,26 @@ def host_with(*scripts, tmp_path, **kw):
 
 
 def view(tmp_path, **kw):
-    v = View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"), **kw)
-    for d in (v.root, v.home, v.tmp):
+    v = View(root=str(tmp_path / "ws"), home=str(tmp_path / "home"), tmp=str(tmp_path / "tmp"),
+             cache=str(tmp_path / "cache"), **kw)
+    for d in (v.root, v.home, v.tmp, v.cache):
         os.makedirs(d, exist_ok=True)
     return v
+
+
+def test_threads_of_a_project_share_its_package_cache(tmp_path, monkeypatch):
+    """pixi keeps packages, and worktrees' environments, in the project's
+    cache on the worker, one mount, so every environment hard-links to one
+    copy of each package."""
+    monkeypatch.setenv("PIXI_EXE", sys.executable)  # any program: _place only names it
+    host = host_with(tmp_path=tmp_path)
+    a, b, other = host._place("t_a", "p_1").view, host._place("t_b", "p_1").view, host._place("t_c", "p_2").view
+    assert a.cache == b.cache == str((tmp_path / "threads" / ".cache" / "p_1").resolve())
+    assert other.cache != a.cache
+    env = thread_env(a)
+    assert env["PIXI_CACHE_DIR"] == a.cache
+    assert env["PIXI_CONFIG_FILE"] == str(Path(a.cache) / "config.toml")  # environments go in the cache too
+    assert ["--bind", a.cache, a.cache] == bwrap_args(a)[bwrap_args(a).index(a.cache) - 1:][:3]
 
 
 def test_commands_see_the_workspace_and_nothing_of_the_runner(tmp_path, monkeypatch):

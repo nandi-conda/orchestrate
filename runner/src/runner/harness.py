@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from .sandbox import View, bwrap, bwrap_args, no_capabilities, thread_env
+from .sandbox import PIXI_CONFIG, View, bwrap, bwrap_args, no_capabilities, pixi_config, thread_env
 
 log = logging.getLogger("runner.harness")
 
@@ -173,8 +173,13 @@ class PrimeAgent:
     def prepare(self, place: Place) -> None:
         """The thread's agent dir (settings, models, the team skill), its venv and its
         kernel wrapper."""
-        for d in (place.view.root, place.view.home, place.view.tmp, place.sessions):
+        for d in (place.view.root, place.view.home, place.view.tmp, place.view.cache, place.sessions):
             Path(d).mkdir(parents=True, exist_ok=True)
+        # The project's other threads may be reading it: written whole, then moved in.
+        config = Path(pixi_config(place.view))
+        made = config.with_name(f"{config.name}.{os.getpid()}.{id(place)}")
+        made.write_text(PIXI_CONFIG)
+        os.replace(made, config)
         settings = {"skills": [f"-{name}/SKILL.md" for name in DROPPED_SKILLS], "imageModel": IMAGE_MODEL}
         (place.agent_dir / "settings.json").write_text(json.dumps(settings, indent=1))
         shutil.copyfile(MODELS, place.agent_dir / "models.json")

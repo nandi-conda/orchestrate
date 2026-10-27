@@ -167,7 +167,7 @@ Secrets (`DEEPSEEK_API_KEY`, `OPENGATEWAY_API_TOKEN`, `RUNNER_TOKEN`) are read f
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | for web search and fetch |
 | `RUNNER_TOKEN` | | bearer token the orchestrator uses to call this runner |
 | `RUNNER_PORT` / `RUNNER_HOST` | `8080` / `0.0.0.0` | |
-| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repos/<project>/` |
+| `RUNNER_WORKDIR` | `/work/threads` | where workspaces go: `<id>/` (the worktree), `.home/<id>/`, `.tmp/<id>/`, `.repos/<project>/`, `.cache/<project>/` |
 | `RUNNER_CAPACITY` | `16` | reported in `/health` for scheduling |
 | `RUNNER_SPEC` | | reported in `/health` as `spec`: the control plane's fingerprint of the service it started |
 
@@ -191,7 +191,8 @@ this view:
 | `$RUNNER_WORKDIR/.home/<id>` | the thread's `HOME`, writable: its venv (`.venv`) and prime-agent's agent dir (`.prime-agent`: settings, `models.json`, skills, the session) |
 | `/tmp` | `$RUNNER_WORKDIR/.tmp/<id>`, kept for the thread |
 | `runner/.pixi/envs/kernel`, prime-agent's bundled skills | read-only: the kernel's Python and packages |
-| `$PIXI_EXE` | read-only, at its own path and on `PATH`: the pixi the runner runs under (every project is a pixi project); it keeps its cache and global tools in the thread's `HOME` |
+| `$PIXI_EXE` | read-only, at its own path and on `PATH`: the pixi the runner runs under (every project is a pixi project); it keeps its global tools in the thread's `HOME` |
+| `$RUNNER_WORKDIR/.cache/<project>` | pixi's cache for the project, writable and shared by its threads on this worker (`PIXI_CACHE_DIR`): the packages, and the worktrees' environments (`PIXI_CONFIG_FILE` sets `detached-environments`), in one mount so the environments hard-link to the packages instead of copying them |
 | `$RUNNER_WORKDIR/.team/<id>.sock` | the thread's team socket |
 | the rest of the orchestrate checkout and the runner's pixi environment, the worker user's home, the rest of `$RUNNER_WORKDIR` | empty: the runner's code, other threads and projects, the keyring and caches are not there |
 | `/proc` | its own pid namespace: the runner's processes, and their environments, are not in it |

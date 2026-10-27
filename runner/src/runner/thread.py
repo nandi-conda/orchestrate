@@ -417,7 +417,8 @@ class ThreadHost:
     def _place(self, tid: str, project: str) -> Place:
         """Where the thread lives on this worker: its worktree, and the view
         its kernel gets of the worker: that, its project's repository's git dir, the
-        thread's own home and /tmp under `.home/` and `.tmp/`, its team socket,
+        thread's own home and /tmp under `.home/` and `.tmp/`, its project's
+        package cache under `.cache/`, its team socket,
         the kernel's Python environment and prime-agent's skills read-only, and pixi."""
         work = self.workdir.resolve()
         socket = str(work / ".team" / f"{tid}.sock")
@@ -426,6 +427,7 @@ class ThreadHost:
                                f"address ({SOCKET_ADDRESS_MAX - 1} bytes): use a shorter workdir than "
                                f"{str(work)!r}")
         view = View(root=str(work / tid), home=str(work / ".home" / tid), tmp=str(work / ".tmp" / tid),
+                    cache=str(work / ".cache" / project),
                     writable=((str(self.repos.get(project).path.resolve() / ".git"),) if self.repos else ())
                     + (socket,),
                     hidden=worker_private(self.workdir), readonly=(str(KERNEL), str(HARNESS / "skills")),
@@ -504,10 +506,10 @@ class ThreadHost:
 
     async def prune(self, keep: set[str]) -> list[str]:
         """Take every project not in `keep` off this worker: its threads here
-        are stopped and forgotten, and its repository and their worktrees,
-        homes, /tmp and team sockets deleted. The orchestrator keeps all of
-        it in its hub, so the project comes back from there if it is ever
-        used again. Returns the projects removed."""
+        are stopped and forgotten, and its repository, its package cache and
+        its threads' worktrees, homes, /tmp and team sockets deleted. The
+        orchestrator keeps all that matters in its hub, so the project comes
+        back from there if it is ever used again. Returns the projects removed."""
         gone = [p for p in self.repos.projects() if p not in keep] if self.repos else []
         for project in gone:
             for tid in [t.id for t in self.threads.values() if t.project == project]:
@@ -519,6 +521,7 @@ class ThreadHost:
                     await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)  # off the event loop
                 for leftover in (self.workdir / ".team").glob(f"{tid}.*"):
                     leftover.unlink(missing_ok=True)
+            await asyncio.to_thread(shutil.rmtree, self.workdir / ".cache" / project, ignore_errors=True)
             await asyncio.to_thread(self.repos.remove, project)
             log.info("project %s is no longer on this worker", project)
         return gone
