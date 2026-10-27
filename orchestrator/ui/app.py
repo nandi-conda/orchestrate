@@ -1561,11 +1561,13 @@ def thread_list() -> None:
         cls("thread")
         cls_if("active", s_eq(h_t3, h_sel) == 1)
         on_click(SELECT, i)
-        div("thread-top")
-        span("thread-title")
+        # The title has a line of its own and wraps, so a long one reads in
+        # full; the badges go on the line under it.
+        div("thread-label")
         jstr(e, "title", h_t1)
         text_ref(h_t1)
         end()
+        div("thread-badges")
         thread_badges(e)
         end()
         jstr(e, "activity", h_t1)
