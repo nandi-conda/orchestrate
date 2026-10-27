@@ -162,12 +162,24 @@ async def folder(path: str) -> str | None:
     return head.out
 
 
+def git_folder(where: Path) -> bool:
+    """Whether where is a git repository's folder. One that cannot be looked
+    into — a system folder only root may read, a mount that has gone — is not
+    one, and the picker lists it like any other: opening it is what says it
+    cannot be read."""
+    try:
+        return (where / ".git").exists()
+    except OSError:
+        return False
+
+
 def folders(path: str = "") -> dict:
     """The folders in a folder on this machine, for picking one to open as a
     project (`path` as remote_url takes it; "" is the home folder): its path,
     its parent ("" at the top), and the folders in it, by name, each with its
-    path and whether it is a git repository's folder. Hidden folders are left out; a folder
-    that is not one, or cannot be read, is refused with the reason."""
+    path and whether it is a git repository's folder (git_folder). Hidden
+    folders are left out; a folder that is not one, or cannot be read, is
+    refused with the reason."""
     where = Path(remote_url(path) if path.strip() else Path.home().resolve())
     if not is_folder(str(where)):
         raise GitError(f"{path} is not a folder path; give its full path")
@@ -179,7 +191,7 @@ def folders(path: str = "") -> dict:
     except OSError as e:
         raise GitError(f"{where} cannot be read: {e.strerror}") from None
     return {"path": str(where), "parent": "" if where.parent == where else str(where.parent),
-            "entries": [{"name": n, "path": str(where / n), "git": (where / n / ".git").exists()} for n in names]}
+            "entries": [{"name": n, "path": str(where / n), "git": git_folder(where / n)} for n in names]}
 
 
 def worker_ref(ref: str, base: str) -> str:

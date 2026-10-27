@@ -4,6 +4,7 @@ echo runner (control.devrunner), served over real HTTP so the peer API is used."
 import asyncio
 import base64
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -893,6 +894,34 @@ async def test_the_folder_picker_lists_folders_from_home(tmp_path, monkeypatch):
             assert r.status_code == 400 and "full path" in r.json()["error"]
             r = await c.get("/api/folders", params={"path": str(tmp_path / "nope")})
             assert r.status_code == 400 and "no folder" in r.json()["error"]
+
+
+async def test_the_folder_picker_lists_a_folder_it_cannot_look_into(tmp_path, monkeypatch):
+    """A folder only root may read (a system folder at the root of the disk, a
+    mount of someone else's) is listed like any other and marked not a
+    repository: the picker used to fail the whole listing of the folder it is
+    in, on looking for its .git."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "open").mkdir()
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked").chmod(0o000)
+    try:
+        try:
+            os.listdir(tmp_path / "locked")
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("a folder with no permissions is readable here (root)")
+        app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
+                         local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
+                         HeuristicRouter(), repos=str(tmp_path / "repos"))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                         timeout=20) as c:
+                home = (await c.get("/api/folders")).json()
+        assert sorted((e["name"], e["git"]) for e in home["entries"]) == [("locked", False), ("open", False)]
+    finally:
+        (tmp_path / "locked").chmod(0o755)
 
 
 async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypatch):
