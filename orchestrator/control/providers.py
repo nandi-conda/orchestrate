@@ -12,8 +12,13 @@ the pool's (`sweep` destroys the rest).
 - `SpritesProvider` makes a Fly Sprite per slot, `orch-w<n>`, labeled
   `orchestrator`, installs the runner on it and runs it as a sprite service
   on port 8080.
-- `AutoProvider` is the default: sprites whenever `SPRITES_TOKEN` is stored,
-  local workers otherwise.
+
+Where a thread's workers run (threads.workers) is the router's decision, per
+thread: "sprites" unless the request asks for "local" (this computer).
+`Places` holds the provider of each place this control plane offers, and why
+it refuses the others; the router is told both, and a thread on a refused
+place fails with that reason instead of running somewhere else. Each place
+has its own pool of slots.
 
 A worker is never told where the control plane is and never connects to it:
 the control plane opens every connection, including the one that collects its
@@ -646,81 +651,70 @@ def service_log_lines(ev: dict) -> list[str]:
     return []
 
 
-class AutoProvider:
-    """Remote first: workers are sprites whenever a token is stored, local
-    runner processes otherwise. Either way the control plane opens every connection, so
-    where it runs never matters to the worker."""
+# Where a thread's workers can run, by the name its provider goes by
+# (Worker.provider), with how the UI names it.
+PLACES = {"local": "This computer", "sprites": "Sprites"}
 
-    name = "auto"
 
-    def __init__(self, local: LocalProvider | None = None, sprites: SpritesProvider | None = None) -> None:
-        self._local = local
-        self._sprites = sprites
-        self._looked_for_token = sprites is not None
-        self._warned_local = False
+class PlaceRefused(Exception):
+    """A thread was to run where this control plane runs no workers."""
 
-    def local(self) -> LocalProvider:
-        if self._local is None:
-            self._local = LocalProvider()
-        return self._local
 
-    def sprites(self) -> SpritesProvider | None:
-        if not self._looked_for_token:
-            from .secrets import get_secret
+class Places:
+    """The providers of the places this control plane runs workers in, and
+    for each place it does not, why. The router names each thread's place;
+    nothing picks another one for it."""
 
-            self._looked_for_token = True
-            self._sprites = SpritesProvider() if get_secret("SPRITES_TOKEN") else None
-        return self._sprites
+    def __init__(self, providers: dict[str, WorkerProvider], refused: dict[str, str] | None = None) -> None:
+        unknown = (set(providers) | set(refused or {})) - set(PLACES)
+        if unknown:
+            raise ValueError(f"unknown worker place {', '.join(sorted(unknown))}")
+        self.providers = providers
+        self.refused = {p: (refused or {}).get(p, "this control plane does not run workers there")
+                        for p in PLACES if p not in providers}
 
-    async def create(self, spec: WorkerSpec) -> Worker:
-        provider = self.sprites()
-        if provider is None:
-            if not self._warned_local:
-                self._warned_local = True
-                print("AutoProvider: SPRITES_TOKEN is not stored; using local workers. "
-                      "Store it with `pixi run set-key SPRITES_TOKEN` to run workers on Sprites.",
-                      file=sys.stderr)
-            return await self.local().create(spec)
-        return await provider.create(spec)
+    def provider(self, place: str) -> WorkerProvider:
+        """The provider of `place`, or PlaceRefused saying why there is none."""
+        if place in self.providers:
+            return self.providers[place]
+        if place not in PLACES:
+            raise PlaceRefused(f"workers cannot run on {place!r}: it is none of {', '.join(PLACES)}")
+        raise PlaceRefused(f"workers cannot run on {PLACES[place]}: {self.refused[place]}")
 
-    def _of(self, worker: Worker):
-        # A worker an earlier control plane made may be asked about first.
-        return self.sprites() if worker.provider == "sprites" else self.local()
-
-    async def destroy(self, worker: Worker) -> None:
-        provider = self._of(worker)
-        if provider is not None:
-            await provider.destroy(worker)
-
-    async def sweep(self, slots: int) -> list[str]:
-        """The pool is sprites when a token is stored, local workers otherwise."""
-        provider = self.sprites()
-        return await (provider or self.local()).sweep(slots)
-
-    async def exists(self, worker: Worker) -> bool:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        return await provider.exists(worker)
-
-    async def logs(self, worker: Worker, lines: int) -> str:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        return await provider.logs(worker, lines)
-
-    async def follow(self, worker: Worker, backlog: int) -> AsyncIterator[str]:
-        provider = self._of(worker)
-        if provider is None:
-            raise RuntimeError(f"no {worker.provider} provider in this control plane")
-        async for line in provider.follow(worker, backlog):
-            yield line
+    def offered(self) -> list[dict]:
+        """Every place, in PLACES order, as the UI shows it: `why` is empty
+        for those this control plane runs workers in."""
+        return [{"id": p, "label": label, "why": self.refused.get(p, "")} for p, label in PLACES.items()]
 
     async def close(self) -> None:
-        for provider in (self._local, self._sprites):
-            if provider is not None:
-                await provider.close()
+        for provider in self.providers.values():
+            close = getattr(provider, "close", None)
+            if close is not None:
+                await close()
 
 
-def default_provider() -> WorkerProvider:
-    return AutoProvider()
+SPRITES_MISSING = ("it needs SPRITES_TOKEN, a Fly Sprites organization token (sent as "
+                   "`Authorization: Bearer <token>` to https://api.sprites.dev/v1). Store it with "
+                   "`pixi run set-key SPRITES_TOKEN`, or set it in the environment, and start the app again")
+
+
+def default_places() -> Places:
+    """This computer, when it can run the runner (Linux, with ../runner and
+    DEEPSEEK_API_KEY), and Sprites, when SPRITES_TOKEN is stored."""
+    from .secrets import get_secret
+
+    providers: dict[str, WorkerProvider] = {}
+    refused: dict[str, str] = {}
+    if not sys.platform.startswith("linux"):
+        refused["local"] = ("the runner is Linux-only (it sandboxes threads with bubblewrap), "
+                            f"and this computer runs {sys.platform}")
+    else:
+        try:
+            providers["local"] = LocalProvider()
+        except RuntimeError as e:
+            refused["local"] = str(e)
+    if get_secret("SPRITES_TOKEN"):
+        providers["sprites"] = SpritesProvider()
+    else:
+        refused["sprites"] = SPRITES_MISSING
+    return Places(providers, refused)

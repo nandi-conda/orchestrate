@@ -8,7 +8,7 @@ connects out to the control plane.
 
 ## Workers on Fly Sprites
 
-With `SPRITES_TOKEN` stored, each worker is a [Fly Sprite](https://sprites.dev)
+For threads the router puts on Sprites (which needs `SPRITES_TOKEN`), each worker is a [Fly Sprite](https://sprites.dev)
 named for its slot in the pool, `orch-w1` to `orch-w3`, and labeled
 `orchestrator`. Workers are not per thread or per project: the pool of 3 is
 shared by every project, each worker holding one repository per project. New
@@ -51,7 +51,7 @@ runtime masks parts of `/proc`.
 
 ### Local workers
 
-Without `SPRITES_TOKEN`, `LocalProvider` starts runners as subprocesses on this
+For threads the router puts on this computer (a request that says "run locally"), `LocalProvider` starts runners as subprocesses on this
 machine under `~/.orchestrate/workers/<id>/`: the real runner from `../runner`
 (Linux only), which needs `DEEPSEEK_API_KEY` like every runner.
 

@@ -138,7 +138,7 @@ worked out at runtime.
 | Secret | What | Sent as |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | **required**: router model, and passed to every worker. Without it the control plane does not start | `Authorization: Bearer <key>` to `https://api.deepseek.com` |
-| `SPRITES_TOKEN` | stored, workers always run on Sprites; without it they fall back to this machine | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
+| `SPRITES_TOKEN` | lets threads run on Sprites; without it the router is told Sprites is off and why, and puts every thread on this computer | `Authorization: Bearer <token>` to `https://api.sprites.dev/v1` |
 | `GITHUB_TOKEN` | GitHub fine-grained token, Contents: Read and write on the projects' repos. Used by the control plane only: for a project with a remote (`repo_url`, set in its settings) it fetches the remote's default branch into the project's hub (`~/.orchestrate/repos/<id>.git`) and pushes finished threads' work to it. Workers never get it | git `http.<repo url>.extraHeader`: `Authorization: Basic base64("x-access-token:<token>")` |
 
 Store one with `pixi run set-key NAME`. Missing ones are printed at startup with
@@ -152,7 +152,7 @@ What the control plane works out for itself:
 
 | | How |
 | --- | --- |
-| Where workers run | Sprites whenever `SPRITES_TOKEN` is stored, even when the browser is on this machine. Local only when no token is stored |
+| Where workers run | The router decides per thread: Sprites, unless the request says to run locally ("run it locally"), then this computer. Each place has its own pool of 3. It never picks a place the control plane cannot run workers in |
 | What a sprite checks out | This checkout's `origin` remote and current branch, with a warning when the sprite would not get this exact commit |
 | Which router | `deepseek-flash`; a request it cannot plan shows as an error in the project |
 | Where its data lives | `~/.orchestrate/`: the SQLite store, project hubs (`repos/`) and local workers (`workers/`). Data an older control plane kept in the checkout (`orchestrator.db`, `.orchestrator/`) is moved there once at startup; data in both places stops startup until one is removed |
@@ -197,8 +197,8 @@ Runners never touch the database, and never connect to the control plane.
 
 ### Sprites
 
-When `SPRITES_TOKEN` is stored, the workers are a pool of 3 sprites shared by
-every project, named for their slot (`orch-w1`..`orch-w3`) and labeled
+Threads on Sprites (every thread whose request does not say to run locally)
+share a pool of 3 sprites, named for their slot (`orch-w1`..`orch-w3`) and labeled
 `orchestrator`, even when the browser reached the control plane on localhost.
 A thread that finds every worker full waits for room; no fourth is made. At
 startup the control plane destroys every other sprite of ours (labeled, or
@@ -214,9 +214,8 @@ pixi run set-key SPRITES_TOKEN
 pixi run serve
 ```
 
-A laptop session now starts billable sprites as soon as it spawns a thread;
-that is the point of storing the token. Remove `SPRITES_TOKEN` to fall back to
-local workers. The sprite
+A laptop session starts billable sprites as soon as it spawns a thread, unless
+the request says to run locally. The sprite
 checks out this checkout's `origin` and current branch, so push before
 expecting local commits to be there; that clone of the orchestrate code uses no
 credentials, so this repository must be publicly readable.
@@ -382,7 +381,7 @@ SQLite or Postgres database the first time the control plane opens it.
 | `control/service.py` | `Orchestrator`: workers, spawning, messaging, event relay, peer calls collected from workers, request handling |
 | `control/router.py` | `ModelRouter` (DeepSeek) |
 | `control/store.py` | `Store` interface, `SqliteStore`, `PostgresStore` |
-| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` (Sprites whenever a token is stored, local otherwise) |
+| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `Places` (where threads' workers can run, and why not) |
 | `control/runner_client.py` | HTTP client for `runner/API.md` |
 | `tests/devrunner.py` | echo runner speaking the same API, for the tests only |
 | `control/secrets.py` | env-then-keyring lookup (shared convention with the runner) |

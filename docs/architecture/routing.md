@@ -91,6 +91,26 @@ The thread list API (`GET /api/projects/{id}/threads`, `GET /api/threads/{id}`)
 returns the same `load`, and the UI shows the backlog as an "N waiting" badge
 beside the thread's state, marked once the thread is backed up.
 
+### Where threads run
+
+There is no setting for it: the router decides, per thread, whether its
+workers run on Sprites or on this computer. Each plan entry carries
+`workers`: `"sprites"` unless the request asks for the person's own computer
+("run it locally", "on my machine", "don't use sprites"), then `"local"`. The
+router sees `places` (`GET /api/places`): the places this control plane can
+run workers in, and why not the others (no `SPRITES_TOKEN`, not Linux, a
+phone). It never picks an unavailable one, so without a token every thread
+goes on this computer, and on a phone every thread goes on Sprites.
+
+- A thread with no place yet (one typed with **New thread**, or created by
+  `POST /api/projects/{id}/threads`, or one the plan left without) is placed
+  by `Router.place` from its request when it is first put on a worker; its
+  Worker log says "asking the router where its workers run".
+- A thread a peer spawns runs where its parent runs.
+- A `send` entry with `workers` moves that thread (`Orchestrator.move`): it
+  is stopped and unbound where it runs, and comes back on the new place with
+  the message, from its work in the hub. Its log shows a `moved` event.
+
 ## Sending never waits
 
 No API handler awaits the router model, a provider creating a worker, or a

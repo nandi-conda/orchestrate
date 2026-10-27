@@ -21,7 +21,8 @@ from control.service import NotOnWorker
 from control.app import create_app
 from control.providers import LocalProvider
 from control.router import clean_plan
-from tests.doubles import ECHO_RUNNER, HeuristicRouter
+from control.providers import PlaceRefused
+from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
 from control.server import Server
 from control.store import SqliteStore
 
@@ -60,7 +61,7 @@ async def test_store_roundtrip(tmp_path):
     assert (p["name"], p["repo_url"]) == ("renamed", "https://example.com/r.git")
     with pytest.raises(ValueError):
         await s.update_project(p["id"], id="p_x")
-    t = await s.create_thread(p["id"], "Fix it", "fix the bug")
+    t = await s.create_thread(p["id"], "Fix it", "fix the bug", "local")
     await s.update_thread(t["id"], state="working", files=["a.py"])
     e1 = await s.append_event(p["id"], t["id"], "assistant", {"content": "hi"})
     e2 = await s.append_event(p["id"], None, "route", {"summary": "spawned 1"})
@@ -95,8 +96,8 @@ async def test_store_lists_archived_threads_apart(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    keep = await s.create_thread(p["id"], "Keep", "k")
-    old = await s.create_thread(p["id"], "Old", "o")
+    keep = await s.create_thread(p["id"], "Keep", "k", "local")
+    old = await s.create_thread(p["id"], "Old", "o", "local")
     assert keep["archived_at"] is None
     await s.update_thread(old["id"], archived_at=123.0)
     assert [t["id"] for t in await s.list_threads(p["id"])] == [keep["id"]]
@@ -144,9 +145,9 @@ async def test_store_lists_working_threads_first(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    a = await s.create_thread(p["id"], "A", "a")
-    b = await s.create_thread(p["id"], "B", "b")
-    c = await s.create_thread(p["id"], "C", "c")
+    a = await s.create_thread(p["id"], "A", "a", "local")
+    b = await s.create_thread(p["id"], "B", "b", "local")
+    c = await s.create_thread(p["id"], "C", "c", "local")
     for t in (a, b, c):
         await s.update_thread(t["id"], state="idle")
 
@@ -166,7 +167,7 @@ async def test_store_takes_the_newest_events_for_a_pane(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "A", "a")
+    t = await s.create_thread(p["id"], "A", "a", "local")
     seqs = []
     for i in range(6):  # alternating: the thread, then the project
         e = await s.append_event(p["id"], t["id"] if i % 2 == 0 else None, "assistant", {"content": str(i)})
@@ -228,8 +229,8 @@ async def test_ingest_tracks_what_a_thread_is_doing(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "Fix it", "fix the bug")
-    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    t = await s.create_thread(p["id"], "Fix it", "fix the bug", "local")
+    orch = service.Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
 
     async def doing(typ, data):
         await orch._ingest({"thread": t["id"], "type": typ, "data": data})
@@ -248,8 +249,8 @@ async def test_streamed_reply_shows_live_then_folds_into_its_events(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "Fix it", "fix the bug")
-    orch = service.Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    t = await s.create_thread(p["id"], "Fix it", "fix the bug", "local")
+    orch = service.Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
 
     async def ingest(typ, data):
         await orch._ingest({"thread": t["id"], "type": typ, "data": data})
@@ -286,7 +287,7 @@ async def test_worker_logs_come_from_the_provider(tmp_path):
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = service.Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
         await asyncio.wait({orch.binding[t["id"]]})  # spawn returns before the worker is up
@@ -326,19 +327,24 @@ def test_turn_summary_is_the_result_and_state_changes_have_their_own_kind():
 
 async def test_heuristic_router():
     r = HeuristicRouter()
-    one = await r.plan("add a login page", [])
+    one = await r.plan("add a login page", [], HERE)
     assert len(one["spawn"]) == 1 and not one["send"]
-    many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [])
+    many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [], HERE)
     assert [s["request"] for s in many["spawn"]] == ["login page", "export bug", "docs"]
-    sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}])
-    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case"}]
+    sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}], HERE)
+    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "workers": ""}]
+    assert (await r.plan("fix it locally", [], HERE))["spawn"][0]["workers"] == "local"
+    assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
 
 def test_clean_plan_drops_unknown_threads():
-    plan = clean_plan({"spawn": [{"request": "x"}, {"title": "no request"}],
-                       "send": [{"thread": "t_nope", "message": "m"}, {"thread": "t_1", "message": "m"}]},
-                      [{"id": "t_1"}])
-    assert len(plan["spawn"]) == 1 and plan["send"] == [{"thread": "t_1", "message": "m"}]
+    plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
+                       "send": [{"thread": "t_nope", "message": "m"},
+                                {"thread": "t_1", "message": "m", "workers": "local"}]},
+                      [{"id": "t_1"}], HERE)
+    # Sprites is not available here: that thread is placed when it is put on a worker.
+    assert [s["workers"] for s in plan["spawn"]] == [""]
+    assert plan["send"] == [{"thread": "t_1", "message": "m", "workers": "local"}]
 
 
 def free_port() -> int:
@@ -359,7 +365,7 @@ def server(tmp_path, monkeypatch):
     # that still holds one open.
     stop = asyncio.Event()
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
                      HeuristicRouter(), shutdown_event=stop, repos=str(tmp_path / "repos"))
     srv = Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
                                 timeout_graceful_shutdown=5), stop)
@@ -550,15 +556,20 @@ async def test_a_reply_in_flight_is_one_row_that_grows_on_the_stream(server):
         assert [r["text"] for r in rows if r["type"] == "assistant"][-1] == ended["text"]
 
 
+# Places.offered of a control plane that runs workers on this computer only.
+HERE = [{"id": "local", "label": "This computer", "why": ""},
+        {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
+
+
 class GatedRouter(HeuristicRouter):
     """A router whose model has not answered until `gate` is set."""
 
     def __init__(self) -> None:
         self.gate = asyncio.Event()
 
-    async def plan(self, request, directory):
+    async def plan(self, request, directory, places):
         await self.gate.wait()
-        return await super().plan(request, directory)
+        return await super().plan(request, directory, places)
 
 
 class GatedProvider(LocalProvider):
@@ -577,7 +588,7 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     router = GatedRouter()
     provider = GatedProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, router,
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), local(provider), router,
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -636,7 +647,7 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
 async def test_archiving_stops_hides_and_unarchives(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     provider = GatedProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), local(provider), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -691,7 +702,7 @@ async def test_archiving_a_project_stops_its_threads_and_takes_it_off_the_worker
         destroyed.append(worker.id)
         await destroy(worker)
     provider.destroy = recording_destroy
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), local(provider), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -762,7 +773,7 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
     worker and serves a file as a download."""
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), HeuristicRouter(),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -807,7 +818,7 @@ async def test_files_of_a_thread_browse_and_download(tmp_path, monkeypatch):
 
 async def test_project_settings_change_name_model_and_remote(tmp_path):
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), HeuristicRouter(),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -835,7 +846,7 @@ async def test_project_settings_change_name_model_and_remote(tmp_path):
 
 async def test_a_project_opens_from_a_folder_named_after_it(tmp_path):
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), HeuristicRouter(),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     folder = tmp_path / "my-app"
     folder.mkdir()
@@ -865,7 +876,7 @@ async def test_the_folder_picker_lists_folders_from_home(tmp_path, monkeypatch):
     (tmp_path / "file.txt").write_text("x")
     subprocess.run(["git", "init", "-q", str(tmp_path / "b-app")], check=True)
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), HeuristicRouter(),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -890,7 +901,7 @@ async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypa
     inside the conversation it is rebuilt from."""
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     store = SqliteStore(str(tmp_path / "db.sqlite"))
-    app = create_app(store, LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER),
+    app = create_app(store, local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
                      NoRoutingRouter(), repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -933,14 +944,17 @@ async def test_pasted_images_are_stored_and_served_not_logged(tmp_path, monkeypa
 class NoRoutingRouter:
     """A router that must not be asked: an image-only request needs no plan."""
 
-    async def plan(self, request, directory):
+    async def plan(self, request, directory, places):
         raise AssertionError("the router was asked to plan a request with no text")
+
+    async def place(self, request, places):
+        return "local"
 
 
 async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER),
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
                      NoRoutingRouter(), repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -963,7 +977,7 @@ async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, mon
 
 async def test_the_image_api_refuses_what_it_cannot_take(tmp_path):
     store = SqliteStore(str(tmp_path / "db.sqlite"))
-    app = create_app(store, LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER),
+    app = create_app(store, local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)),
                      NoRoutingRouter(), repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -984,7 +998,7 @@ async def test_the_image_api_refuses_what_it_cannot_take(tmp_path):
             await refused({"text": "   "}, "text or an image")
 
             # A message to a thread needs text or an image too.
-            t = await store.create_thread(pid, "demo", "go")
+            t = await store.create_thread(pid, "demo", "go", "local")
             r = await c.post(f"/api/threads/{t['id']}/messages", json={"body": ""})
             assert r.status_code == 400 and "body or an image" in r.json()["error"]
 
@@ -995,9 +1009,9 @@ async def test_archiving_a_finished_thread_leaves_its_state(tmp_path):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "Done", "d")
+    t = await s.create_thread(p["id"], "Done", "d", "local")
     await s.update_thread(t["id"], state="done")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     got = await orch.archive(t["id"])
     assert got["state"] == "done" and got["archived_at"] is not None
     assert await orch.archive(t["id"]) == got  # archiving twice changes nothing
@@ -1021,14 +1035,14 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     async def replies(tid):
         return [e["payload"]["content"] for e in await s.list_events(p["id"], tid) if e["type"] == "assistant"]
 
-    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w1"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    first = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w1"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     t = await first.spawn(p["id"], "Hello", "build hello")
     await wait_for(lambda: replies(t["id"]))
     await wait_for(lambda: idle(t["id"]))
     await first.close()
-    await first.provider.close()
+    await first.places.close()
 
-    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    second = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w2"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     await second.send(t["id"], "can I download it?")
     got = await wait_for(lambda: _second_reply(replies, t["id"]))
     await wait_for(lambda: idle(t["id"]))  # its work is saved before it goes idle
@@ -1044,7 +1058,7 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
     assert row["worker_id"] == second.by_thread[t["id"]].worker.id and row["state"] == "idle"
     assert await s.list_messages(t["id"], unread_only=True) == []
     await second.close()
-    await second.provider.close()
+    await second.places.close()
     await s.close()
 
 
@@ -1065,7 +1079,7 @@ async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path,
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     idle_one = await orch.spawn(p["id"], "Idle", "first")
 
     async def state(tid, want):
@@ -1110,7 +1124,7 @@ async def test_a_message_finds_a_dead_worker_before_the_watch_does(tmp_path, mon
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def idle():
@@ -1147,7 +1161,7 @@ async def test_a_worker_that_does_not_answer_for_a_while_is_kept(tmp_path, monke
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread[t["id"]]
@@ -1203,7 +1217,7 @@ async def test_a_restarted_runner_lets_its_idle_threads_go_and_they_come_back_on
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread[t["id"]]
@@ -1242,7 +1256,7 @@ async def test_a_turn_a_runner_restart_cuts_short_resumes_on_that_worker(tmp_pat
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "write notes.txt: never")
 
     async def working():
@@ -1283,7 +1297,7 @@ async def test_a_turn_under_way_goes_on_after_a_control_plane_restart(tmp_path, 
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    first = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    first = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await first.spawn(p["id"], "T", "write notes.txt: never")
 
     async def working():
@@ -1292,7 +1306,7 @@ async def test_a_turn_under_way_goes_on_after_a_control_plane_restart(tmp_path, 
     wid = first.by_thread[t["id"]].worker.id
     await first.close()  # its workers are left running, as a stopped control plane leaves them
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     await orch.open_project(p["id"])
 
     async def resumed():
@@ -1325,7 +1339,7 @@ async def test_a_worker_unreachable_for_too_long_is_reattached_and_its_thread_co
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "write notes.txt: kept")
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread[t["id"]]
@@ -1378,7 +1392,7 @@ async def test_respawn_starts_over_a_thread_stuck_being_put_on_a_worker(tmp_path
     await s.open()
     p = await s.create_project("demo")
     provider = HangingOnceProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     assert (await s.get_thread(t["id"]))["binding"] == "binding"
     await orch.send(t["id"], "second")
@@ -1409,7 +1423,7 @@ async def test_respawn_puts_a_bound_thread_on_its_worker_again(tmp_path, monkeyp
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread[t["id"]]
@@ -1436,9 +1450,9 @@ async def test_an_idle_thread_of_an_earlier_control_plane_is_unbound_when_its_pr
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "T", "x")
+    t = await s.create_thread(p["id"], "T", "x", "local")
     await s.update_thread(t["id"], binding="bound", worker_id=f"{p['id']}-w1", state="idle")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     await orch.open_project(p["id"])
     row = await s.get_thread(t["id"])
     assert (row["binding"], row["state"], row["worker_id"]) == ("unbound", "idle", f"{p['id']}-w1")
@@ -1484,7 +1498,7 @@ async def test_respawning_a_thread_that_never_started_gives_it_its_request(tmp_p
     await s.open()
     p = await s.create_project("demo")
     provider = FailingOnceProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def failed():
@@ -1531,7 +1545,7 @@ async def test_respawning_an_idle_thread_with_no_worker_on_record_brings_it_back
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     await wait_for(lambda: idle_of(s, t["id"]))
     lw = orch.by_thread.pop(t["id"])
@@ -1569,7 +1583,7 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def idle():
@@ -1589,7 +1603,7 @@ async def test_a_stopped_thread_takes_its_next_message(tmp_path, monkeypatch):
     await wait_for(answered)
     assert [b["worker"] for b in await binds(s, p["id"], t["id"])][1:] == [ran_on]
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -1600,7 +1614,7 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    first = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    first = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     t = await first.spawn(p["id"], "T", "write build/app: binary")
 
     async def idle():
@@ -1609,11 +1623,11 @@ async def test_a_thread_keeps_its_uncommitted_files_across_a_control_plane_resta
     ran_on = (await s.get_thread(t["id"]))["worker_id"]
     token = first.by_thread[t["id"]].worker.token
     await first.close()
-    await first.provider.close()
+    await first.places.close()
 
     # The next control plane attaches to the same worker, files and all.
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    second = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    second = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     assert "devrunner: echo runner on port" in await second.worker_logs(t["id"], 50)  # before it is attached
     # Reading its files waits for nothing and binds nothing: it says where
     # the thread stands; Respawn puts it back on its worker.
@@ -1649,11 +1663,11 @@ async def test_threads_on_a_projects_own_worker_from_before_the_pool_come_back_o
                            "token": "x", "index": 1})
     await s._exec(s._q("UPDATE workers SET project_id = ? WHERE id = ?"), p["id"], old)
     (tmp_path / "w" / old).mkdir(parents=True)  # its disk
-    ts = [await s.create_thread(p["id"], title, "") for title in ("A", "B")]
+    ts = [await s.create_thread(p["id"], title, "", "local") for title in ("A", "B")]
     for t in ts:
         await s.update_thread(t["id"], worker_id=old, state="idle")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     await orch.start()
     assert not (tmp_path / "w" / old).exists()
     row = {w["id"]: w for w in await s.list_workers()}[old]
@@ -1689,7 +1703,7 @@ async def test_a_message_between_threads_is_one_event_both_list(tmp_path, monkey
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     a = await orch.spawn(p["id"], "A", "first")
     b = await orch.spawn(p["id"], "B", "second")
     await orch.send(b["id"], "hello b", a["id"], 1)
@@ -1703,7 +1717,7 @@ async def test_a_message_between_threads_is_one_event_both_list(tmp_path, monkey
     row = app_mod.display(sent[0])
     assert (row["kind"], row["from"], row["label"]) == (app_mod.K_PEER, a["id"], f"{a['id']} → {b['id']}")
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -1714,8 +1728,8 @@ async def test_old_two_event_peer_messages_merge_into_one(tmp_path):
     s = SqliteStore(path)
     await s.open()
     p = await s.create_project("demo")
-    a = await s.create_thread(p["id"], "A", "")
-    b = await s.create_thread(p["id"], "B", "")
+    a = await s.create_thread(p["id"], "A", "", "local")
+    b = await s.create_thread(p["id"], "B", "", "local")
     await s.close()
     # A log from before events had peer_id: the message is logged on both sides.
     async with aiosqlite.connect(path) as db:
@@ -1741,7 +1755,7 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), HeuristicRouter(), tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
     await orch.handle_request(p["id"], f"@{t['id']} more", "auto")
     await orch.handle_request(p["id"], "direct", "thread", t["id"])
@@ -1749,7 +1763,7 @@ async def test_routed_messages_are_from_the_router(tmp_path, monkeypatch):
            if e["type"] == "message_in"]
     assert got == [("router", f"router → {t['id']}"), ("user", "You")]
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -1796,7 +1810,7 @@ async def test_postgres_store_and_notify(postgres):
     await a.open()
     await b.open()
     p = await a.create_project("pg")
-    t = await a.create_thread(p["id"], "T", "req")
+    t = await a.create_thread(p["id"], "T", "req", "local")
     assert (await b.get_thread(t["id"]))["title"] == "T"
     # An append on instance a wakes a waiter on instance b (LISTEN/NOTIFY).
     waiter = asyncio.create_task(b.wait_events(p["id"], 0, 5.0))
@@ -1872,12 +1886,12 @@ def test_missing_secret_message_names_the_keyring_backend(monkeypatch):
 
 async def test_heuristic_revision_spawns_only_new_items():
     r = HeuristicRouter()
-    plan = await r.revise("- fix login\n- fix export", "- fix login\n- fix signup", ["t_a"], [])
+    plan = await r.revise("- fix login\n- fix export", "- fix login\n- fix signup", ["t_a"], [], HERE)
     assert [s["request"] for s in plan["spawn"]] == ["fix export"] and not plan["send"]
-    plan = await r.revise("fix login, not signup", "fix signup", ["t_a"], [])
+    plan = await r.revise("fix login, not signup", "fix signup", ["t_a"], [], HERE)
     assert not plan["spawn"] and not plan["send"]
     # An edit that reached no thread is planned like a new request.
-    plan = await r.revise("fix login", "fix signup", [], [])
+    plan = await r.revise("fix login", "fix signup", [], [], HERE)
     assert [s["request"] for s in plan["spawn"]] == ["fix login"]
 
 
@@ -1887,7 +1901,7 @@ async def test_editing_a_message_corrects_the_threads_it_reached(tmp_path, monke
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.05")
     router = GatedRouter()
     app = create_app(SqliteStore(str(tmp_path / "db.sqlite")),
-                     LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER), router,
+                     local(LocalProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)), router,
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -1967,7 +1981,7 @@ async def test_worker_logs_go_to_stdout_and_a_lost_worker_says_why(tmp_path, mon
     await s.open()
     p = await s.create_project("demo")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
 
@@ -2005,7 +2019,7 @@ async def test_a_thread_that_never_started_says_why(tmp_path):
             raise RuntimeError("no capacity on sprites")
 
     provider = Broken(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = service.Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = service.Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     try:
         t = await orch.spawn(p["id"], "Echo", "say hi")
         await asyncio.wait({orch.binding[t["id"]]})
@@ -2041,7 +2055,7 @@ async def test_store_keeps_when_a_turn_began_and_what_a_thread_has_not_got_to(tm
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    t = await s.create_thread(p["id"], "T", "do it")
+    t = await s.create_thread(p["id"], "T", "do it", "local")
     assert t["busy_since"] is not None  # a new thread is queued: its first turn has begun
     idle = await s.update_thread(t["id"], state="idle")
     assert idle["busy_since"] is None
@@ -2068,9 +2082,9 @@ class RecordingRouter(HeuristicRouter):
     def __init__(self) -> None:
         self.directories: list[list[dict]] = []
 
-    async def plan(self, request, directory):
+    async def plan(self, request, directory, places):
         self.directories.append(directory)
-        return await super().plan(request, directory)
+        return await super().plan(request, directory, places)
 
 
 async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
@@ -2081,7 +2095,7 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
     await s.open()
     p = await s.create_project("demo")
     router = RecordingRouter()
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER), router, tmp_path / "repos")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)), router, tmp_path / "repos")
     t = await orch.spawn(p["id"], "T", "first")
 
     async def working():
@@ -2100,7 +2114,7 @@ async def test_the_router_sees_how_loaded_each_thread_is(tmp_path, monkeypatch):
         return load == {"level": "idle", "backlog": 0, "busy_for": 0}
     await wait_for(idle, timeout=30)
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -2122,7 +2136,7 @@ async def test_a_full_pool_makes_a_new_thread_wait_for_room_not_a_new_worker(tmp
         made.append(spec.index)
         return await create(spec)
     provider.create = recording_create
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos", pool=1)
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos", pool=1)
     first = await orch.spawn(p["id"], "First", "one")
 
     async def working():
@@ -2152,7 +2166,7 @@ async def test_projects_share_a_worker_and_see_only_their_own_threads(tmp_path, 
     await s.open()
     a, b = await s.create_project("a"), await s.create_project("b")
     provider = LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos")
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
     ta = await orch.spawn(a["id"], "Mine", "first")
     tb = await orch.spawn(b["id"], "Theirs", "second")
     await wait_for(lambda: idle_of(s, ta["id"]))
@@ -2200,7 +2214,7 @@ async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it
             return await super().create(spec)
 
     provider = SlowSecondSlot(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
-    orch = Orchestrator(s, provider, HeuristicRouter(), tmp_path / "repos", pool=2)
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos", pool=2)
     a = await orch.spawn(p["id"], "A", "one")
 
     async def working():
@@ -2209,7 +2223,7 @@ async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it
     b = await orch.spawn(p["id"], "B", "two")
 
     async def b_waits():
-        return "waiting for worker slot 2" in (await s.get_thread(b["id"]))["activity"] or None
+        return "waiting for local worker slot 2" in (await s.get_thread(b["id"]))["activity"] or None
     await wait_for(b_waits)
     await wait_for(lambda: idle_of(s, a["id"]))
     c = await orch.spawn(p["id"], "C", "three")
@@ -2217,14 +2231,14 @@ async def test_a_worker_slow_to_come_up_holds_up_only_the_threads_waiting_for_it
     assert (await s.get_thread(c["id"]))["worker_id"] == "w1"
     assert (await s.get_thread(b["id"]))["binding"] == "binding"
     text = await orch.worker_logs(b["id"])
-    assert "picking a worker of the pool ..." in text and "waiting for worker slot 2 to come up ..." in text
+    assert "picking a worker of the pool ..." in text and "waiting for local worker slot 2 to come up ..." in text
     assert "worker slot 2, which it waits on:" in text and "making or finding its worker" in text
 
     provider.gate.set()
     await wait_for(lambda: idle_of(s, b["id"]))
     assert [lw.worker.id for lw in orch.workers] == ["w1", "w2"]
     text = await orch.worker_logs(b["id"])
-    assert "waiting for worker slot 2 to come up: done in" in text and "bound: on worker w" in text
+    assert "waiting for local worker slot 2 to come up: done in" in text and "bound: on worker w" in text
     await orch.close()
     await provider.close()
     await s.close()
@@ -2235,7 +2249,7 @@ async def test_reading_files_never_waits_for_a_binding(tmp_path, monkeypatch):
     (409, with where it stands) instead of holding the request open."""
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
     provider = GatedProvider(workdir=str(tmp_path / "workers"), command=ECHO_RUNNER)
-    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), provider, HeuristicRouter(),
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), local(provider), HeuristicRouter(),
                      repos=str(tmp_path / "repos"))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
@@ -2253,3 +2267,76 @@ async def test_reading_files_never_waits_for_a_binding(tmp_path, monkeypatch):
                 r = await c.get(f"/api/threads/{tid}/files?path=")
                 return r.status_code == 200 or None
             await wait_for(listed)
+
+
+class StandInSprites(LocalProvider):
+    """Runs echo runners on this machine under the Sprites place's name, so a
+    test can have two places without the Sprites API."""
+    name = "sprites"
+
+    @staticmethod
+    def worker_name(index: int) -> str:
+        return f"s{index}"
+
+
+async def test_the_router_puts_a_thread_where_its_request_says(tmp_path):
+    """Threads go on Sprites unless the request says to run locally; a place
+    this control plane runs no workers in is never picked, and saying so
+    to an existing thread moves it."""
+    from control.providers import Places
+
+    places = Places({"local": LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
+                     "sprites": StandInSprites(workdir=str(tmp_path / "s"), command=ECHO_RUNNER)})
+    app = create_app(SqliteStore(str(tmp_path / "db.sqlite")), places, HeuristicRouter(),
+                     repos=str(tmp_path / "repos"))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                     timeout=20) as c:
+            assert [p["id"] for p in (await c.get("/api/places")).json()] == ["local", "sprites"]
+            pid = (await c.post("/api/projects", json={"name": "demo"})).json()["id"]
+            cloud = (await c.post(f"/api/projects/{pid}/requests",
+                                  json={"text": "add a login page", "mode": "new"})).json()["spawned"][0]["id"]
+            here = (await c.post(f"/api/projects/{pid}/requests",
+                                 json={"text": "fix the docs, run it locally", "mode": "auto"})).json()
+
+            async def bound(tid):
+                t = (await c.get(f"/api/threads/{tid}")).json()
+                return t if t["binding"] == "bound" else None
+            assert (await wait_for(lambda: bound(cloud)))["worker_id"] == "s1"
+
+            async def routed():
+                return [e for e in (await c.get(f"/api/projects/{pid}/log")).json()
+                        if e.get("type") == "route" and e["payload"].get("spawned")
+                        and e["payload"]["mode"] == "auto"] or None
+            local_tid = (await wait_for(routed))[0]["payload"]["spawned"][0]["id"]
+            t = await wait_for(lambda: bound(local_tid))
+            assert (t["workers"], t["worker_id"]) == ("local", "w1")
+
+            # "run locally" in a request that goes to the cloud thread moves it.
+            await c.post(f"/api/projects/{pid}/requests",
+                         json={"text": f"@{cloud} run this locally too", "mode": "auto"})
+
+            async def moved():
+                t = (await c.get(f"/api/threads/{cloud}")).json()
+                return t if t["worker_id"] == "w1" and t["binding"] == "bound" else None
+            assert (await wait_for(moved))["workers"] == "local"
+
+
+async def test_sprites_without_a_token_is_never_picked(tmp_path):
+    from control.service import Orchestrator
+
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
+                        HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "do it")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    assert (await s.get_thread(t["id"]))["workers"] == "local"
+    with pytest.raises(PlaceRefused, match="cannot run on Sprites"):
+        await orch.spawn(p["id"], "U", "do it", workers="sprites")
+    with pytest.raises(PlaceRefused, match="cannot run on Sprites"):
+        await orch.move(t["id"], "sprites")
+    await orch.close()
+    await orch.places.close()
+    await s.close()

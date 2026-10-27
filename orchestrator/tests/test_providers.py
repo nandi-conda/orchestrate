@@ -104,28 +104,31 @@ class Recording:
         pass
 
 
-async def test_a_token_means_sprites(env):
-    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
-    local, sprites = Recording("local"), Recording("sprites")
-    p = providers.AutoProvider(local=local, sprites=sprites)
-    worker = await p.create(worker_spec(1))
-    assert worker.provider == "sprites" and sprites.created and not local.created
+def test_without_a_token_sprites_are_refused_by_name(env):
+    """Sprites without SPRITES_TOKEN is refused, saying which credential and
+    how it is sent; no other place stands in for it."""
+    env.setattr(secrets, "get_secret", lambda name: "deepseek" if name == "DEEPSEEK_API_KEY" else None)
+    places = providers.default_places()
+    assert "sprites" not in places.providers
+    with pytest.raises(providers.PlaceRefused, match="SPRITES_TOKEN.*Authorization: Bearer"):
+        places.provider("sprites")
+    offered = {p["id"]: p for p in places.offered()}
+    assert offered["sprites"]["label"] == "Sprites" and "SPRITES_TOKEN" in offered["sprites"]["why"]
 
 
-async def test_no_token_means_local_workers(env, capsys):
-    local = Recording("local")
-    p = providers.AutoProvider(local=local)
-    await p.create(worker_spec(1))
-    assert local.created
-    assert "SPRITES_TOKEN is not stored" in capsys.readouterr().err
+def test_a_token_offers_sprites_and_this_computer(env):
+    env.setattr(secrets, "get_secret", lambda name: {"SPRITES_TOKEN": "tok", "DEEPSEEK_API_KEY": "k"}.get(name))
+    places = providers.default_places()
+    assert set(places.providers) == {"local", "sprites"}
+    assert [(p["id"], p["why"]) for p in places.offered()] == [("local", ""), ("sprites", "")]
 
 
-async def test_destroy_goes_to_the_provider_that_made_the_worker(env):
-    local, sprites = Recording("local"), Recording("sprites")
-    p = providers.AutoProvider(local=local, sprites=sprites)
-    worker = providers.Worker(id="x", provider="sprites", handle="x", url="u")
-    await p.destroy(worker)
-    assert sprites.destroyed == [worker] and not local.destroyed
+def test_a_place_nobody_offers_says_why():
+    places = providers.Places({"sprites": Recording("sprites")}, {"local": "not on a phone"})
+    with pytest.raises(providers.PlaceRefused, match="This computer: not on a phone"):
+        places.provider("local")
+    with pytest.raises(providers.PlaceRefused, match="none of"):
+        places.provider("moon")
 
 
 def test_passthrough_env_reads_a_keyring_only_secret(env):
@@ -225,7 +228,7 @@ async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
     r = ModelRouter("key")
     monkeypatch.setattr(r, "_ask", empty)
     with pytest.raises(ValueError, match="planned nothing"):
-        await r.plan("do it", [])
+        await r.plan("do it", [], [])
 
 
 async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(env):
@@ -518,7 +521,41 @@ async def test_local_sweep_deletes_worker_directories_outside_the_slots(tmp_path
     assert sorted(d.name for d in tmp_path.iterdir()) == ["w1", "w2"]
 
 
-async def test_auto_sweeps_the_provider_the_pool_is_on(env):
-    env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
-    p = providers.AutoProvider(local=Recording("local"), sprites=Recording("sprites"))
-    assert await p.sweep(3) == ["sprites-swept-beyond-3"]
+async def test_threads_from_before_places_get_where_they_ran(tmp_path):
+    """A thread from before threads had a place gets the one its worker was
+    in; one never on a worker is left for the router."""
+    from control.service import Orchestrator
+    from control.store import SqliteStore
+    from tests.doubles import HeuristicRouter
+
+    store = SqliteStore(str(tmp_path / "db.sqlite"))
+    await store.open()
+    p = await store.create_project("old")
+    old = await store.create_thread(p["id"], "Old", "o", "")
+    new = await store.create_thread(p["id"], "New", "n", "")
+    await store.upsert_worker({"id": "orch-w1", "provider": "sprites", "handle": "orch-w1", "url": "u",
+                               "token": "t", "capacity": 16, "index": 1})
+    await store.update_thread(old["id"], worker_id="orch-w1")
+    orch = Orchestrator(store, providers.Places({"local": Recording("local"), "sprites": Recording("sprites")}),
+                        HeuristicRouter(), tmp_path / "repos")
+    await orch.start()
+    assert (await store.get_thread(old["id"]))["workers"] == "sprites"
+    assert (await store.get_thread(new["id"]))["workers"] == ""
+    await store.close()
+
+
+async def test_the_router_model_never_places_a_thread_where_workers_cannot_run(monkeypatch):
+    from control.router import ModelRouter
+
+    places = [{"id": "local", "label": "This computer", "why": ""},
+              {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
+    r = ModelRouter("key")
+
+    async def answer(system, content):
+        assert content["places"] == places and "run locally" in system
+        return {"workers": "sprites"}
+    monkeypatch.setattr(r, "_json", answer)
+    with pytest.raises(ValueError, match="picked no place"):
+        await r.place("do it", places)
+    monkeypatch.setattr(r, "_json", lambda *_: asyncio.sleep(0, {"workers": "local"}))
+    assert await r.place("do it", places) == "local"

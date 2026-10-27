@@ -11,7 +11,7 @@
 | `control/store.py` | the `Store` interface, `SqliteStore`, `PostgresStore` |
 | `control/hub.py` | the per-project hub repository: join a remote, take a thread's refs, land |
 | `control/gitio.py` | git subprocess and bundle helpers |
-| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `AutoProvider` |
+| `control/providers.py` | `WorkerProvider`, `LocalProvider`, `SpritesProvider`, `Places` (where threads' workers can run, and why not) |
 | `control/runner_client.py` | HTTP client for the runner API |
 | `tests/devrunner.py` | the tests' echo runner, speaking the same API with no model |
 | `control/paths.py` | where the data lives (`~/.orchestrate`), and the one-time move from the checkout |

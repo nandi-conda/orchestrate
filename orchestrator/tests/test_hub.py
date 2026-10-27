@@ -12,7 +12,7 @@ import pytest
 from control.gitio import GitError
 from control.hub import Hub
 from control.providers import LocalProvider
-from tests.doubles import ECHO_RUNNER, HeuristicRouter
+from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
 from control.service import Orchestrator
 from control.store import SqliteStore
 
@@ -48,7 +48,7 @@ async def setup(tmp_path, repo_url="", workers="w"):
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
     p = await s.create_project("demo")
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / workers), command=ECHO_RUNNER),
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / workers), command=ECHO_RUNNER)),
                         HeuristicRouter(), tmp_path / "repos")
     if repo_url:
         p = await orch.update_project(p["id"], repo_url=repo_url)
@@ -145,7 +145,7 @@ async def test_every_turn_lands_on_the_hub(tmp_path):
     assert set(git(hub, "ls-tree", "--name-only", "main").split()) == {"a.txt", "b.txt", *pixi}
     assert git(hub, "rev-list", "--merges", "--count", "main") == "0"
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -170,7 +170,7 @@ async def test_landing_rebases_onto_what_landed_before_and_conflicts_go_back(tmp
     wt = tmp_path / "w" / "w1" / c["id"]
     assert git(wt, "rev-parse", "origin/main") == git(hub, "rev-parse", "main")
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -194,7 +194,7 @@ async def test_a_project_repository_gets_the_landing_first_and_nothing_else(tmp_
         "notes.txt", "theirs.txt", "a.txt", "b.txt", "pixi.toml", ".gitignore", ".gitattributes"}
     assert git(bare, "for-each-ref", "--format=%(refname)") == "refs/heads/trunk"  # no thread branches
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -207,10 +207,10 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
     assert "build" not in git(hub, "ls-tree", "--name-only", f"thread/{t['id']}").split()
     assert git(hub, "show", f"refs/snapshots/{t['id']}:build/app") == "binary"
     await first.close()
-    await first.provider.close()
+    await first.places.close()
 
     # Its worker's disk is gone: the next control plane makes the worker again in a new directory.
-    second = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w2"), command=ECHO_RUNNER),
+    second = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w2"), command=ECHO_RUNNER)),
                           HeuristicRouter(), tmp_path / "repos")
     await second.respawn(t["id"])
 
@@ -223,7 +223,7 @@ async def test_a_thread_on_a_fresh_worker_gets_its_ignored_files_from_the_hub(tm
     assert (await r.aread()) == b"code\n"
     await r.aclose()
     await second.close()
-    await second.provider.close()
+    await second.places.close()
     await s.close()
 
 
@@ -252,7 +252,7 @@ async def test_an_empty_remote_gets_the_projects_history(tmp_path):
     await orch.update_project(p["id"], repo_url=str(empty))
     assert git(empty, "rev-parse", "main") == landed["commit"]
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -270,7 +270,7 @@ async def test_a_remote_with_another_history_is_refused(tmp_path):
     assert git(hub, "for-each-ref", "--format=%(refname)", "refs/orchestrate") == ""
     assert git(bare, "log", "--format=%s", "trunk") == "init"  # not made a pixi project either
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -299,7 +299,7 @@ async def test_a_remote_ahead_or_behind_follows_and_removing_it_keeps_the_hub(tm
     await orch.update_project(p["id"], repo_url=str(bare))
     assert git(hub, "rev-parse", "trunk") == git(bare, "rev-parse", "trunk")
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -357,7 +357,7 @@ async def test_a_thread_begun_before_the_remote_lands_on_it_without_the_hubs_sta
                                                                          "ignore build", "init"]
     assert git(bare, "show", "trunk:a.txt") == "one"
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -365,7 +365,7 @@ async def opened(tmp_path, folder):
     """A project opened from `folder` on disk, and its orchestrator."""
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
                         HeuristicRouter(), tmp_path / "repos")
     p = await orch.create_project("demo", "", str(folder))
     return s, p, orch
@@ -404,7 +404,7 @@ async def test_a_project_opened_from_a_checkout_lands_in_its_files(tmp_path):
     assert git(hub, "rev-parse", "trunk") == before and not (seed / "c.txt").exists()
     assert (seed / "notes.txt").read_text() == "editing\n"
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -425,7 +425,7 @@ async def test_a_folder_that_is_not_a_repository_becomes_one_with_its_files(tmp_
     assert (folder / "pixi.toml").exists() and (folder / "secret.txt").exists()
     assert git(folder, "status", "--porcelain") == ""
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -454,7 +454,7 @@ async def test_a_folder_starts_from_what_it_has_not_committed(tmp_path):
     assert git(seed, "rev-parse", "HEAD") == landed["commit"] and (seed / "a.txt").exists()
     await wait_for(lambda: idle(s, t["id"]))
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -465,7 +465,7 @@ async def test_a_folder_with_nothing_to_commit_gets_no_commit(tmp_path):
     s, p, orch = await opened(tmp_path, seed)
     assert git(seed, "rev-parse", "HEAD") == head == git(orch.hub_path(p["id"]), "rev-parse", "trunk")
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -480,7 +480,7 @@ async def test_a_gitignore_that_ignores_itself_is_kept(tmp_path):
     assert git(hub, "show", "main~1:.gitignore") == ".*"
     assert (folder / ".gitignore").read_text().splitlines()[:2] == [".*", "# pixi environments"]
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()
 
 
@@ -490,7 +490,7 @@ async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
     git(seed, "checkout", "-q", "--detach")
     s = SqliteStore(str(tmp_path / "db.sqlite"))
     await s.open()
-    orch = Orchestrator(s, LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER),
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
                         HeuristicRouter(), tmp_path / "repos")
     for folder, reason in ((tmp_path / "nope", "there is no folder"),
                            (seed / "sub", "inside the git repository"),
@@ -501,5 +501,5 @@ async def test_a_folder_that_cannot_be_opened_leaves_nothing_behind(tmp_path):
     assert await s.list_projects() == []
     assert list((tmp_path / "repos").iterdir()) == []
     await orch.close()
-    await orch.provider.close()
+    await orch.places.close()
     await s.close()

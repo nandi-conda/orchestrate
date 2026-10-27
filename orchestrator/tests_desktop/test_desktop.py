@@ -221,7 +221,7 @@ def test_copying_a_reply_puts_its_markdown_on_the_clipboard(qtbot, up, tmp_path)
         s = SqliteStore(str(tmp_path / "db.sqlite"))
         await s.open()
         p = await s.create_project("copy")
-        t = await s.create_thread(p["id"], "a thread", "do it")
+        t = await s.create_thread(p["id"], "a thread", "do it", "local")
         await s.append_event(p["id"], t["id"], "assistant", {"content": reply})
         await s.close()
         return p["id"]

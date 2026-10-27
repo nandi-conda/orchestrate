@@ -2,9 +2,15 @@
 
 A plan spawns new threads, sends messages to existing ones, or both:
 
-    {"spawn": [{"title": "...", "request": "..."}],
-     "send":  [{"thread": "t_42", "message": "..."}],
+    {"spawn": [{"title": "...", "request": "...", "workers": "sprites"}],
+     "send":  [{"thread": "t_42", "message": "...", "workers": "local"}],
      "why": "..."}
+
+The router also decides where each thread's workers run (providers.PLACES):
+on Sprites unless the request asks to run on the person's own computer
+("run it locally"). `workers` on a send moves that thread there. A thread
+spawned without one (a new thread typed straight in, or one the plan left
+it off) is asked about with `place` when it is first put on a worker.
 
 When the person edits a request they sent, `revise` plans the edited text.
 Every thread the request already reached gets the edit as a correction from
@@ -35,10 +41,24 @@ waiting on it) or "stalled" (its worker is not answering, so anything sent
 waits); `busy_for` is seconds into its current turn.
 """
 
+PLACES = """Each thread's work runs on workers in one of `places`: "sprites" (cloud
+machines) unless the person asks for their own computer ("run locally", "on my
+machine", "on this computer", "don't use sprites"), then "local". A place with a
+non-empty `why` is unavailable: never pick it; pick the other one. Each thread
+has its `workers` in the directory. Give every spawned thread "workers". Give a
+send "workers" only when the request asks to move that thread to the other place.
+"""
+
 REPLY_FORMAT = """Reply with JSON only:
-{"spawn": [{"title": "<3-6 word title>", "request": "<the task for that thread>"}],
- "send": [{"thread": "<existing thread id>", "message": "<what to tell it>"}],
+{"spawn": [{"title": "<3-6 word title>", "request": "<the task for that thread>", "workers": "sprites|local"}],
+ "send": [{"thread": "<existing thread id>", "message": "<what to tell it>", "workers": "<only to move it>"}],
  "why": "<one sentence>"}"""
+
+PLACE = """A request in a software project starts an agent thread. Decide where its
+workers run, one of `places`: "sprites" (cloud machines) unless the request asks
+for the person's own computer ("run locally", "on my machine", "on this computer",
+"don't use sprites"), then "local". A place with a non-empty `why` is unavailable:
+never pick it. Reply with JSON only: {"workers": "sprites|local"}"""
 
 SYSTEM = """You route requests in a software project to agent threads.
 Each thread is a long-lived agent working in its own git worktree.
@@ -50,7 +70,7 @@ also spawn threads and notify existing threads whose work it touches.
 (a correction, something it needs); new work, even work that follows on from
 it, goes to a new thread instead. Send a backed_up or stalled thread nothing
 it could do without: its messages wait behind the rest.
-
+""" + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -66,15 +86,20 @@ example that a part it had now has its own thread). An empty plan is a fine
 answer when the corrections cover the edit.
 """ + LOAD + """Send a busy thread only what concerns the work it is doing now, and a
 backed_up or stalled thread nothing it could do without.
-
+""" + PLACES + """
 """ + REPLY_FORMAT
 
 
 class Router(Protocol):
-    async def plan(self, request: str, directory: list[dict]) -> dict: ...
+    async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
+        """Plan a request; `places` is where workers can run (Places.offered)."""
 
-    async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict]) -> dict:
+    async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict],
+                     places: list[dict]) -> dict:
         """Plan an edited request; `reached` are the threads the earlier text reached."""
+
+    async def place(self, request: str, places: list[dict]) -> str:
+        """Where a new thread with this request runs: an available place's id."""
 
 
 def title_for(text: str) -> str:
@@ -83,13 +108,22 @@ def title_for(text: str) -> str:
     return (title[:60] + "…") if len(title) > 60 else (title or "New thread")
 
 
-def clean_plan(plan: dict, directory: list[dict]) -> dict:
-    """Keep only well-formed entries that point at real threads."""
-    known = {t["id"] for t in directory}
+def available(places: list[dict]) -> set[str]:
+    return {p["id"] for p in places if not p["why"]}
+
+
+def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
+    """Keep only well-formed entries that point at real threads, each with
+    `workers` an available place, or "" (spawn: asked with `place` when it
+    is first put on a worker; send: not moved)."""
+    known, can = {t["id"] for t in directory}, available(places)
+
+    def where(s: dict) -> str:
+        return s["workers"] if s.get("workers") in can else ""
     spawn = [{"title": str(s.get("title") or title_for(str(s.get("request", ""))))[:80],
-              "request": str(s["request"])}
+              "request": str(s["request"]), "workers": where(s)}
              for s in plan.get("spawn") or [] if isinstance(s, dict) and s.get("request")]
-    send = [{"thread": s["thread"], "message": str(s["message"])}
+    send = [{"thread": s["thread"], "message": str(s["message"]), "workers": where(s)}
             for s in plan.get("send") or []
             if isinstance(s, dict) and s.get("thread") in known and s.get("message")]
     return {"spawn": spawn, "send": send, "why": str(plan.get("why", ""))}
@@ -102,26 +136,38 @@ class ModelRouter:
         self.http = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0,
                                       headers={"authorization": f"Bearer {api_key}"})
 
-    async def _ask(self, system: str, content: dict, directory: list[dict]) -> dict:
-        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load")} for t in directory]
+    async def _json(self, system: str, content: dict) -> dict:
         r = await self.http.post("/chat/completions", json={
             "model": self.model,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": json.dumps({"threads": threads, **content})}],
+                         {"role": "user", "content": json.dumps(content)}],
         })
         r.raise_for_status()
-        return clean_plan(json.loads(r.json()["choices"][0]["message"]["content"]), directory)
+        return json.loads(r.json()["choices"][0]["message"]["content"])
 
-    async def plan(self, request: str, directory: list[dict]) -> dict:
-        plan = await self._ask(SYSTEM, {"request": request}, directory)
+    async def _ask(self, system: str, content: dict, directory: list[dict], places: list[dict]) -> dict:
+        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load", "workers")}
+                   for t in directory]
+        got = await self._json(system, {"threads": threads, "places": places, **content})
+        return clean_plan(got, directory, places)
+
+    async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
+        plan = await self._ask(SYSTEM, {"request": request}, directory, places)
         if not plan["spawn"] and not plan["send"]:
             raise ValueError(f"the router model ({self.model}) planned nothing for the request")
         return plan
 
-    async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict]) -> dict:
+    async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict],
+                     places: list[dict]) -> dict:
         return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
-                               directory)
+                               directory, places)
+
+    async def place(self, request: str, places: list[dict]) -> str:
+        got = (await self._json(PLACE, {"request": request, "places": places})).get("workers")
+        if got not in available(places):
+            raise ValueError(f"the router model ({self.model}) picked no place workers can run in: {got!r}")
+        return got
 
 
 ROUTER_MODEL = "deepseek-flash"

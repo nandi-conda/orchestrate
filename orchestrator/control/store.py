@@ -72,8 +72,9 @@ class Store(Protocol):
         control plane connects the hub to it first, Orchestrator.update_project),
         or archived_at (Orchestrator.archive_project)."""
 
-    async def create_thread(self, project_id: str, title: str, request: str,
-                            parent_id: str | None = None) -> dict: ...
+    async def create_thread(self, project_id: str, title: str, request: str, workers: str,
+                            parent_id: str | None = None) -> dict:
+        """A new thread whose workers run on `workers` (providers.PLACES)."""
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         """The project's threads that are not archived, or with archived=True
         only the archived ones; working (queued or working) threads first,
@@ -195,11 +196,15 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
-                 "archived_at", "binding", "binding_reason")
+                 "archived_at", "binding", "binding_reason", "workers")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
+# A thread's `workers` is where its workers run (providers.PLACES), as the
+# router decided; "" only in a database from before threads had a place,
+# until Orchestrator.start fills it in.
 ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
+                 ("threads", "workers", "TEXT NOT NULL DEFAULT ''"),
                  ("threads", "activity", "TEXT NOT NULL DEFAULT ''"),
                  ("threads", "archived_at", "DOUBLE PRECISION"),
                  ("workers", "idx", "INTEGER NOT NULL DEFAULT 0"),
@@ -278,10 +283,11 @@ class _SqlStore:
         return await self.get_project(project_id)
 
     # threads
-    async def create_thread(self, project_id: str, title: str, request: str,
+    async def create_thread(self, project_id: str, title: str, request: str, workers: str,
                             parent_id: str | None = None) -> dict:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
+               "workers": workers,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
                "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
                "busy_since": t}
