@@ -56,9 +56,13 @@ async def chat(req: Request):
     msgs = body["messages"]
     if msgs[0]["role"] == "system" and msgs[0]["content"].startswith("You route requests"):
         ask = json.loads(msgs[-1]["content"])
-        plan = {"spawn": [{"title": "Fake routed thread", "request": ask["request"]}], "send": [],
-                "why": "fake model plan"}
-        return reply({"role": "assistant", "content": json.dumps(plan)})
+        plan = {"spawn": [{"title": "Fake routed thread", "request": ask["request"],
+                           "workers": body["tools"][0]["function"]["parameters"]["properties"]["spawn"]
+                           ["items"]["properties"]["workers"]["enum"][0]}],
+                "send": [], "why": "fake model plan"}
+        return reply({"role": "assistant", "content": "",
+                      "tool_calls": [{"id": "call_route", "type": "function",
+                                      "function": {"name": "route", "arguments": json.dumps(plan)}}]})
     return reply(agent_reply(msgs))
 
 
@@ -70,7 +74,9 @@ def agent_reply(msgs: list[dict]) -> dict:
                             "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})}}]}
 
 
-app = Starlette(routes=[Route("/chat/completions", chat, methods=["POST"])])
+# The router asks on DeepSeek's /beta base URL (strict tool calls), the runner on the plain one.
+app = Starlette(routes=[Route("/chat/completions", chat, methods=["POST"]),
+                        Route("/beta/chat/completions", chat, methods=["POST"])])
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]) if len(sys.argv) > 1 else 9999, log_level="warning")

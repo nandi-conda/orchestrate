@@ -229,6 +229,59 @@ async def test_a_router_model_that_plans_nothing_is_an_error(monkeypatch):
         await r.plan("do it", [], [])
 
 
+def router_answering(message: dict, seen: list):
+    """A ModelRouter whose model answers every request with `message`."""
+    from control.router import ModelRouter
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "stop"}]})
+    r = ModelRouter("key")
+    r.http = httpx.AsyncClient(base_url="https://api.deepseek.com/beta", transport=httpx.MockTransport(handle))
+    return r
+
+
+def route_call(plan: dict) -> dict:
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "route", "arguments": json.dumps(plan)}}]}
+
+
+async def test_the_router_model_answers_with_one_forced_strict_route_call():
+    """The plan is the arguments of a `route` call the model is made to make,
+    in strict mode (so they have the plan's schema), with thinking off."""
+    places = [{"id": "local", "label": "This computer", "why": ""},
+              {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
+    seen: list = []
+    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local"}],
+                                     "send": [{"thread": "t_1", "message": "heads up", "workers": ""}],
+                                     "why": "new work"}), seen)
+    plan = await r.plan("fix it", [{"id": "t_1", "title": "Old"}], places)
+    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local"}],
+                    "send": [{"thread": "t_1", "message": "heads up", "workers": ""}], "why": "new work"}
+    body = seen[0]
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "route"}}
+    fn = body["tools"][0]["function"]
+    assert fn["strict"] is True and fn["name"] == "route"
+    props = fn["parameters"]["properties"]
+    assert props["spawn"]["items"]["properties"]["workers"]["enum"] == ["local"]
+    assert props["send"]["items"]["properties"]["thread"]["enum"] == ["t_1"]
+    assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
+    # With no threads there is nothing to send to, so the schema has no send.
+    await r.plan("fix it", [], places)
+    assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
+
+
+async def test_a_router_answer_that_is_not_a_route_call_is_an_error_saying_what_came_back():
+    r = router_answering({"role": "assistant", "content": "I would spawn a thread"}, [])
+    with pytest.raises(ValueError, match="did not call route once.*I would spawn a thread"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
+    r = router_answering(route_call({"spawn": [], "why": "nothing asked"}), [])
+    with pytest.raises(ValueError, match="planned nothing.*nothing asked"):
+        await r.plan("fix it", [], [{"id": "sprites", "label": "Sprites", "why": ""}])
+
+
 async def test_sprites_create_checks_for_the_model_key_before_creating_a_sprite(env):
     env.setattr(secrets, "get_secret", lambda name: "tok" if name == "SPRITES_TOKEN" else None)
     p = providers.SpritesProvider(source="https://example.com/fork.git", ref="dev")
@@ -689,11 +742,12 @@ async def test_the_router_model_never_places_a_thread_where_workers_cannot_run(m
               {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
     r = ModelRouter("key")
 
-    async def answer(system, content):
+    async def answer(system, content, tool):
         assert content["places"] == places and "run locally" in system
+        assert tool["parameters"]["properties"]["workers"]["enum"] == ["local"]
         return {"workers": "sprites"}
-    monkeypatch.setattr(r, "_json", answer)
+    monkeypatch.setattr(r, "_call", answer)
     with pytest.raises(ValueError, match="picked no place"):
         await r.place("do it", places)
-    monkeypatch.setattr(r, "_json", lambda *_: asyncio.sleep(0, {"workers": "local"}))
+    monkeypatch.setattr(r, "_call", lambda *_: asyncio.sleep(0, {"workers": "local"}))
     assert await r.place("do it", places) == "local"

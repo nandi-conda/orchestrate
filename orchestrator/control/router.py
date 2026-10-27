@@ -19,10 +19,12 @@ corrections leave out: threads for parts none of them covers, and notes to
 threads about what changed for them. An empty revision is a fine answer.
 
 `ModelRouter` asks a fast OpenAI-compatible model (deepseek-flash by default)
-with the thread directory as context, each thread with its load (load.py), so
-busy and backed-up threads get no new work: it goes to a new thread.
-It leans toward spawning. A request it cannot plan (the model unreachable,
-an answer that is not a plan) is an error the project shows; there is no
+to call a function whose schema is the plan, with the thread directory as
+context, each thread with its load (load.py), so busy and backed-up threads
+get no new work: it goes to a new thread. It leans toward spawning. A request
+it cannot plan (the model unreachable or refusing the call, an answer that is
+not one call of that function, a plan that does nothing) is an error the
+project shows, with what the model said; there is no
 model-less router outside the tests (tests/doubles.py).
 """
 
@@ -45,20 +47,19 @@ PLACES = """Each thread's work runs on workers in one of `places`: "sprites" (cl
 machines) unless the person asks for their own computer ("run locally", "on my
 machine", "on this computer", "don't use sprites"), then "local". A place with a
 non-empty `why` is unavailable: never pick it; pick the other one. Each thread
-has its `workers` in the directory. Give every spawned thread "workers". Give a
-send "workers" only when the request asks to move that thread to the other place.
+has its `workers` in the directory. Give every spawned thread "workers". A send's
+"workers" is "" unless the request asks to move that thread to the other place.
 """
 
-REPLY_FORMAT = """Reply with JSON only:
-{"spawn": [{"title": "<3-6 word title>", "request": "<the task for that thread>", "workers": "sprites|local"}],
- "send": [{"thread": "<existing thread id>", "message": "<what to tell it>", "workers": "<only to move it>"}],
- "why": "<one sentence>"}"""
+REPLY_FORMAT = """Answer by calling `route` once: `spawn` lists the new threads (each with a
+3-6 word title, its task and its workers), `send` the messages to existing
+threads, and `why` says in one sentence why."""
 
 PLACE = """A request in a software project starts an agent thread. Decide where its
 workers run, one of `places`: "sprites" (cloud machines) unless the request asks
 for the person's own computer ("run locally", "on my machine", "on this computer",
 "don't use sprites"), then "local". A place with a non-empty `why` is unavailable:
-never pick it. Reply with JSON only: {"workers": "sprites|local"}"""
+never pick it. Answer by calling `place` once."""
 
 SYSTEM = """You route requests in a software project to agent threads.
 Each thread is a long-lived agent working in its own git worktree.
@@ -129,33 +130,85 @@ def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
     return {"spawn": spawn, "send": send, "why": str(plan.get("why", ""))}
 
 
+def plan_tool(directory: list[dict], places: list[dict]) -> dict:
+    """The `route` function the model must call: its schema is the plan's, so
+    the answer has the plan's shape (strict mode). A spawn's `workers` is an
+    available place; a send's is one, or "" to leave the thread where it is.
+    `send` is offered only when there are threads to send to, and names one
+    of them."""
+    can = sorted(available(places))
+    # Nowhere to run: the thread is refused when it is first put on a worker.
+    spawn = {"type": "object", "additionalProperties": False,
+             "required": ["title", "request", "workers"],
+             "properties": {"title": {"type": "string", "description": "3-6 word title"},
+                            "request": {"type": "string", "description": "the task for that thread"},
+                            "workers": {"type": "string", "enum": can or [""]}}}
+    props = {"spawn": {"type": "array", "items": spawn},
+             "why": {"type": "string", "description": "one sentence"}}
+    if directory:
+        props["send"] = {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["thread", "message", "workers"],
+            "properties": {"thread": {"type": "string", "enum": [t["id"] for t in directory]},
+                           "message": {"type": "string", "description": "what to tell it"},
+                           "workers": {"type": "string", "enum": [""] + can,
+                                       "description": "\"\" unless the request moves the thread"}}}}
+    return {"name": "route", "description": "Route the request: the threads to spawn and the messages to send.",
+            "parameters": {"type": "object", "additionalProperties": False,
+                           "required": list(props), "properties": props}}
+
+
+def place_tool(places: list[dict]) -> dict:
+    return {"name": "place", "description": "Say where the new thread's workers run.",
+            "parameters": {"type": "object", "additionalProperties": False, "required": ["workers"],
+                           "properties": {"workers": {"type": "string",
+                                                      "enum": sorted(available(places)) or [""]}}}}
+
+
 class ModelRouter:
+    """Asks the model to call one function (`route` or `place`) whose JSON
+    schema is the answer's shape: a forced tool call in strict mode, which
+    DeepSeek serves on its /beta base URL and only with thinking off (a
+    forced tool_choice is refused in thinking mode, and routing is meant to
+    be fast). The arguments of that call are the answer."""
+
     def __init__(self, api_key: str, model: str = "deepseek-flash",
-                 base_url: str = "https://api.deepseek.com") -> None:
+                 base_url: str = "https://api.deepseek.com/beta") -> None:
         self.model = model
         self.http = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0,
                                       headers={"authorization": f"Bearer {api_key}"})
 
-    async def _json(self, system: str, content: dict) -> dict:
+    async def _call(self, system: str, content: dict, tool: dict) -> dict:
         r = await self.http.post("/chat/completions", json={
             "model": self.model,
-            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+            "max_tokens": 4096,
+            "tools": [{"type": "function", "function": {**tool, "strict": True}}],
+            "tool_choice": {"type": "function", "function": {"name": tool["name"]}},
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(content)}],
         })
-        r.raise_for_status()
-        return json.loads(r.json()["choices"][0]["message"]["content"])
+        if r.is_error:
+            raise RuntimeError(f"the router model ({self.model}) answered {r.status_code}: {r.text[:500]}")
+        choice = r.json()["choices"][0]
+        calls = choice["message"].get("tool_calls") or []
+        if choice.get("finish_reason") == "length" or len(calls) != 1 \
+                or calls[0]["function"]["name"] != tool["name"]:
+            raise ValueError(f"the router model ({self.model}) did not call {tool['name']} once "
+                             f"(finish_reason {choice.get('finish_reason')!r}): {json.dumps(choice['message'])[:500]}")
+        return json.loads(calls[0]["function"]["arguments"])
 
     async def _ask(self, system: str, content: dict, directory: list[dict], places: list[dict]) -> dict:
         threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load", "workers")}
                    for t in directory]
-        got = await self._json(system, {"threads": threads, "places": places, **content})
+        got = await self._call(system, {"threads": threads, "places": places, **content},
+                               plan_tool(directory, places))
         return clean_plan(got, directory, places)
 
     async def plan(self, request: str, directory: list[dict], places: list[dict]) -> dict:
         plan = await self._ask(SYSTEM, {"request": request}, directory, places)
         if not plan["spawn"] and not plan["send"]:
-            raise ValueError(f"the router model ({self.model}) planned nothing for the request")
+            raise ValueError(f"the router model ({self.model}) planned nothing for the request: {plan['why']!r}")
         return plan
 
     async def revise(self, request: str, previous: str, reached: list[str], directory: list[dict],
@@ -164,14 +217,14 @@ class ModelRouter:
                                directory, places)
 
     async def place(self, request: str, places: list[dict]) -> str:
-        got = (await self._json(PLACE, {"request": request, "places": places})).get("workers")
+        got = (await self._call(PLACE, {"request": request, "places": places}, place_tool(places))).get("workers")
         if got not in available(places):
             raise ValueError(f"the router model ({self.model}) picked no place workers can run in: {got!r}")
         return got
 
 
 ROUTER_MODEL = "deepseek-flash"
-MODEL_BASE_URL = "https://api.deepseek.com"
+MODEL_BASE_URL = "https://api.deepseek.com/beta"
 
 
 def default_router() -> Router:

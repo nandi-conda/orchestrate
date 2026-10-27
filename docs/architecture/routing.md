@@ -54,9 +54,21 @@ image-only request also skips it and spawns one thread.
 | --- | --- | --- |
 | `ModelRouter` | always (`DEEPSEEK_API_KEY` is required) | Asks `deepseek-flash` with the directory as context. Its prompt says threads are cheap: prefer spawning, reuse a thread only when the request clearly continues its work and the thread is idle, split independent parts into several threads, and notify threads whose work the request touches. A busy thread is sent only what concerns its current turn; a backed-up or stalled one nothing it could do without, so new work goes to a new thread. |
 
-A request the model cannot plan (unreachable, an answer that is not a plan, or
-a plan that does nothing) is logged as an `error` event in the project; there
-is no rule-based stand-in outside the tests (`tests/doubles.py`).
+The model answers by calling one function, `route` (`place` when a new thread
+is put on a worker), whose JSON schema is the plan: `tool_choice` names it and
+the function is `strict`, so the arguments have the plan's shape. Spawns'
+`workers` are an enum of the available places, and a send's `thread` an enum
+of the directory's ids (`send` is left out when there are no threads). Strict
+tool calls are a DeepSeek beta feature, so the router asks on
+`https://api.deepseek.com/beta`, and with thinking off: a forced
+`tool_choice` is refused in thinking mode, which `deepseek-flash` is in by
+default.
+
+A request the model cannot plan (unreachable or refusing the call, an answer
+that is not one `route` call, or a plan that does nothing) is logged as an
+`error` event in the project, with the status and body the API sent or what
+the model said; there is no rule-based stand-in outside the tests
+(`tests/doubles.py`).
 
 Plans are cleaned before use (`clean_plan`): sends to unknown threads and
 empty entries are dropped, titles are capped at 80 characters. A project runs
