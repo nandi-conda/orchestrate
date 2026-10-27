@@ -313,6 +313,8 @@ def test_the_space_key_is_made_once_and_kept(tmp_path, monkeypatch):
     # A key from another computer (environment or keyring) names the space instead.
     monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": "a" * 64}.get(name))
     assert Sync.from_env(tmp_path).space == "a" * 64
+    monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": " " + "A" * 64 + "\n"}.get(name))
+    assert Sync.from_env(tmp_path).space == "a" * 64
     monkeypatch.setattr(sync_mod, "get_secret", lambda name: {"ORCHESTRATE_SYNC_SPACE": "nope"}.get(name))
     with pytest.raises(RuntimeError, match="ORCHESTRATE_SYNC_SPACE"):
         Sync.from_env(tmp_path)

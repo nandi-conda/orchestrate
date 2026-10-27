@@ -379,7 +379,9 @@ class Sync:
         names, or this computer's own (space_key)."""
         url = get_secret(URL_KEY) or DEFAULT_URL
         space = get_secret(SPACE_KEY)
-        if space is None:
+        if space is not None:
+            space = space.strip().lower()  # as pasted: a phone keyboard may capitalize it
+        if not space:
             space = space_key(data)
         elif not is_space(space):
             raise RuntimeError(f"{SPACE_KEY} must be a space's key, {SPACE_HEX} hex digits "
