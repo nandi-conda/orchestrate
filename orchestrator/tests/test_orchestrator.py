@@ -341,22 +341,28 @@ async def test_heuristic_router():
     many = await r.plan("Do these:\n1. login page\n2. export bug\n- docs", [], HERE)
     assert [s["request"] for s in many["spawn"]] == ["login page", "export bug", "docs"]
     sent = await r.plan("@t_abc also handle the empty case", [{"id": "t_abc"}], HERE)
-    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "kind": "work", "workers": "",
-                              "where": ""}]
+    assert sent["send"] == [{"thread": "t_abc", "message": "also handle the empty case", "kind": "work",
+                              "objectives": ["also handle the empty case"], "workers": "", "where": ""}]
     assert (await r.plan("fix it locally", [], HERE))["spawn"][0]["workers"] == "local"
     assert (await r.plan("fix it on sprites", [], HERE))["spawn"][0]["workers"] == ""  # not available
 
 
 def test_clean_plan_drops_unknown_threads():
-    plan = clean_plan({"spawn": [{"request": "x", "workers": "sprites"}, {"title": "no request"}],
+    plan = clean_plan({"spawn": [{"request": "x", "objectives": [" do x ", "", 3], "workers": "sprites"},
+                                 {"title": "no request"}],
                        "send": [{"thread": "t_nope", "message": "m"},
                                 {"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
                                  "where": "its logs are here"}]},
                       [{"id": "t_1"}], HERE)
     # Sprites is not available here: that thread is placed when it is put on a worker.
-    assert [(s["workers"], s["where"]) for s in plan["spawn"]] == [("", "")]
-    assert plan["send"] == [{"thread": "t_1", "message": "m", "kind": "steer", "workers": "local",
+    assert [(s["workers"], s["where"], s["objectives"]) for s in plan["spawn"]] == [("", "", ["do x"])]
+    assert plan["send"] == [{"thread": "t_1", "message": "m", "kind": "steer", "objectives": [], "workers": "local",
                              "where": "its logs are here"}]
+
+
+def test_a_planned_thread_with_no_objectives_is_an_error():
+    with pytest.raises(ValueError, match="no objectives"):
+        clean_plan({"spawn": [{"title": "T", "request": "x", "objectives": []}]}, [], HERE)
 
 
 def free_port() -> int:
@@ -628,7 +634,7 @@ async def test_sending_returns_before_routing_and_workers(tmp_path, monkeypatch)
             assert t["load"]["level"] == "busy"
             assert (await post({"text": "check csv too", "mode": "thread", "target": tid})).status_code == 200
             tr = (await c.get(f"/api/threads/{tid}/transcript")).json()
-            assert [(e["type"], e["text"]) for e in tr if e["type"] != "binding"] == [
+            assert [(e["type"], e["text"]) for e in tr if e["type"] not in ("binding", "objectives")] == [
                 ("created", "fix export"), ("message_in", "check csv too")]
 
             # A thread stopped before its worker is up never starts.
@@ -1004,6 +1010,9 @@ class NoRoutingRouter:
 
     async def place(self, request, places):
         return {"workers": "local", "where": ""}
+
+    async def objectives(self, request, directory):
+        return {"objectives": ["look at the image"], "why": "an image alone"}
 
 
 async def test_an_image_alone_starts_one_thread_without_the_router(tmp_path, monkeypatch):
@@ -1895,12 +1904,22 @@ async def idle_of(s, tid):
     return (await s.get_thread(tid))["state"] == "idle" or None
 
 
-async def test_a_thread_that_accomplishes_its_objectives_is_archived(tmp_path, monkeypatch):
-    """A thread's runner says its objectives as its agent moves them; the
-    store keeps them and the UI's thread shows them. Once a turn ends with all
-    done its runner ends it `done`, and the control plane archives it: it takes
-    no more messages. Unarchived, it comes back with its objectives as they
-    were, and new work moves them on."""
+def ids_ok(items):
+    return all(re.fullmatch(r"o_[0-9a-f]{8}", o["id"]) for o in items)
+
+
+def without_ids(items):
+    return [{k: v for k, v in o.items() if k != "id"} for o in items]
+
+
+async def test_a_thread_owns_the_objectives_the_orchestrator_gives_it_and_is_archived_when_done(tmp_path, monkeypatch):
+    """The orchestrator makes the objectives a thread is spawned with (ids,
+    pending) and posts the thread with them; its runner says them as they
+    move; the store keeps them and the UI's thread shows them. Once a turn
+    ends with all done its runner ends it `done`, and the control plane
+    archives it: it takes no more messages. Unarchived, it comes back with
+    its objectives as they were, and a message that is new work brings the
+    objectives the router gave it."""
     from control.service import ArchivedError, Orchestrator
 
     monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
@@ -1909,17 +1928,19 @@ async def test_a_thread_that_accomplishes_its_objectives_is_archived(tmp_path, m
     p = await s.create_project("demo")
     orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
                         HeuristicRouter(), tmp_path / "repos")
-    t = await orch.spawn(p["id"], "T", "objectives: find the bug | fix it\nobjective 0 done: off by one")
+    t = await orch.spawn(p["id"], "T", "objective 0 done: off by one", objectives=["find the bug", "fix it"])
+    assert ids_ok(t["objectives"]) and [o["status"] for o in t["objectives"]] == ["pending", "pending"]
     await wait_for(lambda: idle_of(s, t["id"]))
     row = await s.get_thread(t["id"])
-    assert row["objectives"] == [{"text": "find the bug", "status": "done", "note": "off by one"},
-                                 {"text": "fix it", "status": "pending", "note": ""}]
+    assert [o["id"] for o in row["objectives"]] == [o["id"] for o in t["objectives"]]
+    assert without_ids(row["objectives"]) == [{"text": "find the bug", "status": "done", "note": "off by one"},
+                                              {"text": "fix it", "status": "pending", "note": ""}]
     assert row["archived_at"] is None
     assert app_mod.thread_view(await orch.with_load(row), orch)["objectives"] == row["objectives"]
     shown = [app_mod.display(e) for e in await s.list_events(p["id"], t["id"]) if e["type"] == "objectives"]
-    assert [(e["kind"], e["text"]) for e in shown] == [(app_mod.K_STATE, "0 of 2 done"), (app_mod.K_STATE, "1 of 2 done")]
+    assert [(e["kind"], e["text"]) for e in shown] == [(app_mod.K_STATE, "1 of 2 done")]
 
-    await orch.send(t["id"], "objective 1 done: fixed")
+    await orch.send(t["id"], "objective 1 done: fixed")  # assessed: it steers, bringing no objectives
 
     async def archived():
         row = await s.get_thread(t["id"])
@@ -1933,13 +1954,62 @@ async def test_a_thread_that_accomplishes_its_objectives_is_archived(tmp_path, m
         await orch.send(t["id"], "one more thing")
 
     await orch.unarchive(t["id"])
-    await orch.send(t["id"], "objective 1 in_progress: one more thing")
-    await wait_for(lambda: idle_of(s, t["id"]))  # posted with its objectives: it moved the second one
-    row = await s.get_thread(t["id"])
-    assert row["archived_at"] is None
-    assert row["objectives"][1] == {"text": "fix it", "status": "in_progress", "note": "one more thing"}
+    await orch.send(t["id"], "new job: objectives: tidy up")
+    await wait_for(lambda: idle_of(s, t["id"]))  # posted with its objectives, then given the new one
+
+    async def three():
+        row = await s.get_thread(t["id"])
+        return row if len(row["objectives"]) == 3 else None
+    row = await wait_for(three)
+    assert row["archived_at"] is None and ids_ok(row["objectives"])
+    assert [(o["text"], o["status"]) for o in row["objectives"]] == \
+        [("find the bug", "done"), ("fix it", "done"), ("tidy up", "pending")]
     await orch.close()
     await orch.places.close()
+    await s.close()
+
+
+async def test_the_router_gives_a_thread_nobody_planned_objectives_for_them(tmp_path, monkeypatch):
+    """A thread spawned with no objectives (forced new, by another thread) is
+    given them by the router as it is first put on a worker, before it is
+    posted; a request the router plans spawns threads with the objectives
+    it planned."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    orch = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
+                        HeuristicRouter(), tmp_path / "repos")
+    t = await orch.spawn(p["id"], "T", "objectives: build it | ship it")
+    assert t["objectives"] == []
+    await wait_for(lambda: idle_of(s, t["id"]))
+    row = await s.get_thread(t["id"])
+    assert ids_ok(row["objectives"]) and [o["text"] for o in row["objectives"]] == ["build it", "ship it"]
+    given = [e["payload"] for e in await s.list_events(p["id"], t["id"]) if e["type"] == "objectives"][0]
+    assert given["objectives"] == row["objectives"] and given["why"] == "what its request asks"
+
+    routed = await orch.handle_request(p["id"], "- write docs\n- add tests")
+    rows = [await s.get_thread(x["id"]) for x in routed["spawned"]]
+    assert [[o["text"] for o in r["objectives"]] for r in rows] == [["write docs"], ["add tests"]]
+    await orch.close()
+    await orch.places.close()
+    await s.close()
+
+
+async def test_objectives_from_before_ids_get_them(tmp_path):
+    path = str(tmp_path / "db.sqlite")
+    s = SqliteStore(path)
+    await s.open()
+    p = await s.create_project("demo")
+    t = await s.create_thread(p["id"], "T", "x", "local")
+    await s.update_thread(t["id"], objectives=[{"text": "old", "status": "done", "note": ""}])
+    await s.close()
+    s = SqliteStore(path)
+    await s.open()
+    got = (await s.get_thread(t["id"]))["objectives"]
+    assert ids_ok(got) and without_ids(got) == [{"text": "old", "status": "done", "note": ""}]
     await s.close()
 
 

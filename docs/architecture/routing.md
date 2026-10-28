@@ -140,9 +140,38 @@ once (`Orchestrator._deliver`), as one of:
 
 Who says which: the router's own sends carry `kind` in the plan; an edit's
 correction always steers; a message typed straight to a thread, or sent by
-another thread, is put to the router (`Router.kind`, a forced `kind` tool
-call) only when the thread is busy. A thread just handed a job counts as busy
+another thread, is put to the router (`Router.assess`, a forced `assess` tool
+call), which also says the objectives it brings. A thread just handed a job counts as busy
 until the runner takes it, so two jobs sent at once never both land on it.
+
+### Objectives
+
+The orchestrator owns the project's objectives (`control/objectives.py`) and
+delegates each to one thread, so no two threads chase the same goal:
+
+- **The router makes them.** Every thread it spawns gets the objectives its
+  work must accomplish (`objectives` on each spawn of the `route` call: one
+  per outcome, in the order to work them, at least one), and a send that gives
+  a thread work none of its objectives covers gives it objectives for that
+  work. It sees every thread's objectives (id, status, note) in the directory
+  and never makes one a thread already owns, however the request words it:
+  work toward an owned objective goes to its owner, as a steer.
+- **Nothing else does.** A thread spawned some other way (forced new, by
+  another thread, a hand-off nobody planned objectives for) is given its
+  objectives by the router (`Router.objectives`, told the other threads'
+  objectives) when it is first put on a worker, before it is posted. A message
+  sent straight to a thread is assessed (`Router.assess`): steer or work, and
+  the objectives it brings. New work for a busy thread goes to the new thread
+  with its objectives.
+- **The control plane gives them ids** (`o_` and 8 hex digits) and delegates
+  them: with the thread when it is posted, with the message that brings them
+  (runner API `objectives`). The runner reports each change, and the store
+  keeps them on their owner: the project's objectives are its threads'
+  together.
+
+The thread works its objectives one by one as its agent's goal
+([runner: objectives](runner.md#objectives)); once all are done it ends and is
+archived.
 
 ### Where threads run
 

@@ -6,10 +6,11 @@ It has no model. Each turn it says what it got, and:
 - a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
 - a line `write <path>: <text>` writes text to that file of the thread's workspace
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
-- a line `objectives: <a> | <b> | ...` sets the thread's objectives (pending),
-  `objective <i> <status>: <note>` moves one (`objectives` events, as the team
-  skill's set_objectives and update_objective make); a turn that ends with
-  them all done ends the thread `done`, like the real runner,
+- its objectives are the ones the control plane posts it with, and those a
+  message brings (appended); a line `objective <i> <status>: <note>` moves one
+  (an `objectives` event, as the real runner's goal turns make: it has no
+  model to work them as goals); a turn that ends with them all done ends the
+  thread `done`, like the real runner,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
 A turn its process is stopped in is interrupted, as the real runner's is
@@ -63,7 +64,6 @@ TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
 LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
-OBJECTIVES = re.compile(r"^\s*objectives:\s*(.+)$", re.M)
 OBJECTIVE = re.compile(r"^\s*objective\s+(\d+)\s+(pending|in_progress|done):\s?(.*)$", re.M)
 ENDED = ("done", "stopped", "failed")
 THREAD_ID = re.compile(r"^[\w-]+$")
@@ -219,9 +219,6 @@ class Host:
         for tid in READ.findall(text):
             r = await self.peer_call("read_thread", t["id"], thread_id=tid, last_n=5)
             await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
-        for items in OBJECTIVES.findall(text):
-            t["objectives"] = [{"text": i.strip(), "status": "pending", "note": ""} for i in items.split("|")]
-            await self.emit(t["id"], "objectives", {"objectives": t["objectives"]})
         for i, status, note in OBJECTIVE.findall(text):
             t["objectives"] = [{**o, "status": status, "note": note} if n == int(i) else o
                                for n, o in enumerate(t["objectives"])]  # a new list: the last event keeps its own
@@ -362,6 +359,9 @@ def create_app(host: Host, token: str) -> Starlette:
         if t["state"] in ENDED:
             return JSONResponse({"error": f"thread {t['id']} has ended ({t['state']})"}, 409)
         b = await req.json()
+        if b.get("objectives"):
+            t["objectives"] = t["objectives"] + b["objectives"]
+            await host.emit(t["id"], "objectives", {"objectives": t["objectives"]})
         await host.emit(t["id"], "message_in", {"from": b.get("from", "user"), "body": b["body"],
                                                 "images": b.get("images") or []})
         asyncio.create_task(host.turn(t, b["body"], b.get("images") or []))

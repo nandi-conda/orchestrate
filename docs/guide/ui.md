@@ -66,12 +66,14 @@ newest last (up to the newest 2,000), with a live line per working thread
 saying what it is doing. Past a few lines that list scrolls on its own, so the
 log and the request box stay in view.
 
-Its **Objectives** tab is the overview of what every thread is trying to
-accomplish: each thread the list shows, by its title with where it stands,
-then its objectives as on its own [Objectives tab](#a-threads-pane) (how many
-are done, a progress bar, each objective's status and note). The tab's count
-adds them up over all those threads (`5/9`). It changes live as threads move
-their objectives, and with **Archived** open it covers the archived threads
+Its **Objectives** tab is the project's objectives, as one list. The
+orchestrator makes them from your requests and gives each to one thread, so
+no two threads chase the same goal (see [Objectives](../architecture/routing.md#objectives)).
+Under how many are done and a progress bar, each objective shows its status
+and note and the thread that owns it, by its title with where it stands: the
+ones being worked on first ("Working on it now" when their thread is in a
+turn), then pending, then done. The tab's count is the same total (`5/9`). It
+changes live, and with **Archived** open it covers the archived threads
 instead. Click a thread's title to open it on its Objectives tab.
 
 ### Sending a request
@@ -138,7 +140,7 @@ tabs:
 | Tab | Shows |
 | --- | --- |
 | **Dialog** | The conversation: your messages, messages from other threads and the router, and the agent's replies, rendered as Markdown. Replies grow live as the model streams them. Each message shows when it was sent in your local time (hover it for the full date and zone). |
-| **Objectives** | What the thread is trying to accomplish: its objectives, each with its status (pending, in progress, done) and a note on where it is at, under how many are done and a progress bar. The tab's count says the same (`2/3`). The thread's agent sets them from its request as it starts and moves them as it works, so they change live. |
+| **Objectives** | The objectives the orchestrator gave the thread, in the order it works them, each with its status (pending, in progress, done) and a note on where it is at, under how many are done and a progress bar. The tab's count says the same (`2/3`). The thread works them one at a time as its agent's goal, so they change live. |
 | **Tools** | Every tool call the agent made (`python_repl` code) with its result. |
 | **Thinking** | The agent's reasoning steps in order, numbered, each rendered as Markdown under its time in your local time. A step still streaming shows last and grows live. |
 | **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane and images (png, jpg, gif, webp, svg) open shown there, each with **Back** and **Download**; any other file downloads. Images a markdown file or a reply names by a worktree path (`![plot](out/plot.png)`, relative to the markdown file, or from the root with a leading `/`) show inline; remote images stay links. `.git` is hidden. A thread on no ready worker shows where it stands instead, and its files once it is bound. |
@@ -160,7 +162,7 @@ A thread whose turn ends with every objective done is finished: it ends
 (state **done**) and is archived on its own, with "thread archived: it
 accomplished all its objectives" in its log. If its pane is open, the list
 turns to **Archived** so the pane stays on it. Unarchive it and message it to
-give it more: its agent adds objectives for the new work.
+give it more: the router gives it objectives for the new work.
 
 Reading a thread's files or sending it a message when it is on no worker puts
 it on one first. Nothing is lost by that: its branch, a snapshot of its whole

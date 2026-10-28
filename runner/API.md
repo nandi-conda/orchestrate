@@ -13,7 +13,7 @@ between all its projects. Default port 8080. Every route except `/health` needs
 | GET | `/threads` | | list of directory entries |
 | POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?, "objectives"?}` | 201 + directory entry, `queued`, at once: the thread's worktree and session are made after (`preparing`, `prepared` events, below); 400 without `project` or with objectives that are not valid (below); 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
-| POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202; 409 once the thread has ended (`done`, `stopped`, `failed`): start it again first |
+| POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0, "objectives"? = []}` | 202, the message's `objectives` the thread's from now on, after its own (below); 400 with objectives that are not valid or an id it has; 409 once the thread has ended (`done`, `stopped`, `failed`): start it again first |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first; 409 while its worktree is being made |
@@ -40,14 +40,15 @@ between all its projects. Default port 8080. Every route except `/health` needs
 ```json
 {"id": "t_1a2b3c4d5e", "project": "p", "title": "Fix export", "state": "working",
  "summary": "owns ui/export.py",
- "objectives": [{"text": "Find why Safari ignores the click", "status": "done", "note": "handler bound on click only"},
-                {"text": "Fix it and add a test", "status": "in_progress", "note": "test written"}],
+ "objectives": [{"id": "o_3f9a1c2b", "text": "Find why Safari ignores the click", "status": "done",
+                 "note": "handler bound on click only"},
+                {"id": "o_77e0d415", "text": "Fix it and add a test", "status": "in_progress", "note": "test written"}],
  "files": ["ui/export.py"], "parent": null}
 ```
 
 `state` is one of `queued`, `working`, `idle`, `done`, `failed`, `stopped`. Threads are long-lived: after a turn they go `idle` and wake on the next message.
 
-`objectives` are what the thread is trying to accomplish (`src/runner/objectives.py`): its agent sets them from its request on its first turn and keeps them current with the team skill (`set_objectives`, `update_objective`). Each is `{"text", "status", "note"}`, `status` one of `pending`, `in_progress`, `done`, `note` where it is at; one to 20 of them, `[]` until the agent sets them. A turn that ends with every objective done, and no message waiting, finishes the thread: it goes `done` and its task ends (the orchestrator archives it). A thread brought back is posted with its `objectives` as they last stood.
+`objectives` are the project's objectives the orchestrator delegated to the thread (`src/runner/objectives.py`): it posts the thread with them and sends more with a message that brings more work; the agent cannot make or reword one. Each is `{"id", "text", "status", "note"}`: `id` and `text` the orchestrator's, `status` one of `pending`, `in_progress`, `done`, `note` where it is at (the agent's, `team.update_objective`); at most 20, each id once. The thread works them one at a time, in order, as its agent's prime-agent goal: whenever it has no message to take, the runner gives it a turn on its first objective not done (`/goal`, which marks it `in_progress`, then turns that carry the open goal on, each a `goal` event), and `goal.complete()` marks it `done`. A failed model call, or 10 goal turns in a row, stop them until a message comes. A turn that ends with every objective done, and no message waiting, finishes the thread: it goes `done` and its task ends (the orchestrator archives it). A thread brought back is posted with its `objectives` as they last stood.
 
 ### SSE
 
@@ -72,7 +73,8 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | prime-agent's token counts for one model call |
 | `turn_done` | `{"summary", "final"}` |
-| `objectives` | `{"objectives"}`: the thread's objectives, whole, each time its agent changes them |
+| `objectives` | `{"objectives"}`: the thread's objectives, whole, each time they change |
+| `goal` | `{"objective", "text", "turn"}`: a goal turn starts on that objective, the `turn`th in a row |
 | `saved` | `{"branch", "commit"}`: a turn a model call failed in ended; leftovers committed, the orchestrator took the branch and snapshot but did not land it |
 | `landed` | `{"branch", "base", "commit"}`: a turn ended and the branch is now the tip of `base` in the orchestrator's repository |
 | `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
@@ -153,9 +155,9 @@ wait and then fail; the CLI (`pixi run run`) uses in-process peers instead.
 A thread makes these calls from its kernel with the team skill
 (`skills/team`, `await team.send_message(...)`), over a unix socket of its own
 bound into its sandbox; the runner queues them here. `web_search`,
-`web_fetch`, `objectives`, `set_objectives` and `update_objective` go through
-the same socket but are answered by the runner itself (an `objectives` event
-carries each change).
+`web_fetch`, `objectives` and `update_objective` go through the same socket
+but are answered by the runner itself (an `objectives` event carries each
+change).
 
 | `op` (the tool) | `args` | `result` |
 | --- | --- | --- |

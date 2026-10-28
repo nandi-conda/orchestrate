@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import paths
+from .objectives import with_ids
 from .states import BINDING, RUNNING, WORKER
 
 THREAD_STATES = ("queued", "working", "waiting", "idle", "done", "failed", "stopped")
@@ -80,9 +81,11 @@ class Store(Protocol):
         or archived_at (Orchestrator.archive_project)."""
 
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None, workers_why: str = "") -> dict:
+                            parent_id: str | None = None, workers_why: str = "",
+                            objectives: list[dict] | None = None) -> dict:
         """A new thread whose workers run on `workers` (providers.PLACES),
-        for the reason `workers_why` (the router's)."""
+        for the reason `workers_why` (the router's), owning `objectives`
+        (objectives.made)."""
     async def list_threads(self, project_id: str, archived: bool = False) -> list[dict]:
         """The project's threads that are not archived, or with archived=True
         only the archived ones; working (queued or working) threads first,
@@ -226,9 +229,9 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
                  "archived_at", "binding", "binding_reason", "workers", "workers_why", "objectives")
-# Thread fields kept as JSON text. `objectives` are what the thread is trying
-# to accomplish, as its runner last said ([{"text", "status", "note"}],
-# runner/API.md, "Directory entry").
+# Thread fields kept as JSON text. `objectives` are the project's objectives
+# the thread owns (objectives.py), as its runner last said
+# ([{"id", "text", "status", "note"}], runner/API.md, "Directory entry").
 JSON_THREAD_FIELDS = ("files", "objectives")
 
 # Columns added to tables after their first release: (table, column, definition).
@@ -328,12 +331,13 @@ class _SqlStore:
 
     # threads
     async def create_thread(self, project_id: str, title: str, request: str, workers: str,
-                            parent_id: str | None = None, workers_why: str = "") -> dict:
+                            parent_id: str | None = None, workers_why: str = "",
+                            objectives: list[dict] | None = None) -> dict:
         t = now()
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
                "workers": workers, "workers_why": workers_why,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
-               "binding": "unbound", "binding_reason": "", "files": "[]", "objectives": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
+               "binding": "unbound", "binding_reason": "", "files": "[]", "objectives": json.dumps(objectives or []), "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
                "busy_since": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
@@ -445,6 +449,14 @@ class _SqlStore:
         for r in await self._fetch("SELECT seq FROM events WHERE uid IS NULL"):
             await self._exec(self._q("UPDATE events SET uid = ? WHERE seq = ?"), new_uid(), r["seq"])
         await self._exec(EVENTS_UID_INDEX)
+
+    async def _objective_ids(self) -> None:
+        """Give each objective from before objectives had ids one."""
+        for r in await self._fetch("SELECT id, objectives FROM threads WHERE objectives != '[]'"):
+            items = json.loads(r["objectives"])
+            if any(not o.get("id") for o in items):
+                await self._exec(self._q("UPDATE threads SET objectives = ? WHERE id = ?"),
+                                 json.dumps(with_ids(items)), r["id"])
 
     async def _merge_peer_messages(self) -> None:
         """Once, when events gain `peer_id`: a message between threads used to
@@ -586,6 +598,7 @@ class SqliteStore(_SqlStore):
         if ("events", "peer_id") in added:
             await self._merge_peer_messages()
         await self._fill_uids()
+        await self._objective_ids()
 
     async def close(self) -> None:
         if self.db is not None:
@@ -639,6 +652,7 @@ class PostgresStore(_SqlStore):
         if not had_peer_id:
             await self._merge_peer_messages()
         await self._fill_uids()
+        await self._objective_ids()
         # A dedicated connection hears appends made by any instance.
         self._listener = await asyncpg.connect(self.dsn)
         await self._listener.add_listener(self.CHANNEL, lambda *a: self.notifier.poke(a[3]))

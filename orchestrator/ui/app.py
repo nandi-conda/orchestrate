@@ -2940,11 +2940,11 @@ def objectives_met(t: i32) -> i32:
 
 
 def objectives_list() -> None:
-    """The Objectives tab of a thread: what the selected thread is trying to
-    accomplish, each with its status and where it is at, as its agent last
-    said. It is live: the thread list it reads is fetched again on every
-    event. A thread whose objectives are all done ended with its last turn
-    and was archived."""
+    """The Objectives tab of a thread: the project's objectives the
+    orchestrator gave it, in the order it works them (one at a time, as its
+    agent's goal), each with its status and where it is at. It is live: the
+    thread list it reads is fetched again on every event. A thread whose
+    objectives are all done ended with its last turn and was archived."""
     t: i32
     n: i32 = 0
     t = selected_thread()
@@ -2954,7 +2954,7 @@ def objectives_list() -> None:
         el("p")
         cls("muted")
         cls("empty")
-        text("No objectives yet. The thread sets them from its request as it starts.")
+        text("No objectives yet. The orchestrator gives the thread its objectives as it starts.")
         end()
     else:
         objectives_of(t, n)
@@ -2962,51 +2962,98 @@ def objectives_list() -> None:
         j_free(t)
 
 
+def status_rank(h: i32) -> i32:
+    """Where an objective of status h goes in the project's list: in progress,
+    then pending, then done."""
+    if s_eq(h, h_doing) == 1:
+        return 0
+    if s_eq(h, h_done) == 1:
+        return 2
+    return 1
+
+
 def objectives_overview() -> None:
-    """The Objectives tab of Project orchestrator: every thread the list shows
-    (live, or archived when it shows Archived), each by its title with where
-    it stands and its objectives as on its own tab. Clicking a title opens the
-    thread on its Objectives tab. Live like the thread's own tab."""
+    """The Objectives tab of Project orchestrator: the project's objectives,
+    one list. The orchestrator makes them and gives each to one thread, so
+    each is listed once, with the thread that owns it: the ones being worked
+    on first (saying when their thread is on them right now), then pending,
+    then done. It covers the threads the list shows (live, or archived when
+    it shows Archived). Clicking a thread's title opens it on its Objectives
+    tab. Live like the thread's own tab."""
     n: i32 = 0
     i: i32
+    j: i32
     e: i32
     g: i32
+    os: i32
+    o: i32
+    rank: i32
+    k: i32 = 0
+    goals: i32 = 0
+    met: i32 = 0
     if threads != 0:
         n = j_len(threads, "")
-    if n == 0:
+    for i in range(n):
+        e = j_idx(threads, i)
+        goals = goals + j_len(e, "objectives")
+        met = met + objectives_met(e)
+        j_free(e)
+    if goals == 0:
         el("p")
         cls("muted")
         cls("empty")
         if show_archived == 1:
-            text("No archived threads.")
+            text("No objectives on archived threads.")
         else:
-            text("No threads yet. Their objectives show here as they set them.")
+            text("No objectives yet. The orchestrator makes them from your requests and gives each to a thread.")
         end()
         return
-    for i in range(n):
-        e = j_idx(threads, i)
-        g = j_len(e, "objectives")
-        div("objectives-thread")
-        key(i)
-        div("objectives-thread-head")
-        el("button")
-        cls("objectives-thread-title")
-        on_click(SELECT, i)
-        jstr(e, "title", h_t3)
-        text_ref(h_t3)
-        end()
-        thread_badges(e)
-        end()
-        if g == 0:
-            el("p")
-            cls("muted")
-            cls("objectives-none")
-            text("No objectives yet.")
-            end()
-        else:
-            objectives_of(e, g)
-        end()
-        j_free(e)
+    div("objectives-head")
+    span("objectives-count")
+    num(met)
+    text(" of ")
+    num(goals)
+    text(" done")
+    end()
+    end()
+    objectives_bar(met, goals)
+    el("ol")
+    cls("objectives")
+    for rank in range(3):
+        for i in range(n):
+            e = j_idx(threads, i)
+            g = j_len(e, "objectives")
+            if g > 0:
+                os = j_at(e, "objectives")
+                for j in range(g):
+                    o = j_idx(os, j)
+                    jstr(o, "status", h_t2)
+                    if status_rank(h_t2) == rank:
+                        objective_row(o, k, e, i)
+                        k = k + 1
+                    j_free(o)
+                j_free(os)
+            j_free(e)
+    end()
+
+
+def objectives_bar(met: i32, n: i32) -> None:
+    """A progress bar: met of n (at least one) done."""
+    div("objectives-bar")
+    attr("role", "progressbar")
+    s_set(h_t1, "")
+    s_add_num(h_t1, met)
+    attr_ref("aria-valuenow", h_t1)
+    s_set(h_t1, "")
+    s_add_num(h_t1, n)
+    attr_ref("aria-valuemax", h_t1)
+    div("objectives-fill")
+    s_set(h_t1, "width: ")
+    s_add_num(h_t1, (met * 100) // n)
+    s_add(h_t1, "%")
+    attr_ref("style", h_t1)
+    end()
+    end()
 
 
 def objectives_of(t: i32, n: i32) -> None:
@@ -3032,66 +3079,82 @@ def objectives_of(t: i32, n: i32) -> None:
             text(" · accomplished")
         end()
     end()
-    div("objectives-bar")
-    attr("role", "progressbar")
-    s_set(h_t1, "")
-    s_add_num(h_t1, met)
-    attr_ref("aria-valuenow", h_t1)
-    s_set(h_t1, "")
-    s_add_num(h_t1, n)
-    attr_ref("aria-valuemax", h_t1)
-    div("objectives-fill")
-    s_set(h_t1, "width: ")
-    s_add_num(h_t1, (met * 100) // n)
-    s_add(h_t1, "%")
-    attr_ref("style", h_t1)
-    end()
-    end()
+    objectives_bar(met, n)
     os = j_at(t, "objectives")
     el("ol")
     cls("objectives")
     for i in range(n):
         o = j_idx(os, i)
-        jstr(o, "status", h_t2)
-        el("li")
-        cls("objective")
-        cls_if("objective-done", s_eq(h_t2, h_done) == 1)
-        cls_if("objective-doing", s_eq(h_t2, h_doing) == 1)
-        key(i)
-        span("objective-mark")
-        attr("aria-hidden", "true")
-        if s_eq(h_t2, h_done) == 1:
-            text("✓")
-        elif s_eq(h_t2, h_doing) == 1:
-            text("●")
-        else:
-            text("○")
-        end()
-        div("objective-body")
-        div("objective-text")
-        jstr(o, "text", h_t1)
-        text_ref(h_t1)
-        end()
-        div("objective-meta")
-        span("objective-status")
-        if s_eq(h_t2, h_done) == 1:
-            text("Done")
-        elif s_eq(h_t2, h_doing) == 1:
-            text("In progress")
-        else:
-            text("Pending")
-        end()
-        jstr(o, "note", h_t1)
-        if s_len(h_t1) > 0:
-            span("objective-note")
-            text_ref(h_t1)
-            end()
-        end()
-        end()
-        end()
+        objective_row(o, i, 0, 0)
         j_free(o)
     end()
     j_free(os)
+
+
+def objective_row(o: i32, k: i32, owner: i32, at: i32) -> None:
+    """Objective o as list item k: its mark, text, status and note. With an
+    `owner` (the thread that owns it, `at` in the thread list), that thread
+    too: its title, which opens it, and where it stands, saying when it is
+    working on this objective right now."""
+    jstr(o, "status", h_t2)
+    el("li")
+    cls("objective")
+    cls_if("objective-done", s_eq(h_t2, h_done) == 1)
+    cls_if("objective-doing", s_eq(h_t2, h_doing) == 1)
+    key(k)
+    span("objective-mark")
+    attr("aria-hidden", "true")
+    if s_eq(h_t2, h_done) == 1:
+        text("✓")
+    elif s_eq(h_t2, h_doing) == 1:
+        text("●")
+    else:
+        text("○")
+    end()
+    div("objective-body")
+    div("objective-text")
+    jstr(o, "text", h_t1)
+    text_ref(h_t1)
+    end()
+    div("objective-meta")
+    span("objective-status")
+    if s_eq(h_t2, h_done) == 1:
+        text("Done")
+    elif s_eq(h_t2, h_doing) == 1:
+        text("In progress")
+    else:
+        text("Pending")
+    end()
+    jstr(o, "note", h_t1)
+    if s_len(h_t1) > 0:
+        span("objective-note")
+        text_ref(h_t1)
+        end()
+    end()
+    if owner != 0:
+        div("objective-owner")
+        if s_eq(h_t2, h_doing) == 1:
+            jstr(owner, "state", h_t3)
+            span("objective-owner-label")
+            if s_eq(h_t3, h_working) == 1:
+                text("Working on it now:")
+            else:
+                text("Owned by")
+            end()
+        else:
+            span("objective-owner-label")
+            text("Owned by")
+            end()
+        el("button")
+        cls("objectives-thread-title")
+        on_click(SELECT, at)
+        jstr(owner, "title", h_t3)
+        text_ref(h_t3)
+        end()
+        thread_badges(owner)
+        end()
+    end()
+    end()
 
 
 def thinking_steps(src: i32, n: i32) -> i32:

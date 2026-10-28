@@ -308,17 +308,20 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     places = [{"id": "local", "label": "This computer", "why": ""},
               {"id": "sprites", "label": "Sprites", "why": "it needs SPRITES_TOKEN"}]
     seen: list = []
-    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
-                                                "where": "Sprites are not available"}],
+    r = router_answering(route_call({"spawn": [{"title": "Fix it", "request": "fix it",
+                                                "objectives": ["Find why it breaks", "Fix it with a test"],
+                                                "workers": "local", "where": "Sprites are not available"}],
                                      "send": [{"thread": "t_1", "message": "heads up", "kind": "steer",
-                                               "workers": "", "where": "it stays"}],
+                                               "objectives": [], "workers": "", "where": "it stays"}],
                                      "why": "new work"}), seen)
     plan = await r.plan("fix it", [{"id": "t_1", "title": "Old", "load": {"level": "busy", "busy_for": 9}}],
                         places)
     # A send that moves nothing keeps no reason for a move.
-    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it", "workers": "local",
+    assert plan == {"spawn": [{"title": "Fix it", "request": "fix it",
+                               "objectives": ["Find why it breaks", "Fix it with a test"], "workers": "local",
                                "where": "Sprites are not available"}],
-                    "send": [{"thread": "t_1", "message": "heads up", "kind": "steer", "workers": "", "where": ""}],
+                    "send": [{"thread": "t_1", "message": "heads up", "kind": "steer", "objectives": [],
+                              "workers": "", "where": ""}],
                     "answer": "", "why": "new work"}
     body = seen[0]
     assert body["thinking"] == {"type": "disabled"}
@@ -332,6 +335,9 @@ async def test_the_router_model_answers_with_one_forced_strict_route_call():
     assert props["send"]["items"]["properties"]["kind"]["enum"] == ["steer", "work"]
     assert props["send"]["items"]["properties"]["workers"]["enum"] == ["", "local"]
     assert "answer" in fn["parameters"]["required"] and props["answer"]["type"] == "string"
+    assert "objectives" in props["spawn"]["items"]["required"] and "objectives" in props["send"]["items"]["required"]
+    assert props["spawn"]["items"]["properties"]["objectives"]["items"] == {"type": "string"}
+    assert "Never make an\nobjective that one listed already covers" in body["messages"][0]["content"]
     # With no threads there is nothing to send to, so the schema has no send.
     await r.plan("fix it", [], places)
     assert "send" not in seen[1]["tools"][0]["function"]["parameters"]["properties"]
@@ -352,19 +358,42 @@ async def test_the_router_model_answers_a_quick_question_itself():
     assert "A quick question needs no thread" in seen[0]["messages"][0]["content"]
 
 
-async def test_the_router_model_says_whether_a_message_steers_a_busy_thread_or_is_new_work():
+def tool_call(name: str, arguments: dict) -> dict:
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
+
+async def test_the_router_model_assesses_a_message_sent_straight_to_a_thread():
+    """Steer or new work, and the objectives it brings: new work brings at least one."""
     seen: list = []
-    call = {"role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "type": "function", "function": {
-                "name": "kind", "arguments": json.dumps({"kind": "work", "why": "a new job"})}}]}
-    r = router_answering(call, seen)
-    got = await r.kind("now write the docs", "user", {"id": "t_1", "title": "Fix login", "request": "fix login",
-                                                       "summary": "", "state": "working"})
-    assert got == {"kind": "work", "why": "a new job"}
+    r = router_answering(tool_call("assess", {"kind": "work", "objectives": [" Write the docs "], "why": "a new job"}),
+                         seen)
+    thread = {"id": "t_1", "title": "Fix login", "request": "fix login", "summary": "", "state": "working",
+              "objectives": [{"id": "o_1", "text": "Fix login", "status": "in_progress", "note": ""}]}
+    got = await r.assess("now write the docs", "user", thread, True)
+    assert got == {"kind": "work", "objectives": ["Write the docs"], "why": "a new job"}
     fn = seen[0]["tools"][0]["function"]
-    assert fn["name"] == "kind" and fn["parameters"]["properties"]["kind"]["enum"] == ["steer", "work"]
+    assert fn["name"] == "assess" and fn["parameters"]["properties"]["kind"]["enum"] == ["steer", "work"]
+    assert fn["parameters"]["required"] == ["kind", "objectives", "why"]
     content = json.loads(seen[0]["messages"][1]["content"])
     assert content["message"] == "now write the docs" and content["thread"]["title"] == "Fix login"
+    assert content["thread"]["busy"] is True and content["thread"]["objectives"][0]["id"] == "o_1"
+    r = router_answering(tool_call("assess", {"kind": "work", "objectives": [], "why": "a new job"}), [])
+    with pytest.raises(ValueError, match="new work with no objectives"):
+        await r.assess("now write the docs", "user", thread, False)
+
+
+async def test_the_router_model_gives_a_thread_nobody_planned_its_objectives():
+    seen: list = []
+    r = router_answering(tool_call("objectives", {"objectives": ["Add a CSV export"], "why": "the request"}), seen)
+    others = [{"id": "t_2", "title": "Docs", "summary": "", "objectives": [{"id": "o_9", "text": "Write docs"}]}]
+    assert await r.objectives("add csv export", others) == {"objectives": ["Add a CSV export"], "why": "the request"}
+    content = json.loads(seen[0]["messages"][1]["content"])
+    assert content["threads"][0]["objectives"][0]["id"] == "o_9" and "never repeat" in seen[0]["messages"][0]["content"]
+    r = router_answering(tool_call("objectives", {"objectives": [], "why": "covered"}), [])
+    with pytest.raises(ValueError, match="no objectives.*covered"):
+        await r.objectives("add csv export", others)
 
 
 async def test_a_router_answer_that_is_not_a_route_call_is_an_error_saying_what_came_back():

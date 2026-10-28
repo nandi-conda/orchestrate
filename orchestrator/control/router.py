@@ -3,10 +3,22 @@
 A plan spawns new threads, sends messages to existing ones, answers the
 person itself, or any of these:
 
-    {"spawn": [{"title": "...", "request": "...", "workers": "sprites", "where": "..."}],
-     "send":  [{"thread": "t_42", "message": "...", "kind": "steer", "workers": "local", "where": "..."}],
+    {"spawn": [{"title": "...", "request": "...", "objectives": ["..."], "workers": "sprites", "where": "..."}],
+     "send":  [{"thread": "t_42", "message": "...", "kind": "steer", "objectives": [], "workers": "local",
+                "where": "..."}],
      "answer": "...",
      "why": "..."}
+
+The router makes the project's objectives (objectives.py) and delegates each
+to one thread: every spawned thread is given the objectives its work must
+accomplish, in the order to work them, and a send that gives a thread work it
+has no objective for gives it objectives for that work. It never makes an
+objective a thread already owns, however the request words it: work toward an
+owned objective goes to the thread that owns it. A thread spawned some other
+way (forced new, by another thread, a hand-off of work nobody planned) is
+given its objectives with `objectives` when it is first put on a worker, and a
+message sent straight to a thread is assessed with `assess` (whether it steers
+the thread's job or is new work, and the objectives it brings).
 
 A quick question needs no thread: when what the router is given (the
 threads, their state, summaries, files and load, the places) or what any
@@ -38,8 +50,9 @@ context, each thread with its load (load.py). A thread does one job at a
 time: each send is "steer" (about the job the thread is on: a correction,
 guidance, something it needs; a busy thread takes it mid-turn) or "work" (a
 new job: only an idle thread takes it; the control plane gives work for a
-busy one to a new thread). `kind` decides the same for a message sent
-straight to a busy thread, by the person or by another thread. It leans toward spawning. The router
+busy one to a new thread). `assess` decides the same for a message sent
+straight to a thread, by the person or by another thread, with the objectives
+it brings. It leans toward spawning. The router
 answers a quick question itself (`answer`). A request it cannot plan (the model unreachable or refusing the call, an answer that is
 not one call of that function, a plan that neither answers nor does
 anything) is an error the
@@ -54,6 +67,8 @@ import re
 from typing import Protocol
 
 import httpx
+
+from .objectives import texts
 
 LOAD = """Each thread has a `load` (how much it already has on its plate):
 `level` is "idle" (between turns: it takes a new job at once), "busy" (in a
@@ -87,6 +102,18 @@ A send's "workers" is "" unless the request means that thread's work now needs
 the other place (its "where" says why; "" when it stays).
 """
 
+OBJECTIVES = """The project's objectives are its threads' `objectives`: each one, with its `id`,
+`status` and `note`, is owned by the thread it is listed under, and only that
+thread works on it. You make them. Give every spawned thread the objectives its
+work must accomplish: one per outcome, each a short imperative sentence that
+says when it is done, in the order to work them, at least one. A send that gives
+a thread work none of its objectives covers gives it objectives for that work;
+a send that only steers work it has objectives for gives none. Never make an
+objective that one listed already covers, whatever its status and however the
+request words it: send that work to the thread that owns it, as a steer, and
+give no thread a second copy of it.
+"""
+
 ANSWER = """A quick question needs no thread. When the request is a question that what you
 are given here (the threads, their state, summaries, files and load, the
 places) or general engineering knowledge answers in full, answer it yourself in
@@ -100,9 +127,10 @@ goes to a thread.
 """
 
 REPLY_FORMAT = """Answer by calling `route` once: `spawn` lists the new threads (each with a
-3-6 word title, its task, its workers and where), `send` the messages to existing
-threads, `answer` your own answer to the person ("" when none), and `why` says
-in one sentence why."""
+3-6 word title, its task, its objectives, its workers and where), `send` the
+messages to existing threads (each with the objectives it gives), `answer`
+your own answer to the person ("" when none), and `why` says in one sentence
+why."""
 
 PLACE = """A request in a software project starts an agent thread. Decide where its
 workers run.
@@ -110,17 +138,35 @@ workers run.
 
 WHERE_FIELD = "one sentence: what in its work decided where it runs"
 KIND_FIELD = "steer: about the job it is on now; work: a new job"
+OBJECTIVES_FIELD = {"type": "array", "items": {"type": "string"},
+                    "description": "its objectives, in the order to work them: each a short imperative sentence "
+                                   "that says when it is done"}
 
-KIND = """A message was sent to an agent thread that is in a turn, working on a job.
-A thread does one job at a time: it can be steered, but not given more work.
-Decide whether the message steers the job the thread is on now ("steer": a
+ASSESS = """A message was sent straight to an agent thread. A thread does one job at a
+time: it can be steered, but a thread in a turn is not given more work.
+Decide whether the message steers the job the thread is on ("steer": a
 correction, guidance, a change to what it was asked, an answer or result it is
 waiting for, something it needs to finish) or is a new job ("work": anything it
-would do after its current job, even work that follows on from it). New work
-goes to a new thread. `thread` is the busy thread (its title, the request that
-started it, its summary, and its objectives with where each is at); `message`
+would do after its current job, even work that follows on from it). `thread`
+is the thread (its title, the request that started it, its summary, `busy`
+whether it is in a turn, and its objectives with where each is at); `message`
 is what was sent and `from` who sent it.
-Answer by calling `kind` once."""
+The orchestrator owns the project's objectives and delegates each to one
+thread. Say in `objectives` the new objectives the message brings: for work,
+the objectives that job must accomplish (one per outcome, each a short
+imperative sentence that says when it is done, in the order to work them, at
+least one); for a steer, only work it adds that none of the thread's
+objectives covers, usually none. Never repeat one of its objectives.
+Answer by calling `assess` once."""
+
+OBJECTIVES_FOR = """A new agent thread starts in a software project with `request`. The
+orchestrator owns the project's objectives and delegates each to one thread:
+give this thread the objectives its request must accomplish, one per outcome,
+each a short imperative sentence that says when it is done, in the order to
+work them, at least one. `threads` are the project's other threads with the
+objectives each owns: never repeat one of those; give this thread only what its
+request adds to them.
+Answer by calling `objectives` once."""
 
 SYSTEM = """You route requests in a software project to agent threads.
 Each thread is a long-lived agent working in its own git worktree.
@@ -128,7 +174,7 @@ Threads are cheap: prefer spawning a new thread. Reuse a thread only when the
 request clearly continues that thread's work and the thread is idle. Split a
 request with several independent parts into several new threads. A request can
 also spawn threads and notify existing threads whose work it touches.
-""" + ANSWER + LOAD + PLACES + """
+""" + OBJECTIVES + ANSWER + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -141,8 +187,9 @@ itself what to keep, drop or undo, so plan only what the corrections leave out:
 spawn a thread for each part of the new text that no reached thread covers, and
 send a reached or other thread a message only to say what changed for it (for
 example that a part it had now has its own thread). An empty plan is a fine
-answer when the corrections cover the edit.
-""" + ANSWER + LOAD + PLACES + """
+answer when the corrections cover the edit. A reached thread whose work the
+edit adds to gets a send with the objectives for what it adds.
+""" + OBJECTIVES + ANSWER + LOAD + PLACES + """
 """ + REPLY_FORMAT
 
 
@@ -159,9 +206,14 @@ class Router(Protocol):
         """Where a new thread with this request runs: {"workers": an
         available place's id, "where": why there}."""
 
-    async def kind(self, message: str, sender: str, thread: dict) -> dict:
-        """Whether a message to a busy thread steers its job or is new work:
-        {"kind": "steer" | "work", "why"}."""
+    async def assess(self, message: str, sender: str, thread: dict, busy: bool) -> dict:
+        """Whether a message sent straight to a thread steers its job or is
+        new work, and the objectives it brings (texts, at least one for
+        work): {"kind": "steer" | "work", "objectives", "why"}."""
+
+    async def objectives(self, request: str, directory: list[dict]) -> dict:
+        """The objectives of a new thread nobody planned them for (texts, at
+        least one), none an other thread in `directory` owns: {"objectives", "why"}."""
 
 
 def title_for(text: str) -> str:
@@ -181,18 +233,24 @@ def clean_plan(plan: dict, directory: list[dict], places: list[dict]) -> dict:
     """Keep only well-formed entries that point at real threads, each with
     `workers` an available place, or "" (spawn: asked with `place` when it
     is first put on a worker; send: not moved), and `where` why there. A
-    send's `kind` is "steer" or else "work". `answer` is the router's own
-    answer to the person, "" when it gave none."""
+    send's `kind` is "steer" or else "work". `objectives` are texts
+    (objectives.texts); a spawn with none is an error, since every thread is
+    given its objectives. `answer` is the router's own answer to the person,
+    "" when it gave none."""
     known, can = {t["id"] for t in directory}, available(places)
 
     def placed(s: dict) -> dict:
         workers = s["workers"] if s.get("workers") in can else ""
         return {"workers": workers, "where": str(s.get("where") or "") if workers else ""}
     spawn = [{"title": str(s.get("title") or title_for(str(s.get("request", ""))))[:80],
-              "request": str(s["request"]), **placed(s)}
+              "request": str(s["request"]), "objectives": texts(s.get("objectives")), **placed(s)}
              for s in plan.get("spawn") or [] if isinstance(s, dict) and s.get("request")]
+    for s in spawn:
+        if not s["objectives"]:
+            raise ValueError(f"the router planned thread “{s['title']}” with no objectives")
     send = [{"thread": s["thread"], "message": str(s["message"]),
-             "kind": "steer" if s.get("kind") == "steer" else "work", **placed(s)}
+             "kind": "steer" if s.get("kind") == "steer" else "work",
+             "objectives": texts(s.get("objectives")), **placed(s)}
             for s in plan.get("send") or []
             if isinstance(s, dict) and s.get("thread") in known and s.get("message")]
     return {"spawn": spawn, "send": send, "answer": str(plan.get("answer") or "").strip(),
@@ -208,9 +266,10 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
     can = sorted(available(places))
     # Nowhere to run: the thread is refused when it is first put on a worker.
     spawn = {"type": "object", "additionalProperties": False,
-             "required": ["title", "request", "workers", "where"],
+             "required": ["title", "request", "objectives", "workers", "where"],
              "properties": {"title": {"type": "string", "description": "3-6 word title"},
                             "request": {"type": "string", "description": "the task for that thread"},
+                            "objectives": OBJECTIVES_FIELD,
                             "workers": {"type": "string", "enum": can or [""]},
                             "where": {"type": "string", "description": WHERE_FIELD}}}
     props = {"spawn": {"type": "array", "items": spawn},
@@ -221,10 +280,13 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
     if directory:
         props["send"] = {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "required": ["thread", "message", "kind", "workers", "where"],
+            "required": ["thread", "message", "kind", "objectives", "workers", "where"],
             "properties": {"thread": {"type": "string", "enum": [t["id"] for t in directory]},
                            "message": {"type": "string", "description": "what to tell it"},
                            "kind": {"type": "string", "enum": list(KINDS), "description": KIND_FIELD},
+                           "objectives": {**OBJECTIVES_FIELD,
+                                          "description": "new objectives this gives the thread, in order; [] when "
+                                                         "it only steers work it has objectives for"},
                            "workers": {"type": "string", "enum": [""] + can,
                                        "description": "\"\" unless its work now needs the other place"},
                            "where": {"type": "string", "description": "why it moves; \"\" when it stays"}}}}
@@ -233,10 +295,21 @@ def plan_tool(directory: list[dict], places: list[dict]) -> dict:
                            "required": list(props), "properties": props}}
 
 
-def kind_tool() -> dict:
-    return {"name": "kind", "description": "Say whether the message steers the thread's current job or is new work.",
-            "parameters": {"type": "object", "additionalProperties": False, "required": ["kind", "why"],
+def assess_tool() -> dict:
+    return {"name": "assess",
+            "description": "Say whether the message steers the thread's job or is new work, and the objectives it brings.",
+            "parameters": {"type": "object", "additionalProperties": False, "required": ["kind", "objectives", "why"],
                            "properties": {"kind": {"type": "string", "enum": list(KINDS), "description": KIND_FIELD},
+                                          "objectives": {**OBJECTIVES_FIELD,
+                                                         "description": "the new objectives it brings, in order: at "
+                                                                        "least one for work, usually none for a steer"},
+                                          "why": {"type": "string", "description": "one sentence"}}}}
+
+
+def objectives_tool() -> dict:
+    return {"name": "objectives", "description": "Give the new thread its objectives.",
+            "parameters": {"type": "object", "additionalProperties": False, "required": ["objectives", "why"],
+                           "properties": {"objectives": OBJECTIVES_FIELD,
                                           "why": {"type": "string", "description": "one sentence"}}}}
 
 
@@ -315,12 +388,23 @@ class ModelRouter:
         return await self._ask(REVISE, {"previous": previous, "request": request, "reached": reached},
                                directory, places)
 
-    async def kind(self, message: str, sender: str, thread: dict) -> dict:
-        about = {k: thread.get(k) for k in ("id", "title", "request", "summary", "objectives")}
-        got = await self._call(KIND, {"thread": about, "message": message, "from": sender}, kind_tool())
+    async def assess(self, message: str, sender: str, thread: dict, busy: bool) -> dict:
+        about = {**{k: thread.get(k) for k in ("id", "title", "request", "summary", "objectives")}, "busy": busy}
+        got = await self._call(ASSESS, {"thread": about, "message": message, "from": sender}, assess_tool())
         if got.get("kind") not in KINDS:
             raise ValueError(f"the router model ({self.model}) said neither steer nor work: {got.get('kind')!r}")
-        return {"kind": got["kind"], "why": str(got.get("why") or "")}
+        items = texts(got.get("objectives"))
+        if got["kind"] == "work" and not items:
+            raise ValueError(f"the router model ({self.model}) called the message new work with no objectives")
+        return {"kind": got["kind"], "objectives": items, "why": str(got.get("why") or "")}
+
+    async def objectives(self, request: str, directory: list[dict]) -> dict:
+        threads = [{k: t.get(k) for k in ("id", "title", "summary", "objectives")} for t in directory]
+        got = await self._call(OBJECTIVES_FOR, {"request": request, "threads": threads}, objectives_tool())
+        items = texts(got.get("objectives"))
+        if not items:
+            raise ValueError(f"the router model ({self.model}) gave the thread no objectives: {got.get('why')!r}")
+        return {"objectives": items, "why": str(got.get("why") or "")}
 
     async def place(self, request: str, places: list[dict]) -> dict:
         got = await self._call(PLACE, {"request": request, "places": places}, place_tool(places))

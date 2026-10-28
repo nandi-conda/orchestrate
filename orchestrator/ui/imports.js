@@ -98,7 +98,7 @@ export function imports({ str, strs, vals, dispatch }) {
       for (const t of ["request", "created", "state", "message_in", "message_out", "delta", "reasoning", "assistant", "tool_call",
                        "tool_result", "usage", "turn_done", "dropped", "error", "route", "worker",
                        "saved", "landed", "land_conflict", "preparing", "prepared",
-                       "archived", "unarchived", "edited", "objectives"])
+                       "archived", "unarchived", "edited", "objectives", "goal"])
         es.addEventListener(t, es.onmessage);
       streams.set(id, es);
       return id;

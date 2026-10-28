@@ -72,10 +72,12 @@ class RunnerClient:
         return r.json()
 
     async def post_message(self, thread_id: str, body: str, sender: str = "user", hops: int = 0,
-                           images: list[dict] | None = None) -> None:
+                           images: list[dict] | None = None, objectives: list[dict] | None = None) -> None:
         payload: dict[str, Any] = {"body": body, "from": sender, "hops": hops}
         if images:
             payload["images"] = images
+        if objectives:
+            payload["objectives"] = objectives
         r = await self.http.post(f"/threads/{thread_id}/messages", json=payload)
         check(r)
 

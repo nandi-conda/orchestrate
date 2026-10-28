@@ -314,7 +314,8 @@ class AgentThread:
                     goal = await self._goal_prompt()
                 if goal is not None:
                     self.goal_turns += 1
-                    self.emit("goal", {"objective": self._current()["id"], "turn": self.goal_turns})
+                    o = self._current()
+                    self.emit("goal", {"objective": o["id"], "text": o["text"], "turn": self.goal_turns})
                     await self.harness.prompt(goal)
                 else:
                     item, self.first = self.first or await self.inbox.get(), None

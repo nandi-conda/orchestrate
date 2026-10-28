@@ -30,12 +30,22 @@ def said(workers: str) -> str:
     return "the request says where" if workers else ""
 
 
+OBJECTIVE_LINES = re.compile(r"^\s*objectives:\s*(.+)$", re.M)
+
+
+def objectives_in(text: str) -> list[str]:
+    """A request's objectives: its `objectives: a | b` line, else the request itself."""
+    m = OBJECTIVE_LINES.search(text)
+    return [o.strip() for o in m.group(1).split("|")] if m else [(text.strip().splitlines() or ["its work"])[0][:300]]
+
+
 class HeuristicRouter:
     """No model: "question: ..." is answered with no thread, `@t_xxx` sends that thread work, a bulleted or numbered list
     fans out one thread per item, anything else spawns one thread. "run
     locally" puts the request's threads on this computer (moves a thread a
     message goes to), "on sprites" on Sprites; `place` picks Sprites when it
-    is available, else this computer."""
+    is available, else this computer. A thread's objectives are its
+    request's `objectives: a | b` line, else its request (objectives_in)."""
 
     async def plan(self, request: str, directory: list[dict], places: list[dict], images: int = 0) -> dict:
         if request.lower().startswith("question:") and not images:
@@ -46,23 +56,28 @@ class HeuristicRouter:
         targets = [m for m in MENTION.findall(request) if m in known]
         if targets:
             body = MENTION.sub("", request).strip()
-            return {"spawn": [], "send": [{"thread": t, "message": body, "kind": "work", "workers": workers,
+            return {"spawn": [], "send": [{"thread": t, "message": body, "kind": "work",
+                                           "objectives": objectives_in(body), "workers": workers,
                                            "where": said(workers)} for t in targets],
                     "why": "the request names existing threads"}
         items = [m.group(1) for line in request.splitlines() if (m := ITEM.match(line))]
         if len(items) >= 2:
-            return {"spawn": [{"title": title_for(i), "request": i, "workers": workers, "where": said(workers)}
-                              for i in items],
+            return {"spawn": [{"title": title_for(i), "request": i, "objectives": [i], "workers": workers,
+                               "where": said(workers)} for i in items],
                     "send": [], "why": f"{len(items)} independent items, one thread each"}
-        return {"spawn": [{"title": title_for(request), "request": request, "workers": workers,
-                           "where": said(workers)}], "send": [],
+        return {"spawn": [{"title": title_for(request), "request": request, "objectives": objectives_in(request),
+                           "workers": workers, "where": said(workers)}], "send": [],
                 "why": "new work gets a new thread"}
 
-    async def kind(self, message: str, sender: str, thread: dict) -> dict:
-        """New work only when the message says so ("new job: ..."); else it steers."""
+    async def assess(self, message: str, sender: str, thread: dict, busy: bool) -> dict:
+        """New work only when the message says so ("new job: ..."), with its
+        objectives; else it steers, bringing none."""
         if message.lower().startswith("new job:"):
-            return {"kind": "work", "why": "it says it is a new job"}
-        return {"kind": "steer", "why": "it is about the job the thread is on"}
+            return {"kind": "work", "objectives": objectives_in(message[8:]), "why": "it says it is a new job"}
+        return {"kind": "steer", "objectives": [], "why": "it is about the job the thread is on"}
+
+    async def objectives(self, request: str, directory: list[dict]) -> dict:
+        return {"objectives": objectives_in(request), "why": "what its request asks"}
 
     async def place(self, request: str, places: list[dict]) -> dict:
         can = [p["id"] for p in places if not p["why"]]
@@ -81,8 +96,8 @@ class HeuristicRouter:
         new = [m.group(1) for line in request.splitlines() if (m := ITEM.match(line)) and m.group(1) not in old]
         if new:
             workers = where(request, places)
-            return {"spawn": [{"title": title_for(i), "request": i, "workers": workers, "where": said(workers)}
-                              for i in new], "send": [],
+            return {"spawn": [{"title": title_for(i), "request": i, "objectives": [i], "workers": workers,
+                               "where": said(workers)} for i in new], "send": [],
                     "why": f"{len(new)} new item{'s' if len(new) > 1 else ''} in the edit, one thread each"}
         return {"spawn": [], "send": [], "why": "the threads on it take the edit as a correction"}
 

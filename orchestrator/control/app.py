@@ -156,6 +156,10 @@ def display(ev: dict) -> dict:
         items = d.get("objectives") or []
         done = sum(o.get("status") == "done" for o in items)
         kind, label, text = K_STATE, "objectives", f"{done} of {len(items)} done"
+    elif t == "goal":
+        # The runner gives the thread a turn on its objective, as its agent's goal.
+        kind, label = K_STATE, "goal"
+        text = f"turn {d.get('turn', 1)} on objective “{d.get('text', d.get('objective', ''))}”"
     elif t in ("project_archived", "project_unarchived"):
         kind, label = K_STATUS, t.removeprefix("project_")
         text = f"project {label}"
