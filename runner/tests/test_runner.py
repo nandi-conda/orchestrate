@@ -11,10 +11,10 @@ import pytest
 import uvicorn
 from conftest import Scripted, Web, in_view, py, results, sh, until
 
-from runner import ThreadHost, View
+from runner import Limits, ThreadHost, View
 from runner.sandbox import SandboxError, bwrap_args, pixi, runner_checkout, thread_env, worker_private
+from runner.objectives import ObjectiveError
 from runner.server import create_app, serve
-from runner.thread import NO_OBJECTIVES
 
 
 def host_with(*scripts, tmp_path, **kw):
@@ -192,7 +192,7 @@ async def test_a_message_during_a_turn_steers_it(tmp_path):
     assert sum(e["type"] == "turn_done" for e in t.events) == 1
     messages = (await t.harness.command("get_messages"))["messages"]
     users = [m for m in messages if m["role"] == "user"]
-    assert users[-1]["content"][0]["text"] == "[from t_other] also do this" + NO_OBJECTIVES
+    assert users[-1]["content"][0]["text"] == "[from t_other] also do this"
     await host.stop(t.id)
 
 
@@ -634,82 +634,87 @@ def test_opengateway_calls_carry_its_token_from_the_environment(tmp_path):
     assert body["messages"][0]["role"] == "system" and "store" not in body
 
 
-async def test_a_thread_keeps_its_objectives_and_ends_when_all_are_done(tmp_path):
-    """The agent sets its objectives from its request and moves them as it
-    works; each change is an `objectives` event. A turn that ends with some
-    not done leaves the thread idle; one that ends with all done ends it."""
+GIVEN = [{"id": "o_1", "text": "find the bug"}, {"id": "o_2", "text": "fix it", "note": "after the bug"}]
+
+
+def goals(t) -> list[str]:
+    return [e["data"]["objective"] for e in t.events if e["type"] == "goal"]
+
+
+async def test_a_thread_works_its_objectives_one_by_one_as_goals_and_ends_when_all_are_done(tmp_path):
+    """The orchestrator gives a thread its objectives. After its request's
+    turn, the runner gives it turns on its first objective not done as its
+    goal (in_progress), until its agent completes the goal (done); then the
+    next. A turn that leaves every objective done ends the thread."""
     host = host_with([
-        py("print(await team.set_objectives(['find the bug', {'text': 'fix it', 'note': 'after the bug'}]))"),
-        py("await team.update_objective(0, 'done', 'found: off by one')\n"
-           "await team.update_objective(1, 'in_progress')\nprint(await team.objectives())"),
-        "half way",
-        py("await team.update_objective(1, 'done', 'fixed')"),
-        "all done",
+        py("print(await team.objectives())"), "looked",                      # its request
+        py("print(await goal.get())"), "found it",                           # o_1 set as its goal
+        py("print(await goal.complete())"), "o_1 done",                      # o_1 carried on: completed
+        "half way",                                                          # o_2 set as its goal
+        py("await team.update_objective('o_2', 'patched, testing')\nprint(await goal.complete())"), "fixed",
     ], tmp_path=tmp_path)
-    t = await host.start(project="p", title="t", request="fix the bug")
-    await host.wait_idle(t.id)
-    assert t.state == "idle"
-    assert "'status': 'pending'" in results(t)[0] and "'note': 'after the bug'" in results(t)[0]
-    assert t.objectives == [{"text": "find the bug", "status": "done", "note": "found: off by one"},
-                            {"text": "fix it", "status": "in_progress", "note": "after the bug"}]
-    assert t.directory_entry()["objectives"] == t.objectives
-    t.deliver("finish it")
+    t = await host.start(project="p", title="t", request="fix the bug", objectives=GIVEN)
     await until(lambda: t.task.done())  # its harness closes as it ends
-    assert t.state == "done" and t.objectives[1] == {"text": "fix it", "status": "done", "note": "fixed"}
-    changes = [e["data"]["objectives"] for e in t.events if e["type"] == "objectives"]
-    assert len(changes) == 4 and changes[-1] == t.objectives
+    assert "'status': 'pending'" in results(t)[0] and "'note': 'after the bug'" in results(t)[0]
+    assert "find the bug (objective o_1)" in results(t)[1] and "'status': 'active'" in results(t)[1]
+    assert goals(t) == ["o_1", "o_1", "o_2", "o_2"]
+    assert t.state == "done"
+    assert t.objectives == [{"id": "o_1", "text": "find the bug", "status": "done", "note": ""},
+                            {"id": "o_2", "text": "fix it", "status": "done", "note": "patched, testing"}]
+    assert t.directory_entry()["objectives"] == t.objectives
+    changes = [[o["status"] for o in e["data"]["objectives"]] for e in t.events if e["type"] == "objectives"]
+    assert changes == [["in_progress", "pending"], ["done", "pending"], ["done", "in_progress"],
+                       ["done", "in_progress"], ["done", "done"]]
     states = [e["data"]["state"] for e in t.events if e["type"] == "state"]
     assert states[-2:] == ["idle", "done"]  # its last turn ended first
 
 
+async def test_goal_turns_stop_after_the_limit_until_a_message_brings_more(tmp_path):
+    """An objective whose goal its agent does not complete gets
+    max_goal_turns turns in a row, then the thread waits idle, its note
+    saying so. A message carries it on, and brings the objectives delegated
+    with it: the thread's from then on, after its own."""
+    host = host_with([
+        "ok",                                                                # its request
+        "not yet",                                                           # o_1's one goal turn
+        py("print([o['id'] for o in await team.objectives()])"), "on it",    # the message
+        py("await goal.complete()"), "o_1 done",                             # o_1 carried on
+        py("await goal.complete()"), "o_3 done",                             # o_3
+    ], tmp_path=tmp_path, limits=Limits(max_goal_turns=1))
+    t = await host.start(project="p", title="t", request="x", objectives=GIVEN[:1])
+    await until(lambda: "runner stopped" in t.objectives[0]["note"])
+    await host.wait_idle(t.id)
+    assert t.state == "idle" and t.objectives[0]["status"] == "in_progress"
+    t.deliver("and this", objectives=[{"id": "o_3", "text": "this too"}])
+    assert [o["id"] for o in t.objectives] == ["o_1", "o_3"]
+    with pytest.raises(ObjectiveError):  # an id the thread already has
+        t.deliver("again", objectives=[{"id": "o_3", "text": "this too"}])
+    await until(lambda: t.task.done())
+    assert "['o_1', 'o_3']" in results(t)[0]
+    assert goals(t) == ["o_1", "o_1", "o_3"] and t.state == "done"
+
+
 async def test_objectives_the_team_skill_refuses(tmp_path):
-    host = host_with([py("for call in (team.set_objectives([]), team.set_objectives(['a', {'text': 'b', 'status': 'half'}]),\n"
-                         "             team.update_objective(3, 'done')):\n"
-                         "    try:\n        await call\n    except team.TeamError as e:\n        print(e)"),
-                      "done"], tmp_path=tmp_path)
-    t = await host.start(project="p", title="t", request="x")
+    """The agent keeps notes on its own objectives, and cannot make, reword
+    or move one: the orchestrator makes them, its goals move them."""
+    host = host_with([py("for call in (lambda: team.update_objective('o_9', 'x'), lambda: team.update_objective('o_1', 'x', 'done')):\n"
+                         "    try:\n        await call()\n    except (team.TeamError, TypeError) as e:\n        print(e)\n"
+                         "print(hasattr(team, 'set_objectives'))"),
+                      "done"], tmp_path=tmp_path, limits=Limits(max_goal_turns=0))
+    t = await host.start(project="p", title="t", request="x", objectives=GIVEN)
     await host.wait_idle(t.id)
     out = results(t)[0].splitlines()
-    assert "at least one objective" in out[0] and "not 'half'" in out[1] and "no objective 3" in out[2], out
-    assert t.objectives == [] and t.state == "idle"  # no objectives: never finished
+    assert "no objective 'o_9'" in out[0] and "positional argument" in out[1] and out[2] == "False", out
+    assert [o["status"] for o in t.objectives] == ["pending", "pending"] and t.state == "idle"
     await host.stop(t.id)
 
 
 async def test_a_thread_brought_back_keeps_its_objectives(tmp_path):
-    host = host_with(["ok"], tmp_path=tmp_path)
-    kept = [{"text": "ship it", "status": "in_progress", "note": "tests pass"}]
+    host = host_with(["ok"], tmp_path=tmp_path, limits=Limits(max_goal_turns=0))
+    kept = [{"id": "o_1", "text": "ship it", "status": "in_progress", "note": "tests pass"}]
     t = await host.start(project="p", title="t", request="go on", objectives=kept)
     await host.wait_idle(t.id)
     assert t.objectives == kept and t.state == "idle"
-    await host.stop(t.id)
-
-
-async def test_a_turn_with_no_objectives_asks_for_them(tmp_path):
-    """A thread that began before objectives existed has none when it is
-    brought back mid-work: each turn it starts says so, until it sets them."""
-    sent = []
-
-    class Spied(Scripted):
-        async def start(self, place, *, model, append_prompt):
-            harness = await super().start(place, model=model, append_prompt=append_prompt)
-            prompt = harness.prompt
-
-            async def spy(text, images=None):
-                sent.append(text)
-                return await prompt(text, images)
-            harness.prompt = spy
-            return harness
-
-    host = ThreadHost(agent=Spied(["no objectives set", py("await team.set_objectives(['finish'])"), "ok", "ok"]),
-                      web=Web(), workdir=str(tmp_path / "threads"))
-    t = await host.start(project="p", title="t", request="go on")
-    await host.wait_idle(t.id)
-    t.deliver("again")
-    await until(lambda: len(sent) == 2)
-    await host.wait_idle(t.id)
-    t.deliver("once more")
-    await until(lambda: len(sent) == 3)
-    assert ["no objectives yet" in m for m in sent] == [True, True, False], sent
     await host.stop(t.id)
 
 

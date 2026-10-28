@@ -46,18 +46,22 @@ How the team works, through the `team` skill (read its SKILL.md):
 - Keep your directory entry current with `team.set_summary` when your focus changes.
 - `team.web_search` and `team.web_fetch` search and read the web.
 
-Your objectives: the thread has a list of the things it is trying to accomplish, each `pending`,
-`in_progress` or `done` with a short note on where it is at. The person watches them as you work.
-- Set them from your request before anything else, in the first turn (or in the next one when the
-  list is empty, as a thread that began before objectives existed finds it): `team.set_objectives([...])`,
-  one objective per outcome the request asks for. `team.objectives()` reads them back.
-- Keep them current as you go: `team.update_objective(i, "in_progress", "where it is at")` when
-  you start on one and as it moves, and set them again when you learn the work is different. A
-  message that brings more work adds objectives for it.
-- Mark one `done` only once it is accomplished and its work is committed. A turn that ends with
-  every objective done finishes the thread: it ends and is archived, and takes no more messages.
-  So while you still need something to finish (an answer, another thread's result), leave the
-  objective that needs it not done.
+Your objectives: the orchestrator owns the project's objectives and delegates each to one thread;
+yours are the ones it gave this thread, in the order to work them, each `pending`, `in_progress`
+or `done` with a short note on where it is at. The person watches them as you work.
+- `team.objectives()` lists them. They come with your request, and a message that brings more work
+  comes with objectives for it. You never make or reword objectives: the orchestrator does, so no
+  two threads chase the same goal.
+- You work them in order, one at a time, each as your goal (the `goal` skill): the runner sets
+  your first objective not done as your goal, `in_progress`, and keeps giving you turns on it
+  while it is open. Call `await goal.complete()` once it is achieved: that marks the objective
+  `done`, and the runner moves you on to the next. Never create or complete a goal for anything
+  else. Keep a note on where it is at: `team.update_objective(id, "where it is at")`.
+- Work no objective names is not yours: leave it to whoever owns it, or spawn a thread for it
+  (the orchestrator gives that thread its objectives).
+- When every objective is done the thread is finished: it ends and is archived, and takes no
+  more messages. So while you still need something to finish (an answer, another thread's
+  result), do not complete the goal that needs it.
 
 The project is a pixi project (https://pixi.sh): pixi.toml at the root of your workspace says
 its dependencies, environments and tasks, and pixi.lock pins them. Use pixi for all of it:
@@ -131,6 +135,9 @@ def claim_workdir(workdir: str | os.PathLike) -> int:
 class Limits:
     max_spawn: int = 8
     max_hops: int = 6
+    # Goal turns in a row (no message between them) the runner gives one
+    # objective before it waits for a message to carry it on.
+    max_goal_turns: int = 10
 
 
 class DeltaBuffer:
@@ -182,8 +189,16 @@ def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
 
-NO_OBJECTIVES = ("\n\n[thread: you have no objectives yet. Before anything else, set them from the work "
-                 "you are on with team.set_objectives([...]).]")
+# Objectives are worked one at a time, in order, as the agent's prime-agent
+# goal (GOALS below).
+GOAL_ON = ("Your goal is still open: {goal}. Carry on with it, and call `await goal.complete()` once it is "
+           "achieved.")
+GOAL_STOPPED = "the runner stopped after {n} goal turns in a row without it done; a message carries it on"
+
+
+def goal_of(o: dict) -> str:
+    """The prime-agent goal an objective is worked as."""
+    return f"{o['text']} (objective {o['id']})"
 
 
 def user_text(sender: str, body: str) -> str:
@@ -225,6 +240,7 @@ class AgentThread:
         self.stopping = ""
         self.session = ""  # the thread's session commit on this worker, as its last turn left it
         self.resumed = False  # started to resume a turn cut short here
+        self.goal_turns = 0  # goal turns in a row (GOALS)
 
     def emit(self, type: str, data: Any = None):
         if type == "error":  # every failure a thread reports is in the worker log too
@@ -240,14 +256,33 @@ class AgentThread:
                 "summary": self.summary, "objectives": self.objectives, "files": sorted(self.files),
                 "parent": self.parent}
 
-    def set_objectives(self, objectives: list[dict]) -> list[dict]:
-        """Replace the thread's objectives (checked: objectives.objectives),
-        an `objectives` event for the control plane and the person."""
+    def _set_objectives(self, objectives: list[dict]) -> list[dict]:
+        """The thread's objectives become `objectives` (checked:
+        objectives.objectives): an `objectives` event for the control plane
+        and the person."""
         self.objectives = O.objectives(objectives)
         self.emit("objectives", {"objectives": self.objectives})
         return self.objectives
 
-    def deliver(self, body: str, sender: str = "user", hops: int = 0, images: list[dict] | None = None):
+    def add_objectives(self, objectives: list[dict]) -> list[dict]:
+        """Objectives the orchestrator delegated to the thread, after its own."""
+        return self._set_objectives(self.objectives + list(objectives))
+
+    def move_objective(self, oid: str, status: str | None = None, note: str | None = None) -> list[dict]:
+        """One of its objectives moves on: its status (the runner's, from the
+        agent's goal), its note (the agent's, on where it is at)."""
+        if oid not in {o["id"] for o in self.objectives}:
+            raise O.ObjectiveError(f"no objective {oid!r}: this thread's are "
+                                   f"{', '.join(o['id'] for o in self.objectives) or 'none'}")
+        changed = {k: v for k, v in (("status", status), ("note", note)) if v is not None}
+        return self._set_objectives([{**o, **changed} if o["id"] == oid else o for o in self.objectives])
+
+    def deliver(self, body: str, sender: str = "user", hops: int = 0, images: list[dict] | None = None,
+                objectives: list[dict] | None = None):
+        """A message for the thread's next turn; `objectives` are the ones the
+        orchestrator delegates with it, the thread's from now on."""
+        if objectives:
+            self.add_objectives(objectives)
         self.inbox.put_nowait({"from": sender, "body": body, "hops": hops, "images": images or []})
 
     def prompt(self) -> str:
@@ -261,7 +296,7 @@ class AgentThread:
             return False
         self.emit("message_in", {"from": item["from"], "body": item["body"]})
         text = user_text(item["from"], item["body"])
-        await self.harness.prompt(text + (NO_OBJECTIVES if not self.objectives else ""), item.get("images"))
+        await self.harness.prompt(text, item.get("images"))
         return True
 
     async def run(self, prepare: Callable[[], Any] | None = None):
@@ -274,13 +309,31 @@ class AgentThread:
             await self.team.start()
             self.harness = await self.agent.start(self.place, model=self.model, append_prompt=self.prompt())
             while True:
-                item, self.first = self.first or await self.inbox.get(), None
-                if await self._send(item):
-                    await self._turn()
-                    if O.accomplished(self.objectives) and self.inbox.empty():
-                        # Its turn ended with every objective done: the thread is finished.
-                        self.set_state("done")
-                        return
+                goal = None
+                if self.first is None and self.inbox.empty():
+                    goal = await self._goal_prompt()
+                if goal is not None:
+                    self.goal_turns += 1
+                    self.emit("goal", {"objective": self._current()["id"], "turn": self.goal_turns})
+                    await self.harness.prompt(goal)
+                else:
+                    item, self.first = self.first or await self.inbox.get(), None
+                    if not await self._send(item):
+                        continue
+                    self.goal_turns = 0  # a message carries the objective on
+                failed = await self._turn()
+                await self._settle_goal()
+                if goal is not None and self.goal_turns == self.limits.max_goal_turns and self._current():
+                    self.move_objective(self._current()["id"], note=GOAL_STOPPED.format(n=self.goal_turns))
+                if failed:  # its model calls fail: no goal turns until a message comes
+                    self.goal_turns = self.limits.max_goal_turns
+                if O.accomplished(self.objectives) and self.inbox.empty():
+                    # Its last turn left every objective done: the thread is finished.
+                    await self._report()
+                    self.set_state("done")
+                    return
+                if self.inbox.empty() and not self._goes_on():
+                    await self._report()
         except asyncio.CancelledError:
             if not self.stopping:
                 self._turn_over()
@@ -301,9 +354,68 @@ class AgentThread:
                 await self.harness.close()
             await self.team.close()
 
-    async def _turn(self):
+    # GOALS. The thread works its objectives one at a time, in order, each as
+    # its agent's prime-agent goal (goal_of): whenever it has no message to
+    # take, the runner gives it a turn on its first objective not done. A
+    # goal not set yet is set (`/goal`, which marks the objective
+    # in_progress); one still open is carried on (GOAL_ON). The agent calls
+    # goal.complete() when it is achieved, which marks the objective done
+    # (_settle_goal). prime-agent's RPC mode keeps a goal's state but takes
+    # no turns on it by itself: these turns are the runner's. A goal turn
+    # whose model call failed, or max_goal_turns of them in a row, stop
+    # them until a message comes.
+
+    def _current(self) -> dict | None:
+        return next((o for o in self.objectives if o["status"] != "done"), None)
+
+    def _goes_on(self) -> bool:
+        """Whether the runner gives the thread another goal turn."""
+        return self._current() is not None and self.goal_turns < self.limits.max_goal_turns
+
+    async def _goal_prompt(self) -> str | None:
+        """What the next goal turn starts with, or None for no goal turn (the
+        thread waits for a message)."""
+        o = self._current()
+        if o is None:
+            return None
+        if self.goal_turns >= self.limits.max_goal_turns:
+            return None
+        goal = await self.harness.goal()
+        if goal and goal.get("status") == "active":
+            if goal.get("objective") != goal_of(o):
+                self.emit("error", {"error": f"its agent's goal is {goal.get('objective')!r}, not its objective "
+                                             f"{o['id']}: no goal turns until a message comes"})
+                self.goal_turns = self.limits.max_goal_turns
+                return None
+            return user_text("runner", GOAL_ON.format(goal=goal_of(o)))
+        if o["status"] != "in_progress":
+            self.move_objective(o["id"], status="in_progress")
+        return f"/goal {goal_of(o)}"
+
+    async def _settle_goal(self):
+        """A goal its agent completed marks its objective done."""
+        goal = await self.harness.goal()
+        if not goal or goal.get("status") != "complete":
+            return
+        for o in self.objectives:
+            if goal_of(o) == goal.get("objective") and o["status"] != "done":
+                self.move_objective(o["id"], status="done")
+                self.goal_turns = 0
+
+    async def _report(self):
+        """The thread stops for now: a thread that started it hears so."""
+        if not self.parent:
+            return
+        try:
+            await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary}")
+        except Exception as e:
+            log.warning("thread %s: telling its parent failed", self.id, exc_info=True)
+            self.emit("error", {"error": f"peer update failed: {type(e).__name__}: {e}"})
+
+    async def _turn(self) -> bool:
         """One turn: the agent's run from the message just sent until it is idle
-        again. Messages that arrive meanwhile steer it."""
+        again. Messages that arrive meanwhile steer it. True when a model
+        call failed in it."""
         self.set_state("working")
         Path(self.place.turn).write_text(json.dumps({"session": self.session, "since": time.time()}))
         turn = Turn(self)
@@ -336,11 +448,10 @@ class AgentThread:
         self.emit("turn_done", {"summary": self.summary, "final": turn.final})
         try:
             await self.peers.set_summary(self.id, self.summary, sorted(self.files))
-            if self.parent:
-                await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary or turn.final}")
         except Exception as e:
             log.warning("thread %s: peer update failed", self.id, exc_info=True)
             self.emit("error", {"error": f"peer update failed: {type(e).__name__}: {e}"})
+        return turn.failed
 
     def _turn_over(self):
         """No turn of the thread's is under way any more: none to resume."""

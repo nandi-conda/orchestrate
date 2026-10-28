@@ -200,7 +200,11 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
         if t.task is None or t.task.done():
             return JSONResponse({"error": f"thread {t.id} has ended ({t.state}): start it again to message it"},
                                 status_code=409)
-        t.deliver(b.get("body", ""), sender=b.get("from", "user"), hops=int(b.get("hops", 0)), images=images)
+        try:
+            t.deliver(b.get("body", ""), sender=b.get("from", "user"), hops=int(b.get("hops", 0)), images=images,
+                      objectives=b.get("objectives") or None)
+        except ObjectiveError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return JSONResponse({"ok": True}, status_code=202)
 
     async def stop(req: Request):

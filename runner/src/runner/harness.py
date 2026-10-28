@@ -338,6 +338,11 @@ class Harness:
         return bool(state.get("isStreaming") or state.get("isCompacting")
                     or (state.get("sessionActions") or {}).get("queuedCount"))
 
+    async def goal(self) -> dict | None:
+        """The session's prime-agent goal (`objective`, `status`: active,
+        complete, ...), None when it has none."""
+        return (await self.command("get_state")).get("goal")
+
     async def abort(self) -> None:
         await self.command("abort")
 

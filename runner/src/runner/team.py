@@ -58,18 +58,8 @@ async def _objectives(t: AgentThread) -> list[dict]:
     return t.objectives
 
 
-async def _set_objectives(t: AgentThread, objectives: list) -> list[dict]:
-    return t.set_objectives(objectives)
-
-
-async def _update_objective(t: AgentThread, index: int, status: str | None = None, note: str | None = None,
-                            text: str | None = None) -> list[dict]:
-    if not isinstance(index, int) or not 0 <= index < len(t.objectives):
-        raise TeamError(f"no objective {index}: the thread has {len(t.objectives)} (team.objectives() lists them)")
-    changed = {k: v for k, v in (("status", status), ("note", note), ("text", text)) if v is not None}
-    items = list(t.objectives)
-    items[index] = {**items[index], **changed}
-    return t.set_objectives(items)
+async def _update_objective(t: AgentThread, id: str, note: str) -> list[dict]:
+    return t.move_objective(id, note=note)
 
 
 async def _web_search(t: AgentThread, query: str, count: int = 10, question: str | None = None) -> list[dict]:
@@ -82,7 +72,7 @@ async def _web_fetch(t: AgentThread, url: str) -> dict:
 
 OPS = {"list_threads": _list_threads, "read_thread": _read_thread, "send_message": _send_message,
        "spawn_thread": _spawn_thread, "set_summary": _set_summary, "objectives": _objectives,
-       "set_objectives": _set_objectives, "update_objective": _update_objective, "web_search": _web_search,
+       "update_objective": _update_objective, "web_search": _web_search,
        "web_fetch": _web_fetch}
 
 

@@ -1,9 +1,14 @@
-"""A thread's objectives: the things it is trying to accomplish.
+"""A thread's objectives: the project's objectives the orchestrator delegated
+to it.
 
-Its agent sets them from its request on its first turn and keeps them current
+The orchestrator makes every objective (its router plans them from the
+person's requests, without repeating one a thread already owns) and gives
+each to one thread: with the thread when it is posted, and with the message
+that brings the thread more work. The thread's agent only moves its own
 through the team skill (team.py): each is `pending`, `in_progress` or `done`,
-with a short note on where it is at. A turn that ends with every objective done
-ends the thread (`done`), and the control plane archives it.
+with a short note on where it is at, and they are in the order to work them.
+A turn that ends with every objective done ends the thread (`done`), and the
+control plane archives it.
 """
 
 from __future__ import annotations
@@ -19,12 +24,13 @@ class ObjectiveError(ValueError):
 
 
 def objective(item) -> dict:
-    """One objective, `{"text", "status", "note"}`, from a string (pending,
-    no note) or a dict with `text` and optionally `status` and `note`."""
-    if isinstance(item, str):
-        item = {"text": item}
+    """One objective, `{"id", "text", "status", "note"}`: `id` and `text` as
+    the orchestrator made them, `status` (pending when left out) and `note`."""
     if not isinstance(item, dict):
-        raise ObjectiveError("an objective is a string or a dict with text, status and note")
+        raise ObjectiveError("an objective is a dict with id, text, status and note")
+    oid = str(item.get("id") or "").strip()
+    if not oid:
+        raise ObjectiveError("an objective needs its id")
     text = str(item.get("text") or "").strip()
     if not text:
         raise ObjectiveError("an objective needs its text")
@@ -36,18 +42,20 @@ def objective(item) -> dict:
     note = str(item.get("note") or "").strip()
     if len(note) > NOTE_MAX:
         raise ObjectiveError(f"an objective's note is at most {NOTE_MAX} characters")
-    return {"text": text, "status": status, "note": note}
+    return {"id": oid, "text": text, "status": status, "note": note}
 
 
 def objectives(items) -> list[dict]:
-    """A whole list of objectives: at least one, at most MAX."""
+    """A list of objectives, each id once, at most MAX."""
     if not isinstance(items, list):
         raise ObjectiveError("objectives are a list")
-    if not items:
-        raise ObjectiveError("a thread has at least one objective")
     if len(items) > MAX:
         raise ObjectiveError(f"a thread has at most {MAX} objectives")
-    return [objective(i) for i in items]
+    out = [objective(i) for i in items]
+    ids = [o["id"] for o in out]
+    if len(set(ids)) != len(ids):
+        raise ObjectiveError("each objective's id is in the list once")
+    return out
 
 
 def accomplished(items: list[dict]) -> bool:

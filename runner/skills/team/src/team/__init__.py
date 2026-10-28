@@ -61,13 +61,8 @@ async def objectives() -> list[dict]:
     return await _call("objectives")
 
 
-async def set_objectives(objectives: list) -> list[dict]:
-    return await _call("set_objectives", objectives=objectives)
-
-
-async def update_objective(index: int, status: str | None = None, note: str | None = None,
-                           text: str | None = None) -> list[dict]:
-    return await _call("update_objective", index=index, status=status, note=note, text=text)
+async def update_objective(id: str, note: str) -> list[dict]:
+    return await _call("update_objective", id=id, note=note)
 
 
 async def web_search(query: str, count: int = 10, question: str | None = None) -> list[dict]:
