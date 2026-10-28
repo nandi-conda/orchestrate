@@ -37,7 +37,10 @@ def main() -> None:
         raise SystemExit(str(e)) from None
     prepare_qt()
     app = QApplication([sys.argv[0], *rest])
-    app.setApplicationName("Orchestrator")
+    app.setApplicationName("Orchestrator")  # X11's WM_CLASS, the launcher's StartupWMClass
+    # Wayland's app_id: the launcher the package installs (recipe/menu/orchestrate.json,
+    # named <menu_name>_<name> by menuinst), so the window takes its icon and dock entry
+    app.setDesktopFileName("orchestrator_orchestrator")
     control = ControlPlane(a.port, lambda shutdown, on_startup: create_app(
         store=store_from_url(a.db), shutdown_event=shutdown, sync=sync, on_startup=on_startup))
     w = MainWindow(control)

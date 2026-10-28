@@ -24,6 +24,13 @@ build:
     - cp -R orchestrator/control orchestrator/desktop $SP_DIR/orchestrate/orchestrator/
     - cp -R orchestrator/ui/dist orchestrator/ui/icon.svg $SP_DIR/orchestrate/orchestrator/ui/
     - cp -R runner/pixi.toml runner/pixi.lock runner/pyproject.toml runner/models.json runner/src runner/skills runner/deploy $SP_DIR/orchestrate/runner/
+    # The app launcher (menuinst): installing the package, e.g. with `pixi global
+    # install`, adds the desktop window to the system's application menu. The
+    # shortcut runs `orchestrate` in the activated environment, so git and pixi
+    # from the package's environment are on its PATH.
+    - mkdir -p $PREFIX/Menu
+    - cp recipe/menu/orchestrate.json $PREFIX/Menu/
+    - $BUILD_PREFIX/bin/python recipe/menu/icons.py orchestrator/ui/icon.svg $PREFIX/Menu
   python:
     entry_points:
       - orchestrate = orchestrate:desktop
@@ -33,6 +40,9 @@ requirements:
   build:
     - python 3.12.*
     - ultra >=0.1.20,<0.2
+    # recipe/menu/icons.py
+    - cairosvg
+    - pillow
   host:
     - python 3.12.*
   run:
@@ -54,6 +64,7 @@ tests:
   - script:
       - orchestrate --help
       - orchestrate-serve --help
+      - python -c "import sys; from pathlib import Path; menu = Path(sys.prefix) / 'Menu'; assert all((menu / f'orchestrate.{x}').stat().st_size for x in ('json', 'png', 'icns', 'ico'))"
       - python -c "import orchestrate; ui = orchestrate.ORCHESTRATOR / 'ui'; assert (ui / 'dist/app.wasm').stat().st_size and (ui / 'icon.svg').is_file()"
 
 about:

@@ -36,6 +36,11 @@ window runs: linux-64, osx-arm64 and win-64. Store keys with
 nandi-testing mirrors only part of conda-forge (no python 3.12, an older Qt),
 so with it first the strict channel priority finds no solution.
 
+The install also adds **Orchestrator** to the system's application menu (Start
+menu on Windows, Applications on macOS), with the app icon; it opens the
+desktop window. `recipe/menu/` defines the shortcut (menuinst), and
+`pixi global install --no-shortcuts` leaves it out.
+
 `pixi run package` in a checkout builds the same package into `output/`
 (`recipe/recipe.yaml`; `.github/workflows/package.yml` publishes it).
 
