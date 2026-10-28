@@ -238,7 +238,9 @@ as a thread's state.
 - **Now:** while binding, the activity line names the step under way
   (`picking a worker of the pool`, `waiting for worker slot 2 to come up`,
   `sending worker orch-3f9a1c2b-w1 the bundle (12 KiB)`, ...), with how long it has
-  taken once it passes 15 seconds.
+  taken once it passes 15 seconds. Threads put on one worker send a project's
+  hub to it one at a time (`waiting for the hub of project … to be sent`), so
+  the second sends only what the first's bundle did not carry.
 - **The Files tab** of a thread on no ready worker answers at once with
   where the thread stands, and lists the files once its binding event says
   it is bound. Opening it puts no thread on a worker.

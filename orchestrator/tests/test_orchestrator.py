@@ -2633,3 +2633,37 @@ async def test_app_settings_show_keys_and_keep_them_in_the_keyring(tmp_path, mon
                 assert (await c.post("/api/settings/keys", json={"name": "SPRITES_TOKEN", "value": ""})).status_code == 200
     finally:
         keyring.set_keyring(before)
+
+
+async def test_ship_sends_a_projects_hub_to_a_worker_once_at_a_time():
+    """Two threads bound to one worker together do not each send it the whole hub:
+    the second asks what the worker has once the first's bundle landed."""
+    landed: list[str] = []
+    sent: list[list[str]] = []
+
+    class Client:
+        async def repo_refs(self, pid):
+            return {f"refs/remotes/{c}": c for c in landed}
+
+        async def push_repo(self, pid, data, base, refs):
+            await asyncio.sleep(0.05)  # the upload takes a while
+            landed.append("base")
+
+    class Hub:
+        base = "main"
+
+        async def sync(self, steps):
+            pass
+
+        async def pack(self, tid, have):
+            sent.append(list(have))
+            return (b"" if have else b"x" * 10), {}
+
+    async def hub(project):
+        return Hub()
+
+    lw = service.LiveWorker(types.SimpleNamespace(id="w1"), Client())
+    me = types.SimpleNamespace(hub=hub)
+    await asyncio.gather(*(service.Orchestrator._ship(me, lw, {"id": "p_1"}, tid, service.Steps(tid))
+                           for tid in ("t_1", "t_2")))
+    assert sent == [[], ["base"]]

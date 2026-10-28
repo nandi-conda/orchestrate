@@ -228,6 +228,9 @@ class LiveWorker:
     failures: int = 0  # reattaches that failed, so a waiter knows one did
     reattach: asyncio.Task | None = None
     changed: asyncio.Condition = field(default_factory=asyncio.Condition)
+    # One shipment of a project's hub at a time (_ship), so a second thread asks
+    # what the worker has after the first's bundle landed and sends only the rest.
+    shipping: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     def tasks(self) -> list[asyncio.Task]:
         return [task for task in (self.relay, self.pump, self.watch, self.logs, self.reattach) if task]
@@ -1119,12 +1122,17 @@ class Orchestrator:
         async with steps.step(f"opening project {pid}'s hub"):
             hub = await self.hub(project)
         await hub.sync(steps)  # a step of its own when there is a remote
-        async with steps.step(f"asking worker {wid} which commits of project {pid} it has"):
-            have = list((await lw.client.repo_refs(pid)).values())
-        async with steps.step("bundling what it lacks"):
-            data, refs = await hub.pack(tid, have)
-        async with steps.step(f"sending worker {wid} the bundle ({len(data) / 1024:.0f} KiB)"):
-            await lw.client.push_repo(pid, data, hub.base, refs)
+        async with steps.step(f"waiting for the hub of project {pid} to be sent to worker {wid} for other threads"):
+            await lw.shipping.setdefault(pid, asyncio.Lock()).acquire()
+        try:
+            async with steps.step(f"asking worker {wid} which commits of project {pid} it has"):
+                have = list((await lw.client.repo_refs(pid)).values())
+            async with steps.step("bundling what it lacks"):
+                data, refs = await hub.pack(tid, have)
+            async with steps.step(f"sending worker {wid} the bundle ({len(data) / 1024:.0f} KiB)"):
+                await lw.client.push_repo(pid, data, hub.base, refs)
+        finally:
+            lw.shipping[pid].release()
 
     async def _ingest(self, ev: dict, lw: LiveWorker | None = None) -> None:
         tid, typ, data = ev.get("thread"), ev.get("type", "event"), ev.get("data") or {}
