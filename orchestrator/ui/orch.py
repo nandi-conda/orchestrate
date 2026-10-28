@@ -121,6 +121,12 @@ def scroll_end(id: str) -> None:
     pass
 
 @jscall
+def scroll_top(id: str) -> None:
+    """Scroll the element with this id to the top after the next render, and
+    stop following its bottom (until the reader scrolls down to it)."""
+    pass
+
+@jscall
 def scroll_follow(id: str) -> None:
     """Like scroll_end, unless the reader scrolled the element away from the
     bottom since (until they scroll back to it)."""

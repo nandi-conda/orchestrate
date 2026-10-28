@@ -324,6 +324,14 @@ export function imports({ str, strs, vals, dispatch }) {
       follow.set(sel, true);
       requestAnimationFrame(() => requestAnimationFrame(() => toEnd(sel)));
     },
+    scroll_top: (id) => {
+      const sel = str(id);
+      follow.set(sel, false);
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const el = document.getElementById(sel);
+        if (el) el.scrollTop = 0;
+      }));
+    },
     scroll_follow: (id) => {
       const sel = str(id);
       requestAnimationFrame(() => requestAnimationFrame(() => { if (follow.get(sel) !== false) toEnd(sel); }));

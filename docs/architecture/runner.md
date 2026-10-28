@@ -116,8 +116,9 @@ Every message the agent is sent while the list is empty ends with a note to set
 them, so a thread that began before objectives existed gets them on its next turn.
 Each change is an `objectives` event; the control plane stores the list on the
 thread (it posts a thread brought back on another worker with it) and the UI
-shows it in the thread's Objectives tab. A turn that ends with every objective
-done, and no message waiting, finishes the thread: the runner ends it `done`,
+shows it in the thread's Objectives tab, and beside every other thread's in
+Project orchestrator's. A turn that ends with every objective done, and no
+message waiting, finishes the thread: the runner ends it `done`,
 and the control plane archives it. A thread with no objectives never finishes
 on its own.
 

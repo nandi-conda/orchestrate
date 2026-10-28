@@ -17,7 +17,7 @@ from ui import (btn, btn_open, card_open, card_header, card_content_open, card_f
                 input_open, label, badge, dialog_open, dialog_footer_open, alert, separator,
                 toggle_group_open, toggle_open, toggle, tabs_list_open, tab, aria)
 from orch import (o_new, o_str, o_lit, o_images, http_post, http_get_text, sse_open, sse_close, page_project,
-                  nav_push, on_nav, host_keys, open_host_keys, set_title, scroll_end, scroll_follow, md_parse, md_op, md_str, s_add_enc,
+                  nav_push, on_nav, host_keys, open_host_keys, set_title, scroll_end, scroll_top, scroll_follow, md_parse, md_op, md_str, s_add_enc,
                   clip_copy, on_select, sel_clear, s_quote, o_int, jump_to, j_when, focus_end, is_md, is_img, path_join, path_dir,
                   on_paste, img_count, img_url,
                   img_drop, img_stash, img_restore, img_clear, on_zoom, newline_keys, j_put_row,
@@ -603,7 +603,7 @@ def show_activity() -> None:
     editing = 0
     if mode == TO_THREAD:
         mode = AUTO
-    if pane_tab == WLOG or pane_tab == FILES or pane_tab == THINKING or pane_tab == OBJECTIVES:
+    if pane_tab == WLOG or pane_tab == FILES or pane_tab == THINKING:
         pane_tab = DIALOG
     jump = 1
     fetch_log()
@@ -746,8 +746,9 @@ def take(old: i32, new: i32) -> i32:
 
 def land() -> None:
     """New pane content has arrived. Content navigation asked for opens at the
-    bottom; content that streamed in keeps the bottom in view only if the
-    reader was already there, so scrolling up to read is left alone."""
+    bottom (Objectives, read from the top, at the top); content that streamed
+    in keeps the bottom in view only if the reader was already there, so
+    scrolling up to read is left alone."""
     global jump, jump_seq
     if jump_seq != 0:
         jump = 0
@@ -755,7 +756,10 @@ def land() -> None:
         jump_seq = 0
     elif jump == 1:
         jump = 0
-        scroll_end("pane")
+        if pane_tab == OBJECTIVES:
+            scroll_top("pane")
+        else:
+            scroll_end("pane")
     else:
         scroll_follow("pane")
 
@@ -1264,7 +1268,10 @@ def update(msg: i32, arg: i32) -> None:
             fetch_wlog()
         if pane_tab == FILES and files == 0:
             fetch_files()
-        scroll_end("pane")
+        if pane_tab == OBJECTIVES:
+            scroll_top("pane")
+        else:
+            scroll_end("pane")
     elif msg == WLOG_REFRESH:
         fetch_wlog()
     elif msg == GOT_WLOG:
@@ -2866,10 +2873,11 @@ def tab_open(active: bool, arg: i32) -> None:
 
 
 def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool, goals: i32, met: i32) -> None:
-    """Dialog (the conversation) and Tools (calls and their output), with
-    counts, and for a thread (logs set) Objectives (what it is trying to
-    accomplish: `met` of its `goals` done), Thinking (its reasoning steps),
-    Files (its worktree) and Worker log (the runner's stdout and stderr)."""
+    """Dialog (the conversation), Objectives (`met` of `goals` done: the
+    thread's, or every listed thread's for the project) and Tools (calls and
+    their output), with counts, and for a thread (logs set) Thinking (its
+    reasoning steps), Files (its worktree) and Worker log (the runner's
+    stdout and stderr)."""
     div("pane-tabs")
     tabs_list_open()
     tab_open(pane_tab == DIALOG, DIALOG)
@@ -2878,16 +2886,15 @@ def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool, goals: i32, me
     num(dialog)
     end()
     end()
-    if logs:
-        tab_open(pane_tab == OBJECTIVES, OBJECTIVES)
-        text("Objectives")
-        if goals > 0:
-            span("tab-count")
-            num(met)
-            text("/")
-            num(goals)
-            end()
+    tab_open(pane_tab == OBJECTIVES, OBJECTIVES)
+    text("Objectives")
+    if goals > 0:
+        span("tab-count")
+        num(met)
+        text("/")
+        num(goals)
         end()
+    end()
     tab_open(pane_tab == TOOLS, TOOLS)
     text("Tools")
     span("tab-count")
@@ -2933,16 +2940,13 @@ def objectives_met(t: i32) -> i32:
 
 
 def objectives_list() -> None:
-    """The Objectives tab: what the selected thread is trying to accomplish,
-    each with its status and where it is at, as its agent last said. It is
-    live: the thread list it reads is fetched again on every event. A thread
-    whose objectives are all done ended with its last turn and was archived."""
+    """The Objectives tab of a thread: what the selected thread is trying to
+    accomplish, each with its status and where it is at, as its agent last
+    said. It is live: the thread list it reads is fetched again on every
+    event. A thread whose objectives are all done ended with its last turn
+    and was archived."""
     t: i32
-    os: i32
-    o: i32
     n: i32 = 0
-    i: i32
-    met: i32
     t = selected_thread()
     if t != 0:
         n = j_len(t, "objectives")
@@ -2952,9 +2956,66 @@ def objectives_list() -> None:
         cls("empty")
         text("No objectives yet. The thread sets them from its request as it starts.")
         end()
-        if t != 0:
-            j_free(t)
+    else:
+        objectives_of(t, n)
+    if t != 0:
+        j_free(t)
+
+
+def objectives_overview() -> None:
+    """The Objectives tab of Project orchestrator: every thread the list shows
+    (live, or archived when it shows Archived), each by its title with where
+    it stands and its objectives as on its own tab. Clicking a title opens the
+    thread on its Objectives tab. Live like the thread's own tab."""
+    n: i32 = 0
+    i: i32
+    e: i32
+    g: i32
+    if threads != 0:
+        n = j_len(threads, "")
+    if n == 0:
+        el("p")
+        cls("muted")
+        cls("empty")
+        if show_archived == 1:
+            text("No archived threads.")
+        else:
+            text("No threads yet. Their objectives show here as they set them.")
+        end()
         return
+    for i in range(n):
+        e = j_idx(threads, i)
+        g = j_len(e, "objectives")
+        div("objectives-thread")
+        key(i)
+        div("objectives-thread-head")
+        el("button")
+        cls("objectives-thread-title")
+        on_click(SELECT, i)
+        jstr(e, "title", h_t3)
+        text_ref(h_t3)
+        end()
+        thread_badges(e)
+        end()
+        if g == 0:
+            el("p")
+            cls("muted")
+            cls("objectives-none")
+            text("No objectives yet.")
+            end()
+        else:
+            objectives_of(e, g)
+        end()
+        j_free(e)
+
+
+def objectives_of(t: i32, n: i32) -> None:
+    """Thread t's n (at least one) objectives: how many are done with a
+    progress bar, then each with its status and note."""
+    os: i32
+    o: i32
+    i: i32
+    met: i32
     met = objectives_met(t)
     div("objectives-head")
     span("objectives-count")
@@ -3031,7 +3092,6 @@ def objectives_list() -> None:
         j_free(o)
     end()
     j_free(os)
-    j_free(t)
 
 
 def thinking_steps(src: i32, n: i32) -> i32:
@@ -3325,6 +3385,13 @@ def pane() -> None:
             goals = j_len(t, "objectives")
             met = objectives_met(t)
             j_free(t)
+    if activity == 1 and threads != 0:
+        j = j_len(threads, "")
+        for i in range(j):
+            t = j_idx(threads, i)
+            goals = goals + j_len(t, "objectives")
+            met = met + objectives_met(t)
+            j_free(t)
     pane_tabs(said, tools, thoughts, activity == 0, goals, met)
     if activity == 1 and pane_tab == DIALOG:
         working_now()
@@ -3343,7 +3410,10 @@ def pane() -> None:
         end()
         return
     if pane_tab == OBJECTIVES:
-        objectives_list()
+        if activity == 1:
+            objectives_overview()
+        else:
+            objectives_list()
         end()
         end()
         return

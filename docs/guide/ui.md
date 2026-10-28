@@ -66,6 +66,14 @@ newest last (up to the newest 2,000), with a live line per working thread
 saying what it is doing. Past a few lines that list scrolls on its own, so the
 log and the request box stay in view.
 
+Its **Objectives** tab is the overview of what every thread is trying to
+accomplish: each thread the list shows, by its title with where it stands,
+then its objectives as on its own [Objectives tab](#a-threads-pane) (how many
+are done, a progress bar, each objective's status and note). The tab's count
+adds them up over all those threads (`5/9`). It changes live as threads move
+their objectives, and with **Archived** open it covers the archived threads
+instead. Click a thread's title to open it on its Objectives tab.
+
 ### Sending a request
 
 Type in the request box and press Enter. Shift+Enter starts a new line, and
