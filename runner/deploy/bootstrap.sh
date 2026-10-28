@@ -23,5 +23,8 @@ git -C "$HOME_DIR" checkout -q --force FETCH_HEAD
 cd "$HOME_DIR/runner"
 pixi install -e prod
 pixi install -e kernel        # the Python threads' prime-agent kernels run on
+# The team skill is this checkout's own code under a version that never changes,
+# so pixi keeps the build it first installed; rebuild it from the checkout each run.
+pixi reinstall -e kernel team
 bash deploy/install-harness.sh  # the prime-agent binary, pinned
 echo "runner ready at $HOME_DIR/runner"

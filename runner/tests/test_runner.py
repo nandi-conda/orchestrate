@@ -681,3 +681,10 @@ async def test_a_thread_brought_back_keeps_its_objectives(tmp_path):
     await host.wait_idle(t.id)
     assert t.objectives == kept and t.state == "idle"
     await host.stop(t.id)
+
+
+def test_bootstrap_rebuilds_the_team_skill_from_the_checkout():
+    # pixi keeps the first build of a path package whose version never changes,
+    # so a worker that updated its checkout kept running the old team module.
+    script = (Path(__file__).parent.parent / "deploy" / "bootstrap.sh").read_text()
+    assert "pixi reinstall -e kernel team" in script
