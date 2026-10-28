@@ -20,7 +20,8 @@ and comes to one level:
     busy     in a turn: takes only steering; new work goes to a new thread.
     stalled  its worker is not answering (unreachable, or being reattached):
              a message to it moves it to a ready worker, cutting short the
-             turn it had under way there.
+             turn it had under way there. Or its worker is broken (or being
+             replaced): it takes nothing until Respawn has replaced it.
 """
 
 from __future__ import annotations
@@ -30,8 +31,9 @@ from .states import RUNNING
 LEVELS = ("idle", "busy", "stalled")
 
 # Worker states (states.WORKER) in which nothing sent to its threads gets through
-# (a message moves its thread to a ready worker instead).
-WORKER_AWAY = {"unreachable", "reattaching"}
+# (a message moves its thread to a ready worker instead, but off a broken one,
+# which only Respawn mends).
+WORKER_AWAY = {"unreachable", "reattaching", "broken", "replacing"}
 
 
 def running(thread: dict, taken: bool = False) -> bool:

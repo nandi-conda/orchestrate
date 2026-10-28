@@ -21,7 +21,7 @@ from control import app as app_mod
 from control import secrets, service
 from control.service import NotOnWorker
 from control.app import create_app
-from control.providers import LocalProvider
+from control.providers import LocalProvider, WorkerBroken
 from control.router import clean_plan
 from control.providers import PlaceRefused
 from tests.doubles import ECHO_RUNNER, HeuristicRouter, local
@@ -1120,6 +1120,87 @@ async def test_messaging_a_thread_whose_worker_is_gone_brings_it_back(tmp_path, 
 async def _second_reply(replies, tid):
     r = await replies(tid)
     return r[1] if len(r) > 1 else None
+
+
+class BreakableProvider(LocalProvider):
+    """A provider that says its workers are broken while `broken` is set (a
+    sprite whose services database Fly reports corrupted)."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.broken = False
+        self.destroyed: list[str] = []
+
+    async def create(self, spec):
+        if self.broken:
+            raise WorkerBroken("looking for its runner service failed: 500: database disk image is malformed")
+        return await super().create(spec)
+
+    async def destroy(self, worker):
+        self.destroyed.append(worker.id)
+        await super().destroy(worker)
+
+
+async def test_a_broken_worker_holds_its_threads_until_respawn_replaces_it(tmp_path, monkeypatch):
+    """A worker its provider says is broken is kept in its slot, broken, with
+    the provider's words: a message to a thread on it fails at once and says
+    Respawn mends it, and the slot is not attached again for it. Respawn
+    destroys the worker and makes it afresh in its slot; the thread comes
+    back on it from its last saved turn and answers."""
+    from control.service import Orchestrator
+
+    monkeypatch.setenv("DEVRUNNER_DELAY", "0.02")
+    s = SqliteStore(str(tmp_path / "db.sqlite"))
+    await s.open()
+    p = await s.create_project("demo")
+    first = Orchestrator(s, local(LocalProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)),
+                         HeuristicRouter(), tmp_path / "repos")
+    t = await first.spawn(p["id"], "T", "write notes.txt: kept")
+    await wait_for(lambda: idle_of(s, t["id"]))
+    wid = first.by_thread[t["id"]].worker.id
+    await first.close()
+    await first.places.close()
+
+    provider = BreakableProvider(workdir=str(tmp_path / "w"), command=ECHO_RUNNER)
+    provider.broken = True
+    orch = Orchestrator(s, local(provider), HeuristicRouter(), tmp_path / "repos")
+    await orch.send(t["id"], "hello")
+
+    async def refused():
+        return [r for r in await unbinds(s, p["id"], t["id"]) if "is broken" in r] or None
+    reason = (await wait_for(refused))[0]
+    assert "database disk image is malformed" in reason and "Respawn" in reason
+    [lw] = orch.workers
+    assert (lw.worker.id, lw.state) == (wid, "broken")
+    assert (await orch.with_load(await s.get_thread(t["id"])))["load"]["level"] in ("idle", "stalled")
+    await orch.send(t["id"], "still there?")  # held, not attached again: no second worker, no destroy
+    await wait_for(lambda: _unbound_count(s, p["id"], t["id"], 3))
+    assert orch.workers == [lw] and provider.destroyed == []
+
+    provider.broken = False
+    await orch.respawn(t["id"])
+
+    async def rebound():
+        return len(await binds(s, p["id"], t["id"])) >= 2 or None
+    await wait_for(rebound)
+    await orch.send(t["id"], "after")
+
+    async def answered():
+        return any(e["type"] == "assistant" and e["payload"]["content"].startswith("Echo: after")
+                   for e in await s.list_events(p["id"], t["id"])) or None
+    await wait_for(answered)
+    assert provider.destroyed == [wid] and lw.state == "ready" and orch.by_thread[t["id"]] is lw
+    states = [(e["payload"]["from"], e["payload"]["to"]) for e in await s.list_events(p["id"])
+              if e["type"] == "worker_state"]
+    assert states == [("", "broken"), ("broken", "replacing"), ("replacing", "ready")]
+    assert (await binds(s, p["id"], t["id"]))[-1]["worker"] == wid
+    await orch.close()
+    await provider.close()
+    await s.close()
+
+
+async def _unbound_count(s, pid, tid, n):
+    return len(await unbinds(s, pid, tid)) >= n or None
 
 
 async def test_a_worker_that_dies_is_dropped_and_its_threads_come_back(tmp_path, monkeypatch):

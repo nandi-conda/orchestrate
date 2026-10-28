@@ -30,7 +30,7 @@ import httpx
 
 from .hub import Hub, is_folder, remote_url
 from .load import load_of, running
-from .providers import PLACES, Places, Worker, WorkerProvider, WorkerSpec, wait_healthy
+from .providers import PLACES, Places, Worker, WorkerBroken, WorkerProvider, WorkerSpec, wait_healthy
 from .models import check_key, check_name, worker_model
 from .router import Router
 from .runner_client import RunnerClient
@@ -227,13 +227,14 @@ class LiveWorker:
     unreachable_since: float = 0.0
     failures: int = 0  # reattaches that failed, so a waiter knows one did
     reattach: asyncio.Task | None = None
+    replace: asyncio.Task | None = None  # its replacement, when broken (Orchestrator._replace)
     changed: asyncio.Condition = field(default_factory=asyncio.Condition)
     # One shipment of a project's hub at a time (_ship), so a second thread asks
     # what the worker has after the first's bundle landed and sends only the rest.
     shipping: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     def tasks(self) -> list[asyncio.Task]:
-        return [task for task in (self.relay, self.pump, self.watch, self.logs, self.reattach) if task]
+        return [task for task in (self.relay, self.pump, self.watch, self.logs, self.reattach, self.replace) if task]
 
 
 # The time a runner log line starts with: UTC, to the millisecond, marked Z
@@ -257,6 +258,11 @@ def local_log(text: str) -> str:
 def print_worker_line(worker_id: str, line: str) -> None:
     sys.stdout.write(f"{worker_id} | {local_line(line)}\n")
     sys.stdout.flush()
+
+
+def broken_reason(place: str, why: str) -> str:
+    return (f"its {place} provider says it is broken ({why}). Respawn a thread on it to replace it: it is "
+            "destroyed, disk and all, and made afresh, and its threads come back from their last saved turns")
 
 
 def when(ts: float) -> str:
@@ -554,8 +560,11 @@ class Orchestrator:
         spec.pool, spec.steps = self.pool_id, steps
         spec.token = next((w["token"] for w in await self.store.list_workers()
                            if (w["provider"], w["idx"]) == slot and pooled(w) and w["lost_at"] is None), "")
-        async with steps.step(f"making or finding its worker ({provider.name} provider)"):
-            worker = await provider.create(spec)
+        try:
+            async with steps.step(f"making or finding its worker ({provider.name} provider)"):
+                worker = await provider.create(spec)
+        except WorkerBroken as e:
+            return await self._keep_broken(slot, spec.token, str(e), steps)
         steps.name = f"worker {worker.id}"
         await self.store.upsert_worker(worker.record())
         lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
@@ -563,15 +572,40 @@ class Orchestrator:
             lw.boot = (await lw.client.health(timeout=HEALTH_TIMEOUT)).get("boot")
         async with steps.step("taking archived projects off it"):
             await self._prune(lw)
-        lw.logs = asyncio.create_task(self._follow_logs(lw))
-        lw.relay = asyncio.create_task(self._relay(lw))
-        lw.pump = asyncio.create_task(self._pump_peer_calls(lw))
-        lw.watch = asyncio.create_task(self._watch(lw))
+        self._run(lw)
         self.workers.append(lw)
         steps.note(f"attached at {worker.url}")
         await self.store.append_event(project["id"], None, "worker",
                                       {"id": worker.id, "provider": worker.provider, "url": worker.url})
         await self._made_room()
+        return lw
+
+    def _run(self, lw: LiveWorker) -> None:
+        """Start following a worker: its log, its events, its threads' peer
+        calls and its health. Each that runs already is left running."""
+        lw.logs = lw.logs or asyncio.create_task(self._follow_logs(lw))
+        lw.relay = lw.relay or asyncio.create_task(self._relay(lw))
+        lw.pump = lw.pump or asyncio.create_task(self._pump_peer_calls(lw))
+        lw.watch = lw.watch or asyncio.create_task(self._watch(lw))
+
+    async def _keep_broken(self, slot: Slot, token: str, why: str, steps: Steps) -> LiveWorker:
+        """Hold the worker in `slot`, which its provider says is broken
+        (providers.WorkerBroken), in its slot and out of use: broken. No
+        thread is put on it, so the slot is not attached again for each one
+        that tries. Its threads are put on no worker until Respawn of one of
+        them replaces it (_replace): its disk is given up only when asked."""
+        place, index = slot
+        provider = self.places.provider(place)
+        name = provider.worker_name(index, self.pool_id)
+        worker = Worker(id=name, provider=place, handle=name, url="", capacity=CAPACITY, index=index)
+        worker.token = token or worker.token
+        steps.name = f"worker {name}"
+        await self.store.upsert_worker(worker.record())
+        lw = LiveWorker(worker, RunnerClient(worker.url, worker.token))
+        self.workers.append(lw)
+        steps.note(f"its {place} provider says it is broken; it is kept out of use until Respawn of a thread "
+                   "on it replaces it", logging.WARNING)
+        await self._announce(lw, "", "broken", broken_reason(place, why))
         return lw
 
     async def _prune(self, lw: LiveWorker) -> None:
@@ -609,6 +643,13 @@ class Orchestrator:
         looked at the same state cannot both make it."""
         frm, wid = lw.state, lw.worker.id
         WORKER.check(f"worker {wid}", frm, to)
+        await self._announce(lw, frm, to, reason)
+
+    async def _announce(self, lw: LiveWorker, frm: str, to: str, reason: str) -> None:
+        """Put a worker in state `to`, from `frm` ("" for a worker just taken
+        into its slot), and say so: the store, the log and every project with
+        a thread on it. Only _worker_to and _keep_broken call it."""
+        wid = lw.worker.id
         lw.state, lw.reason = to, reason
         if to == "unreachable" and frm != "unreachable":
             lw.unreachable_since = asyncio.get_running_loop().time()
@@ -736,6 +777,10 @@ class Orchestrator:
             if lw.unstopped:
                 async with steps.step("stopping the threads moved off it while it did not answer"):
                     await self._stop_moved(lw, client)
+        except WorkerBroken as e:
+            lw.failures += 1
+            await self._worker_to(lw, "broken", broken_reason(lw.worker.provider, str(e)))
+            return
         except Exception as e:
             lw.failures += 1
             failed = describe(e)
@@ -756,6 +801,58 @@ class Orchestrator:
         await self._restarted(lw, h)
         steps.note(f"ready again at {worker.url}")
         await self._worker_to(lw, "ready", f"reattached: its {worker.provider} provider started its runner again")
+
+    async def _replace(self, lw: LiveWorker, waiter: Steps) -> None:
+        """Replace a broken worker: destroy it, disk and all, and make a new one
+        in its slot (with a new token). Concurrent callers share one attempt;
+        it ends with the worker ready, or broken again with why. Respawn of a
+        thread on the worker starts it; a thread put on the worker meanwhile
+        waits for it too. The threads that were on it come back on the new
+        worker from their last saved turns in the hub, as after a restart:
+        what the broken one held beyond those (a turn under way, files of a
+        turn not ended) is gone with it. The waiter's steps wait on its own."""
+        slot = slot_of(lw.worker)
+        if lw.replace is None or lw.replace.done():
+            made = Steps(f"worker {lw.worker.id} replacement")
+            self.attach_steps[slot] = made
+            lw.replace = asyncio.create_task(self._do_replace(lw, made))
+        async with waiter.step(f"waiting for broken worker {lw.worker.id} to be replaced"):
+            waiter.waits_on = self.attach_steps[slot]
+            try:
+                await asyncio.shield(lw.replace)
+            finally:
+                waiter.waits_on = None
+
+    async def _do_replace(self, lw: LiveWorker, steps: Steps) -> None:
+        if lw.state != "broken":
+            return
+        await self._worker_to(lw, "replacing", "Respawn: it is destroyed, disk and all, and made afresh "
+                                               f"(it was broken: {lw.reason})")
+        provider = self.provider(lw.worker)
+        spec = worker_spec(lw.worker.index)
+        spec.pool, spec.steps = self.pool_id, steps  # a new token: the new runner is this control plane's
+        try:
+            async with steps.step(f"destroying it, disk and all ({provider.name} provider)"):
+                await provider.destroy(lw.worker)
+            async with steps.step(f"making it afresh in slot {lw.worker.index}"):
+                worker = await provider.create(spec)
+            client = RunnerClient(worker.url, worker.token)
+            async with steps.step("reading which runner process serves it (/health)"):
+                h = await client.health(timeout=HEALTH_TIMEOUT)
+            async with steps.step("taking archived projects off it"):
+                await client.prune([p["id"] for p in await self.store.list_projects()])
+        except Exception as e:
+            await self._worker_to(lw, "broken", f"replacing it failed: {describe(e)}. Respawn a thread on it "
+                                                "to replace it again")
+            return
+        old = lw.client
+        lw.worker, lw.client = worker, client
+        await old.close()
+        await self.store.upsert_worker(worker.record())
+        await self._restarted(lw, h)
+        self._run(lw)
+        steps.note(f"ready at {worker.url}")
+        await self._worker_to(lw, "ready", f"replaced: its {worker.provider} provider made it afresh")
 
     async def _restarted(self, lw: LiveWorker, h: dict) -> None:
         """Take note of the runner process serving the worker. One started
@@ -1204,12 +1301,13 @@ class Orchestrator:
         self._begin_binding(tid, thread["binding_reason"], entered=True)
         return thread
 
-    def _begin_binding(self, tid: str, why: str, entered: bool = False) -> asyncio.Task:
+    def _begin_binding(self, tid: str, why: str, entered: bool = False, replace: bool = False) -> asyncio.Task:
         """Start putting a thread on a worker (_bind), in the background;
-        `entered` when the caller moved it to binding already. Its task is
+        `entered` when the caller moved it to binding already; `replace`
+        (Respawn) replaces its worker when that is broken. Its task is
         registered at once, so callers that come after it wait for it
         (live_worker) instead of starting another."""
-        task = asyncio.create_task(self._bind(tid, why, entered))
+        task = asyncio.create_task(self._bind(tid, why, entered, replace))
         self.binding[tid] = task
         self.background.add(task)
         task.add_done_callback(self.background.discard)
@@ -1218,7 +1316,7 @@ class Orchestrator:
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
         return task
 
-    async def _bind(self, tid: str, why: str, entered: bool = False) -> LiveWorker:
+    async def _bind(self, tid: str, why: str, entered: bool = False, replace: bool = False) -> LiveWorker:
         """Put a thread on a worker: unbound or bound -> binding -> bound, or
         back to unbound with why it failed. It goes on the worker it was on
         while that one is ready, so the worktree there is the one it continues
@@ -1230,7 +1328,10 @@ class Orchestrator:
         none of whose turns was saved (new, or its worker went before its
         first turn ended) is given its request; the rest wait idle for their
         next message. One the worker's runner still runs (only this control
-        plane lost track of it) is bound as it is: posting it would be refused."""
+        plane lost track of it) is bound as it is: posting it would be refused.
+        A thread whose worker is broken goes on no worker: with `replace`
+        (Respawn) that worker is replaced first (_replace), else the binding
+        fails and says Respawn does it."""
         if not entered:
             await self._bind_to(tid, "binding", why)
         t = await self.store.get_thread(tid)
@@ -1261,6 +1362,12 @@ class Orchestrator:
             if lw is None and t["worker_id"] is not None:
                 async with steps.step(f"finding worker {t['worker_id']}, which it was on"):
                     lw = await self._home(project, t["workers"], t["worker_id"], steps)
+            if lw is not None and (lw.state == "replacing" or (lw.state == "broken" and replace)):
+                await self._replace(lw, steps)
+                if lw.state != "ready":
+                    raise RuntimeError(f"its worker {lw.worker.id} is still broken: {lw.reason}")
+            if lw is not None and lw.state == "broken":
+                raise RuntimeError(f"its worker {lw.worker.id} is broken: {lw.reason}")
             if lw is not None and lw.state != "ready":
                 if lw.state != "lost":
                     lw.moved_off.add(tid)
@@ -1510,7 +1617,7 @@ class Orchestrator:
             task.cancel("Respawn called off putting it on a worker, to start over")
             await asyncio.wait({task})
         if thread_id not in self.binding:
-            self._begin_binding(thread_id, "Respawn")
+            self._begin_binding(thread_id, "Respawn", replace=True)
 
     async def _inline_images(self, refs: list[dict] | None) -> list[dict]:
         """Image references as a runner needs them: the bytes, base64-encoded.

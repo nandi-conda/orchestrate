@@ -21,6 +21,12 @@ Worker (one per LiveWorker):
                  once by Respawn of one of its threads.
     reattaching  the provider is starting its runner again, on the same disk.
                  Ready when that answers, unreachable when it fails.
+    broken       its provider has it but says it cannot run a runner on it
+                 (providers.WorkerBroken: a sprite Fly reports corrupted). Its
+                 threads are put on no worker until Respawn of one of them
+                 replaces it: its disk is not given up unasked.
+    replacing    being destroyed, disk and all, and made afresh in its slot.
+                 Ready when the new one answers, broken again when that fails.
     lost         its provider says it is gone. Retired.
 
     A ready worker whose runner restarted (a new boot id) moves ready -> ready:
@@ -87,7 +93,9 @@ class Machine:
 WORKER = Machine("worker", "ready", {
     "ready": {"ready", "unreachable", "lost"},
     "unreachable": {"ready", "reattaching", "lost"},
-    "reattaching": {"ready", "unreachable", "lost"},
+    "reattaching": {"ready", "unreachable", "broken", "lost"},
+    "broken": {"replacing"},
+    "replacing": {"ready", "broken"},
     "lost": set(),
 }, retired={"lost"})
 

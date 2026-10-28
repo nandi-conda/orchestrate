@@ -56,6 +56,15 @@ from .steps import Steps
 log = logging.getLogger("orchestrator.providers")
 
 
+class WorkerBroken(RuntimeError):
+    """The provider has the worker but says it cannot run a runner on it: the
+    machine itself is broken on the provider's side (a sprite whose services
+    database Fly reports corrupted). Nothing done to the runner mends it, so
+    the control plane keeps it out of use, broken (states.WORKER), until
+    Respawn of a thread on it has it replaced: destroyed, with its disk, and
+    made afresh in its slot."""
+
+
 @dataclass
 class Worker:
     id: str
@@ -667,7 +676,8 @@ class SpritesProvider:
         """Whether sprite `name` has a runner service. A cold sprite's services
         API answers 500 "services manager not started" until the sprite has
         booted it, so that answer is waited out (up to SERVICES_WAIT); a 404
-        is no service, and any other answer an error."""
+        is no service. Any other 500 is the sprite broken on Fly's side
+        (WorkerBroken), and any other answer an error."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SERVICES_WAIT
         while True:
@@ -675,6 +685,11 @@ class SpritesProvider:
             if r.status_code in (200, 404):
                 return r.status_code == 200
             booting = r.status_code == 500 and SERVICES_BOOTING in r.text
+            if r.status_code == 500 and not booting:
+                # Fly's own failure on this sprite (its services database
+                # "disk image is malformed"), not a gateway's (502-504) nor one
+                # of booting: the sprite is broken.
+                raise WorkerBroken(failure(f"looking for sprite {name}'s runner service", r))
             if not booting or loop.time() > deadline:
                 raise RuntimeError(failure(f"looking for sprite {name}'s runner service", r)
                                    + (f" (still, after {SERVICES_WAIT:.0f}s)" if booting else ""))

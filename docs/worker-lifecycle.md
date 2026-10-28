@@ -90,6 +90,11 @@ stateDiagram-v2
     reattaching --> ready: runner started again and answers
     reattaching --> unreachable: reattach failed
     reattaching --> lost: provider says gone
+    reattaching --> broken: provider says broken
+    [*] --> broken: provider says broken when attached
+    broken --> replacing: Respawn of a thread on it
+    replacing --> ready: destroyed, made afresh, answers
+    replacing --> broken: replacing failed
     lost --> [*]
 ```
 
@@ -108,6 +113,8 @@ goes on from its last saved turn. The old worker keeps the thread on a
 until then nothing it sends for that thread is taken (its peer calls for it
 are refused, since the thread is no longer on it). A thread no work comes
 for while its worker is away stays on it and carries on when it answers.
+| `broken` | its provider has it but says it cannot run a runner on it: Sprites answered a 500 for the sprite's runner service that is not the "services manager not started" of a cold boot (for example `failed to query service: database disk image is malformed`, a services database Fly has corrupted) | attaching or reattaching it | Respawn of a thread on it replaces it. Nothing else does: replacing gives up its disk, so that is asked for, never done on its own |
+| `replacing` | being destroyed, disk and all, and made afresh in its slot with a new token | Respawn of a thread on a broken worker | ready once the new one answers; broken again, with why, if that fails |
 | `lost` | its provider says it no longer exists | a failed health check whose provider lookup says gone | none: it is destroyed and its slot filled again by a new worker of the same name. Its threads are unbound and come back on the pool |
 
 `ready → ready` is a runner restart: `/health` returns a new `boot` id (the
@@ -343,6 +350,18 @@ A Sprites API call that fails says what the API answered: the status, how
 long the call took, the request id its proxy gave it, and the body, or that
 it had none.
 
+### A broken worker
+
+A broken worker stays in its slot, so the slot is not attached again (a slow
+look at a broken sprite can take minutes) for every thread that tries it, and
+no thread is picked onto it. Its threads go on no worker: putting one on it
+fails at once, and the thread's `unbound` reason gives the provider's words
+and says Respawn replaces it. Respawn of any of them destroys the worker and
+makes it afresh in the same slot; that thread is bound on the new one, and
+the others come back on it with their next message, each from its last saved
+turn in the hub. What the old disk held beyond the hub (a turn that was under
+way, files of a turn that never ended) is gone with it.
+
 ## A worker's disk
 
 A worker is shared by every project, and every thread that ran on it leaves
@@ -376,6 +395,7 @@ returns at once; the thread's `binding` events show how it went.
 | `binding` (stuck starting, e.g. a sprite that never comes up) | calls the start off (`binding → unbound`) and starts again; messages sent meanwhile wait for the new start and are delivered |
 | `bound`, worker `ready` | stops it on its runner and posts it again (`bound → binding → bound`); a turn under way is cut short |
 | `bound`, worker `unreachable` or `reattaching` | reattaches the worker first (its runner is started again), then binds the thread on it |
+| worker `broken` or `replacing` | replaces the worker (destroyed, disk and all, and made afresh in its slot), then binds the thread on it |
 | worker `lost` | its threads are already unbound; Respawn binds them on the pool |
 
 ## Messages to a thread in each state
@@ -388,6 +408,8 @@ A message is logged at once and delivered in the background, in order:
 - **bound, worker unreachable:** waits for the worker to be ready again (it
   answers, or is reattached after 300 s); if a reattach fails, the message
   fails with the worker's state and reason in the thread's log.
+- **its worker broken:** fails at once, saying the worker is broken and that
+  Respawn replaces it. While it is being replaced, the message waits for that.
 
 ## For developers
 

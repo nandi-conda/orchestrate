@@ -644,6 +644,20 @@ async def test_looking_for_the_runner_service_fails_on_an_api_error(env):
         await _sprites_create(env, defined=True, fake=Broken(True))
 
 
+async def test_a_sprite_fly_cannot_query_services_on_is_broken(env):
+    """Any other 500 from the services API is Fly's own failure on the sprite
+    ("database disk image is malformed"): WorkerBroken, with Fly's words."""
+    class Corrupt(FakeSprites):
+        async def get(self, url, **kw):
+            if url.endswith("/services/runner"):
+                return httpx.Response(500, text="failed to query service: database disk image is malformed (11)",
+                                      request=httpx.Request("GET", url))
+            return await super().get(url, **kw)
+
+    with pytest.raises(providers.WorkerBroken, match=r"failed: 500 .*database disk image is malformed"):
+        await _sprites_create(env, defined=True, fake=Corrupt(True))
+
+
 async def test_a_cold_sprites_services_manager_is_waited_for(env):
     """A cold sprite's services API answers 500 "services manager not started"
     until it has booted it: that is waited out, then the answer read."""
