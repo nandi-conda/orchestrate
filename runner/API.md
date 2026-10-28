@@ -164,12 +164,14 @@ change).
 | `list_threads` | `{"project", "query"}` (`query` may be null; `project` is the caller's) | list of directory entries (the thread itself is left out of what it sees) |
 | `read_thread` | `{"thread_id", "last_n"}` | directory entry + `"events"`: recent event list |
 | `send_message` | `{"sender", "to", "body", "reply_to"}` | `{"ok": true}` |
+| `report` | `{"thread_id", "summary"}` | `{"ok": true, "delivered": bool}` (false when the parent is archived) |
 | `spawn_thread` | `{"parent", "project", "title", "request"}` | `{"id", "title"}` |
 | `set_summary` | `{"thread_id", "summary", "files"}` | anything |
 | `save` | `{"thread_id", "land"}` | `{"landed", "base", "commit"?, "conflict"?, "message"?}`: see [Repository](#repository) |
 
-A thread also calls `set_summary` after each turn, and when it has a `parent`, sends
-`Finished: <summary>` to the parent through `send_message`. The orchestrator routes
+A thread also calls `set_summary` after each turn, and when it has a `parent`, reports
+`Finished: <summary>` to the parent through `report`, which the orchestrator drops when the
+parent is archived. The orchestrator routes
 `send_message` to whichever worker holds `to` (`POST /threads/{to}/messages` with
 `hops + 1`), and `spawn_thread` to the least loaded worker of its pool.
 

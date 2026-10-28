@@ -229,8 +229,7 @@ class Host:
         await self.emit(t["id"], "turn_done", {"summary": summary, "final": f"Echo: {text}"})
         await self.peer_call("set_summary", t["id"], thread_id=t["id"], summary=summary, files=[])
         if t.get("parent") and not text.startswith("Finished:"):
-            await self.peer_call("send_message", t["id"], sender=t["id"], to=t["parent"],
-                                 body=f"Finished: {summary}")
+            await self.peer_call("report", t["id"], thread_id=t["id"], summary=summary)
         self.turn_file(t["id"]).unlink(missing_ok=True)
         if t["state"] != "stopped":
             await self.set_state(t, "idle")

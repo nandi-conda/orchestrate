@@ -1043,6 +1043,18 @@ class Orchestrator:
             raise PeerCallError(str(e)) from None
         return {"ok": True}
 
+    async def peer_report(self, lw: LiveWorker, caller: dict, thread_id: str, summary: str) -> dict:
+        """A thread finished: its parent hears so, unless the parent is
+        archived, which takes no messages (the report has no one to reach)."""
+        self._as_caller(caller, thread_id)
+        parent = await self.store.get_thread(caller["parent_id"]) if caller["parent_id"] else None
+        if parent is None:
+            raise PeerCallError(f"thread {thread_id} has no parent to report to")
+        if parent["archived_at"] is not None:
+            return {"ok": True, "delivered": False}
+        await self.send(parent["id"], f"Finished: {summary}", thread_id, 1)
+        return {"ok": True, "delivered": True}
+
     async def peer_spawn_thread(self, lw: LiveWorker, caller: dict, parent: str | None, project: str, title: str,
                                 request: str) -> dict:
         self._as_caller(caller, parent)
@@ -1099,7 +1111,7 @@ class Orchestrator:
         return result
 
     PEER_OPS = {"list_threads": peer_list_threads, "read_thread": peer_read_thread,
-                "send_message": peer_send_message, "spawn_thread": peer_spawn_thread,
+                "send_message": peer_send_message, "report": peer_report, "spawn_thread": peer_spawn_thread,
                 "set_summary": peer_set_summary, "save": peer_save}
 
     # ---------------------------------------------------------------- hubs

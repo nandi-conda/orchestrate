@@ -408,7 +408,7 @@ class AgentThread:
         if not self.parent:
             return
         try:
-            await self.peers.send_message(self.id, self.parent, f"Finished: {self.summary}")
+            await self.peers.report(self.id, self.summary)
         except Exception as e:
             log.warning("thread %s: telling its parent failed", self.id, exc_info=True)
             self.emit("error", {"error": f"peer update failed: {type(e).__name__}: {e}"})

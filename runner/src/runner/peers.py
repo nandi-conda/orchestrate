@@ -23,6 +23,9 @@ class Peers(Protocol):
     async def list_threads(self, caller: str, project: str, query: str | None = None) -> list[dict]: ...
     async def read_thread(self, caller: str, thread_id: str, last_n: int = 20) -> dict: ...
     async def send_message(self, sender: str, to: str, body: str, reply_to: str | None = None) -> dict: ...
+    async def report(self, thread_id: str, summary: str) -> dict:
+        """Tell the thread's parent it finished: `{"ok": true, "delivered"}`,
+        `delivered` false when the parent is archived and takes no messages."""
     async def spawn_thread(self, parent: str, project: str, title: str, request: str) -> dict: ...
     async def set_summary(self, thread_id: str, summary: str, files: list[str] | None = None) -> None: ...
     async def save(self, thread_id: str, land: bool = False) -> dict:
@@ -117,6 +120,9 @@ class OrchestratorPeers:
     async def send_message(self, sender, to, body, reply_to=None):
         return await self._call("send_message", sender, sender=sender, to=to, body=body, reply_to=reply_to)
 
+    async def report(self, thread_id, summary):
+        return await self._call("report", thread_id, thread_id=thread_id, summary=summary)
+
     async def spawn_thread(self, parent, project, title, request):
         return await self._call("spawn_thread", parent, parent=parent, project=project, title=title,
                                 request=request)
@@ -161,6 +167,14 @@ class LocalPeers:
             return {"ok": False, "error": f"no thread {to}"}
         t.deliver(body, sender=sender)
         return {"ok": True}
+
+    async def report(self, thread_id, summary):
+        t = self._threads().get(thread_id)
+        parent = self._threads().get(t.parent) if t and t.parent else None
+        if parent is None:
+            return {"ok": False, "error": f"no parent of thread {thread_id}"}
+        parent.deliver(f"Finished: {summary}", sender=thread_id)
+        return {"ok": True, "delivered": True}
 
     async def spawn_thread(self, parent, project, title, request):
         t = await self.host.start(project=project, title=title, request=request, parent=parent)

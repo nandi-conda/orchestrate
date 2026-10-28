@@ -452,6 +452,20 @@ async def test_end_to_end_with_echo_runner(server):
             return any(e["type"] == "message_in" and e["text"].startswith("Finished:") for e in tr)
         await wait_for(child_reported)
 
+        # A child that finishes after its parent was archived reports to no one.
+        child = next(t for t in (await c.get(f"/api/projects/{pid}/threads")).json() if t["parent_id"] == ids[0])
+        before = (await c.get(f"/api/threads/{child['id']}")).json()["summary"]
+        assert (await c.post(f"/api/threads/{ids[0]}/archive")).status_code == 200
+        await c.post(f"/api/projects/{pid}/requests",
+                     json={"text": "a longer follow-up for the child", "mode": "thread", "target": child["id"]})
+
+        async def child_finished_again():
+            return (await c.get(f"/api/threads/{child['id']}")).json()["summary"] != before
+        await wait_for(child_finished_again)
+        log = (await c.get(f"/api/projects/{pid}/log")).json()
+        assert not any(e["type"] == "error" and "archived" in str(e["payload"]) for e in log)
+        assert (await c.post(f"/api/threads/{ids[0]}/unarchive")).status_code == 200
+
         # Workers never call the control plane, so it serves no peer API.
         assert (await c.get(f"/api/peer/projects/{pid}/threads")).status_code == 404
 
