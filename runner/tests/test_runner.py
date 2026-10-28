@@ -14,6 +14,7 @@ from conftest import Scripted, Web, in_view, py, results, sh, until
 from runner import ThreadHost, View
 from runner.sandbox import SandboxError, bwrap_args, pixi, runner_checkout, thread_env, worker_private
 from runner.server import create_app, serve
+from runner.thread import NO_OBJECTIVES
 
 
 def host_with(*scripts, tmp_path, **kw):
@@ -191,7 +192,7 @@ async def test_a_message_during_a_turn_steers_it(tmp_path):
     assert sum(e["type"] == "turn_done" for e in t.events) == 1
     messages = (await t.harness.command("get_messages"))["messages"]
     users = [m for m in messages if m["role"] == "user"]
-    assert users[-1]["content"][0]["text"] == "[from t_other] also do this"
+    assert users[-1]["content"][0]["text"] == "[from t_other] also do this" + NO_OBJECTIVES
     await host.stop(t.id)
 
 
@@ -680,6 +681,35 @@ async def test_a_thread_brought_back_keeps_its_objectives(tmp_path):
     t = await host.start(project="p", title="t", request="go on", objectives=kept)
     await host.wait_idle(t.id)
     assert t.objectives == kept and t.state == "idle"
+    await host.stop(t.id)
+
+
+async def test_a_turn_with_no_objectives_asks_for_them(tmp_path):
+    """A thread that began before objectives existed has none when it is
+    brought back mid-work: each turn it starts says so, until it sets them."""
+    sent = []
+
+    class Spied(Scripted):
+        async def start(self, place, *, model, append_prompt):
+            harness = await super().start(place, model=model, append_prompt=append_prompt)
+            prompt = harness.prompt
+
+            async def spy(text, images=None):
+                sent.append(text)
+                return await prompt(text, images)
+            harness.prompt = spy
+            return harness
+
+    host = ThreadHost(agent=Spied(["no objectives set", py("await team.set_objectives(['finish'])"), "ok", "ok"]),
+                      web=Web(), workdir=str(tmp_path / "threads"))
+    t = await host.start(project="p", title="t", request="go on")
+    await host.wait_idle(t.id)
+    t.deliver("again")
+    await until(lambda: len(sent) == 2)
+    await host.wait_idle(t.id)
+    t.deliver("once more")
+    await until(lambda: len(sent) == 3)
+    assert ["no objectives yet" in m for m in sent] == [True, True, False], sent
     await host.stop(t.id)
 
 

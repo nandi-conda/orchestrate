@@ -112,6 +112,8 @@ calls are queued for the control plane to [collect](pull-mode.md#peer-calls);
 Every thread keeps a list of objectives. Its prompt has the agent set them
 from its request at the start of its first turn, keep each one's status and
 note current as it works, and add objectives when a message brings more work.
+Every message the agent is sent while the list is empty ends with a note to set
+them, so a thread that began before objectives existed gets them on its next turn.
 Each change is an `objectives` event; the control plane stores the list on the
 thread (it posts a thread brought back on another worker with it) and the UI
 shows it in the thread's Objectives tab. A turn that ends with every objective

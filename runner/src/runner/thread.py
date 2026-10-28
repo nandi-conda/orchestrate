@@ -48,8 +48,9 @@ How the team works, through the `team` skill (read its SKILL.md):
 
 Your objectives: the thread has a list of the things it is trying to accomplish, each `pending`,
 `in_progress` or `done` with a short note on where it is at. The person watches them as you work.
-- Start your first turn by setting them from your request: `team.set_objectives([...])`, one
-  objective per outcome the request asks for. `team.objectives()` reads them back.
+- Set them from your request before anything else, in the first turn (or in the next one when the
+  list is empty, as a thread that began before objectives existed finds it): `team.set_objectives([...])`,
+  one objective per outcome the request asks for. `team.objectives()` reads them back.
 - Keep them current as you go: `team.update_objective(i, "in_progress", "where it is at")` when
   you start on one and as it moves, and set them again when you learn the work is different. A
   message that brings more work adds objectives for it.
@@ -181,6 +182,10 @@ def _id() -> str:
     return "t_" + uuid.uuid4().hex[:10]
 
 
+NO_OBJECTIVES = ("\n\n[thread: you have no objectives yet. Before anything else, set them from the work "
+                 "you are on with team.set_objectives([...]).]")
+
+
 def user_text(sender: str, body: str) -> str:
     return body if sender == "user" else f"[from {sender}] {body}"
 
@@ -255,7 +260,8 @@ class AgentThread:
             self.emit("dropped", {"from": item["from"], "reason": "hop limit"})
             return False
         self.emit("message_in", {"from": item["from"], "body": item["body"]})
-        await self.harness.prompt(user_text(item["from"], item["body"]), item.get("images"))
+        text = user_text(item["from"], item["body"])
+        await self.harness.prompt(text + (NO_OBJECTIVES if not self.objectives else ""), item.get("images"))
         return True
 
     async def run(self, prepare: Callable[[], Any] | None = None):

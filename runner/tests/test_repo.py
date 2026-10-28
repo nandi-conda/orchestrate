@@ -10,6 +10,7 @@ from conftest import Scripted, Web, in_view, py, sh, started, types, until
 from runner import ThreadHost
 from runner.peers import OrchestratorPeers, PeerOutbox
 from runner.repo import GitError, Repo, Repos
+from runner.thread import NO_OBJECTIVES
 
 
 def git(cwd, *args):
@@ -198,7 +199,7 @@ async def test_turn_end_commits_leftovers_snapshots_the_worktree_and_lands(tmp_p
     session = f"refs/sessions/{t.id}"
     files = git(repo, "ls-tree", "-r", "--name-only", session).splitlines()
     assert any(f.startswith("sessions/") and f.endswith(".jsonl") for f in files), files
-    assert '"draft"' in git(repo, "show", f"{session}:{next(f for f in files if f.endswith('.jsonl'))}")
+    assert '"text":"draft' in git(repo, "show", f"{session}:{next(f for f in files if f.endswith('.jsonl'))}")
 
 
 async def test_a_turn_a_model_call_failed_in_is_saved_not_landed(tmp_path):
@@ -374,7 +375,8 @@ async def test_resumed_thread_continues_on_a_new_worker_with_its_files_and_sessi
     messages = (await r.harness.command("get_messages"))["messages"]
     said = [(m["role"], b.get("text")) for m in messages if m["role"] in ("user", "assistant")
             for b in m["content"] if b.get("type") == "text"]
-    assert said == [("user", "draft"), ("assistant", "saved a draft"), ("user", "and now?"), ("assistant", "still here")]
+    assert said == [("user", "draft" + NO_OBJECTIVES), ("assistant", "saved a draft"),
+                    ("user", "and now?" + NO_OBJECTIVES), ("assistant", "still here")]
     await second.stop(r.id)
 
 
@@ -390,7 +392,7 @@ async def test_stopped_thread_restarts_in_the_worktree_and_session_it_had(tmp_pa
     await h.wait_idle(r.id)
     messages = (await r.harness.command("get_messages"))["messages"]
     users = [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b.get("type") == "text"]
-    assert users == ["x", "go on"]
+    assert users == ["x" + NO_OBJECTIVES, "go on" + NO_OBJECTIVES]
     await h.stop(r.id)
 
 
