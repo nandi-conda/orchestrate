@@ -369,6 +369,25 @@ img.zoom.zoomed { position: fixed; z-index: 70; inset: 3vh 3vw; width: 94vw; hei
 .thinking-step .step-num { font-weight: 600; }
 .thinking-step .step-text { font-size: 14px; }
 
+/* Objectives tab: what the thread is trying to accomplish, its progress, and where each one is at */
+.objectives-head { display: flex; align-items: baseline; gap: 4px; font-size: 13px; margin-bottom: 6px; }
+.objectives-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.objectives-bar { height: 6px; border-radius: 3px; background: var(--muted); overflow: hidden; margin-bottom: 12px; }
+.objectives-fill { height: 100%; background: hsl(142 71% 45%); transition: width .3s ease; }
+.objectives { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.objective { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+.objective-mark { flex: none; width: 18px; text-align: center; color: var(--muted-foreground); line-height: 20px; }
+.objective-doing { border-color: hsl(221 83% 53% / .5); }
+.objective-doing .objective-mark { color: hsl(221 83% 53%); }
+.objective-done .objective-mark { color: hsl(142 71% 40%); font-weight: 600; }
+.objective-done .objective-text { color: var(--muted-foreground); }
+.objective-body { flex: 1; min-width: 0; }
+.objective-text { font-size: 14px; line-height: 20px; word-break: break-word; }
+.objective-meta { font-size: 12px; color: var(--muted-foreground); display: flex; flex-wrap: wrap; gap: 0 6px; }
+.objective-status { font-weight: 600; }
+.objective-note { word-break: break-word; }
+.objective-note::before { content: "· "; }
+
 /* The folder picker: under a folder field, in its dialog */
 .field-row { display: flex; gap: 8px; align-items: center; }
 .field-row > input { flex: 1; min-width: 0; }

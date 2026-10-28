@@ -18,6 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from . import files, sandbox
+from .objectives import ObjectiveError
 from .harness import RUNNER, PrimeAgent, model_env
 from .peers import OrchestratorPeers
 from .repo import THREAD_ID, GitError, Repos, refs_header
@@ -171,7 +172,10 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
                                  title=b.get("title") or (b.get("request") or b.get("id") or "thread")[:60],
                                  request=request, parent=b.get("parent"),
                                  model=b.get("model"), id=b.get("id"),
-                                 summary=b.get("summary") or "", images=images)
+                                 summary=b.get("summary") or "", objectives=b.get("objectives") or None,
+                                 images=images)
+        except ObjectiveError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         except Exception as e:
@@ -193,6 +197,9 @@ def create_app(host: ThreadHost, token: str | None) -> Starlette:
             images = images_of(b)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+        if t.task is None or t.task.done():
+            return JSONResponse({"error": f"thread {t.id} has ended ({t.state}): start it again to message it"},
+                                status_code=409)
         t.deliver(b.get("body", ""), sender=b.get("from", "user"), hops=int(b.get("hops", 0)), images=images)
         return JSONResponse({"ok": True}, status_code=202)
 

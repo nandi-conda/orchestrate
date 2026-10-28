@@ -150,7 +150,12 @@ def display(ev: dict) -> dict:
         kind, label = K_ROUTE, "router"
         text = d.get("summary", "") + (f" — {d['why']}" if d.get("why") else "")
     elif t in ("archived", "unarchived"):
-        kind, label, text = K_STATUS, t, f"thread {t}"
+        kind, label, text = K_STATUS, t, f"thread {t}" + (f": {d['why']}" if d.get("why") else "")
+    elif t == "objectives":
+        # The Objectives tab shows them; the Dialog leaves them to it, like a state change.
+        items = d.get("objectives") or []
+        done = sum(o.get("status") == "done" for o in items)
+        kind, label, text = K_STATE, "objectives", f"{done} of {len(items)} done"
     elif t in ("project_archived", "project_unarchived"):
         kind, label = K_STATUS, t.removeprefix("project_")
         text = f"project {label}"
@@ -279,7 +284,8 @@ def fold(events: list[dict]) -> list[dict]:
 def thread_view(t: dict, orch: Orchestrator) -> dict:
     """A thread for the UI, with its binding and the state of the worker it
     is bound to (states.py), each with why, and its load (load.py)."""
-    view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "activity", "state",
+    view = {k: t[k] for k in ("id", "project_id", "parent_id", "title", "request", "summary", "objectives",
+                              "activity", "state",
                               "binding", "binding_reason", "worker_id", "files", "archived_at", "created_at",
                               "updated_at", "load", "workers", "workers_why")}
     view["worker_state"], view["worker_reason"] = orch.worker_state(t)

@@ -118,7 +118,8 @@ correction, guidance, a change to what it was asked, an answer or result it is
 waiting for, something it needs to finish) or is a new job ("work": anything it
 would do after its current job, even work that follows on from it). New work
 goes to a new thread. `thread` is the busy thread (its title, the request that
-started it, its summary); `message` is what was sent and `from` who sent it.
+started it, its summary, and its objectives with where each is at); `message`
+is what was sent and `from` who sent it.
 Answer by calling `kind` once."""
 
 SYSTEM = """You route requests in a software project to agent threads.
@@ -297,7 +298,7 @@ class ModelRouter:
                              f"not JSON ({e}; finish_reason {choice.get('finish_reason')!r}): {arguments[:500]}") from None
 
     async def _ask(self, system: str, content: dict, directory: list[dict], places: list[dict]) -> dict:
-        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "files", "load", "workers")}
+        threads = [{k: t.get(k) for k in ("id", "title", "state", "summary", "objectives", "files", "load", "workers")}
                    for t in directory]
         got = await self._call(system, {"threads": threads, "places": places, **content},
                                plan_tool(directory, places))
@@ -315,7 +316,7 @@ class ModelRouter:
                                directory, places)
 
     async def kind(self, message: str, sender: str, thread: dict) -> dict:
-        about = {k: thread.get(k) for k in ("id", "title", "request", "summary")}
+        about = {k: thread.get(k) for k in ("id", "title", "request", "summary", "objectives")}
         got = await self._call(KIND, {"thread": about, "message": message, "from": sender}, kind_tool())
         if got.get("kind") not in KINDS:
             raise ValueError(f"the router model ({self.model}) said neither steer nor work: {got.get('kind')!r}")

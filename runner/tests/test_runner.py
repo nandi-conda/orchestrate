@@ -631,3 +631,53 @@ def test_opengateway_calls_carry_its_token_from_the_environment(tmp_path):
     assert (path, auth) == ("/v1/chat/completions", "Bearer og-token")
     assert body["model"] == "deepseek/deepseek-v4.1-flash-ultrafast"
     assert body["messages"][0]["role"] == "system" and "store" not in body
+
+
+async def test_a_thread_keeps_its_objectives_and_ends_when_all_are_done(tmp_path):
+    """The agent sets its objectives from its request and moves them as it
+    works; each change is an `objectives` event. A turn that ends with some
+    not done leaves the thread idle; one that ends with all done ends it."""
+    host = host_with([
+        py("print(await team.set_objectives(['find the bug', {'text': 'fix it', 'note': 'after the bug'}]))"),
+        py("await team.update_objective(0, 'done', 'found: off by one')\n"
+           "await team.update_objective(1, 'in_progress')\nprint(await team.objectives())"),
+        "half way",
+        py("await team.update_objective(1, 'done', 'fixed')"),
+        "all done",
+    ], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="fix the bug")
+    await host.wait_idle(t.id)
+    assert t.state == "idle"
+    assert "'status': 'pending'" in results(t)[0] and "'note': 'after the bug'" in results(t)[0]
+    assert t.objectives == [{"text": "find the bug", "status": "done", "note": "found: off by one"},
+                            {"text": "fix it", "status": "in_progress", "note": "after the bug"}]
+    assert t.directory_entry()["objectives"] == t.objectives
+    t.deliver("finish it")
+    await until(lambda: t.task.done())  # its harness closes as it ends
+    assert t.state == "done" and t.objectives[1] == {"text": "fix it", "status": "done", "note": "fixed"}
+    changes = [e["data"]["objectives"] for e in t.events if e["type"] == "objectives"]
+    assert len(changes) == 4 and changes[-1] == t.objectives
+    states = [e["data"]["state"] for e in t.events if e["type"] == "state"]
+    assert states[-2:] == ["idle", "done"]  # its last turn ended first
+
+
+async def test_objectives_the_team_skill_refuses(tmp_path):
+    host = host_with([py("for call in (team.set_objectives([]), team.set_objectives(['a', {'text': 'b', 'status': 'half'}]),\n"
+                         "             team.update_objective(3, 'done')):\n"
+                         "    try:\n        await call\n    except team.TeamError as e:\n        print(e)"),
+                      "done"], tmp_path=tmp_path)
+    t = await host.start(project="p", title="t", request="x")
+    await host.wait_idle(t.id)
+    out = results(t)[0].splitlines()
+    assert "at least one objective" in out[0] and "not 'half'" in out[1] and "no objective 3" in out[2], out
+    assert t.objectives == [] and t.state == "idle"  # no objectives: never finished
+    await host.stop(t.id)
+
+
+async def test_a_thread_brought_back_keeps_its_objectives(tmp_path):
+    host = host_with(["ok"], tmp_path=tmp_path)
+    kept = [{"text": "ship it", "status": "in_progress", "note": "tests pass"}]
+    t = await host.start(project="p", title="t", request="go on", objectives=kept)
+    await host.wait_idle(t.id)
+    assert t.objectives == kept and t.state == "idle"
+    await host.stop(t.id)

@@ -127,6 +127,7 @@ TOOLS: Const[i32] = 1
 WLOG: Const[i32] = 2
 FILES: Const[i32] = 3
 THINKING: Const[i32] = 4
+OBJECTIVES: Const[i32] = 5
 
 # the fields the folder picker fills
 PICK_NEW: Const[i32] = 1       # the Open folder dialog's folder
@@ -181,7 +182,7 @@ sending: i32 = 0
 mode: i32 = 0
 pending: i32 = 0         # a refresh is scheduled
 threads_pending: i32 = 0 # a thread-list refresh is scheduled
-pane_tab: i32 = 0        # DIALOG, TOOLS, THINKING, FILES or WLOG
+pane_tab: i32 = 0        # DIALOG, OBJECTIVES, TOOLS, THINKING, FILES or WLOG
 stream: i32 = 0          # the open project's event stream, 0 when none
 wlog: i32 = 0            # JSON handle: the selected thread's worker log ({text})
 wlog_loading: i32 = 0
@@ -238,6 +239,8 @@ h_idle: i32 = 0
 h_failed: i32 = 0
 h_queued: i32 = 0
 h_stopped: i32 = 0
+h_done: i32 = 0          # "done": a thread state, and an objective's status
+h_doing: i32 = 0         # "in_progress", an objective's status
 h_bound: i32 = 0
 h_unbound: i32 = 0
 h_ready: i32 = 0
@@ -301,7 +304,7 @@ def get_text(url: i32, msg: i32) -> None:
 def init() -> None:
     global h_pid, h_sel, h_name, h_repo, h_req, h_last, h_err, h_route, h_url, h_t1, h_t2, h_t3
     global h_bound, h_unbound, h_ready, h_local, h_place, h_plabel
-    global h_working, h_idle, h_failed, h_queued, h_stopped, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
+    global h_working, h_idle, h_failed, h_queued, h_stopped, h_done, h_doing, h_wlog_err, h_md, h_run, h_tid, h_fpath, h_files_err
     global h_fview, h_fview_err, h_mdtid, h_mdbase, h_mdsrc, h_mdkey, h_code, h_ckey
     global h_clip, h_seltext, h_selpos, h_quote, h_lastq, h_body, h_act, h_edit
     global h_selsrc, h_qsrc, h_lastqsrc, h_evid
@@ -338,6 +341,10 @@ def init() -> None:
     s_set(h_queued, "queued")
     h_stopped = s_new()
     s_set(h_stopped, "stopped")
+    h_done = s_new()
+    s_set(h_done, "done")
+    h_doing = s_new()
+    s_set(h_doing, "in_progress")
     h_bound = s_new()
     s_set(h_bound, "bound")
     h_unbound = s_new()
@@ -596,7 +603,7 @@ def show_activity() -> None:
     editing = 0
     if mode == TO_THREAD:
         mode = AUTO
-    if pane_tab == WLOG or pane_tab == FILES or pane_tab == THINKING:
+    if pane_tab == WLOG or pane_tab == FILES or pane_tab == THINKING or pane_tab == OBJECTIVES:
         pane_tab = DIALOG
     jump = 1
     fetch_log()
@@ -985,6 +992,15 @@ def update(msg: i32, arg: i32) -> None:
         if screen == 1:
             loading = 0
             threads = take(threads, arg)
+            # The open thread left the live list with nobody here archiving it:
+            # it accomplished its objectives (or another computer archived it).
+            # The list turns to the archived threads, where it is, so its pane
+            # stays on it.
+            if s_len(h_sel) > 0 and show_archived == 0 and threads != 0 and selected_thread() == 0:
+                show_archived = 1
+                if mode == TO_THREAD:
+                    mode = AUTO
+                fetch_threads()
         else:
             j_free(arg)
     elif msg == GOT_LOG:
@@ -1401,6 +1417,8 @@ def state_badge(h: i32) -> None:
         badge("stopped", "outline")
     elif s_eq(h, h_idle) == 1:
         badge("idle", "secondary")
+    elif s_eq(h, h_done) == 1:
+        badge("done", "")
     else:
         el("span")
         cls("badge")
@@ -1414,7 +1432,7 @@ def thread_badges(t: i32) -> None:
     its runner's state (queued, working, idle...), and its worker's state when
     that is not ready. On none, or on its way to one: its binding, since a
     runner state is only true while a runner has it; a turn that ended badly
-    (failed, stopped) still says so. Then the messages it has not got to, if
+    (failed, stopped) still says so, as does one that is done. Then the messages it has not got to, if
     any (its load)."""
     jstr(t, "binding", h_t2)
     if s_eq(h_t2, h_bound) == 1:
@@ -1426,7 +1444,7 @@ def thread_badges(t: i32) -> None:
     else:
         outline_badge("", h_t2)
         jstr(t, "state", h_t2)
-        if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1:
+        if s_eq(h_t2, h_failed) == 1 or s_eq(h_t2, h_stopped) == 1 or s_eq(h_t2, h_done) == 1:
             state_badge(h_t2)
     jstr(t, "workers", h_t2)
     if s_eq(h_t2, h_local) == 1:
@@ -2847,10 +2865,11 @@ def tab_open(active: bool, arg: i32) -> None:
     on_click(TAB, arg)
 
 
-def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool) -> None:
+def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool, goals: i32, met: i32) -> None:
     """Dialog (the conversation) and Tools (calls and their output), with
-    counts, and for a thread (logs set) Thinking (its reasoning steps), Files
-    (its worktree) and Worker log (the runner's stdout and stderr)."""
+    counts, and for a thread (logs set) Objectives (what it is trying to
+    accomplish: `met` of its `goals` done), Thinking (its reasoning steps),
+    Files (its worktree) and Worker log (the runner's stdout and stderr)."""
     div("pane-tabs")
     tabs_list_open()
     tab_open(pane_tab == DIALOG, DIALOG)
@@ -2859,6 +2878,16 @@ def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool) -> None:
     num(dialog)
     end()
     end()
+    if logs:
+        tab_open(pane_tab == OBJECTIVES, OBJECTIVES)
+        text("Objectives")
+        if goals > 0:
+            span("tab-count")
+            num(met)
+            text("/")
+            num(goals)
+            end()
+        end()
     tab_open(pane_tab == TOOLS, TOOLS)
     text("Tools")
     span("tab-count")
@@ -2880,6 +2909,129 @@ def pane_tabs(dialog: i32, tools: i32, thoughts: i32, logs: bool) -> None:
         end()
     end()
     end()
+
+
+def objectives_met(t: i32) -> i32:
+    """How many of thread t's objectives are done."""
+    n: i32
+    i: i32
+    o: i32
+    os: i32
+    met: i32 = 0
+    n = j_len(t, "objectives")
+    if n == 0:
+        return 0
+    os = j_at(t, "objectives")
+    for i in range(n):
+        o = j_idx(os, i)
+        jstr(o, "status", h_t2)
+        if s_eq(h_t2, h_done) == 1:
+            met = met + 1
+        j_free(o)
+    j_free(os)
+    return met
+
+
+def objectives_list() -> None:
+    """The Objectives tab: what the selected thread is trying to accomplish,
+    each with its status and where it is at, as its agent last said. It is
+    live: the thread list it reads is fetched again on every event. A thread
+    whose objectives are all done ended with its last turn and was archived."""
+    t: i32
+    os: i32
+    o: i32
+    n: i32 = 0
+    i: i32
+    met: i32
+    t = selected_thread()
+    if t != 0:
+        n = j_len(t, "objectives")
+    if n == 0:
+        el("p")
+        cls("muted")
+        cls("empty")
+        text("No objectives yet. The thread sets them from its request as it starts.")
+        end()
+        if t != 0:
+            j_free(t)
+        return
+    met = objectives_met(t)
+    div("objectives-head")
+    span("objectives-count")
+    num(met)
+    text(" of ")
+    num(n)
+    text(" done")
+    end()
+    if met == n:
+        span("muted")
+        if j_has(t, "archived_at") == 1:
+            text(" · accomplished; the thread is archived")
+        else:
+            text(" · accomplished")
+        end()
+    end()
+    div("objectives-bar")
+    attr("role", "progressbar")
+    s_set(h_t1, "")
+    s_add_num(h_t1, met)
+    attr_ref("aria-valuenow", h_t1)
+    s_set(h_t1, "")
+    s_add_num(h_t1, n)
+    attr_ref("aria-valuemax", h_t1)
+    div("objectives-fill")
+    s_set(h_t1, "width: ")
+    s_add_num(h_t1, (met * 100) // n)
+    s_add(h_t1, "%")
+    attr_ref("style", h_t1)
+    end()
+    end()
+    os = j_at(t, "objectives")
+    el("ol")
+    cls("objectives")
+    for i in range(n):
+        o = j_idx(os, i)
+        jstr(o, "status", h_t2)
+        el("li")
+        cls("objective")
+        cls_if("objective-done", s_eq(h_t2, h_done) == 1)
+        cls_if("objective-doing", s_eq(h_t2, h_doing) == 1)
+        key(i)
+        span("objective-mark")
+        attr("aria-hidden", "true")
+        if s_eq(h_t2, h_done) == 1:
+            text("✓")
+        elif s_eq(h_t2, h_doing) == 1:
+            text("●")
+        else:
+            text("○")
+        end()
+        div("objective-body")
+        div("objective-text")
+        jstr(o, "text", h_t1)
+        text_ref(h_t1)
+        end()
+        div("objective-meta")
+        span("objective-status")
+        if s_eq(h_t2, h_done) == 1:
+            text("Done")
+        elif s_eq(h_t2, h_doing) == 1:
+            text("In progress")
+        else:
+            text("Pending")
+        end()
+        jstr(o, "note", h_t1)
+        if s_len(h_t1) > 0:
+            span("objective-note")
+            text_ref(h_t1)
+            end()
+        end()
+        end()
+        end()
+        j_free(o)
+    end()
+    j_free(os)
+    j_free(t)
 
 
 def thinking_steps(src: i32, n: i32) -> i32:
@@ -3136,6 +3288,8 @@ def pane() -> None:
     t: i32 = 0
     tools: i32 = 0
     thoughts: i32 = 0
+    goals: i32 = 0
+    met: i32 = 0
     shown: i32 = 0
     src: i32
     activity: i32
@@ -3168,8 +3322,10 @@ def pane() -> None:
         t = selected_thread()
         thread_head(t)
         if t != 0:
+            goals = j_len(t, "objectives")
+            met = objectives_met(t)
             j_free(t)
-    pane_tabs(said, tools, thoughts, activity == 0)
+    pane_tabs(said, tools, thoughts, activity == 0, goals, met)
     if activity == 1 and pane_tab == DIALOG:
         working_now()
     el("div")
@@ -3183,6 +3339,11 @@ def pane() -> None:
         return
     if pane_tab == FILES:
         file_list()
+        end()
+        end()
+        return
+    if pane_tab == OBJECTIVES:
+        objectives_list()
         end()
         end()
         return

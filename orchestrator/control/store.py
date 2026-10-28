@@ -187,7 +187,8 @@ SCHEMA = [
         activity TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, files TEXT NOT NULL DEFAULT '[]',
         token TEXT NOT NULL DEFAULT '', archived_at DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL, binding TEXT NOT NULL DEFAULT 'unbound',
-        binding_reason TEXT NOT NULL DEFAULT '', busy_since DOUBLE PRECISION)""",
+        binding_reason TEXT NOT NULL DEFAULT '', busy_since DOUBLE PRECISION,
+        objectives TEXT NOT NULL DEFAULT '[]')""",
     "CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id)",
     """CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, sender TEXT NOT NULL,
@@ -224,7 +225,11 @@ PG_IMAGES = """CREATE TABLE IF NOT EXISTS images (
     name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, data BYTEA NOT NULL,
     created_at DOUBLE PRECISION NOT NULL)"""
 THREAD_FIELDS = ("parent_id", "title", "request", "summary", "activity", "state", "worker_id", "files", "token",
-                 "archived_at", "binding", "binding_reason", "workers", "workers_why")
+                 "archived_at", "binding", "binding_reason", "workers", "workers_why", "objectives")
+# Thread fields kept as JSON text. `objectives` are what the thread is trying
+# to accomplish, as its runner last said ([{"text", "status", "note"}],
+# runner/API.md, "Directory entry").
+JSON_THREAD_FIELDS = ("files", "objectives")
 
 # Columns added to tables after their first release: (table, column, definition).
 # open() adds any a database made before them is missing.
@@ -246,14 +251,16 @@ ADDED_COLUMNS = [("projects", "archived_at", "DOUBLE PRECISION"),
                  ("events", "peer_id", "TEXT"),
                  ("threads", "busy_since", "DOUBLE PRECISION"),
                  ("threads", "workers_why", "TEXT NOT NULL DEFAULT ''"),
-                 ("events", "uid", "TEXT")]
+                 ("events", "uid", "TEXT"),
+                 ("threads", "objectives", "TEXT NOT NULL DEFAULT '[]'")]
 # Made once every event has its uid (_fill_uids).
 EVENTS_UID_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS events_uid ON events(uid)"
 
 
 def _thread(row: dict) -> dict:
     row = dict(row)
-    row["files"] = json.loads(row.get("files") or "[]")
+    for k in JSON_THREAD_FIELDS:
+        row[k] = json.loads(row.get(k) or "[]")
     return row
 
 
@@ -326,7 +333,7 @@ class _SqlStore:
         row = {"id": new_id("t"), "project_id": project_id, "parent_id": parent_id, "title": title,
                "workers": workers, "workers_why": workers_why,
                "request": request, "summary": "", "activity": "", "state": "queued", "worker_id": None,
-               "binding": "unbound", "binding_reason": "", "files": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
+               "binding": "unbound", "binding_reason": "", "files": "[]", "objectives": "[]", "token": secrets.token_urlsafe(24), "archived_at": None, "created_at": t, "updated_at": t,
                "busy_since": t}
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
@@ -354,7 +361,7 @@ class _SqlStore:
             if k == "binding" and v not in BINDING.states:
                 raise ValueError(f"unknown thread binding {v}")
             sets.append(f"{k} = ?")
-            args.append(json.dumps(v) if k == "files" else v)
+            args.append(json.dumps(v) if k in JSON_THREAD_FIELDS else v)
         if "state" in fields:
             # busy_since: when its current turn began, kept while it stays in
             # one (queued -> working), NULL when it is not in one. Read from
@@ -382,7 +389,7 @@ class _SqlStore:
         await self._upsert("projects", row)
 
     async def import_thread(self, row: dict) -> None:
-        row = {**row, "files": json.dumps(row.get("files") or [])}
+        row = {**row, **{k: json.dumps(row.get(k) or []) for k in JSON_THREAD_FIELDS}}
         await self._upsert("threads", row)
 
     async def import_message(self, row: dict) -> None:

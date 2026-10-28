@@ -104,7 +104,7 @@ def stored_worker(w: dict) -> Worker:
 def peer_entry(t: dict) -> dict:
     """A thread as the runner's directory entry shape (runner/API.md)."""
     return {"id": t["id"], "project": t["project_id"], "title": t["title"], "state": t["state"],
-            "summary": t["summary"], "files": t["files"], "parent": t["parent_id"]}
+            "summary": t["summary"], "objectives": t["objectives"], "files": t["files"], "parent": t["parent_id"]}
 
 
 def tool_arg(args) -> str:
@@ -1165,11 +1165,16 @@ class Orchestrator:
             fields["state"] = data["state"]
         elif typ == "turn_done" and data.get("summary"):
             fields["summary"] = data["summary"]
+        elif typ == "objectives" and isinstance(data.get("objectives"), list):
+            fields["objectives"] = data["objectives"]
         if fields:
             await self.store.update_thread(tid, **fields)
         await self.store.append_event(project_id, tid, typ, data)
         if "state" in fields:  # a thread that ends a turn makes room on its worker
             await self._made_room()
+        if fields.get("state") == "done":
+            # Its runner ended it: its last turn left every objective done.
+            await self.archive(tid, why="it accomplished all its objectives")
         if typ in ENDS_STREAM:
             await self.store.delete_events(project_id, tid, "delta")
 
@@ -1324,7 +1329,7 @@ class Orchestrator:
                                   + (" with its request" if request is not None else "")):
                 entry = await lw.client.create_thread(id=tid, title=t["title"], project=project["id"],
                                                       parent=t["parent_id"], model=model, summary=t["summary"],
-                                                      request=request,
+                                                      objectives=t["objectives"] or None, request=request,
                                                       images=await self._inline_images(images) or None)
         except BaseException:
             if request is not None:
@@ -1625,9 +1630,11 @@ class Orchestrator:
             await lw.client.stop(thread_id)
         await self.store.update_thread(thread_id, state="stopped", activity="")
 
-    async def archive(self, thread_id: str) -> dict:
+    async def archive(self, thread_id: str, why: str = "") -> dict:
         """Hide a thread from the main list, the router and its peers. A thread
-        still on its runner is stopped first."""
+        still on its runner is stopped first. `why` is said when it is not the
+        person's doing: a thread that accomplished all its objectives is
+        archived as it ends (_ingest)."""
         t = await self.store.get_thread(thread_id)
         if t is None:
             raise KeyError(thread_id)
@@ -1638,7 +1645,7 @@ class Orchestrator:
         if t["state"] not in ENDED:
             await self.stop(thread_id)
         t = await self.store.update_thread(thread_id, archived_at=now())
-        await self.store.append_event(t["project_id"], thread_id, "archived", {})
+        await self.store.append_event(t["project_id"], thread_id, "archived", {"why": why} if why else {})
         return t
 
     async def unarchive(self, thread_id: str) -> dict:

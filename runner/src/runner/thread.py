@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import objectives as O
 from .harness import HARNESS, KERNEL, SESSION, Harness, HarnessError, Place, PrimeAgent
 from .peers import LocalPeers, PeerError, Peers
 from .repo import GitError, Repos, Workspace
@@ -44,6 +45,18 @@ How the team works, through the `team` skill (read its SKILL.md):
   messages that start with [from <thread id>] or [from router]; the user's own come as they are.
 - Keep your directory entry current with `team.set_summary` when your focus changes.
 - `team.web_search` and `team.web_fetch` search and read the web.
+
+Your objectives: the thread has a list of the things it is trying to accomplish, each `pending`,
+`in_progress` or `done` with a short note on where it is at. The person watches them as you work.
+- Start your first turn by setting them from your request: `team.set_objectives([...])`, one
+  objective per outcome the request asks for. `team.objectives()` reads them back.
+- Keep them current as you go: `team.update_objective(i, "in_progress", "where it is at")` when
+  you start on one and as it moves, and set them again when you learn the work is different. A
+  message that brings more work adds objectives for it.
+- Mark one `done` only once it is accomplished and its work is committed. A turn that ends with
+  every objective done finishes the thread: it ends and is archived, and takes no more messages.
+  So while you still need something to finish (an answer, another thread's result), leave the
+  objective that needs it not done.
 
 The project is a pixi project (https://pixi.sh): pixi.toml at the root of your workspace says
 its dependencies, environments and tasks, and pixi.lock pins them. Use pixi for all of it:
@@ -180,7 +193,8 @@ def result_text(result: dict | None) -> str:
 class AgentThread:
     def __init__(self, *, id: str, project: str, title: str, agent: PrimeAgent, model: dict | None, place: Place,
                  peers: Peers, web: DeepSeekWeb, limits: Limits, parent: str | None, workspace: Workspace | None,
-                 emit: Callable[["AgentThread", str, Any], None], summary: str = ""):
+                 emit: Callable[["AgentThread", str, Any], None], summary: str = "",
+                 objectives: list[dict] | None = None):
         self.id, self.project, self.title, self.parent = id, project, title, parent
         self.agent, self.model, self.place = agent, model, place
         self.root = place.view.root
@@ -191,6 +205,7 @@ class AgentThread:
         self._emit = emit
         self.state = "queued"
         self.summary = summary
+        self.objectives = O.objectives(objectives) if objectives else []
         self.files: set[str] = set()
         self.spawned = 0
         self.events: list[dict] = []
@@ -217,7 +232,15 @@ class AgentThread:
 
     def directory_entry(self) -> dict:
         return {"id": self.id, "project": self.project, "title": self.title, "state": self.state,
-                "summary": self.summary, "files": sorted(self.files), "parent": self.parent}
+                "summary": self.summary, "objectives": self.objectives, "files": sorted(self.files),
+                "parent": self.parent}
+
+    def set_objectives(self, objectives: list[dict]) -> list[dict]:
+        """Replace the thread's objectives (checked: objectives.objectives),
+        an `objectives` event for the control plane and the person."""
+        self.objectives = O.objectives(objectives)
+        self.emit("objectives", {"objectives": self.objectives})
+        return self.objectives
 
     def deliver(self, body: str, sender: str = "user", hops: int = 0, images: list[dict] | None = None):
         self.inbox.put_nowait({"from": sender, "body": body, "hops": hops, "images": images or []})
@@ -248,6 +271,10 @@ class AgentThread:
                 item, self.first = self.first or await self.inbox.get(), None
                 if await self._send(item):
                     await self._turn()
+                    if O.accomplished(self.objectives) and self.inbox.empty():
+                        # Its turn ended with every objective done: the thread is finished.
+                        self.set_state("done")
+                        return
         except asyncio.CancelledError:
             if not self.stopping:
                 self._turn_over()
@@ -495,11 +522,11 @@ class ThreadHost:
 
     async def start(self, *, project: str, title: str, request: str | None = None, parent: str | None = None,
                     model: dict | None = None, id: str | None = None, summary: str = "",
-                    images: list[dict] | None = None) -> AgentThread:
+                    objectives: list[dict] | None = None, images: list[dict] | None = None) -> AgentThread:
         """Start a thread on this worker. A thread the orchestrator brings back
         continues its branch and its agent's session; with no `request` it
         waits idle for its next message. `images` belong to the request. An
-        id whose thread here has ended (stopped or failed) is started afresh.
+        id whose thread here has ended (done, stopped or failed) is started afresh.
         It returns at once, the thread `queued`: making its worktree and
         session (_prepare) is the start of its task, since that can take
         minutes (a snapshot with many files to write).
@@ -516,7 +543,7 @@ class ThreadHost:
         place = self._place(tid, project)
         t = AgentThread(id=tid, project=project, title=title, agent=self.agent, model=model, place=place,
                         peers=self.peers, web=self.web, limits=self.limits, parent=parent, workspace=None,
-                        emit=self._emit, summary=summary)
+                        emit=self._emit, summary=summary, objectives=objectives)
         t.stopping = self.stopping
         if old is not None:
             t.events = old.events  # the worker's event backlog keeps the thread's earlier events
@@ -672,7 +699,7 @@ class ThreadHost:
         """Wait until a thread has finished at least one turn and its inbox is empty (tests, CLI)."""
         t = self.threads[thread_id]
         async def _w():
-            while not (t.state in ("idle", "failed", "stopped") and t.first is None and t.inbox.empty()
+            while not (t.state in ("idle", "done", "failed", "stopped") and t.first is None and t.inbox.empty()
                        and any(e["type"] in ("turn_done", "error") for e in t.events)):
                 await asyncio.sleep(0.02)
         await asyncio.wait_for(_w(), timeout)

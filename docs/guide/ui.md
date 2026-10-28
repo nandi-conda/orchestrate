@@ -124,12 +124,13 @@ router re-assesses it in the background:
 ## A thread's pane
 
 Open a thread from the list. The pane has a title bar, a **Now** line saying
-what the thread is doing ("thinking", "running python_repl: …"), and five
+what the thread is doing ("thinking", "running python_repl: …"), and six
 tabs:
 
 | Tab | Shows |
 | --- | --- |
 | **Dialog** | The conversation: your messages, messages from other threads and the router, and the agent's replies, rendered as Markdown. Replies grow live as the model streams them. Each message shows when it was sent in your local time (hover it for the full date and zone). |
+| **Objectives** | What the thread is trying to accomplish: its objectives, each with its status (pending, in progress, done) and a note on where it is at, under how many are done and a progress bar. The tab's count says the same (`2/3`). The thread's agent sets them from its request as it starts and moves them as it works, so they change live. |
 | **Tools** | Every tool call the agent made (`python_repl` code) with its result. |
 | **Thinking** | The agent's reasoning steps in order, numbered, each rendered as Markdown under its time in your local time. A step still streaming shows last and grows live. |
 | **Files** | The thread's worktree, one directory at a time. Click a directory to open it (**Up** goes back). Markdown files open rendered in the pane and images (png, jpg, gif, webp, svg) open shown there, each with **Back** and **Download**; any other file downloads. Images a markdown file or a reply names by a worktree path (`![plot](out/plot.png)`, relative to the markdown file, or from the root with a leading `/`) show inline; remote images stay links. `.git` is hidden. A thread on no ready worker shows where it stands instead, and its files once it is bound. |
@@ -146,6 +147,12 @@ The buttons in the title bar:
   thread list, the router and the other threads. **Archived** at the top of
   the thread list shows archived threads; **Unarchive** brings one back
   (stopped). An archived thread takes no messages.
+
+A thread whose turn ends with every objective done is finished: it ends
+(state **done**) and is archived on its own, with "thread archived: it
+accomplished all its objectives" in its log. If its pane is open, the list
+turns to **Archived** so the pane stays on it. Unarchive it and message it to
+give it more: its agent adds objectives for the new work.
 
 Reading a thread's files or sending it a message when it is on no worker puts
 it on one first. Nothing is lost by that: its branch, a snapshot of its whole

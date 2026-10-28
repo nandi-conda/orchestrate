@@ -90,7 +90,10 @@ The `team` module is ready in every thread's kernel; all functions are async:
 
 | Call | Does |
 | --- | --- |
-| `team.list_threads(query=None)` | the project's other threads: id, title, state, summary, files, parent |
+| `team.set_objectives(objectives)` | this thread's objectives, the things it is trying to accomplish: each a string, or `{text, status, note}` with `status` `pending`, `in_progress` or `done` |
+| `team.update_objective(index, status=None, note=None, text=None)` | move one objective on |
+| `team.objectives()` | this thread's objectives as they stand |
+| `team.list_threads(query=None)` | the project's other threads: id, title, state, summary, objectives, files, parent |
 | `team.read_thread(id, last_n=20)` | a thread's directory entry and recent events |
 | `team.send_message(to, body, reply_to=None)` | a message in another thread's inbox |
 | `team.spawn_thread(title, request)` | a new thread for independent work; its result comes back as a message |
@@ -101,7 +104,20 @@ The `team` module is ready in every thread's kernel; all functions are async:
 The module talks to the runner over a unix socket bound into the sandbox. Peer
 calls are queued for the control plane to [collect](pull-mode.md#peer-calls);
 `web_search` and `web_fetch` are answered by the runner itself, with the same
-`DEEPSEEK_API_KEY`. A failed call raises `team.TeamError`.
+`DEEPSEEK_API_KEY`, and so are the objectives calls. A failed call raises
+`team.TeamError`.
+
+### Objectives
+
+Every thread keeps a list of objectives. Its prompt has the agent set them
+from its request at the start of its first turn, keep each one's status and
+note current as it works, and add objectives when a message brings more work.
+Each change is an `objectives` event; the control plane stores the list on the
+thread (it posts a thread brought back on another worker with it) and the UI
+shows it in the thread's Objectives tab. A turn that ends with every objective
+done, and no message waiting, finishes the thread: the runner ends it `done`,
+and the control plane archives it. A thread with no objectives never finishes
+on its own.
 
 ## The sandbox
 

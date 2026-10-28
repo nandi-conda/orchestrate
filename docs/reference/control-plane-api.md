@@ -41,7 +41,7 @@ a message is delivered, the images are inlined as base64 for the runner.
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/projects/{id}/threads` | `?archived=1` for archived ones | the thread directory, each thread with its [load](../architecture/routing.md#thread-load) |
+| GET | `/api/projects/{id}/threads` | `?archived=1` for archived ones | the thread directory, each thread with its [load](../architecture/routing.md#thread-load) and its `objectives` (`[{"text", "status", "note"}]`, [runner API](runner-api.md#directory-entry)); a thread whose objectives are all done is archived as its last turn ends |
 | POST | `/api/projects/{id}/threads` | `{request?, images?, title?}` | 201 + a new thread, bypassing the router |
 | GET | `/api/threads/{id}` | | the thread, with its state, binding and reason, and its load |
 | POST | `/api/threads/{id}/stop` | | `{ok}` |

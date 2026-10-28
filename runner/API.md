@@ -11,9 +11,9 @@ between all its projects. Default port 8080. Every route except `/health` needs
 | --- | --- | --- | --- |
 | GET | `/health` | | `{"ok", "threads", "running", "capacity", "commit", "boot", "spec"}`: `commit` is the orchestrate checkout the runner runs from (null outside a git checkout); `boot` is random per runner process, so a control plane can tell the runner restarted (its threads are gone from memory, its event `seq` starts again at 1); `spec` is `$RUNNER_SPEC`, the control plane's fingerprint of how it started this runner ("" when unset) |
 | GET | `/threads` | | list of directory entries |
-| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?}` | 201 + directory entry, `queued`, at once: the thread's worktree and session are made after (`preparing`, `prepared` events, below); 400 without `project`; 409 if `id` is running here |
+| POST | `/threads` | `{"project", "request"?, "images"?, "title"?, "parent"?, "model"?, "id"?, "summary"?, "objectives"?}` | 201 + directory entry, `queued`, at once: the thread's worktree and session are made after (`preparing`, `prepared` events, below); 400 without `project` or with objectives that are not valid (below); 409 if `id` is running here |
 | GET | `/threads/{id}` | | directory entry + `"events"` (count) |
-| POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202 |
+| POST | `/threads/{id}/messages` | `{"body", "images"? = [], "from"? = "user", "hops"? = 0}` | 202; 409 once the thread has ended (`done`, `stopped`, `failed`): start it again first |
 | POST | `/threads/{id}/stop` | | `{"ok": true}` |
 | GET | `/threads/{id}/events` | | SSE stream for one thread |
 | GET | `/threads/{id}/files` | `?path=<dir>` (default: the root) | `{"path", "entries": [{"name", "dir", "size"}]}`, directories first; 409 while its worktree is being made |
@@ -26,7 +26,7 @@ between all its projects. Default port 8080. Every route except `/health` needs
 | GET | `/peer/calls` | `?wait=25` | queued peer calls (below) |
 | POST | `/peer/calls/{id}` | `{"ok", "result"}` or `{"ok": false, "error"}` | `{"ok": true}`; 404 if unknown or already answered |
 
-- `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`stopped`, `failed`) is started afresh.
+- `id` lets the orchestrator pick thread ids so they match its own records. Omitted, the runner makes `t_<10 hex>`. An `id` whose thread on this worker has ended (`done`, `stopped`, `failed`) is started afresh.
 - `request`, `id` or `images` is required. An `id` with no `request` brings a thread back: see [Resuming a thread](#resuming-a-thread).
 - `images` are pasted pictures: `[{"media_type": "image/png", "data": "<base64>"}]`, at most 4 per message, each at most 8 MB, types `image/png`, `image/jpeg`, `image/webp` or `image/gif`. They become image parts of the user message the model reads; on a thread whose model takes text only (`deepseek-v4-pro`), prime-agent sends that turn to its `imageModel`, `deepseek/deepseek-flash` (`IMAGE_MODEL` in `src/runner/harness.py`). They need no text: `request` (or a message's `body`) may be empty. On `/threads` they belong to the request; on a message, to that message. The orchestrator validates them too, and a worker reachable on its own checks its own.
 - `model` is `{"provider", "model"}`, passed to prime-agent as `--provider` and `--model`. It runs `--offline`, so the models it knows are the ones `runner/models.json` declares: `deepseek` (`deepseek-flash`, `deepseek-v4-pro`, key `DEEPSEEK_API_KEY`) and `opengateway` (`deepseek/deepseek-v4.1-flash-ultrafast` at `https://apis.opengateway.ai/v1`, key `OPENGATEWAY_API_TOKEN`, the provider's `apiKey`). A model it does not declare, or whose key the runner has not got, is refused with 409 before a thread is made. Omitted: `deepseek` with `$DEEPSEEK_MODEL` (`deepseek-flash` when unset).
@@ -39,10 +39,15 @@ between all its projects. Default port 8080. Every route except `/health` needs
 
 ```json
 {"id": "t_1a2b3c4d5e", "project": "p", "title": "Fix export", "state": "working",
- "summary": "owns ui/export.py", "files": ["ui/export.py"], "parent": null}
+ "summary": "owns ui/export.py",
+ "objectives": [{"text": "Find why Safari ignores the click", "status": "done", "note": "handler bound on click only"},
+                {"text": "Fix it and add a test", "status": "in_progress", "note": "test written"}],
+ "files": ["ui/export.py"], "parent": null}
 ```
 
-`state` is one of `queued`, `working`, `idle`, `failed`, `stopped`. Threads are long-lived: after a turn they go `idle` and wake on the next message.
+`state` is one of `queued`, `working`, `idle`, `done`, `failed`, `stopped`. Threads are long-lived: after a turn they go `idle` and wake on the next message.
+
+`objectives` are what the thread is trying to accomplish (`src/runner/objectives.py`): its agent sets them from its request on its first turn and keeps them current with the team skill (`set_objectives`, `update_objective`). Each is `{"text", "status", "note"}`, `status` one of `pending`, `in_progress`, `done`, `note` where it is at; one to 20 of them, `[]` until the agent sets them. A turn that ends with every objective done, and no message waiting, finishes the thread: it goes `done` and its task ends (the orchestrator archives it). A thread brought back is posted with its `objectives` as they last stood.
 
 ### SSE
 
@@ -67,6 +72,7 @@ Each event is sent as `id: <seq>`, `event: <type>`, `data: <json>`. Resume with 
 | `tool_result` | `{"id", "name", "result"}` (cut to 4000 chars) |
 | `usage` | prime-agent's token counts for one model call |
 | `turn_done` | `{"summary", "final"}` |
+| `objectives` | `{"objectives"}`: the thread's objectives, whole, each time its agent changes them |
 | `saved` | `{"branch", "commit"}`: a turn a model call failed in ended; leftovers committed, the orchestrator took the branch and snapshot but did not land it |
 | `landed` | `{"branch", "base", "commit"}`: a turn ended and the branch is now the tip of `base` in the orchestrator's repository |
 | `land_conflict` | `{"branch", "base", "files"}`: rebasing onto `base` conflicted; the thread gets a message from `runner` and resolves it |
@@ -83,7 +89,7 @@ harness state, kept in the thread's home and committed by the runner as
 previous turn's). To bring a thread back on any worker (its old one was
 deleted, the orchestrator restarted, or the thread stopped or failed), the
 orchestrator sends its refs (`POST /projects/{project}/repo`), then posts `/threads` with the
-thread's `id`, `title`, `parent` and `summary`, and usually no `request`:
+thread's `id`, `title`, `parent`, `summary` and `objectives`, and usually no `request`:
 
 - The worktree is the worker's own for that thread when it still has one
   holding `origin/thread/<id>`; else it is made from `origin/thread/<id>`
@@ -147,8 +153,9 @@ wait and then fail; the CLI (`pixi run run`) uses in-process peers instead.
 A thread makes these calls from its kernel with the team skill
 (`skills/team`, `await team.send_message(...)`), over a unix socket of its own
 bound into its sandbox; the runner queues them here. `web_search`,
-`web_fetch` go through the same socket but are answered by the
-runner itself.
+`web_fetch`, `objectives`, `set_objectives` and `update_objective` go through
+the same socket but are answered by the runner itself (an `objectives` event
+carries each change).
 
 | `op` (the tool) | `args` | `result` |
 | --- | --- | --- |

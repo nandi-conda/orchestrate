@@ -6,6 +6,10 @@ It has no model. Each turn it says what it got, and:
 - a line `list: <query>` lists the project's threads, `read t_xxx` reads one,
 - a line `write <path>: <text>` writes text to that file of the thread's workspace
   (`$RUNNER_WORKDIR/<id>`), which /threads/{id}/files lists and serves,
+- a line `objectives: <a> | <b> | ...` sets the thread's objectives (pending),
+  `objective <i> <status>: <note>` moves one (`objectives` events, as the team
+  skill's set_objectives and update_objective make); a turn that ends with
+  them all done ends the thread `done`, like the real runner,
 - child threads report `Finished: ...` to their parent, like the real runner.
 
 A turn its process is stopped in is interrupted, as the real runner's is
@@ -59,6 +63,9 @@ TELL = re.compile(r"^\s*tell\s+(t_[0-9a-zA-Z]+):\s*(.+)$", re.M)
 LIST = re.compile(r"^\s*list:(.*)$", re.M)
 READ = re.compile(r"^\s*read\s+(t_[0-9a-zA-Z]+)\s*$", re.M)
 WRITE = re.compile(r"^\s*write\s+([^:\n]+):\s?(.*)$", re.M)
+OBJECTIVES = re.compile(r"^\s*objectives:\s*(.+)$", re.M)
+OBJECTIVE = re.compile(r"^\s*objective\s+(\d+)\s+(pending|in_progress|done):\s?(.*)$", re.M)
+ENDED = ("done", "stopped", "failed")
 THREAD_ID = re.compile(r"^[\w-]+$")
 RESUME = "Your last turn was cut short: the runner restarted while it ran. Finish that turn."
 
@@ -212,6 +219,13 @@ class Host:
         for tid in READ.findall(text):
             r = await self.peer_call("read_thread", t["id"], thread_id=tid, last_n=5)
             await self.emit(t["id"], "tool_result", {"id": "c3", "name": "read_thread", "result": r})
+        for items in OBJECTIVES.findall(text):
+            t["objectives"] = [{"text": i.strip(), "status": "pending", "note": ""} for i in items.split("|")]
+            await self.emit(t["id"], "objectives", {"objectives": t["objectives"]})
+        for i, status, note in OBJECTIVE.findall(text):
+            t["objectives"] = [{**o, "status": status, "note": note} if n == int(i) else o
+                               for n, o in enumerate(t["objectives"])]  # a new list: the last event keeps its own
+            await self.emit(t["id"], "objectives", {"objectives": t["objectives"]})
         summary = f"echoed {len(text)} chars"
         t["summary"] = summary
         await self.save(t)
@@ -223,6 +237,8 @@ class Host:
         self.turn_file(t["id"]).unlink(missing_ok=True)
         if t["state"] != "stopped":
             await self.set_state(t, "idle")
+            if t["objectives"] and all(o["status"] == "done" for o in t["objectives"]):
+                await self.set_state(t, "done")
 
     async def save(self, t: dict) -> None:
         """Commit and snapshot the worktree; the control plane takes both and
@@ -260,7 +276,7 @@ class Host:
         return p
 
     def entry(self, t: dict) -> dict:
-        return {k: t[k] for k in ("id", "project", "title", "state", "summary", "files", "parent")}
+        return {k: t[k] for k in ("id", "project", "title", "state", "summary", "objectives", "files", "parent")}
 
 
 def create_app(host: Host, token: str) -> Starlette:
@@ -296,10 +312,11 @@ def create_app(host: Host, token: str) -> Starlette:
         if not b.get("request") and not b.get("id") and not b.get("images"):
             return JSONResponse({"error": "request, or the id of a thread to bring back, is required"}, 400)
         tid = b.get("id") or f"t_{secrets.token_hex(5)}"
-        if tid in host.threads and host.threads[tid]["state"] not in ("stopped", "failed"):
+        if tid in host.threads and host.threads[tid]["state"] not in ENDED:
             return JSONResponse({"error": "exists"}, 409)
         t = {"id": tid, "project": b["project"], "title": b.get("title") or (b.get("request") or tid)[:40],
-             "state": "queued", "summary": b.get("summary") or "", "files": [], "parent": b.get("parent"),
+             "state": "queued", "summary": b.get("summary") or "", "objectives": b.get("objectives") or [],
+             "files": [], "parent": b.get("parent"),
              "resumed": not (b.get("request") or b.get("images"))}
         host.threads[tid] = t
         await host.emit(tid, "created", host.entry(t))
@@ -342,6 +359,8 @@ def create_app(host: Host, token: str) -> Starlette:
         t = host.threads.get(req.path_params["tid"])
         if t is None:
             return JSONResponse({"error": "no such thread"}, 404)
+        if t["state"] in ENDED:
+            return JSONResponse({"error": f"thread {t['id']} has ended ({t['state']})"}, 409)
         b = await req.json()
         await host.emit(t["id"], "message_in", {"from": b.get("from", "user"), "body": b["body"],
                                                 "images": b.get("images") or []})
